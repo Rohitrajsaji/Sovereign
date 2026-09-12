@@ -1,0 +1,79 @@
+{
+  "task_id": "M1-T04",
+  "status": "completed",
+  "completed_at_utc": "2026-09-12T17:55:41Z",
+  "title": "Implement minimum deterministic security/resource kernel, action journal, and process runner",
+  "source_hashes": {
+    "crates/sovereign-state/migrations/0003_security_kernel.sql": "sha256:1d85dfb109720e0d347b0fa5af217cd65fe048ba3679ecae831d37d7737b7b4d",
+    "crates/sovereign-policy/src/lib.rs": "sha256:5f2f22f0177658abe3f8b08ab67370f3d3eb2028655146e6c9096de7dd9050f1",
+    "crates/sovereign-tools/src/lib.rs": "sha256:012d26b35c9ac4cd18478ae12cd80159d66c838a6e1440c29a4e754c00b936ba"
+  },
+  "implementation": {
+    "state_schema_version": 3,
+    "canonical_v3_migration": "crates/sovereign-state/migrations/0003_security_kernel.sql",
+    "migration_compatibility_decision": "No persistent project runtime database existed at reconciliation time. Completed M0/M1 evidence was produced on schema <=2 and no *.sqlite/*.sqlite3 database existed outside ignored build/research trees. The two in-progress version-3 drafts were therefore unreleased implementation drafts. They were reconciled into exactly one canonical version-3 migration. Existing version-2 data is upgraded in place and tested; any database carrying a different recorded version-3 checksum fails closed through MigrationRunner checksum validation rather than being silently reinterpreted.",
+    "durable_action_outcome": "Result receipt bytes are published to the existing CAS before Observed. The Observed action row binds result_digest through a foreign key to artifact metadata. A database CHECK forbids state=committed without result_digest. Final Committed transition is allowed only from Observed/Reconciled with an already-bound result digest.",
+    "receipt_redaction_floor": "T04 receipt v1 intentionally persists no raw stdout/stderr text: only exit/limit/elapsed/cleanup metadata, byte counts, and SHA-256 digests. M1-T05 adds post-ingress redacted retained raw evidence and deterministic compression.",
+    "cleanup_floor": "Timeout/limit cleanup owns a process group. If group membership remains, action becomes unknown. If forced cleanup occurred while subprocesses were allowed, descendant absence cannot be proven against setsid escape on this host, so action becomes unknown and recovery is blocked. Output drains are bounded to 500 ms; an escaped descendant holding inherited pipes therefore cannot hang ProcessRunner.",
+    "isolation_floor": "MacSandboxExecBackend performs runtime read-deny, network-deny, write-jail allow/deny probes before advertising capability. Protected roots are denied even when nested below the repository. Selective task networking is unavailable in the M1 macOS backend and fails closed; only proven offline task execution is admitted.",
+    "environment_floor": "Child environment is env_clear plus Controller-approved entries. Action-supplied PATH is always rejected, including if individually listed; ProcessRunner injects only the approved toolchain-root PATH.",
+    "exact_authority_binding": "AuthorizedAction digest binds plan/revision/task/attempt, tool id/version/content digest, executable digest/path, repository id, destination digest, permission class, execution epoch, global policy digest, isolation-policy digest, nonce, expiry, structured argv/workdir/env/resource ceilings, and reconciliation mode. ProcessRunner rechecks executable pin and isolation digest before dispatch.",
+    "resource_floor": "One MODEL lease, MODEL/BUILD_HEAVY exclusion, and live-pressure override are implemented. M1 pressure bands use controlled working set, host headroom, swap-out/compressor growth, OS pressure, recent pressure event, and thermal serious state; constrained pressure denies new heavy leases."
+  },
+  "action_state_transition_traces": [
+    {
+      "scenario": "successful repository write",
+      "trace": ["prepared", "authorized", "dispatched", "observed", "committed"],
+      "durable_result": "committed row carries a CAS result_digest and the receipt is reopened by digest",
+      "validated_by": "sovereign-tools::runner::process_runner_refuses_execution_until_exact_action_is_durably_authorized"
+    },
+    {
+      "scenario": "crash/uncertainty after dispatch",
+      "trace": ["prepared", "authorized", "dispatched", "unknown"],
+      "validated_by": "sovereign-tools::runner::crash_after_dispatch_becomes_unknown_safe_read_reconciles_and_unsafe_unknown_blocks"
+    },
+    {
+      "scenario": "safe idempotent reconciliation",
+      "trace": ["prepared", "authorized", "dispatched", "unknown", "reconciled"],
+      "validated_by": "sovereign-tools::runner::crash_after_dispatch_becomes_unknown_safe_read_reconciles_and_unsafe_unknown_blocks"
+    },
+    {
+      "scenario": "receipt published before action observation then process restart",
+      "trace": ["prepared", "authorized", "dispatched", "unknown"],
+      "invariant": "orphan receipt publication cannot create a false committed action",
+      "validated_by": "sovereign-tools::runner::published_receipt_before_state_observation_never_creates_false_commit"
+    },
+    {
+      "scenario": "receipt bound at observed then restart before final commit",
+      "trace": ["prepared", "authorized", "dispatched", "observed", "committed"],
+      "invariant": "same durable result_digest survives restart and is required for final commit",
+      "validated_by": "sovereign-tools::runner::observed_receipt_survives_restart_and_can_then_commit"
+    },
+    {
+      "scenario": "escaped descendant holds inherited output pipe",
+      "trace": ["prepared", "authorized", "dispatched", "unknown"],
+      "invariant": "bounded drain returns and recovery blocks instead of claiming descendants were reaped",
+      "validated_by": "sovereign-tools::runner::escaped_descendant_holding_output_pipe_is_bounded_and_recovery_blocked"
+    }
+  ],
+  "verification": {
+    "cargo_fmt": "passed",
+    "cargo_clippy_workspace_all_targets_deny_warnings": "passed",
+    "cargo_test_sovereign_tools_sovereign_policy": "passed",
+    "cargo_test_workspace": "passed",
+    "cargo_test_workspace_offline": "passed",
+    "current_test_counts": {
+      "sovereign_policy_kernel": 11,
+      "sovereign_tools_runner": 9,
+      "sovereign_state_security_kernel": 6
+    }
+  },
+  "audit_steering": {
+    "durable_outcomes": "resolved for T04",
+    "cleanup_proof": "resolved for T04 minimum; subprocess-enabled forced cleanup intentionally recovery-blocks when descendant death cannot be proven",
+    "duplicate_v3_migrations": "resolved",
+    "isolation_runtime_probe_nested_protected_path_network": "resolved",
+    "context_accounting_and_absolute_model_deadline": "open M1 closure item; handled in sovereign-model before M1 closure",
+    "representative_full_packet_model_qualification": "open M1 closure item; must be satisfied by M1-T10/T07/T08/T09 vertical slice and real-model evidence, not by historical M1-T03 smoke"
+  }
+}

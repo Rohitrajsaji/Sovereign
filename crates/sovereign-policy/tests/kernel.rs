@@ -1,8 +1,9 @@
 use sovereign_policy::{
     CheckpointIntegrityFloor, CommandMode, CommandPolicy, CommandRisk, CommandSpec,
-    ExecutionIsolationBackend, HeavyLeaseClass, IsolationRequest, MacSandboxExecBackend,
-    MinimalNetworkPolicy, MinimalResourceLeaseAuthority, ModelCallBudget, NetworkDestination,
-    PathPolicy, PinnedExecutable, sanitized_environment,
+    ExecutionIsolationBackend, HeavyLeaseClass, HostPressureSnapshot, IsolationRequest,
+    M1ResourceGovernor, MacSandboxExecBackend, MinimalNetworkPolicy, MinimalResourceLeaseAuthority,
+    ModelCallBudget, NetworkDestination, PathPolicy, PinnedExecutable, PressureBand,
+    ResourceGovernor, sanitized_environment,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -89,6 +90,13 @@ fn inherited_sensitive_environment_is_absent_unless_individually_authorized() {
         sanitized_environment(
             &BTreeMap::from([("PATH".to_owned(), "/tmp/repo-shim".to_owned())]),
             &BTreeSet::new(),
+        )
+        .is_err()
+    );
+    assert!(
+        sanitized_environment(
+            &BTreeMap::from([("PATH".to_owned(), "/tmp/repo-shim".to_owned())]),
+            &BTreeSet::from(["PATH".to_owned()]),
         )
         .is_err()
     );
@@ -203,6 +211,58 @@ fn model_and_build_heavy_leases_serialize_and_second_model_is_denied() {
 }
 
 #[test]
+fn live_pressure_overrides_nominal_heavy_lease_admission() {
+    let green = HostPressureSnapshot {
+        controlled_working_set_mib: 4_000,
+        host_headroom_mib: 1_800,
+        swap_out_growth_mib_per_min: 0,
+        compressor_growth_mib_per_min: 0,
+        os_pressure_warning: false,
+        recent_pressure_event: false,
+        thermal_serious: false,
+    };
+    assert_eq!(green.classify(), PressureBand::Green);
+
+    let guarded = HostPressureSnapshot {
+        swap_out_growth_mib_per_min: 64,
+        ..green
+    };
+    assert_eq!(guarded.classify(), PressureBand::Guarded);
+
+    let constrained = HostPressureSnapshot {
+        swap_out_growth_mib_per_min: 300,
+        ..green
+    };
+    assert_eq!(constrained.classify(), PressureBand::Constrained);
+
+    let mut governor = M1ResourceGovernor::default();
+    assert!(
+        governor
+            .acquire(
+                "model-pressure-denied".to_owned(),
+                HeavyLeaseClass::Model,
+                constrained
+            )
+            .is_err()
+    );
+    let lease = governor
+        .acquire("model-green".to_owned(), HeavyLeaseClass::Model, green)
+        .unwrap_or_else(|error| panic!("green model lease: {error}"));
+    assert!(
+        governor
+            .acquire(
+                "build-overlap".to_owned(),
+                HeavyLeaseClass::BuildHeavy,
+                green,
+            )
+            .is_err()
+    );
+    governor
+        .release(&lease)
+        .unwrap_or_else(|error| panic!("release: {error}"));
+}
+
+#[test]
 fn checkpoint_floor_blocks_action_journal_sequence_mismatch() {
     assert!(
         CheckpointIntegrityFloor {
@@ -231,15 +291,21 @@ fn mac_sandbox_denies_protected_home_read_and_offline_network() {
     fs::create_dir_all(&repo).unwrap_or_else(|error| panic!("repo: {error}"));
     let repo_file = repo.join("inside.txt");
     let secret = test_home.0.join("secret.txt");
+    let nested_protected = repo.join(".controller-secrets");
+    fs::create_dir_all(&nested_protected)
+        .unwrap_or_else(|error| panic!("nested protected: {error}"));
+    let nested_secret = nested_protected.join("token.txt");
     fs::write(&repo_file, b"inside").unwrap_or_else(|error| panic!("inside: {error}"));
     fs::write(&secret, b"secret").unwrap_or_else(|error| panic!("secret: {error}"));
+    fs::write(&nested_secret, b"nested-secret")
+        .unwrap_or_else(|error| panic!("nested secret: {error}"));
 
     let backend =
         MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("sandbox: {error}"));
     let request = IsolationRequest {
         repository_root: repo.clone(),
         user_home_root: test_home.0.clone(),
-        extra_protected_read_roots: Vec::new(),
+        extra_protected_read_roots: vec![nested_protected.clone()],
         network_offline: true,
         allow_repository_write: true,
         require_full_filesystem_read_jail: false,
@@ -271,6 +337,21 @@ fn mac_sandbox_denies_protected_home_read_and_offline_network() {
         .unwrap_or_else(|error| panic!("run secret: {error}"));
     assert!(!status.success());
 
+    let nested = direct_spec(
+        "/bin/cat",
+        &[nested_secret
+            .to_str()
+            .unwrap_or_else(|| panic!("nested secret utf8"))],
+    );
+    let isolated = backend
+        .isolate(&nested, &request)
+        .unwrap_or_else(|error| panic!("isolate nested secret: {error}"));
+    let status = Command::new(&isolated.executable)
+        .args(&isolated.args)
+        .status()
+        .unwrap_or_else(|error| panic!("run nested secret: {error}"));
+    assert!(!status.success());
+
     let network = direct_spec(
         "/usr/bin/python3",
         &[
@@ -290,6 +371,11 @@ fn mac_sandbox_denies_protected_home_read_and_offline_network() {
     let mut strict = request;
     strict.require_full_filesystem_read_jail = true;
     assert!(backend.isolate(&inside, &strict).is_err());
+
+    let mut selective_network = strict;
+    selective_network.require_full_filesystem_read_jail = false;
+    selective_network.network_offline = false;
+    assert!(backend.isolate(&inside, &selective_network).is_err());
 }
 
 #[test]

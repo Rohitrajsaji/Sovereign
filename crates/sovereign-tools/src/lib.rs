@@ -4,14 +4,15 @@
 //! Controller-created authority to exist durably before an operating-system process starts.
 
 use sha2::{Digest, Sha256};
+use sovereign_evidence::{ArtifactStore, EvidenceError};
 use sovereign_policy::{
-    CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, IsolationRequest,
-    PolicyError, sanitized_environment,
+    CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, IsolatedCommand,
+    IsolationRequest, PolicyError, sanitized_environment,
 };
 use sovereign_state::{
     ActionTransition, NewActionRecord, PersistedActionRecord, StateError, StateStore,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
@@ -21,6 +22,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -28,6 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub enum ToolError {
     Policy(PolicyError),
     State(StateError),
+    Evidence(EvidenceError),
     Io(std::io::Error),
     Authority(String),
     InvalidTransition(String),
@@ -41,6 +44,7 @@ impl Display for ToolError {
         match self {
             Self::Policy(error) => write!(f, "tool policy error: {error}"),
             Self::State(error) => write!(f, "tool state error: {error}"),
+            Self::Evidence(error) => write!(f, "tool evidence error: {error}"),
             Self::Io(error) => write!(f, "tool I/O error: {error}"),
             Self::Authority(message) => write!(f, "tool authority error: {message}"),
             Self::InvalidTransition(message) => write!(f, "invalid action transition: {message}"),
@@ -62,6 +66,12 @@ impl From<PolicyError> for ToolError {
 impl From<StateError> for ToolError {
     fn from(value: StateError) -> Self {
         Self::State(value)
+    }
+}
+
+impl From<EvidenceError> for ToolError {
+    fn from(value: EvidenceError) -> Self {
+        Self::Evidence(value)
     }
 }
 
@@ -127,10 +137,17 @@ pub struct AuthorizedAction {
     pub plan_id: String,
     pub plan_revision: u32,
     pub task_id: String,
+    pub attempt_id: String,
     pub tool_id: String,
+    pub tool_version: String,
+    pub tool_digest: String,
+    pub executable_digest: String,
+    pub repository_id: String,
+    pub destination_digest: Option<String>,
     pub permission_class: PermissionClass,
     pub execution_epoch: i64,
     pub policy_digest: String,
+    pub isolation_policy_digest: String,
     pub nonce: String,
     pub expires_at_ms: i64,
     pub command: CommandSpec,
@@ -147,10 +164,21 @@ impl AuthorizedAction {
         digest_field(&mut hasher, &self.plan_id);
         hasher.update(self.plan_revision.to_be_bytes());
         digest_field(&mut hasher, &self.task_id);
+        digest_field(&mut hasher, &self.attempt_id);
         digest_field(&mut hasher, &self.tool_id);
+        digest_field(&mut hasher, &self.tool_version);
+        digest_field(&mut hasher, &self.tool_digest);
+        digest_field(&mut hasher, &self.executable_digest);
+        digest_field(&mut hasher, &self.repository_id);
+        if let Some(destination_digest) = &self.destination_digest {
+            digest_field(&mut hasher, destination_digest);
+        } else {
+            digest_field(&mut hasher, "none");
+        }
         digest_field(&mut hasher, permission_name(self.permission_class));
         hasher.update(self.execution_epoch.to_be_bytes());
         digest_field(&mut hasher, &self.policy_digest);
+        digest_field(&mut hasher, &self.isolation_policy_digest);
         digest_field(&mut hasher, &self.nonce);
         hasher.update(self.expires_at_ms.to_be_bytes());
         digest_field(&mut hasher, &self.command.executable.display().to_string());
@@ -198,9 +226,19 @@ impl AuthorizedAction {
         if self.action_id.trim().is_empty()
             || self.plan_id.trim().is_empty()
             || self.task_id.trim().is_empty()
+            || self.attempt_id.trim().is_empty()
             || self.tool_id.trim().is_empty()
+            || self.tool_version.trim().is_empty()
+            || self.repository_id.trim().is_empty()
             || self.nonce.trim().is_empty()
+            || !self.tool_digest.starts_with("sha256:")
+            || !self.executable_digest.starts_with("sha256:")
             || !self.policy_digest.starts_with("sha256:")
+            || !self.isolation_policy_digest.starts_with("sha256:")
+            || self
+                .destination_digest
+                .as_ref()
+                .is_some_and(|digest| !digest.starts_with("sha256:"))
             || self.execution_epoch < 0
         {
             return Err(ToolError::Authority(
@@ -259,6 +297,13 @@ impl<'a> ActionJournal<'a> {
             return Err(ToolError::Authority(format!(
                 "action tool {} does not match manifest {}",
                 action.tool_id, manifest.tool_id
+            )));
+        }
+        if manifest.version != action.tool_version || manifest.content_digest != action.tool_digest
+        {
+            return Err(ToolError::Authority(format!(
+                "action tool identity does not match manifest {}@{}",
+                manifest.tool_id, manifest.version
             )));
         }
         if !manifest
@@ -360,7 +405,59 @@ impl<'a> ActionJournal<'a> {
             event_id: &event_id(&action.action_id, next.as_str()),
             event_kind: next.as_str(),
             payload_json: "{}",
+            result_digest: None,
         })?)
+    }
+
+    /// Publishes a durable receipt to CAS and binds it to the observed action before commit.
+    ///
+    /// # Errors
+    /// Returns an evidence/state error when publication or durable observation fails.
+    pub fn observe_with_receipt(
+        &mut self,
+        action: &AuthorizedAction,
+        artifacts: &ArtifactStore,
+        receipt: &[u8],
+    ) -> Result<String, ToolError> {
+        let artifact = artifacts.put(self.store, receipt)?;
+        let digest = artifact.digest;
+        self.store.transition_action_with_event(ActionTransition {
+            action_id: &action.action_id,
+            expected_state: ActionState::Dispatched.as_str(),
+            next_state: ActionState::Observed.as_str(),
+            expected_epoch: action.execution_epoch,
+            event_id: &event_id(&action.action_id, ActionState::Observed.as_str()),
+            event_kind: ActionState::Observed.as_str(),
+            payload_json: "{}",
+            result_digest: Some(&digest),
+        })?;
+        Ok(digest)
+    }
+
+    /// Commits an observed/reconciled action only when durable result evidence is bound.
+    ///
+    /// # Errors
+    /// Returns an authority/state error when evidence is missing or state is stale.
+    pub fn commit_with_bound_result(
+        &mut self,
+        action: &AuthorizedAction,
+        expected: ActionState,
+    ) -> Result<i64, ToolError> {
+        if !matches!(expected, ActionState::Observed | ActionState::Reconciled) {
+            return Err(ToolError::InvalidTransition(
+                "commit requires observed or reconciled state".to_owned(),
+            ));
+        }
+        let record = self
+            .store
+            .action_record(&action.action_id)?
+            .ok_or_else(|| ToolError::Authority("missing action for commit".to_owned()))?;
+        if record.state != expected.as_str() || record.result_digest.is_none() {
+            return Err(ToolError::Authority(
+                "committed action requires durable bound result evidence".to_owned(),
+            ));
+        }
+        self.transition(action, expected, ActionState::Committed)
     }
 
     /// Converts a crash-left dispatched action into explicit unknown state on recovery.
@@ -392,7 +489,6 @@ impl<'a> ActionJournal<'a> {
             }
             Reconciliation::CommitObservedEffect => {
                 self.transition(action, ActionState::Unknown, ActionState::Reconciled)?;
-                self.transition(action, ActionState::Reconciled, ActionState::Committed)?;
             }
             Reconciliation::FailProvenAbsent => {
                 self.transition(action, ActionState::Unknown, ActionState::Reconciled)?;
@@ -520,6 +616,12 @@ pub struct ProcessRunner<'a, I: ExecutionIsolationBackend> {
     poll_interval: Duration,
 }
 
+struct PreparedExecution {
+    isolated: IsolatedCommand,
+    environment: BTreeMap<String, String>,
+    baseline_disk: u64,
+}
+
 impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
     #[must_use]
     pub fn new(command_policy: &'a CommandPolicy, isolation: &'a I) -> Self {
@@ -540,9 +642,59 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         journal: &mut ActionJournal<'_>,
         action: &AuthorizedAction,
         isolation_request: &IsolationRequest,
+        artifacts: &ArtifactStore,
     ) -> Result<RawToolResult, ToolError> {
         journal.verify_authorized(action)?;
-        self.command_policy.authorize(&action.command)?;
+        let prepared = self.prepare_execution(action, isolation_request)?;
+        journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
+        self.execute_dispatched(journal, action, artifacts, prepared)
+    }
+
+    fn prepare_execution(
+        &self,
+        action: &AuthorizedAction,
+        isolation_request: &IsolationRequest,
+    ) -> Result<PreparedExecution, ToolError> {
+        let effective_risk = self.command_policy.authorize(&action.command)?;
+        let executable = self
+            .command_policy
+            .pinned_executable(&action.command.executable)?;
+        if executable.sha256 != action.executable_digest {
+            return Err(ToolError::Authority(
+                "authorized executable digest no longer matches pinned executable".to_owned(),
+            ));
+        }
+        if isolation_request.digest()? != action.isolation_policy_digest {
+            return Err(ToolError::Authority(
+                "authorized isolation-policy digest does not match execution request".to_owned(),
+            ));
+        }
+        if isolation_request.allow_repository_write
+            && !matches!(
+                action.permission_class,
+                PermissionClass::RepositoryWrite
+                    | PermissionClass::PackageInstall
+                    | PermissionClass::Destructive
+            )
+        {
+            return Err(ToolError::Authority(
+                "process execution alone does not grant repository write authority".to_owned(),
+            ));
+        }
+        if effective_risk == CommandRisk::PackageInstall
+            && action.permission_class != PermissionClass::PackageInstall
+        {
+            return Err(ToolError::Authority(
+                "package installation requires exact package_install action authority".to_owned(),
+            ));
+        }
+        if effective_risk == CommandRisk::Destructive
+            && action.permission_class != PermissionClass::Destructive
+        {
+            return Err(ToolError::Authority(
+                "destructive command requires exact destructive action authority".to_owned(),
+            ));
+        }
         let mut environment = sanitized_environment(
             &action.command.environment,
             &action.individually_authorized_environment,
@@ -550,15 +702,26 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         environment.insert("PATH".to_owned(), self.command_policy.approved_path());
         let isolated = self.isolation.isolate(&action.command, isolation_request)?;
         let baseline_disk = directory_size(&action.command.working_directory)?;
+        Ok(PreparedExecution {
+            isolated,
+            environment,
+            baseline_disk,
+        })
+    }
 
-        journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
-
-        let mut command = Command::new(&isolated.executable);
+    fn execute_dispatched(
+        &self,
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        artifacts: &ArtifactStore,
+        prepared: PreparedExecution,
+    ) -> Result<RawToolResult, ToolError> {
+        let mut command = Command::new(&prepared.isolated.executable);
         command
-            .args(&isolated.args)
+            .args(&prepared.isolated.args)
             .current_dir(&action.command.working_directory)
             .env_clear()
-            .envs(environment)
+            .envs(prepared.environment)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -584,33 +747,14 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             Arc::clone(&output_count),
         );
         let start = Instant::now();
-        let mut limited = None;
-        let status = loop {
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            if elapsed_ms > action.command.timeout_ms {
-                limited = Some(ResourceLimitKind::Timeout);
-            } else if output_count.load(Ordering::Relaxed) > action.command.output_limit_bytes {
-                limited = Some(ResourceLimitKind::OutputBytes);
-            } else if directory_size(&action.command.working_directory)?
-                .saturating_sub(baseline_disk)
-                > action.command.disk_write_limit_bytes
-            {
-                limited = Some(ResourceLimitKind::DiskBytes);
-            } else if descendant_count(pgid)? > action.command.subprocess_limit {
-                limited = Some(ResourceLimitKind::Subprocesses);
-            }
-            if limited.is_some() {
-                terminate_process_group(&mut child, pgid)?;
-                break child.wait()?;
-            }
-            thread::sleep(self.poll_interval);
-        };
+        let (status, limited) = self.monitor_child(
+            &mut child,
+            pgid,
+            action,
+            prepared.baseline_disk,
+            &output_count,
+        )?;
 
-        let stdout = join_reader(stdout_handle)?;
-        let stderr = join_reader(stderr_handle)?;
         let reaped = wait_group_absent(pgid, Duration::from_millis(500))?;
         if !reaped {
             journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
@@ -619,16 +763,71 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             )));
         }
 
-        journal.transition(action, ActionState::Dispatched, ActionState::Observed)?;
-        journal.transition(action, ActionState::Observed, ActionState::Committed)?;
-        Ok(RawToolResult {
+        if limited.is_some() && action.command.subprocess_limit > 0 {
+            journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
+            return Err(ToolError::RecoveryBlocked(
+                "forced cleanup cannot prove absence of descendants that may have escaped the process group"
+                    .to_owned(),
+            ));
+        }
+
+        let stdout =
+            receive_reader(stdout_handle, Duration::from_millis(500)).inspect_err(|_| {
+                let _ = journal.transition(action, ActionState::Dispatched, ActionState::Unknown);
+            })?;
+        let stderr =
+            receive_reader(stderr_handle, Duration::from_millis(500)).inspect_err(|_| {
+                let _ = journal.transition(action, ActionState::Dispatched, ActionState::Unknown);
+            })?;
+
+        let result = RawToolResult {
             exit_code: status.code(),
             stdout,
             stderr,
             elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
             terminated_for_limit: limited,
             process_group_reaped: true,
-        })
+        };
+        let receipt = durable_result_receipt(action, &result)?;
+        journal.observe_with_receipt(action, artifacts, &receipt)?;
+        journal.commit_with_bound_result(action, ActionState::Observed)?;
+        Ok(result)
+    }
+
+    fn monitor_child(
+        &self,
+        child: &mut Child,
+        pgid: u32,
+        action: &AuthorizedAction,
+        baseline_disk: u64,
+        output_count: &AtomicU64,
+    ) -> Result<(std::process::ExitStatus, Option<ResourceLimitKind>), ToolError> {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok((status, None));
+            }
+            let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let limited = if elapsed_ms > action.command.timeout_ms {
+                Some(ResourceLimitKind::Timeout)
+            } else if output_count.load(Ordering::Relaxed) > action.command.output_limit_bytes {
+                Some(ResourceLimitKind::OutputBytes)
+            } else if directory_size(&action.command.working_directory)?
+                .saturating_sub(baseline_disk)
+                > action.command.disk_write_limit_bytes
+            {
+                Some(ResourceLimitKind::DiskBytes)
+            } else if descendant_count(pgid)? > action.command.subprocess_limit {
+                Some(ResourceLimitKind::Subprocesses)
+            } else {
+                None
+            };
+            if let Some(limit) = limited {
+                terminate_process_group(child, pgid)?;
+                return Ok((child.wait()?, Some(limit)));
+            }
+            thread::sleep(self.poll_interval);
+        }
     }
 
     fn reconcile_proven_no_child(
@@ -693,7 +892,7 @@ struct CapturedOutput {
     bytes: Vec<u8>,
 }
 
-type ReaderHandle = thread::JoinHandle<Result<CapturedOutput, std::io::Error>>;
+type ReaderHandle = Receiver<Result<CapturedOutput, std::io::Error>>;
 
 fn spawn_reader(
     pipe: Option<impl Read + Send + 'static>,
@@ -701,33 +900,82 @@ fn spawn_reader(
     total: Arc<AtomicU64>,
 ) -> Option<ReaderHandle> {
     pipe.map(|mut pipe| {
-        thread::spawn(move || {
+        let (sender, receiver) = mpsc::channel();
+        let handle = thread::spawn(move || {
             let retain_limit = usize::try_from(retain_limit).unwrap_or(usize::MAX);
             let mut retained = Vec::new();
             let mut buffer = [0_u8; 8 * 1024];
-            loop {
-                let read = pipe.read(&mut buffer)?;
-                if read == 0 {
-                    break;
+            let outcome = (|| -> Result<CapturedOutput, std::io::Error> {
+                loop {
+                    let read = pipe.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    total.fetch_add(u64::try_from(read).unwrap_or(u64::MAX), Ordering::Relaxed);
+                    let remaining = retain_limit.saturating_sub(retained.len());
+                    retained.extend_from_slice(&buffer[..read.min(remaining)]);
                 }
-                total.fetch_add(u64::try_from(read).unwrap_or(u64::MAX), Ordering::Relaxed);
-                let remaining = retain_limit.saturating_sub(retained.len());
-                retained.extend_from_slice(&buffer[..read.min(remaining)]);
-            }
-            Ok(CapturedOutput { bytes: retained })
-        })
+                Ok(CapturedOutput { bytes: retained })
+            })();
+            let _ = sender.send(outcome);
+        });
+        drop(handle);
+        receiver
     })
 }
 
-fn join_reader(handle: Option<ReaderHandle>) -> Result<Vec<u8>, ToolError> {
+fn receive_reader(handle: Option<ReaderHandle>, timeout: Duration) -> Result<Vec<u8>, ToolError> {
     let Some(handle) = handle else {
         return Ok(Vec::new());
     };
     handle
-        .join()
-        .map_err(|_| ToolError::RecoveryBlocked("output reader thread panicked".to_owned()))?
+        .recv_timeout(timeout)
+        .map_err(|_| ToolError::RecoveryBlocked("bounded output drain timed out".to_owned()))?
         .map(|captured| captured.bytes)
         .map_err(ToolError::Io)
+}
+
+fn durable_result_receipt(
+    action: &AuthorizedAction,
+    result: &RawToolResult,
+) -> Result<Vec<u8>, ToolError> {
+    let stdout_digest = digest_bytes(&result.stdout);
+    let stderr_digest = digest_bytes(&result.stderr);
+    let value = serde_json::json!({
+        "schema": "sovereign-tool-result-receipt-v1",
+        "action_id": action.action_id,
+        "payload_digest": action.payload_digest(),
+        "exit_code": result.exit_code,
+        "elapsed_ms": result.elapsed_ms,
+        "terminated_for_limit": result.terminated_for_limit.map(resource_limit_name),
+        "process_group_reaped": result.process_group_reaped,
+        "stdout": {
+            "sha256": stdout_digest,
+            "retained_bytes": result.stdout.len()
+        },
+        "stderr": {
+            "sha256": stderr_digest,
+            "retained_bytes": result.stderr.len()
+        }
+    });
+    serde_json::to_vec(&value).map_err(|error| {
+        ToolError::Authority(format!("result receipt serialization failed: {error}"))
+    })
+}
+
+fn digest_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+const fn resource_limit_name(limit: ResourceLimitKind) -> &'static str {
+    match limit {
+        ResourceLimitKind::Timeout => "timeout",
+        ResourceLimitKind::OutputBytes => "output_bytes",
+        ResourceLimitKind::DiskBytes => "disk_bytes",
+        ResourceLimitKind::Subprocesses => "subprocesses",
+    }
 }
 
 fn directory_size(root: &Path) -> Result<u64, ToolError> {

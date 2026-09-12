@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 sha2.workspace = true
+serde_json.workspace = true
+sovereign-evidence = { path = "../sovereign-evidence" }
 sovereign-policy = { path = "../sovereign-policy" }
 sovereign-state = { path = "../sovereign-state" }
 

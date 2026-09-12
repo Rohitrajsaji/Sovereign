@@ -167,6 +167,7 @@ pub struct PersistedActionRecord {
     pub payload_digest: String,
     pub policy_digest: String,
     pub execution_epoch: i64,
+    pub result_digest: Option<String>,
     pub last_event_sequence: i64,
     pub updated_at_ms: i64,
 }
@@ -194,6 +195,7 @@ pub struct ActionTransition<'a> {
     pub event_id: &'a str,
     pub event_kind: &'a str,
     pub payload_json: &'a str,
+    pub result_digest: Option<&'a str>,
 }
 
 /// One immutable generation in the Controller checkpoint hash chain.
@@ -607,9 +609,9 @@ impl StateStore {
         action_id: &str,
     ) -> Result<Option<PersistedActionRecord>, StateError> {
         Ok(self.connection.query_row(
-            "SELECT action_id, state, payload_digest, policy_digest, execution_epoch, last_event_sequence, updated_at_ms FROM action_records WHERE action_id=?1",
+            "SELECT action_id, state, payload_digest, policy_digest, execution_epoch, result_digest, last_event_sequence, updated_at_ms FROM action_records WHERE action_id=?1",
             [action_id],
-            |row| Ok(PersistedActionRecord { action_id: row.get(0)?, state: row.get(1)?, payload_digest: row.get(2)?, policy_digest: row.get(3)?, execution_epoch: row.get(4)?, last_event_sequence: row.get(5)?, updated_at_ms: row.get(6)? }),
+            |row| Ok(PersistedActionRecord { action_id: row.get(0)?, state: row.get(1)?, payload_digest: row.get(2)?, policy_digest: row.get(3)?, execution_epoch: row.get(4)?, result_digest: row.get(5)?, last_event_sequence: row.get(6)?, updated_at_ms: row.get(7)? }),
         ).optional()?)
     }
 
@@ -649,8 +651,14 @@ impl StateStore {
             )?;
             let sequence = tx.last_insert_rowid();
             tx.execute(
-                "UPDATE action_records SET state=?2, last_event_sequence=?3, updated_at_ms=?4 WHERE action_id=?1",
-                (transition.action_id, transition.next_state, sequence, now),
+                "UPDATE action_records SET state=?2, result_digest=COALESCE(?3, result_digest), last_event_sequence=?4, updated_at_ms=?5 WHERE action_id=?1",
+                (
+                    transition.action_id,
+                    transition.next_state,
+                    transition.result_digest,
+                    sequence,
+                    now,
+                ),
             )?;
             Ok(sequence)
         })

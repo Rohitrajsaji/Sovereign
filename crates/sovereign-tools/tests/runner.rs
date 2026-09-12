@@ -1,3 +1,4 @@
+use sovereign_evidence::ArtifactStore;
 use sovereign_policy::{
     CommandMode, CommandPolicy, CommandRisk, CommandSpec, IsolationRequest, MacSandboxExecBackend,
     PinnedExecutable,
@@ -9,8 +10,11 @@ use sovereign_tools::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::Command;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct TestDir(PathBuf);
 
@@ -60,7 +64,10 @@ fn manifest() -> ToolManifest {
         tool_id: "tool_shell".to_owned(),
         version: "1".to_owned(),
         content_digest: "sha256:manifest".to_owned(),
-        permission_ceiling: BTreeSet::from([PermissionClass::ProcessExec]),
+        permission_ceiling: BTreeSet::from([
+            PermissionClass::ProcessExec,
+            PermissionClass::RepositoryWrite,
+        ]),
         declared_risk_floor: CommandRisk::Shell,
     }
 }
@@ -80,15 +87,24 @@ fn shell_action(
     limits: Limits,
     mode: ReconciliationMode,
 ) -> AuthorizedAction {
+    let executable = PinnedExecutable::from_path("/bin/sh", "macos-system")
+        .unwrap_or_else(|error| panic!("pin shell action: {error}"));
     AuthorizedAction {
         action_id: id.to_owned(),
         plan_id: "plan_m1".to_owned(),
         plan_revision: 1,
         task_id: "task_t04".to_owned(),
+        attempt_id: format!("attempt-{id}"),
         tool_id: "tool_shell".to_owned(),
+        tool_version: "1".to_owned(),
+        tool_digest: "sha256:manifest".to_owned(),
+        executable_digest: executable.sha256,
+        repository_id: "repo_fixture".to_owned(),
+        destination_digest: None,
         permission_class: PermissionClass::ProcessExec,
         execution_epoch: 0,
         policy_digest: "sha256:policy".to_owned(),
+        isolation_policy_digest: "sha256:pending-isolation".to_owned(),
         nonce: format!("nonce-{id}"),
         expires_at_ms: now_ms() + 60_000,
         command: CommandSpec {
@@ -118,22 +134,33 @@ fn fixture(label: &str) -> (TestDir, PathBuf, PathBuf, StateStore) {
     (temp, repo, home, store)
 }
 
-fn isolation(repo: &Path, home: &Path) -> IsolationRequest {
+fn artifacts(temp: &TestDir) -> ArtifactStore {
+    ArtifactStore::open(temp.0.join("cas")).unwrap_or_else(|error| panic!("artifacts: {error}"))
+}
+
+fn isolation(repo: &Path, home: &Path, allow_repository_write: bool) -> IsolationRequest {
     IsolationRequest {
         repository_root: repo.to_path_buf(),
         user_home_root: home.to_path_buf(),
         extra_protected_read_roots: Vec::new(),
         network_offline: true,
-        allow_repository_write: true,
+        allow_repository_write,
         require_full_filesystem_read_jail: false,
     }
+}
+
+fn bind_isolation(action: &mut AuthorizedAction, request: &IsolationRequest) {
+    action.isolation_policy_digest = request
+        .digest()
+        .unwrap_or_else(|error| panic!("isolation digest: {error}"));
 }
 
 #[cfg(target_os = "macos")]
 #[test]
 fn process_runner_refuses_execution_until_exact_action_is_durably_authorized() {
-    let (_temp, repo, home, mut store) = fixture("authorization");
-    let action = shell_action(
+    let (temp, repo, home, mut store) = fixture("authorization");
+    let artifact_store = artifacts(&temp);
+    let mut action = shell_action(
         "action_auth",
         &repo,
         "printf ran > marker.txt",
@@ -145,30 +172,231 @@ fn process_runner_refuses_execution_until_exact_action_is_durably_authorized() {
         },
         ReconciliationMode::UnsafeSideEffect,
     );
+    action.permission_class = PermissionClass::RepositoryWrite;
     let command_policy = shell_policy();
     let backend =
         MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("sandbox: {error}"));
     let runner = ProcessRunner::new(&command_policy, &backend);
-    let request = isolation(&repo, &home);
+    let request = isolation(&repo, &home, true);
+    bind_isolation(&mut action, &request);
+    let result_digest = {
+        let mut journal = ActionJournal::new(&mut store);
+        assert!(
+            runner
+                .run(&mut journal, &action, &request, &artifact_store)
+                .is_err()
+        );
+        assert!(!repo.join("marker.txt").exists());
+        assert!(journal.record(&action.action_id).unwrap_or(None).is_none());
+
+        journal
+            .authorize(&action, &manifest())
+            .unwrap_or_else(|error| panic!("authorize: {error}"));
+        let result = runner
+            .run(&mut journal, &action, &request, &artifact_store)
+            .unwrap_or_else(|error| panic!("run: {error}"));
+        assert_eq!(result.exit_code, Some(0));
+        assert!(repo.join("marker.txt").exists());
+        let record = journal
+            .record(&action.action_id)
+            .unwrap_or_else(|error| panic!("record: {error}"))
+            .unwrap_or_else(|| panic!("missing action"));
+        assert_eq!(record.state, "committed");
+        record
+            .result_digest
+            .unwrap_or_else(|| panic!("committed action missing result digest"))
+    };
+    let mut receipt_file = artifact_store
+        .open_artifact(&store, &result_digest)
+        .unwrap_or_else(|error| panic!("open receipt: {error}"));
+    let mut receipt = Vec::new();
+    receipt_file
+        .read_to_end(&mut receipt)
+        .unwrap_or_else(|error| panic!("read receipt: {error}"));
+    let value: serde_json::Value =
+        serde_json::from_slice(&receipt).unwrap_or_else(|error| panic!("receipt json: {error}"));
+    assert_eq!(value["action_id"].as_str(), Some("action_auth"));
+    assert_eq!(value["exit_code"].as_i64(), Some(0));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn process_exec_does_not_imply_repository_write_and_isolation_binding_is_exact() {
+    let (temp, repo, home, mut store) = fixture("process-exec-no-write");
+    let artifact_store = artifacts(&temp);
+    let mut action = shell_action(
+        "action_process_exec_no_write",
+        &repo,
+        "printf denied > marker.txt",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 4 * 1024,
+            disk_bytes: 4 * 1024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::UnsafeSideEffect,
+    );
+    let request = isolation(&repo, &home, true);
+    bind_isolation(&mut action, &request);
+    let command_policy = shell_policy();
+    let backend =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("sandbox: {error}"));
+    let runner = ProcessRunner::new(&command_policy, &backend);
     let mut journal = ActionJournal::new(&mut store);
-
-    assert!(runner.run(&mut journal, &action, &request).is_err());
-    assert!(!repo.join("marker.txt").exists());
-    assert!(journal.record(&action.action_id).unwrap_or(None).is_none());
-
     journal
         .authorize(&action, &manifest())
         .unwrap_or_else(|error| panic!("authorize: {error}"));
-    let result = runner
-        .run(&mut journal, &action, &request)
-        .unwrap_or_else(|error| panic!("run: {error}"));
-    assert_eq!(result.exit_code, Some(0));
-    assert!(repo.join("marker.txt").exists());
+    assert!(
+        runner
+            .run(&mut journal, &action, &request, &artifact_store)
+            .is_err()
+    );
+    assert!(!repo.join("marker.txt").exists());
+    assert_eq!(
+        journal
+            .record(&action.action_id)
+            .unwrap_or(None)
+            .map(|record| record.state),
+        Some("authorized".to_owned())
+    );
+
+    let mut read_action = shell_action(
+        "action_isolation_digest",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 4 * 1024,
+            disk_bytes: 4 * 1024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::IdempotentRead,
+    );
+    let offline = isolation(&repo, &home, false);
+    bind_isolation(&mut read_action, &offline);
+    journal
+        .authorize(&read_action, &manifest())
+        .unwrap_or_else(|error| panic!("authorize read: {error}"));
+    let mut changed = offline;
+    changed.allow_repository_write = true;
+    assert!(
+        runner
+            .run(&mut journal, &read_action, &changed, &artifact_store)
+            .is_err()
+    );
+    assert_eq!(
+        journal
+            .record(&read_action.action_id)
+            .unwrap_or(None)
+            .map(|record| record.state),
+        Some("authorized".to_owned())
+    );
+}
+
+#[test]
+fn published_receipt_before_state_observation_never_creates_false_commit() {
+    let (temp, repo, _home, mut store) = fixture("receipt-before-observe");
+    let db = temp.0.join("state.sqlite3");
+    let artifact_store = artifacts(&temp);
+    let action = shell_action(
+        "action_receipt_gap",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 1_024,
+            disk_bytes: 1_024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::IdempotentRead,
+    );
+    {
+        let mut journal = ActionJournal::new(&mut store);
+        journal
+            .authorize(&action, &manifest())
+            .unwrap_or_else(|error| panic!("authorize: {error}"));
+        journal
+            .transition(&action, ActionState::Authorized, ActionState::Dispatched)
+            .unwrap_or_else(|error| panic!("dispatch: {error}"));
+    }
+    let artifact = artifact_store
+        .put(&mut store, b"{\"schema\":\"test-receipt\"}")
+        .unwrap_or_else(|error| panic!("publish receipt: {error}"));
+    drop(store);
+
+    let mut reopened = StateStore::open(&db).unwrap_or_else(|error| panic!("reopen: {error}"));
+    assert!(
+        artifact_store
+            .open_artifact(&reopened, &artifact.digest)
+            .is_ok()
+    );
+    let mut journal = ActionJournal::new(&mut reopened);
     let record = journal
         .record(&action.action_id)
         .unwrap_or_else(|error| panic!("record: {error}"))
         .unwrap_or_else(|| panic!("missing action"));
-    assert_eq!(record.state, "committed");
+    assert_eq!(record.state, "dispatched");
+    assert!(record.result_digest.is_none());
+    journal
+        .recover_dispatched_as_unknown(&action)
+        .unwrap_or_else(|error| panic!("recover unknown: {error}"));
+    assert_eq!(
+        journal
+            .record(&action.action_id)
+            .unwrap_or(None)
+            .map(|record| record.state),
+        Some("unknown".to_owned())
+    );
+}
+
+#[test]
+fn observed_receipt_survives_restart_and_can_then_commit() {
+    let (temp, repo, _home, mut store) = fixture("observe-restart");
+    let db = temp.0.join("state.sqlite3");
+    let artifact_store = artifacts(&temp);
+    let action = shell_action(
+        "action_observed_restart",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 1_024,
+            disk_bytes: 1_024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::IdempotentRead,
+    );
+    let digest = {
+        let mut journal = ActionJournal::new(&mut store);
+        journal
+            .authorize(&action, &manifest())
+            .unwrap_or_else(|error| panic!("authorize: {error}"));
+        journal
+            .transition(&action, ActionState::Authorized, ActionState::Dispatched)
+            .unwrap_or_else(|error| panic!("dispatch: {error}"));
+        journal
+            .observe_with_receipt(&action, &artifact_store, b"{\"result\":\"known\"}")
+            .unwrap_or_else(|error| panic!("observe receipt: {error}"))
+    };
+    drop(store);
+
+    let mut reopened = StateStore::open(&db).unwrap_or_else(|error| panic!("reopen: {error}"));
+    let mut journal = ActionJournal::new(&mut reopened);
+    let observed = journal
+        .record(&action.action_id)
+        .unwrap_or_else(|error| panic!("record: {error}"))
+        .unwrap_or_else(|| panic!("missing observed action"));
+    assert_eq!(observed.state, "observed");
+    assert_eq!(observed.result_digest.as_deref(), Some(digest.as_str()));
+    journal
+        .commit_with_bound_result(&action, ActionState::Observed)
+        .unwrap_or_else(|error| panic!("commit after restart: {error}"));
+    let committed = journal
+        .record(&action.action_id)
+        .unwrap_or_else(|error| panic!("committed record: {error}"))
+        .unwrap_or_else(|| panic!("missing committed action"));
+    assert_eq!(committed.state, "committed");
+    assert_eq!(committed.result_digest.as_deref(), Some(digest.as_str()));
 }
 
 #[test]
@@ -266,16 +494,17 @@ fn crash_after_dispatch_becomes_unknown_safe_read_reconciles_and_unsafe_unknown_
 #[cfg(target_os = "macos")]
 #[test]
 fn timeout_kills_and_reaps_the_entire_process_group() {
-    let (_temp, repo, home, mut store) = fixture("timeout");
-    let action = shell_action(
+    let (temp, repo, home, mut store) = fixture("timeout");
+    let artifact_store = artifacts(&temp);
+    let mut action = shell_action(
         "action_timeout",
         &repo,
-        "sleep 30 & wait",
+        "while :; do :; done",
         Limits {
             timeout_ms: 120,
             output_bytes: 16 * 1024,
             disk_bytes: 16 * 1024,
-            subprocesses: 4,
+            subprocesses: 0,
         },
         ReconciliationMode::IdempotentRead,
     );
@@ -283,13 +512,14 @@ fn timeout_kills_and_reaps_the_entire_process_group() {
     let backend =
         MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("sandbox: {error}"));
     let runner = ProcessRunner::new(&command_policy, &backend);
-    let request = isolation(&repo, &home);
+    let request = isolation(&repo, &home, false);
+    bind_isolation(&mut action, &request);
     let mut journal = ActionJournal::new(&mut store);
     journal
         .authorize(&action, &manifest())
         .unwrap_or_else(|error| panic!("authorize: {error}"));
     let result = runner
-        .run(&mut journal, &action, &request)
+        .run(&mut journal, &action, &request, &artifact_store)
         .unwrap_or_else(|error| panic!("run: {error}"));
     assert_eq!(
         result.terminated_for_limit,
@@ -304,33 +534,26 @@ fn output_disk_and_subprocess_ceilings_terminate_bounded_commands() {
     let cases = [
         (
             "action_output",
-            "i=0; while [ $i -lt 1000 ]; do echo 12345678901234567890; i=$((i+1)); sleep 0.005; done",
+            "i=0; while [ $i -lt 10000 ]; do echo 12345678901234567890; i=$((i+1)); done",
             128,
             64 * 1024,
-            4,
+            0,
             ResourceLimitKind::OutputBytes,
         ),
         (
             "action_disk",
-            "i=0; while [ $i -lt 1000 ]; do printf 12345678901234567890 >> growing.bin; i=$((i+1)); sleep 0.005; done",
+            "i=0; while [ $i -lt 10000 ]; do printf 12345678901234567890 >> growing.bin; i=$((i+1)); done",
             64 * 1024,
             80,
-            4,
+            0,
             ResourceLimitKind::DiskBytes,
-        ),
-        (
-            "action_children",
-            "sleep 30 & sleep 30 & wait",
-            16 * 1024,
-            16 * 1024,
-            1,
-            ResourceLimitKind::Subprocesses,
         ),
     ];
 
     for (label, script, output_limit, disk_limit, process_limit, expected) in cases {
-        let (_temp, repo, home, mut store) = fixture(label);
-        let action = shell_action(
+        let (temp, repo, home, mut store) = fixture(label);
+        let artifact_store = artifacts(&temp);
+        let mut action = shell_action(
             label,
             &repo,
             script,
@@ -342,19 +565,114 @@ fn output_disk_and_subprocess_ceilings_terminate_bounded_commands() {
             },
             ReconciliationMode::IdempotentRead,
         );
+        let allow_write = label == "action_disk";
+        if allow_write {
+            action.permission_class = PermissionClass::RepositoryWrite;
+        }
         let command_policy = shell_policy();
         let backend =
             MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("sandbox: {error}"));
         let runner = ProcessRunner::new(&command_policy, &backend);
-        let request = isolation(&repo, &home);
+        let request = isolation(&repo, &home, allow_write);
+        bind_isolation(&mut action, &request);
         let mut journal = ActionJournal::new(&mut store);
         journal
             .authorize(&action, &manifest())
             .unwrap_or_else(|error| panic!("authorize {label}: {error}"));
         let result = runner
-            .run(&mut journal, &action, &request)
+            .run(&mut journal, &action, &request, &artifact_store)
             .unwrap_or_else(|error| panic!("run {label}: {error}"));
         assert_eq!(result.terminated_for_limit, Some(expected), "{label}");
         assert!(result.process_group_reaped, "{label}");
+    }
+
+    let (temp, repo, home, mut store) = fixture("action_children");
+    let artifact_store = artifacts(&temp);
+    let mut action = shell_action(
+        "action_children",
+        &repo,
+        "/bin/sleep 30 & /bin/sleep 30 & wait",
+        Limits {
+            timeout_ms: 4_000,
+            output_bytes: 16 * 1024,
+            disk_bytes: 16 * 1024,
+            subprocesses: 1,
+        },
+        ReconciliationMode::IdempotentRead,
+    );
+    let command_policy = shell_policy();
+    let backend =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("sandbox: {error}"));
+    let runner = ProcessRunner::new(&command_policy, &backend);
+    let request = isolation(&repo, &home, false);
+    bind_isolation(&mut action, &request);
+    let mut journal = ActionJournal::new(&mut store);
+    journal
+        .authorize(&action, &manifest())
+        .unwrap_or_else(|error| panic!("authorize children: {error}"));
+    assert!(
+        runner
+            .run(&mut journal, &action, &request, &artifact_store)
+            .is_err()
+    );
+    let record = journal
+        .record(&action.action_id)
+        .unwrap_or_else(|error| panic!("record children: {error}"))
+        .unwrap_or_else(|| panic!("missing child action"));
+    assert_eq!(record.state, "unknown");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn escaped_descendant_holding_output_pipe_is_bounded_and_recovery_blocked() {
+    let (temp, repo, home, mut store) = fixture("escaped-pipe");
+    let artifact_store = artifacts(&temp);
+    let mut action = shell_action(
+        "action_escaped_pipe",
+        &repo,
+        "/usr/bin/python3 -c 'import os,time; os.setsid(); open(\"escaped.pid\",\"w\").write(str(os.getpid())); time.sleep(10)' & exit 0",
+        Limits {
+            timeout_ms: 2_000,
+            output_bytes: 16 * 1024,
+            disk_bytes: 16 * 1024,
+            subprocesses: 2,
+        },
+        ReconciliationMode::UnsafeSideEffect,
+    );
+    action.permission_class = PermissionClass::RepositoryWrite;
+    let command_policy = shell_policy();
+    let backend =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("sandbox: {error}"));
+    let runner = ProcessRunner::new(&command_policy, &backend);
+    let request = isolation(&repo, &home, true);
+    bind_isolation(&mut action, &request);
+    let mut journal = ActionJournal::new(&mut store);
+    journal
+        .authorize(&action, &manifest())
+        .unwrap_or_else(|error| panic!("authorize: {error}"));
+    let started = std::time::Instant::now();
+    assert!(
+        runner
+            .run(&mut journal, &action, &request, &artifact_store)
+            .is_err()
+    );
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let record = journal
+        .record(&action.action_id)
+        .unwrap_or_else(|error| panic!("record: {error}"))
+        .unwrap_or_else(|| panic!("missing action"));
+    assert_eq!(record.state, "unknown");
+
+    let pid_path = repo.join("escaped.pid");
+    for _ in 0..20 {
+        if pid_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    if let Ok(pid) = fs::read_to_string(&pid_path) {
+        let _ = Command::new("/bin/kill")
+            .args(["-KILL", pid.trim()])
+            .status();
     }
 }

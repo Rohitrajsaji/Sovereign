@@ -750,6 +750,7 @@ name = "sovereign-state"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "serde_json",
  "sha2",
  "sovereign-types",
 ]
@@ -758,7 +759,9 @@ dependencies = [
 name = "sovereign-tools"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "sha2",
+ "sovereign-evidence",
  "sovereign-policy",
  "sovereign-state",
 ]

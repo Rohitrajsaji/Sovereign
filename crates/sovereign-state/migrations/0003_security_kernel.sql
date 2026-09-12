@@ -4,8 +4,10 @@ CREATE TABLE action_records (
     payload_digest TEXT NOT NULL,
     policy_digest TEXT NOT NULL,
     execution_epoch INTEGER NOT NULL CHECK (execution_epoch >= 0),
+    result_digest TEXT REFERENCES artifact_metadata(digest) ON DELETE RESTRICT,
     last_event_sequence INTEGER NOT NULL CHECK (last_event_sequence >= 0),
-    updated_at_ms INTEGER NOT NULL
+    updated_at_ms INTEGER NOT NULL,
+    CHECK (state <> 'committed' OR result_digest IS NOT NULL)
 ) STRICT;
 
 CREATE TABLE controller_runtime (

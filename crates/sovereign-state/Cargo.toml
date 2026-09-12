@@ -10,6 +10,8 @@ rusqlite.workspace = true
 sha2.workspace = true
 sovereign-types = { path = "../sovereign-types" }
 
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true
-

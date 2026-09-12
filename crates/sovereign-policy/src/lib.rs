@@ -356,9 +356,7 @@ impl CommandPolicy {
     /// # Errors
     /// Returns a denial for unpinned executables or unauthorized risk classes.
     pub fn authorize(&self, spec: &CommandSpec) -> Result<CommandRisk, PolicyError> {
-        if spec.timeout_ms == 0
-            || spec.output_limit_bytes == 0
-            || spec.disk_write_limit_bytes == 0
+        if spec.timeout_ms == 0 || spec.output_limit_bytes == 0 || spec.disk_write_limit_bytes == 0
         {
             return Err(PolicyError::Denied(
                 "command resource ceilings must be positive".to_owned(),
@@ -517,6 +515,12 @@ pub fn sanitized_environment(
             return Err(PolicyError::Denied("invalid environment entry".to_owned()));
         }
         let upper = name.to_ascii_uppercase();
+        if upper == "PATH" {
+            return Err(PolicyError::Denied(
+                "action-supplied PATH is forbidden; Controller constructs toolchain PATH"
+                    .to_owned(),
+            ));
+        }
         let forbidden = AMBIENT_DENY_NAMES.iter().any(|entry| upper == *entry)
             || upper.ends_with("_TOKEN")
             || upper.ends_with("_PASSWORD")
@@ -561,6 +565,39 @@ pub struct IsolationRequest {
     pub network_offline: bool,
     pub allow_repository_write: bool,
     pub require_full_filesystem_read_jail: bool,
+}
+
+impl IsolationRequest {
+    /// Computes a canonical digest of the exact enforceable isolation request.
+    ///
+    /// # Errors
+    /// Returns an I/O/policy error when roots cannot be canonicalized.
+    pub fn digest(&self) -> Result<String, PolicyError> {
+        let repo = self.repository_root.canonicalize()?;
+        let home = self.user_home_root.canonicalize()?;
+        let mut protected = self
+            .extra_protected_read_roots
+            .iter()
+            .map(|root| canonicalize_existing_or_parent(root))
+            .collect::<Result<Vec<_>, _>>()?;
+        protected.sort();
+        let mut hasher = Sha256::new();
+        digest_policy_field(&mut hasher, &repo.display().to_string());
+        digest_policy_field(&mut hasher, &home.display().to_string());
+        for root in protected {
+            digest_policy_field(&mut hasher, &root.display().to_string());
+        }
+        hasher.update([u8::from(self.network_offline)]);
+        hasher.update([u8::from(self.allow_repository_write)]);
+        hasher.update([u8::from(self.require_full_filesystem_read_jail)]);
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    }
+}
+
+fn digest_policy_field(hasher: &mut Sha256, value: &str) {
+    let bytes = value.as_bytes();
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(bytes);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,6 +659,8 @@ impl MacSandboxExecBackend {
         fs::create_dir_all(&root)?;
         let root = root.canonicalize()?;
         let secret = root.join("secret");
+        let writable = root.join("writable");
+        fs::create_dir_all(&writable)?;
         fs::write(&secret, b"secret")?;
         let profile = format!(
             "(version 1)(allow default)(deny file-read* (subpath {}))(deny network*)",
@@ -631,6 +670,8 @@ impl MacSandboxExecBackend {
             .args(["-p", &profile, "/bin/cat"])
             .arg(&secret)
             .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
@@ -639,18 +680,38 @@ impl MacSandboxExecBackend {
             address.port()
         );
         let denied_network = std::process::Command::new(&self.sandbox_exec)
-            .args([
-                "-p",
-                &profile,
-                "/usr/bin/python3",
-                "-c",
-                &network_probe,
-            ])
+            .args(["-p", &profile, "/usr/bin/python3", "-c", &network_probe])
             .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        let write_profile = format!(
+            "(version 1)(allow default)(deny file-write* (subpath \"/\"))(allow file-write* (subpath {}))",
+            seatbelt_string(&writable)
+        );
+        let inside_write = writable.join("inside");
+        let outside_write = root.join("outside");
+        let allowed_write = std::process::Command::new(&self.sandbox_exec)
+            .args(["-p", &write_profile, "/bin/sh", "-c"])
+            .arg(format!("printf ok > '{}'", inside_write.display()))
+            .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        let denied_write = std::process::Command::new(&self.sandbox_exec)
+            .args(["-p", &write_profile, "/bin/sh", "-c"])
+            .arg(format!("printf no > '{}'", outside_write.display()))
+            .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()?;
         drop(listener);
         let _ = fs::remove_dir_all(&root);
-        if denied_read.success() || denied_network.success() {
+        if denied_read.success()
+            || denied_network.success()
+            || !allowed_write.success()
+            || denied_write.success()
+        {
             return Err(PolicyError::IsolationUnavailable(
                 "sandbox-exec runtime self-test did not enforce required read/network denial"
                     .to_owned(),
@@ -715,14 +776,12 @@ impl ExecutionIsolationBackend for MacSandboxExecBackend {
         }
         for root in &request.extra_protected_read_roots {
             let root = canonicalize_existing_or_parent(root)?;
-            if !root.starts_with(&repo) {
-                write!(
-                    &mut profile,
-                    "(deny file-read* (subpath {}))",
-                    seatbelt_string(&root)
-                )
-                .map_err(|_| PolicyError::Denied("failed to build isolation profile".to_owned()))?;
-            }
+            write!(
+                &mut profile,
+                "(deny file-read* (subpath {}))",
+                seatbelt_string(&root)
+            )
+            .map_err(|_| PolicyError::Denied("failed to build isolation profile".to_owned()))?;
         }
         profile.push_str("(deny network*)");
         if spec.subprocess_limit == 0 {
@@ -754,6 +813,48 @@ fn seatbelt_string(path: &Path) -> String {
 pub enum HeavyLeaseClass {
     Model,
     BuildHeavy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureBand {
+    Green,
+    Guarded,
+    Constrained,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostPressureSnapshot {
+    pub controlled_working_set_mib: u64,
+    pub host_headroom_mib: u64,
+    pub swap_out_growth_mib_per_min: u64,
+    pub compressor_growth_mib_per_min: u64,
+    pub os_pressure_warning: bool,
+    pub recent_pressure_event: bool,
+    pub thermal_serious: bool,
+}
+
+impl HostPressureSnapshot {
+    #[must_use]
+    pub const fn classify(self) -> PressureBand {
+        if self.os_pressure_warning
+            || self.thermal_serious
+            || self.swap_out_growth_mib_per_min > 256
+            || self.compressor_growth_mib_per_min > 256
+            || self.controlled_working_set_mib > 5_376
+            || self.host_headroom_mib < 1_280
+        {
+            PressureBand::Constrained
+        } else if self.recent_pressure_event
+            || self.swap_out_growth_mib_per_min >= 64
+            || self.compressor_growth_mib_per_min >= 64
+            || self.controlled_working_set_mib >= 4_864
+            || self.host_headroom_mib < 1_536
+        {
+            PressureBand::Guarded
+        } else {
+            PressureBand::Green
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -822,6 +923,50 @@ impl MinimalResourceLeaseAuthority {
     #[must_use]
     pub fn active_count(&self) -> usize {
         self.active.len()
+    }
+}
+
+pub trait ResourceGovernor {
+    /// Admits one heavy lease only when both the exclusion matrix and live pressure permit it.
+    ///
+    /// # Errors
+    /// Returns a resource denial when pressure or lease conflicts require serialization/deferral.
+    fn acquire(
+        &mut self,
+        lease_id: String,
+        class: HeavyLeaseClass,
+        pressure: HostPressureSnapshot,
+    ) -> Result<ResourceLease, PolicyError>;
+
+    /// Releases one exact heavy lease.
+    ///
+    /// # Errors
+    /// Returns a resource denial for an unknown or mismatched lease.
+    fn release(&mut self, lease: &ResourceLease) -> Result<(), PolicyError>;
+}
+
+#[derive(Debug, Default)]
+pub struct M1ResourceGovernor {
+    leases: MinimalResourceLeaseAuthority,
+}
+
+impl ResourceGovernor for M1ResourceGovernor {
+    fn acquire(
+        &mut self,
+        lease_id: String,
+        class: HeavyLeaseClass,
+        pressure: HostPressureSnapshot,
+    ) -> Result<ResourceLease, PolicyError> {
+        if pressure.classify() == PressureBand::Constrained {
+            return Err(PolicyError::ResourceDenied(
+                "live host pressure forbids a new heavy lease".to_owned(),
+            ));
+        }
+        self.leases.acquire(lease_id, class)
+    }
+
+    fn release(&mut self, lease: &ResourceLease) -> Result<(), PolicyError> {
+        self.leases.release(lease)
     }
 }
 

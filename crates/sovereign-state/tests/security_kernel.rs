@@ -1,6 +1,7 @@
 use rusqlite::Connection;
 use sovereign_state::{
-    ActionTransition, NewActionRecord, NewCheckpointIntegrityRecord, NewJournalEvent, StateStore,
+    ActionTransition, CURRENT_SCHEMA_VERSION, MIGRATIONS, MigrationRunner, NewActionRecord,
+    NewCheckpointIntegrityRecord, NewJournalEvent, StateStore,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -64,6 +65,7 @@ fn exact_action_authorization_and_transitions_are_atomic_and_epoch_bound() {
             event_id: "event_dispatched",
             event_kind: "dispatched",
             payload_json: "{}",
+            result_digest: None,
         })
         .unwrap_or_else(|error| panic!("dispatch: {error}"));
     assert_eq!(dispatched_sequence, 2);
@@ -84,6 +86,7 @@ fn exact_action_authorization_and_transitions_are_atomic_and_epoch_bound() {
                 event_id: "event_stale_state",
                 event_kind: "observed",
                 payload_json: "{}",
+                result_digest: None,
             })
             .is_err()
     );
@@ -103,6 +106,7 @@ fn exact_action_authorization_and_transitions_are_atomic_and_epoch_bound() {
                 event_id: "event_wrong_epoch",
                 event_kind: "observed",
                 payload_json: "{}",
+                result_digest: None,
             })
             .is_err()
     );
@@ -197,4 +201,125 @@ fn missing_checkpoint_blocks_nonzero_authoritative_journal_sequence() {
         })
         .unwrap_or_else(|error| panic!("event: {error}"));
     assert!(store.validate_checkpoint_integrity_floor(sequence).is_err());
+}
+
+#[test]
+fn committed_action_requires_durable_result_reference() {
+    let temp = TestDir::new("committed-result");
+    let mut store = StateStore::open(temp.db()).unwrap_or_else(|error| panic!("open: {error}"));
+    let epoch = store
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("epoch: {error}"));
+    store
+        .insert_action_record(NewActionRecord {
+            action_id: "action_receipt",
+            state: "authorized",
+            payload_digest: "sha256:payload",
+            policy_digest: "sha256:policy",
+            execution_epoch: epoch,
+            event_id: "event_receipt_authorized",
+            event_kind: "authorized",
+            payload_json: "{}",
+        })
+        .unwrap_or_else(|error| panic!("authorize: {error}"));
+    store
+        .transition_action_with_event(ActionTransition {
+            action_id: "action_receipt",
+            expected_state: "authorized",
+            next_state: "dispatched",
+            expected_epoch: epoch,
+            event_id: "event_receipt_dispatched",
+            event_kind: "dispatched",
+            payload_json: "{}",
+            result_digest: None,
+        })
+        .unwrap_or_else(|error| panic!("dispatch: {error}"));
+    store
+        .transition_action_with_event(ActionTransition {
+            action_id: "action_receipt",
+            expected_state: "dispatched",
+            next_state: "observed",
+            expected_epoch: epoch,
+            event_id: "event_receipt_observed",
+            event_kind: "observed",
+            payload_json: "{}",
+            result_digest: None,
+        })
+        .unwrap_or_else(|error| panic!("observe: {error}"));
+    assert!(
+        store
+            .transition_action_with_event(ActionTransition {
+                action_id: "action_receipt",
+                expected_state: "observed",
+                next_state: "committed",
+                expected_epoch: epoch,
+                event_id: "event_receipt_commit_without_result",
+                event_kind: "committed",
+                payload_json: "{}",
+                result_digest: None,
+            })
+            .is_err()
+    );
+    let record = store
+        .action_record("action_receipt")
+        .unwrap_or_else(|error| panic!("record: {error}"))
+        .unwrap_or_else(|| panic!("missing action"));
+    assert_eq!(record.state, "observed");
+    assert!(record.result_digest.is_none());
+}
+
+#[test]
+fn version_two_database_upgrades_in_place_to_single_canonical_version_three() {
+    let temp = TestDir::new("v2-upgrade");
+    let db = temp.db();
+    let mut connection =
+        Connection::open(&db).unwrap_or_else(|error| panic!("open raw v2: {error}"));
+    MigrationRunner::apply(&mut connection, &MIGRATIONS[..2])
+        .unwrap_or_else(|error| panic!("apply v2: {error}"));
+    connection
+        .execute(
+            "INSERT INTO state_records(namespace, record_key, value_json, version, updated_at_ms) VALUES ('compat', 'kept', '{\"v\":2}', 1, 1)",
+            [],
+        )
+        .unwrap_or_else(|error| panic!("seed v2: {error}"));
+    drop(connection);
+
+    let store = StateStore::open(&db).unwrap_or_else(|error| panic!("upgrade: {error}"));
+    assert_eq!(store.schema_version().unwrap_or(-1), CURRENT_SCHEMA_VERSION);
+    assert_eq!(
+        store.get_state("compat", "kept").unwrap_or_default(),
+        Some("{\"v\":2}".to_owned())
+    );
+    assert_eq!(store.current_execution_epoch().unwrap_or(-1), 0);
+}
+
+#[test]
+fn migration_manifest_has_one_version_three_and_matches_runtime() {
+    let manifest_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("migrations")
+        .join("manifest.json");
+    let bytes = fs::read(&manifest_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display()));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&bytes).unwrap_or_else(|error| panic!("manifest json: {error}"));
+    assert_eq!(
+        manifest["current_version"].as_i64(),
+        Some(CURRENT_SCHEMA_VERSION)
+    );
+    let migrations = manifest["migrations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("migrations array"));
+    let v3 = migrations
+        .iter()
+        .filter(|entry| entry["version"].as_i64() == Some(3))
+        .collect::<Vec<_>>();
+    assert_eq!(v3.len(), 1);
+    assert_eq!(v3[0]["path"].as_str(), Some("0003_security_kernel.sql"));
+    assert_eq!(
+        MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version == 3)
+            .count(),
+        1
+    );
 }
