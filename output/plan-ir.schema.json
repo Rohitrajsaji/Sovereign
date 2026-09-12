@@ -1,0 +1,1122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sovereign.local/schemas/plan-ir-v1.json",
+  "title": "Sovereign Plan IR v1.2",
+  "description": "Normative executable plan contract compiled and validated by the Sovereign Controller. Plan IR v1.2 is the 2026-09-12.6 security/autonomy/resilience amendment. It preserves the v1.1 dependency/evidence/retry/rollback semantics and adds explicit untrusted-code isolation, stronger filesystem/process/network/package/browser/secret controls, audit policy, bounded replanning/model-call deadlines, and optional external-intelligence policy. Context levels remain ceilings/permissions rather than fill targets; semantic retrieval remains gap-driven and optional.",
+  "$comment": "JSON Schema enforces structural validity. PlanValidator additionally enforces referential, graph, capability-intersection, revision-lineage, acceptance/verification-linkage, environment/tool-manifest, resource-conflict, and state-transition semantics described by the frozen architecture.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "ir_version",
+    "plan_id",
+    "revision",
+    "supersedes_revision",
+    "compiled_at",
+    "compiler_version",
+    "project",
+    "goal",
+    "requirements",
+    "repositories",
+    "depth",
+    "policy",
+    "tasks",
+    "edges",
+    "completion_gate",
+    "provenance"
+  ],
+  "properties": {
+    "ir_version": { "const": "1.2" },
+    "plan_id": { "$ref": "#/$defs/id" },
+    "revision": { "type": "integer", "minimum": 1 },
+    "compiled_at": { "$ref": "#/$defs/dateTime" },
+    "compiler_version": { "type": "string", "minLength": 1 },
+    "supersedes_revision": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "Must be null for revision 1. For revision N>1, semantic validation requires this to identify the previously active revision of the same plan_id; branching authoritative revision histories are not allowed."
+    },
+    "project": { "$ref": "#/$defs/project" },
+    "goal": { "$ref": "#/$defs/goal" },
+    "requirements": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/requirement" }
+    },
+    "repositories": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/repository" }
+    },
+    "depth": { "$ref": "#/$defs/depth" },
+    "policy": { "$ref": "#/$defs/policy" },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/task" }
+    },
+    "edges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/edge" }
+    },
+    "completion_gate": { "$ref": "#/$defs/completionGate" },
+    "provenance": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/provenance" }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "revision": { "const": 1 } },
+        "required": ["revision"]
+      },
+      "then": {
+        "properties": { "supersedes_revision": { "type": "null" } }
+      }
+    },
+    {
+      "if": {
+        "properties": { "revision": { "minimum": 2 } },
+        "required": ["revision"]
+      },
+      "then": {
+        "properties": { "supersedes_revision": { "type": "integer", "minimum": 1 } }
+      }
+    }
+  ],
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_.:-]{2,127}$"
+    },
+    "dateTime": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "project": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_id", "name", "workspace_roots"],
+      "properties": {
+        "project_id": { "$ref": "#/$defs/id" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "workspace_roots": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "goal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal_id", "statement", "source", "invariants"],
+      "properties": {
+        "goal_id": { "$ref": "#/$defs/id" },
+        "statement": { "type": "string", "minLength": 1 },
+        "source": { "$ref": "#/$defs/sourceRef" },
+        "invariants": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "non_goals": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "requirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirement_id", "priority", "kind", "text", "source", "evidence_expectations"],
+      "properties": {
+        "requirement_id": { "$ref": "#/$defs/id" },
+        "priority": { "enum": ["must", "should", "could"] },
+        "kind": { "enum": ["functional", "quality", "security", "performance", "migration", "operational", "constraint"] },
+        "text": { "type": "string", "minLength": 1 },
+        "source": { "$ref": "#/$defs/sourceRef" },
+        "evidence_expectations": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "sourceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "locator"],
+      "properties": {
+        "kind": { "enum": ["user", "document", "repository", "model", "memory", "tool", "generated"] },
+        "locator": { "type": "string", "minLength": 1 },
+        "digest": { "type": ["string", "null"] }
+      }
+    },
+    "permissionClass": {
+      "enum": [
+        "read",
+        "sandbox_write",
+        "repo_write",
+        "process_exec",
+        "package_install",
+        "network_read",
+        "network_write",
+        "browser_interactive",
+        "secret_use",
+        "external_side_effect",
+        "external_intelligence",
+        "destructive"
+      ]
+    },
+    "relativeSelector": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+"
+    },
+    "contractClause": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["clause_id", "text"],
+      "properties": {
+        "clause_id": { "$ref": "#/$defs/id" },
+        "text": { "type": "string", "minLength": 1 },
+        "evidence_requirements": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidenceRequirement" }
+        }
+      }
+    },
+    "assumption": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assumption_id", "text", "invalidation_scope", "basis_evidence"],
+      "properties": {
+        "assumption_id": { "$ref": "#/$defs/id" },
+        "text": { "type": "string", "minLength": 1 },
+        "invalidation_scope": { "enum": ["task", "dependency_branch", "plan"] },
+        "basis_evidence": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/evidenceRef" }
+        },
+        "fingerprints": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "filesystemPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["canonical_roots_required", "symlink_escape", "controller_state_protected", "atomic_replace_untrusted_targets", "revalidate_before_commit", "sibling_repo_requires_scope", "protected_path_classes"],
+      "properties": {
+        "canonical_roots_required": { "const": true },
+        "symlink_escape": { "const": "deny" },
+        "controller_state_protected": { "const": true },
+        "atomic_replace_untrusted_targets": { "const": true },
+        "revalidate_before_commit": { "const": true },
+        "sibling_repo_requires_scope": { "const": true },
+        "protected_path_classes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["os_roots", "ssh", "gnupg", "cloud_credentials", "kube", "keychains", "sovereign_internal"] }
+        }
+      }
+    },
+    "processPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["structured_commands", "shell_mode", "inherit_environment", "allowed_env_names", "deny_hidden_execution", "untrusted_code_isolation", "executable_resolution", "strip_ambient_capabilities", "kill_process_tree_on_timeout", "default_max_subprocesses"],
+      "properties": {
+        "structured_commands": { "const": true },
+        "shell_mode": { "enum": ["disabled", "explicit_task_only"] },
+        "inherit_environment": { "const": false },
+        "allowed_env_names": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "deny_hidden_execution": { "const": true },
+        "untrusted_code_isolation": { "const": "required_or_block" },
+        "executable_resolution": { "const": "pinned_manifest_or_approved_path" },
+        "strip_ambient_capabilities": { "const": true },
+        "kill_process_tree_on_timeout": { "const": true },
+        "default_max_subprocesses": { "type": "integer", "minimum": 0, "maximum": 256 }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Semantic validation requires write-like methods/actions to also hold network_write or external_side_effect authority plus reconciliation. Host allowlisting is not sufficient until DNS resolution and the connected peer satisfy address policy; ambient proxy is denied.",
+      "required": ["default", "allowed_hosts", "allowed_schemes", "allowed_ports", "allowed_methods", "follow_redirects", "max_redirects", "allow_private_ranges", "dns_revalidation", "connected_peer_validation", "ambient_proxy", "allow_task_loopback"],
+      "properties": {
+        "default": { "enum": ["offline", "read_only", "task_scoped"] },
+        "allowed_hosts": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "allowed_schemes": { "type": "array", "uniqueItems": true, "items": { "enum": ["http", "https"] } },
+        "allowed_ports": { "type": "array", "uniqueItems": true, "items": { "type": "integer", "minimum": 1, "maximum": 65535 } },
+        "allowed_methods": { "type": "array", "uniqueItems": true, "items": { "enum": ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"] } },
+        "follow_redirects": { "type": "boolean" },
+        "max_redirects": { "type": "integer", "minimum": 0, "maximum": 20 },
+        "allow_private_ranges": { "type": "boolean" },
+        "dns_revalidation": { "const": true },
+        "connected_peer_validation": { "const": true },
+        "ambient_proxy": { "const": "deny" },
+        "allow_task_loopback": { "type": "boolean" }
+      }
+    },
+    "secretPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed_providers", "persist_values", "redact_evidence", "redact_model_context", "model_secret_values", "ephemeral_resolution", "temporary_file_private"],
+      "properties": {
+        "allowed_providers": { "type": "array", "uniqueItems": true, "items": { "enum": ["macos_keychain", "environment", "external_broker"] } },
+        "persist_values": { "const": false },
+        "redact_evidence": { "const": true },
+        "redact_model_context": { "const": true },
+        "model_secret_values": { "const": "never" },
+        "ephemeral_resolution": { "const": true },
+        "temporary_file_private": { "const": true }
+      }
+    },
+    "approvalPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exact_action_binding", "reapprove_on_payload_change", "max_ttl_seconds", "required_permissions"],
+      "properties": {
+        "exact_action_binding": { "const": true },
+        "reapprove_on_payload_change": { "const": true },
+        "max_ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 86400 },
+        "required_permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["package_install", "network_write", "external_side_effect", "external_intelligence", "destructive"] }
+        }
+      }
+    },
+    "browserPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["default_profile_mode", "persistent_profile_requires_explicit_grant", "downloads", "clipboard", "notifications", "extensions", "disable_web_security", "trace_policy", "auto_open_downloads", "local_file_navigation", "offline_telemetry"],
+      "properties": {
+        "default_profile_mode": { "const": "isolated" },
+        "persistent_profile_requires_explicit_grant": { "const": true },
+        "downloads": { "enum": ["deny", "task_scoped"] },
+        "clipboard": { "const": "deny" },
+        "notifications": { "const": "deny" },
+        "extensions": { "const": "deny_by_default" },
+        "disable_web_security": { "const": false },
+        "trace_policy": { "enum": ["off", "redacted"] },
+        "auto_open_downloads": { "const": false },
+        "local_file_navigation": { "const": "deny" },
+        "offline_telemetry": { "const": "deny" }
+      }
+    },
+    "auditPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["append_only_events", "hash_chain", "record_policy_digest", "record_provenance", "on_corruption"],
+      "properties": {
+        "append_only_events": { "const": true },
+        "hash_chain": { "const": true },
+        "record_policy_digest": { "const": true },
+        "record_provenance": { "const": true },
+        "on_corruption": { "const": "block_high_risk_until_reconciled" }
+      }
+    },
+    "externalIntelligencePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Normal local profile uses allowed_providers=[] and raw_repository_export=deny. explicit_grant_only is only a global ceiling: a task must also allow the exact provider/data class and a separate persisted grant must bind the external escalation manifest. External output never gains tool authority.",
+      "required": ["enabled_by_default", "requires_explicit_grant", "allowed_providers", "allow_resolved_secrets", "raw_repository_export", "allow_raw_logs", "output_trust", "tool_authority"],
+      "properties": {
+        "enabled_by_default": { "const": false },
+        "requires_explicit_grant": { "const": true },
+        "allowed_providers": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "allow_resolved_secrets": { "const": false },
+        "raw_repository_export": { "enum": ["deny", "explicit_grant_only"] },
+        "allow_raw_logs": { "const": false },
+        "output_trust": { "const": "untrusted_external_model" },
+        "tool_authority": { "const": "none" }
+      }
+    },
+    "secretRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["secret_ref_id", "provider", "purpose", "injection", "target"],
+      "properties": {
+        "secret_ref_id": { "$ref": "#/$defs/id" },
+        "provider": { "enum": ["macos_keychain", "environment", "external_broker"] },
+        "purpose": { "type": "string", "minLength": 1 },
+        "injection": { "enum": ["environment", "stdin", "temporary_file", "adapter_handle"] },
+        "target": { "type": "string", "minLength": 1 }
+      }
+    },
+    "packagePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "allowed_registries", "lockfile_required", "integrity_required", "lifecycle_scripts", "global_install", "isolated_target_required"],
+      "properties": {
+        "allowed": { "type": "boolean" },
+        "allowed_registries": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "lockfile_required": { "type": "boolean" },
+        "integrity_required": { "type": "boolean" },
+        "lifecycle_scripts": { "enum": ["deny", "explicit_task_only"] },
+        "global_install": { "const": false },
+        "isolated_target_required": { "const": true }
+      }
+    },
+    "taskBrowserPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["allowed", "allowed_domains", "max_tabs", "downloads", "persistent_profile", "auto_open_downloads", "allow_local_file_navigation"],
+      "properties": {
+        "allowed": { "type": "boolean" },
+        "allowed_domains": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "max_tabs": { "type": "integer", "minimum": 1, "maximum": 20 },
+        "downloads": { "enum": ["deny", "task_scoped"] },
+        "persistent_profile": { "type": "boolean" },
+        "auto_open_downloads": { "const": false },
+        "allow_local_file_navigation": { "const": false },
+        "download_root": { "type": ["string", "null"] }
+      }
+    },
+    "taskExternalIntelligencePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "$comment": "Task-level narrowing of global external-intelligence policy. whole_repository_export=explicit_grant_only does not itself grant export; the global ceiling must permit it and an exact persisted grant must bind provider/purpose/payload manifest.",
+      "required": ["allowed", "allowed_providers", "allowed_data_classes", "whole_repository_export", "raw_logs", "resolved_secrets", "tool_authority", "max_payload_bytes"],
+      "properties": {
+        "allowed": { "type": "boolean" },
+        "allowed_providers": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "allowed_data_classes": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["contract", "requirement", "source_slice", "diff", "tool_synopsis", "verification", "memory_synopsis", "architecture_doc"] }
+        },
+        "whole_repository_export": { "enum": ["deny", "explicit_grant_only"] },
+        "raw_logs": { "const": false },
+        "resolved_secrets": { "const": false },
+        "tool_authority": { "const": "none" },
+        "max_payload_bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "taskActionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["write_roots", "network", "packages", "browser", "external_intelligence", "secret_refs", "approval_required_permissions"],
+      "properties": {
+        "write_roots": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/scopedPath" } },
+        "network": { "$ref": "#/$defs/networkPolicy" },
+        "packages": { "$ref": "#/$defs/packagePolicy" },
+        "browser": { "$ref": "#/$defs/taskBrowserPolicy" },
+        "external_intelligence": { "$ref": "#/$defs/taskExternalIntelligencePolicy" },
+        "secret_refs": { "type": "array", "items": { "$ref": "#/$defs/secretRef" } },
+        "approval_required_permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["package_install", "network_write", "external_side_effect", "external_intelligence", "destructive"] }
+        }
+      }
+    },
+    "scopedPath": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository_id", "path"],
+      "properties": {
+        "repository_id": { "$ref": "#/$defs/id" },
+        "path": { "$ref": "#/$defs/relativeSelector" }
+      }
+    },
+    "commandSpec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tool_id", "mode", "program", "args", "repository_id", "working_dir_relative", "literal_env", "secret_env", "timeout_seconds", "output_limit_bytes"],
+      "properties": {
+        "tool_id": { "type": "string", "minLength": 1 },
+        "mode": { "enum": ["exec", "shell_explicit"] },
+        "program": { "type": "string", "minLength": 1 },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "repository_id": { "$ref": "#/$defs/id" },
+        "working_dir_relative": { "$ref": "#/$defs/relativeSelector" },
+        "literal_env": { "type": "object", "additionalProperties": { "type": "string" } },
+        "secret_env": { "type": "object", "additionalProperties": { "$ref": "#/$defs/id" } },
+        "stdin_artifact_id": {
+          "oneOf": [
+            { "$ref": "#/$defs/id" },
+            { "type": "null" }
+          ]
+        },
+        "timeout_seconds": { "type": "integer", "minimum": 1 },
+        "output_limit_bytes": { "type": "integer", "minimum": 1024 }
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository_id", "root", "baseline", "instructions", "index_snapshot_id"],
+      "properties": {
+        "repository_id": { "$ref": "#/$defs/id" },
+        "root": { "type": "string", "minLength": 1 },
+        "baseline": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["vcs", "head", "dirty_digest"],
+          "properties": {
+            "vcs": { "enum": ["git", "none"] },
+            "head": { "type": ["string", "null"] },
+            "branch": { "type": ["string", "null"] },
+            "dirty_digest": { "type": "string", "minLength": 1 },
+            "protected_changes_present": { "type": "boolean", "default": false }
+          }
+        },
+        "instructions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidenceRef" }
+        },
+        "index_snapshot_id": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "description": "Nullable during the M1 exact-retrieval slice. Semantic validation requires a compatible non-null snapshot when a task requests lexical/symbol/dependency/semantic indexed evidence."
+        },
+        "languages": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "depth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "reason", "features"],
+      "properties": {
+        "mode": { "enum": ["D0", "D1", "D2", "D3", "D4"] },
+        "reason": { "type": "string", "minLength": 1 },
+        "features": {
+          "type": "object",
+          "additionalProperties": { "type": ["number", "integer", "boolean", "string"] }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_ceiling", "filesystem", "process", "network", "secrets", "approval", "browser", "audit", "external_intelligence", "retry", "escalation", "checkpoint", "resources"],
+      "properties": {
+        "capability_ceiling": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/permissionClass" }
+        },
+        "filesystem": { "$ref": "#/$defs/filesystemPolicy" },
+        "process": { "$ref": "#/$defs/processPolicy" },
+        "network": { "$ref": "#/$defs/networkPolicy" },
+        "secrets": { "$ref": "#/$defs/secretPolicy" },
+        "approval": { "$ref": "#/$defs/approvalPolicy" },
+        "browser": { "$ref": "#/$defs/browserPolicy" },
+        "audit": { "$ref": "#/$defs/auditPolicy" },
+        "external_intelligence": { "$ref": "#/$defs/externalIntelligencePolicy" },
+        "retry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["default_max_attempts", "same_failure_limit", "max_tasks_per_revision", "max_plan_revisions", "max_replans_per_scope"],
+          "properties": {
+            "default_max_attempts": { "type": "integer", "minimum": 1, "maximum": 10 },
+            "same_failure_limit": { "type": "integer", "minimum": 1, "maximum": 5 },
+            "max_tasks_per_revision": { "type": "integer", "minimum": 1, "maximum": 1000 },
+            "max_plan_revisions": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "max_replans_per_scope": { "type": "integer", "minimum": 0, "maximum": 20 }
+          }
+        },
+        "escalation": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7"] }
+        },
+        "checkpoint": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["before_mutation", "after_mutation", "on_verification", "periodic_seconds", "generation_required", "verify_references", "integrity", "on_corruption"],
+          "properties": {
+            "before_mutation": { "const": true },
+            "after_mutation": { "const": true },
+            "on_verification": { "const": true },
+            "periodic_seconds": { "type": "integer", "minimum": 10 },
+            "generation_required": { "const": true },
+            "verify_references": { "const": true },
+            "integrity": { "const": "hash_chain" },
+            "on_corruption": { "const": "fallback_last_valid_or_block" }
+          }
+        },
+        "resources": { "$ref": "#/$defs/resourceBudget" }
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "task_id",
+        "title",
+        "objective",
+        "rationale",
+        "requirement_ids",
+        "dependencies",
+        "dependency_bindings",
+        "scope",
+        "evidence_requirements",
+        "role",
+        "skills",
+        "tools",
+        "permissions",
+        "action_policy",
+        "implementation_contract",
+        "expected_artifacts",
+        "acceptance_criteria",
+        "verification",
+        "failure_policy",
+        "rollback",
+        "resource_budget",
+        "context_budget",
+        "checkpoint_policy",
+        "next_state_rules"
+      ],
+      "properties": {
+        "task_id": { "$ref": "#/$defs/id" },
+        "title": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "objective": { "type": "string", "minLength": 1 },
+        "rationale": { "type": "string", "minLength": 1 },
+        "requirement_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "dependencies": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "dependency_bindings": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/dependencyBinding" },
+          "description": "Machine-readable inputs consumed from hard dependencies. PlanValidator requires exactly one binding for every dependencies[] task ID and forbids bindings to non-dependencies."
+        },
+        "scope": { "$ref": "#/$defs/scope" },
+        "evidence_requirements": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/evidenceRequirement" }
+        },
+        "role": { "$ref": "#/$defs/versionedCapability" },
+        "skills": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/versionedCapability" }
+        },
+        "tools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/versionedCapability" }
+        },
+        "permissions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/permissionClass" },
+          "description": "Requested task capability ceiling only. Effective runtime authority is the intersection of Controller/global policy, project policy, this request, role/tool ceilings, and any persisted user approval/grant."
+        },
+        "action_policy": { "$ref": "#/$defs/taskActionPolicy" },
+        "implementation_contract": { "$ref": "#/$defs/implementationContract" },
+        "constraints": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "expected_artifacts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/expectedArtifact" }
+        },
+        "acceptance_criteria": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/acceptanceCriterion" }
+        },
+        "verification": { "$ref": "#/$defs/verification" },
+        "failure_policy": { "$ref": "#/$defs/failurePolicy" },
+        "rollback": { "$ref": "#/$defs/rollback" },
+        "resource_budget": { "$ref": "#/$defs/resourceBudget" },
+        "context_budget": { "$ref": "#/$defs/contextBudget" },
+        "checkpoint_policy": { "$ref": "#/$defs/taskCheckpointPolicy" },
+        "next_state_rules": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/nextStateRule" }
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repositories", "files", "symbols", "allow_create", "allow_delete", "scope_resolution"],
+      "properties": {
+        "repositories": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "files": { "type": "array", "items": { "$ref": "#/$defs/relativeSelector" } },
+        "symbols": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "allow_create": { "type": "array", "items": { "$ref": "#/$defs/relativeSelector" } },
+        "allow_delete": { "type": "array", "items": { "$ref": "#/$defs/relativeSelector" } },
+        "scope_resolution": { "enum": ["exact", "bounded_discovery"] }
+      }
+    },
+    "evidenceRequirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirement_id", "kind", "query", "required_before", "satisfaction", "freshness"],
+      "properties": {
+        "requirement_id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["exact", "lexical", "symbol", "dependency", "diff", "memory", "semantic", "test", "config", "external"] },
+        "query": { "type": "string", "minLength": 1 },
+        "required_before": { "enum": ["execution", "verification", "completion"] },
+        "satisfaction": {
+          "enum": ["query_completed", "at_least_one", "exactly_one", "evaluator_pass"],
+          "description": "How the Controller proves this requirement satisfied. query_completed proves acquisition completed but does not by itself prove a truth/absence claim; evaluator_pass requires a governed evaluator over retained evidence."
+        },
+        "evaluator": { "type": "string", "minLength": 1 },
+        "freshness": {
+          "enum": ["current_repository_snapshot", "current_plan_revision", "validated_external"],
+          "description": "Minimum provenance/freshness domain required for evidence satisfying this requirement."
+        },
+        "max_items": { "type": "integer", "minimum": 1, "maximum": 100 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "satisfaction": { "const": "evaluator_pass" } }, "required": ["satisfaction"] },
+          "then": { "required": ["evaluator"] }
+        }
+      ]
+    },
+    "dependencyBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["upstream_task_id", "required_artifact_ids", "required_acceptance_criterion_ids", "freshness"],
+      "properties": {
+        "upstream_task_id": { "$ref": "#/$defs/id" },
+        "required_artifact_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "required_acceptance_criterion_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/id" }
+        },
+        "freshness": { "enum": ["same_plan_revision", "carry_forward_if_inputs_unchanged"] }
+      },
+      "anyOf": [
+        { "properties": { "required_artifact_ids": { "minItems": 1 } } },
+        { "properties": { "required_acceptance_criterion_ids": { "minItems": 1 } } }
+      ]
+    },
+    "versionedCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "digest"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "digest": { "type": "string", "minLength": 16 }
+      }
+    },
+    "implementationContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["preconditions", "assumptions", "inputs", "outputs", "invariants", "non_goals"],
+      "properties": {
+        "preconditions": { "type": "array", "items": { "$ref": "#/$defs/contractClause" } },
+        "assumptions": { "type": "array", "items": { "$ref": "#/$defs/assumption" } },
+        "inputs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "outputs": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "invariants": { "type": "array", "items": { "$ref": "#/$defs/contractClause" } },
+        "non_goals": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "expectedArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "kind", "locator", "required"],
+      "properties": {
+        "artifact_id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["file", "patch", "binary", "report", "schema", "migration", "test_result", "evidence"] },
+        "locator": { "type": "string", "minLength": 1 },
+        "required": { "type": "boolean" }
+      }
+    },
+    "acceptanceCriterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["criterion_id", "description", "kind", "verification_step_ids", "evidence_type", "evidence_freshness", "required"],
+      "properties": {
+        "criterion_id": { "$ref": "#/$defs/id" },
+        "description": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["command", "assertion", "diff", "artifact", "review", "manual"] },
+        "verification_step_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "evidence_type": { "type": "string", "minLength": 1 },
+        "evidence_freshness": {
+          "enum": ["current_attempt", "current_task_revision", "carry_forward_if_inputs_unchanged"],
+          "description": "Required freshness of evidence used to satisfy this criterion. Carry-forward is allowed only after the Controller revalidates the task/dependency/input fingerprints."
+        },
+        "required": { "type": "boolean" }
+      }
+    },
+    "verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["steps", "required_evidence_types", "fresh_reviewer_role"],
+      "$comment": "PlanValidator requires globally unique step IDs within the task, bidirectional criterion<->step linkage, evidence-type compatibility, and that every command_spec.tool_id resolves to one of task.tools and to a compatible ToolManifest/toolchain capability for the repository snapshot.",
+      "properties": {
+        "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/verificationStep" } },
+        "required_evidence_types": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+        "fresh_reviewer_role": {
+          "oneOf": [
+            { "$ref": "#/$defs/versionedCapability" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "verificationStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step_id", "criterion_ids", "kind", "evidence_type"],
+      "properties": {
+        "step_id": { "$ref": "#/$defs/id" },
+        "criterion_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } },
+        "kind": { "enum": ["command", "assertion", "diff", "artifact", "review", "manual"] },
+        "evidence_type": { "type": "string", "minLength": 1 },
+        "command_spec": { "$ref": "#/$defs/commandSpec" },
+        "expected_exit_codes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
+        "evaluator": { "type": "string", "minLength": 1 },
+        "artifact_id": { "$ref": "#/$defs/id" },
+        "reviewer_role": { "$ref": "#/$defs/versionedCapability" },
+        "manual_gate_id": { "$ref": "#/$defs/id" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "command" } }, "required": ["kind"] },
+          "then": { "required": ["command_spec", "expected_exit_codes"] }
+        },
+        {
+          "if": { "properties": { "kind": { "enum": ["assertion", "diff"] } }, "required": ["kind"] },
+          "then": { "required": ["evaluator"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "artifact" } }, "required": ["kind"] },
+          "then": { "required": ["artifact_id"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "review" } }, "required": ["kind"] },
+          "then": { "required": ["reviewer_role"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "manual" } }, "required": ["kind"] },
+          "then": { "required": ["manual_gate_id"] }
+        }
+      ]
+    },
+    "failurePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_attempts", "same_failure_limit", "resource_retry_limit", "on_execution_failure", "on_plan_failure", "on_resource_failure", "on_unknown_action", "on_attempts_exhausted", "on_same_failure_exhausted"],
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1, "maximum": 10, "description": "Maximum started execution attempts for this task contract, including the initial attempt." },
+        "same_failure_limit": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Maximum recorded occurrences of one normalized failure signature before another identical repair attempt is forbidden." },
+        "resource_retry_limit": { "type": "integer", "minimum": 0, "maximum": 5 },
+        "on_execution_failure": { "enum": ["repair", "block", "fail"] },
+        "on_plan_failure": { "enum": ["replan_smallest_scope", "replan_task", "replan_branch", "replan_plan", "block"] },
+        "on_resource_failure": { "enum": ["checkpoint_defer", "repair", "block", "fail"] },
+        "on_unknown_action": { "enum": ["reconcile", "block"] },
+        "on_attempts_exhausted": { "enum": ["block", "fail", "escalate"] },
+        "on_same_failure_exhausted": { "enum": ["block", "fail", "escalate"] }
+      }
+    },
+    "rollback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "procedure"],
+      "properties": {
+        "mode": { "enum": ["patch_reverse", "worktree_discard", "migration_down", "compensating_action", "none"] },
+        "procedure": { "type": "string", "minLength": 1 },
+        "preconditions": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "reason_no_rollback": { "type": "string", "minLength": 1 },
+        "verification_steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/rollbackVerificationStep" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "none" } }, "required": ["mode"] },
+          "then": { "required": ["reason_no_rollback"] },
+          "else": {
+            "required": ["verification_steps"],
+            "properties": { "verification_steps": { "minItems": 1 } }
+          }
+        }
+      ]
+    },
+    "rollbackVerificationStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step_id", "kind", "evidence_type"],
+      "properties": {
+        "step_id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["command", "assertion", "diff", "artifact", "manual"] },
+        "evidence_type": { "type": "string", "minLength": 1 },
+        "command_spec": { "$ref": "#/$defs/commandSpec" },
+        "expected_exit_codes": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "integer", "minimum": 0, "maximum": 255 } },
+        "evaluator": { "type": "string", "minLength": 1 },
+        "artifact_id": { "$ref": "#/$defs/id" },
+        "manual_gate_id": { "$ref": "#/$defs/id" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "command" } }, "required": ["kind"] },
+          "then": { "required": ["command_spec", "expected_exit_codes"] }
+        },
+        {
+          "if": { "properties": { "kind": { "enum": ["assertion", "diff"] } }, "required": ["kind"] },
+          "then": { "required": ["evaluator"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "artifact" } }, "required": ["kind"] },
+          "then": { "required": ["artifact_id"] }
+        },
+        {
+          "if": { "properties": { "kind": { "const": "manual" } }, "required": ["kind"] },
+          "then": { "required": ["manual_gate_id"] }
+        }
+      ]
+    },
+    "resourceBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_wall_seconds", "max_model_calls", "max_model_call_seconds", "max_tool_actions", "max_single_tool_action_seconds", "max_peak_rss_mb", "max_output_bytes", "max_retained_raw_bytes", "max_disk_write_mb", "max_network_bytes", "max_subprocesses", "max_child_cpu_seconds", "heavy_leases"],
+      "properties": {
+        "max_wall_seconds": { "type": "integer", "minimum": 1 },
+        "max_model_calls": { "type": "integer", "minimum": 0 },
+        "max_model_call_seconds": { "type": "integer", "minimum": 1 },
+        "max_tool_actions": { "type": "integer", "minimum": 0 },
+        "max_single_tool_action_seconds": { "type": "integer", "minimum": 1 },
+        "max_peak_rss_mb": {
+          "type": "integer",
+          "minimum": 64,
+          "description": "Admission estimate/managed-process ceiling, not a claim about additive physical unified-memory use. Live host memory pressure may deny a lease even below this value."
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "description": "Aggregate observed tool/process output ceiling for the task. This is distinct from retained post-ingress CAS/spool quota and from model-context token budgets."
+        },
+        "max_retained_raw_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "description": "Task quota for retained post-ingress/redacted raw bytes in spool/CAS. Exceedance requires explicit segmentation/truncation evidence with raw_complete=false; it is never silently dropped."
+        },
+        "max_disk_write_mb": { "type": "integer", "minimum": 0 },
+        "max_network_bytes": { "type": "integer", "minimum": 0 },
+        "max_subprocesses": { "type": "integer", "minimum": 0 },
+        "max_child_cpu_seconds": { "type": "integer", "minimum": 0 },
+        "heavy_leases": {
+          "type": "array",
+          "uniqueItems": true,
+          "description": "Heavy capability classes this task may request across its lifetime; this does not authorize simultaneous residency. Hardware policy owns pairwise exclusion/conditional-admission rules. BROWSER covers deterministic/adaptive browser subtypes; INDEXER covers native, semantic-build, large multi-repo, and optional CodeGraph/wiki index/build subtypes, each with tool-specific calibrated lease estimates.",
+          "items": { "enum": ["MODEL", "EMBEDDER", "BROWSER", "INDEXER", "LANGUAGE_SERVER", "BUILD_HEAVY"] }
+        }
+      }
+    },
+    "contextBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_input_tokens", "reserve_output_tokens", "max_evidence_items", "levels"],
+      "$comment": "The Controller builds the smallest sufficient packet. Permitting C2/C3/C4 does not require filling them. In particular, C4 is permission for gap-driven semantic/docs evidence, never a default vector-RAG route. Per-route candidate/injection limits and packet partitioning are hardware/Controller policy and are recorded in runtime RetrievalTrace/ContextMetrics rather than duplicated into every task contract.",
+      "properties": {
+        "max_input_tokens": { "type": "integer", "minimum": 512 },
+        "reserve_output_tokens": { "type": "integer", "minimum": 128 },
+        "max_evidence_items": { "type": "integer", "minimum": 1, "maximum": 200 },
+        "levels": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "enum": ["C0", "C1", "C2", "C3", "C4", "C5"] }
+        }
+      }
+    },
+    "taskCheckpointPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["before_mutation", "after_mutation", "on_attempt_end", "on_verification", "generation_required", "verify_references", "integrity", "on_corruption"],
+      "properties": {
+        "before_mutation": { "const": true },
+        "after_mutation": { "const": true },
+        "on_attempt_end": { "const": true },
+        "on_verification": { "const": true },
+        "generation_required": { "const": true },
+        "verify_references": { "const": true },
+        "integrity": { "const": "hash_chain" },
+        "on_corruption": { "const": "fallback_last_valid_or_block" }
+      }
+    },
+    "nextStateRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["event", "guards", "transition"],
+      "properties": {
+        "event": {
+          "enum": [
+            "execution_complete",
+            "verification_passed",
+            "execution_failure",
+            "plan_failure",
+            "permission_required",
+            "resource_exhausted",
+            "unknown_action",
+            "cancellation_requested"
+          ]
+        },
+        "guards": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "dependencies_satisfied",
+              "dependency_bindings_satisfied",
+              "execution_evidence_satisfied",
+              "baseline_fresh",
+              "task_contract_current",
+              "checkpoint_reconciled",
+              "permission_granted",
+              "retry_budget_remaining",
+              "plan_revision_active",
+              "all_required_acceptance_passed",
+              "no_unknown_actions"
+            ]
+          }
+        },
+        "transition": { "enum": ["verify", "succeed", "repair", "replan_smallest_scope", "replan_task", "replan_branch", "replan_plan", "checkpoint_defer", "reconcile", "block", "fail", "await_approval", "cancel", "rollback"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "transition": { "const": "verify" } }, "required": ["transition"] },
+          "then": {
+            "properties": {
+              "event": { "const": "execution_complete" },
+              "guards": {
+                "allOf": [
+                  { "contains": { "const": "dependencies_satisfied" } },
+                  { "contains": { "const": "dependency_bindings_satisfied" } },
+                  { "contains": { "const": "execution_evidence_satisfied" } },
+                  { "contains": { "const": "baseline_fresh" } },
+                  { "contains": { "const": "task_contract_current" } },
+                  { "contains": { "const": "checkpoint_reconciled" } },
+                  { "contains": { "const": "plan_revision_active" } }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "transition": { "const": "succeed" } }, "required": ["transition"] },
+          "then": {
+            "properties": {
+              "event": { "const": "verification_passed" },
+              "guards": {
+                "allOf": [
+                  { "contains": { "const": "all_required_acceptance_passed" } },
+                  { "contains": { "const": "no_unknown_actions" } },
+                  { "contains": { "const": "baseline_fresh" } },
+                  { "contains": { "const": "task_contract_current" } },
+                  { "contains": { "const": "plan_revision_active" } }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "event": { "const": "execution_failure" } }, "required": ["event"] },
+          "then": { "properties": { "transition": { "enum": ["repair", "block", "fail"] } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "plan_failure" } }, "required": ["event"] },
+          "then": { "properties": { "transition": { "enum": ["replan_smallest_scope", "replan_task", "replan_branch", "replan_plan", "block"] } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "resource_exhausted" } }, "required": ["event"] },
+          "then": { "properties": { "transition": { "enum": ["checkpoint_defer", "repair", "block", "fail"] } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "unknown_action" } }, "required": ["event"] },
+          "then": { "properties": { "transition": { "enum": ["reconcile", "block"] } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "permission_required" } }, "required": ["event"] },
+          "then": { "properties": { "transition": { "enum": ["await_approval", "block"] } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "cancellation_requested" } }, "required": ["event"] },
+          "then": { "properties": { "transition": { "const": "cancel" } } }
+        }
+      ]
+    },
+    "edge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["edge_id", "from", "to", "kind"],
+      "properties": {
+        "edge_id": { "$ref": "#/$defs/id" },
+        "from": { "$ref": "#/$defs/id" },
+        "to": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["produces_for", "serializes_with", "invalidates_if_changed"] },
+        "contract": { "type": ["string", "null"] }
+      }
+    },
+    "completionGate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["require_all_must_requirements", "require_fresh_acceptance", "require_all_required_tasks_resolved", "require_no_unknown_actions", "require_artifact_digests", "require_scope_audit", "require_final_checkpoint", "require_final_repository_revisions", "checks"],
+      "properties": {
+        "require_all_must_requirements": { "const": true },
+        "require_fresh_acceptance": { "const": true },
+        "require_all_required_tasks_resolved": { "const": true },
+        "require_no_unknown_actions": { "const": true },
+        "require_artifact_digests": { "const": true },
+        "require_scope_audit": { "const": true },
+        "require_final_checkpoint": { "const": true },
+        "require_final_repository_revisions": { "const": true },
+        "checks": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/completionCheck" } }
+      }
+    },
+    "completionCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["check_id", "kind", "required_evidence_types"],
+      "properties": {
+        "check_id": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["requirements", "acceptance", "task_resolution", "unknown_actions", "artifacts", "scope_audit", "checkpoint", "repository_revisions", "custom"] },
+        "required_evidence_types": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "observed_at"],
+      "properties": {
+        "source": { "$ref": "#/$defs/sourceRef" },
+        "observed_at": { "$ref": "#/$defs/dateTime" },
+        "notes": { "type": "string" }
+      }
+    },
+    "evidenceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_id", "digest", "locator", "trust", "freshness"],
+      "properties": {
+        "evidence_id": { "$ref": "#/$defs/id" },
+        "digest": { "type": "string", "minLength": 1 },
+        "locator": { "type": "string", "minLength": 1 },
+        "trust": { "enum": ["governed", "validated", "observed", "untrusted"] },
+        "freshness": { "$ref": "#/$defs/dateTime" }
+      }
+    }
+  }
+}

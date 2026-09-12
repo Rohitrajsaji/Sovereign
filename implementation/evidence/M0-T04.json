@@ -1,0 +1,38 @@
+{
+  "task_id": "M0-T04",
+  "completed_at": "2026-09-12T16:33:04Z",
+  "dependencies": ["M0-T01"],
+  "dependency_evidence": ["implementation/evidence/M0-T01.json"],
+  "verification": [
+    {
+      "command": "cargo test -p sovereign-types -- interface_contracts",
+      "status": "passed",
+      "tests": 4
+    },
+    {
+      "command": "cargo clippy -p sovereign-types --all-targets -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    }
+  ],
+  "manifest": {
+    "path": "schemas/interface-contracts/v1.json",
+    "sha256": "0782686ff180ded3f9998456d3c7ed094814d5b3a0eac30f58b09770280eb2e5",
+    "stable_interfaces": 22
+  },
+  "rust_contract_types": {
+    "path": "crates/sovereign-types/src/interface_contracts.rs",
+    "sha256": "65e2053bf454d7898d3f8ee6ec9166f130826affa2e360152c0008f2604d6860"
+  },
+  "dependency_direction_test_report": {
+    "unique_ownership": "passed",
+    "duplicate_authority_rejection": "passed",
+    "forbidden_dependency_direction_check": "passed",
+    "roadmap_task_reference_resolution": "passed",
+    "roadmap_manifest_equality": "passed"
+  }
+}
+

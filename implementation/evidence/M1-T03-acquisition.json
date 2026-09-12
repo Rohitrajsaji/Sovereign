@@ -1,0 +1,30 @@
+{
+  "schema": "sovereign-acquisition-evidence-v1",
+  "task": "M1-T03",
+  "runtime": {
+    "name": "llama.cpp llama-server",
+    "release": "b10516",
+    "version": "0.1.2-dev",
+    "commit": "b95502ba9",
+    "source_url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-macos-arm64.tar.gz",
+    "archive_path": ".tools/llama-b10516.tar.gz",
+    "archive_sha256": "ee3324327d621026ae80c24031670e65fa62a0b23a3a027dbe2f65f240affd30",
+    "archive_size_bytes": 11089823,
+    "executable_path": ".tools/llama-b10516/llama-b10516/llama-server",
+    "executable_sha256": "d0878274b8d6bd3c8ea26a78eb66cd1ffd943d007c62b9dff31c8aa99922d713",
+    "upstream_archive_sha256_match": true
+  },
+  "model": {
+    "repository": "Qwen/Qwen3-4B-GGUF",
+    "repo_commit": "bc640142c66e1fdd12af0bd68f40445458f3869b",
+    "artifact": "Qwen3-4B-Q4_K_M.gguf",
+    "parameter_class": "4B",
+    "quantization": "Q4_K_M",
+    "source_url": "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/main/Qwen3-4B-Q4_K_M.gguf?download=true",
+    "path": ".models/Qwen3-4B-Q4_K_M.gguf",
+    "size_bytes": 2497280256,
+    "sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+    "upstream_linked_etag_sha256_match": true
+  },
+  "local_first_note": "Network was used only to acquire pinned project-local runtime/model artifacts. Runtime execution and verification are local loopback/offline-capable."
+}

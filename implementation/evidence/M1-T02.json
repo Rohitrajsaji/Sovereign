@@ -1,0 +1,104 @@
+{
+  "task_id": "M1-T02",
+  "completed_at": "2026-09-12T16:50:39Z",
+  "dependencies": [
+    "M0-T02"
+  ],
+  "dependency_evidence": [
+    "implementation/evidence/M0-T02.json"
+  ],
+  "roadmap_version": "1.4-frozen",
+  "verification": [
+    {
+      "command": "cargo test -p sovereign-repo",
+      "status": "passed",
+      "integration_tests": 5
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --workspace",
+      "status": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo clippy --workspace --all-targets -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test --workspace",
+      "status": "passed"
+    }
+  ],
+  "fixture_snapshot_manifests": {
+    "clean": {
+      "test": "clean_repo_snapshot_has_no_protected_changes",
+      "assertions": [
+        "HEAD captured",
+        "branch captured when symbolic",
+        "staged/unstaged/untracked path sets empty",
+        "protected_changes_present=false",
+        "manifest JSON serializes"
+      ]
+    },
+    "dirty": {
+      "test": "dirty_repo_separates_staged_unstaged_and_untracked_changes",
+      "assertions": [
+        "staged tracked.txt fingerprint retained",
+        "unstaged tracked.txt content fingerprint retained",
+        "untracked new.txt content fingerprint retained",
+        "protected_changes_present=true"
+      ]
+    },
+    "delta": {
+      "test": "snapshot_and_delta_change_after_worktree_edit",
+      "assertions": [
+        "dirty digest changes after edit",
+        "RepoDelta marks Unstaged only for worktree edit",
+        "HEAD remains unchanged"
+      ]
+    }
+  },
+  "acceptance_evidence": {
+    "pre_existing_changes_provable": true,
+    "instruction_scope_deterministic": "nested_agents_scope_is_root_to_leaf_and_deterministic",
+    "symlink_scope_fail_closed": "symlink_repository_and_scoped_path_are_rejected",
+    "repository_truth": "Git/filesystem source; no derived index is authoritative",
+    "git_read_environment": "environment cleared; system/global config disabled; hooks/fsmonitor disabled; optional locks disabled"
+  },
+  "artifacts": {
+    "repository_implementation": {
+      "path": "crates/sovereign-repo/src/lib.rs",
+      "sha256": "98c38ae29791db5c0d13338f57a7e07be2ef1fc876da613d5b39bac06e81366c"
+    },
+    "baseline_tests": {
+      "path": "crates/sovereign-repo/tests/baseline.rs",
+      "sha256": "069c5b195e750d614818458cfe62ced98706a333c11bb3fdeed804cecf25a111"
+    },
+    "crate_manifest": {
+      "path": "crates/sovereign-repo/Cargo.toml",
+      "sha256": "7f3e3df89cd9c63707aff0647747c8b705e7a4601abf5e60964509d108a698dc"
+    },
+    "dependency_lock": {
+      "path": "Cargo.lock",
+      "sha256": "d6f06c2a84d125347cb3e3746c89bd088439f182e9b4ead3dd0614863f30c9aa"
+    }
+  },
+  "implementation_notes": [
+    "RepositoryIntelligence is introduced as the exact baseline/instruction authority surface; richer derived retrieval indexes are deferred to M2.",
+    "Staged state fingerprints raw Git index bytes; unstaged/untracked state fingerprints filesystem bytes without following symlinks.",
+    "AGENTS.md scope resolves deterministically root-to-leaf and rejects existing symlink components.",
+    "No network, model, browser, semantic index, or additional resident service is required."
+  ],
+  "failure_fix_history": [
+    {
+      "failure": "strict Clippy struct_excessive_bools on RepoDelta",
+      "resolution": "replaced five booleans with typed RepoChangeKind dimensions; no lint allow added"
+    }
+  ]
+}

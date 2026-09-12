@@ -1,0 +1,119 @@
+{
+  "task_id": "M1-T01",
+  "completed_at": "2026-09-12T16:45:42Z",
+  "dependencies": [
+    "M0-T02"
+  ],
+  "dependency_evidence": [
+    "implementation/evidence/M0-T02.json"
+  ],
+  "roadmap_version": "1.4-frozen",
+  "plan_ir_version": "1.2",
+  "verification": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test -p sovereign-plan",
+      "status": "passed",
+      "integration_tests": 19
+    },
+    {
+      "command": "cargo test --workspace",
+      "status": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo clippy --workspace --all-targets -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test --workspace",
+      "status": "passed"
+    }
+  ],
+  "validator_fixture_results": {
+    "valid_trivial_plan_is_accepted": "passed",
+    "hard_dependency_cycle_is_rejected": "passed",
+    "missing_hard_dependency_is_rejected": "passed",
+    "dependency_bindings_are_one_for_one_and_cannot_create_dependencies": "passed",
+    "dependency_binding_artifact_and_criterion_refs_must_resolve_upstream": "passed",
+    "execution_evidence_requires_stable_id_satisfaction_and_freshness": "passed",
+    "missing_acceptance_evidence_is_rejected": "passed",
+    "required_acceptance_criterion_requires_explicit_freshness": "passed",
+    "task_permission_cannot_exceed_global_capability_ceiling": "passed",
+    "task_resource_budget_cannot_exceed_global_or_hardware_ceiling": "passed",
+    "untrusted_code_is_rejected_when_isolation_is_unavailable": "passed",
+    "command_timeout_cannot_exceed_task_tool_deadline": "passed",
+    "task_model_call_deadline_cannot_exceed_global_deadline": "passed",
+    "write_like_network_and_browser_scope_require_authority_and_reconciliation": "passed",
+    "external_intelligence_scope_cannot_exceed_global_or_schema_policy": "passed",
+    "task_revision_and_replan_ceilings_are_enforced": "passed",
+    "mutating_rollback_none_and_unverified_non_none_rollback_are_rejected": "passed",
+    "next_state_failure_routing_cannot_contradict_failure_policy": "passed",
+    "canonical_digest_is_stable_for_equivalent_object_key_order": "passed"
+  },
+  "acceptance_evidence": {
+    "invalid_plans_cannot_gain_plan_validation_acceptance": true,
+    "controller_activation_remains_outside_plan_crate": true,
+    "canonical_serialization_deterministic": "canonical_digest_is_stable_for_equivalent_object_key_order",
+    "structural_authority": "schemas/plan-ir-v1.json",
+    "semantic_authority": "crates/sovereign-plan/src/lib.rs::PlanValidator",
+    "schema_remote_file_resolution_disabled": "jsonschema workspace dependency uses default-features=false; frozen schema uses internal refs only"
+  },
+  "artifacts": {
+    "frozen_schema": {
+      "path": "output/plan-ir.schema.json",
+      "sha256": "395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d"
+    },
+    "implementation_schema": {
+      "path": "schemas/plan-ir-v1.json",
+      "sha256": "395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d"
+    },
+    "validator": {
+      "path": "crates/sovereign-plan/src/lib.rs",
+      "sha256": "37bde57080a71ac67a19f2af4c2af20464072b7d324ebadf27c21d0ee2153c58"
+    },
+    "validator_tests": {
+      "path": "crates/sovereign-plan/tests/validator.rs",
+      "sha256": "4a7898db7f696bc64b7ebf4d118de9ed330f7b27f5f1caa4af521abd2b9d5d96"
+    },
+    "valid_fixture": {
+      "path": "crates/sovereign-plan/tests/fixtures/valid_trivial_plan.json",
+      "sha256": "d123d692a12e3966efaf328f884d48aeba9e7da6eab230b17fe33f77aff5d894"
+    },
+    "dependency_lock": {
+      "path": "Cargo.lock",
+      "sha256": "508b21bc9a8b7a4956638313897c5fca9a8d5d1198c0fa14de6253ca0c548a09"
+    }
+  },
+  "implementation_notes": [
+    "Frozen JSON Schema is the structural authority; deterministic Rust semantic validation supplements it.",
+    "Hard dependencies are authoritative only through task.dependencies; dependency_bindings cannot create edges.",
+    "Task resource budgets narrow global ceilings; heavy_leases are allowed lease classes, not simultaneous-residency requirements.",
+    "External-intelligence payload ceiling is additionally bounded by task/global network-byte budgets.",
+    "PlanIr remains a candidate value; Controller activation authority is introduced later and is not granted by deserialization."
+  ],
+  "failure_fix_history": [
+    {
+      "failure": "cargo fmt --check reported sovereign-plan formatting differences",
+      "resolution": "formatted source without relaxing policy"
+    },
+    {
+      "failure": "E0308 rollback permission matcher dereferenced &str incorrectly",
+      "resolution": "matched *permission rather than **permission"
+    },
+    {
+      "failure": "strict Clippy rejected expect() in validator tests",
+      "resolution": "replaced expect() with explicit match/let-else panic paths; no lint allow added"
+    },
+    {
+      "failure": "strict Clippy uninlined_format_args",
+      "resolution": "used captured format arguments"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+[package]
+name = "sovereign"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sovereign-types = { path = "../../crates/sovereign-types" }
+
+[lints]
+workspace = true
+

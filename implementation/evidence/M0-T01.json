@@ -1,0 +1,38 @@
+{
+  "task_id": "M0-T01",
+  "completed_at": "2026-09-12T16:24:06Z",
+  "dependencies": [],
+  "verification": [
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test --workspace",
+      "status": "passed",
+      "tests": 3
+    }
+  ],
+  "workspace_manifest": {
+    "path": "Cargo.toml",
+    "sha256": "151c2d4edea34bdb73a397f49e9f228d2fdbe4abce5eac9657fb3c34ec17e68f"
+  },
+  "toolchain": {
+    "rustc": "1.89.0 (29483883e 2025-08-04)",
+    "cargo": "1.89.0 (c24e10642 2025-06-23)",
+    "rustfmt": "1.8.0-stable (29483883ee 2025-08-04)",
+    "clippy": "0.1.89 (29483883ee 2025-08-04)"
+  },
+  "artifacts": [
+    "Cargo.toml",
+    "rust-toolchain.toml",
+    "crates/sovereign-types",
+    "apps/sovereign",
+    "scripts/verify.sh",
+    "DEVELOPMENT.md"
+  ]
+}

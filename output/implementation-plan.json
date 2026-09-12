@@ -1,0 +1,2534 @@
+{
+  "roadmap_version": "1.4-frozen",
+  "roadmap_id": "sovereign-local-autonomous-se-roadmap",
+  "architecture": "output/SOVEREIGN_ARCHITECTURE.md",
+  "architecture_revision": "2026-09-12.7",
+  "research_audit": "output/RESEARCH_AUDIT.md",
+  "research_audit_revision": "2026-09-12.2",
+  "plan_ir_schema": "output/plan-ir.schema.json",
+  "plan_ir_version": "1.2",
+  "resource_contract": "output/RESOURCE_STRESS_TEST.md@2026-09-12.3",
+  "execution_policy": {
+    "target_machine": "MacBook Air M1 8GB",
+    "normal_operation": "local-first",
+    "default_model_concurrency": 1,
+    "default_mutation_concurrency": 1,
+    "internet_required_after_acquisition": false,
+    "cloud_model_required": false,
+    "implementation_language": "Rust 2024 for core; Python/Node only for optional adapters",
+    "core_state": "SQLite WAL + content-addressed artifact store",
+    "rule": "Complete a required milestone only when every task with required_for_core=true has completion evidence and its core milestone gates pass. Optional tasks/tracks never gate core release unless a selected product profile explicitly promotes them to required.",
+    "core_release_ignores_optional_tracks": true,
+    "optional_tracks": [
+      "M7 semantic/browser/acquisition adapters",
+      "M8-T02 CodeGraph adapter",
+      "M8-T03 Wiki/document graph adapter",
+      "external-model providers"
+    ],
+    "m1_minimum_security_kernel": "Required before the first repository mutation: offline-by-default network, canonical path jail/protected roots, sanitized environment, structured and pinned executable resolution, a minimum local ExecutionIsolationBackend for repository-controlled code or fail-closed refusal, durable capability/action authorization journal, package/destructive/network denial unless explicitly granted, model/tool deadlines, minimal resource leases, process-tree cleanup, and unknown-outcome reconciliation.",
+    "roadmap_verification_command_note": "verification_commands in this roadmap are human-readable implementation-agent instructions, not Plan IR runtime authorization. Sovereign runtime verification must resolve to digest-pinned tools and structured CommandSpec; no opaque shell string bypass is permitted."
+  },
+  "machine_execution_contract": {
+    "schema_version": "roadmap-task-v1",
+    "required_effective_fields": [
+      "task_id",
+      "title",
+      "depends_on",
+      "targets",
+      "objective",
+      "interfaces",
+      "schemas",
+      "artifacts",
+      "tests",
+      "acceptance",
+      "resource_constraints",
+      "verification_commands",
+      "migration_steps",
+      "completion_evidence",
+      "required_for_core"
+    ],
+    "resolution": {
+      "dependencies": "task.depends_on contains task IDs only; containing milestone.depends_on supplies milestone prerequisites.",
+      "schemas": "Resolve from task.schemas when present, otherwise schema_contracts_by_task[task_id], otherwise an empty array only when the task introduces no durable/wire contract.",
+      "artifacts": "Resolve from task.artifacts when present; otherwise use implementation changes under declared targets plus deterministic fixtures/tests and the task's completion_evidence outputs.",
+      "resource_constraints": "Merge global_task_resource_constraints, containing milestone.resource_constraints when present, and resource_constraints_by_task[task_id]. A task may narrow but never silently widen output/RESOURCE_STRESS_TEST.md.",
+      "migration_steps": "Use migration_steps_by_task[task_id], defaulting to an empty array only when the task introduces no durable compatibility transition. Derived indexes are rebuilt rather than promoted to canonical state.",
+      "completion": "A task is complete only when dependencies are complete, listed tests and acceptance pass, verification commands have durable evidence, and every completion_evidence item exists with provenance."
+    },
+    "safety": "No machine consumer may infer missing permission, rollback, resource, verification, migration, or completion semantics from model prose. Missing required effective data is a roadmap validation error."
+  },
+  "priority_vertical_slice": {
+    "milestone_id": "M1",
+    "name": "goal-to-verified-change-with-restart-and-repair",
+    "input": "A simple natural-language engineering goal against a local fixture repository.",
+    "mandatory_capabilities": [
+      "Controller authority",
+      "Plan IR v1.2 validation",
+      "canonical PlanCompiler",
+      "bounded local 3B-4B ModelBackend execution",
+      "exact repository retrieval",
+      "authorized tool execution",
+      "evidence compression/expansion",
+      "deterministic verification",
+      "checkpoint/resume",
+      "bounded targeted repair"
+    ],
+    "task_chain": [
+      "M1-T01",
+      "M1-T02",
+      "M1-T03",
+      "M1-T04",
+      "M1-T05",
+      "M1-T06",
+      "M1-T10",
+      "M1-T07",
+      "M1-T08",
+      "M1-T09"
+    ],
+    "proof": "The goal must be compiled by M1-T10 into validated Plan IR v1.2 and then consumed by the real Controller loop. Hand-authored Plan IR remains useful for validator/unit fixtures but cannot satisfy the M1 end-to-end gate.",
+    "explicitly_not_required": [
+      "FTS5/BM25",
+      "tree-sitter graph",
+      "persistent memory",
+      "roles/skills",
+      "semantic embeddings",
+      "browser",
+      "CodeGraph/wiki",
+      "external intelligence provider"
+    ]
+  },
+  "proposed_repository_layout": {
+    "Cargo.toml": "Rust workspace manifest",
+    "crates/sovereign-types": "shared IDs, events, errors, contracts",
+    "crates/sovereign-state": "SQLite migrations, repositories, event journal, CAS metadata",
+    "crates/sovereign-plan": "Plan IR models, compiler, DAG validator, replanning",
+    "crates/sovereign-repo": "repository discovery, Git baselines, FTS/symbol/dependency indexes",
+    "crates/sovereign-evidence": "CAS, retained post-ingress/redacted tool evidence, compression, expansion, spool quotas",
+    "crates/sovereign-context": "retrieval router, context packet builder, token budgeting",
+    "crates/sovereign-model": "ModelBackend abstraction and local provider adapters",
+    "crates/sovereign-tools": "tool manifests, runner, process supervision, action reconciliation",
+    "crates/sovereign-memory": "typed memory lifecycle, retrieval, invalidation, retention",
+    "crates/sovereign-policy": "permissions, resource governor, secret broker, security policy",
+    "crates/sovereign-controller": "authoritative autonomous loop and state machines",
+    "crates/sovereign-eval": "fixtures, metrics, replay/evaluation harness",
+    "apps/sovereign": "CLI entry point",
+    "adapters/": "optional Scrapling/browser/Tencent/OpenViking/external-model adapters",
+    "schemas/": "versioned exported schemas",
+    "fixtures/": "deterministic evaluation repositories and task fixtures"
+  },
+  "stable_interface_contracts": [
+    {
+      "interface": "Controller",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T07",
+      "extended_by": ["M3-T03", "M5-T01", "M6-T04", "M6-T06", "M6-T07", "M8-T01", "M9-T02"],
+      "invariant": "Only deterministic Controller code owns authoritative execution transitions, authorization, budgets, verification, recovery truth, and completion."
+    },
+    {
+      "interface": "TaskStateMachine",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T07",
+      "extended_by": ["M3-T03", "M9-T02"],
+      "invariant": "ready/blocked are derived views and mutation dispatch is rechecked inside one current execution epoch."
+    },
+    {
+      "interface": "AttemptStateMachine",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T07",
+      "extended_by": ["M1-T09", "M3-T03"],
+      "invariant": "Started attempts are immutable history; repair creates a new bounded attempt."
+    },
+    {
+      "interface": "Scheduler",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T07",
+      "extended_by": ["M3-T03", "M6-T01", "M8-T01"],
+      "invariant": "Dispatch requires current dependencies, evidence, baseline, checkpoint, permission possibility, and resource admission in one Controller epoch."
+    },
+    {
+      "interface": "PlanCompiler",
+      "owner": "crates/sovereign-plan",
+      "introduced_by": "M1-T10",
+      "extended_by": ["M3-T01", "M3-T02", "M3-T03", "M8-T01"],
+      "invariant": "Compiler produces immutable candidate Plan IR revisions; PlanValidator and Controller activation remain deterministic authority."
+    },
+    {
+      "interface": "PlanValidator",
+      "owner": "crates/sovereign-plan",
+      "introduced_by": "M1-T01",
+      "extended_by": ["M3-T02", "M3-T03", "M9-T03"],
+      "invariant": "No plan revision becomes active without deterministic Plan IR v1.2 structural, policy, evidence, and resource validation."
+    },
+    {
+      "interface": "RepositoryIntelligence",
+      "owner": "crates/sovereign-repo",
+      "introduced_by": "M1-T02",
+      "extended_by": ["M2-T01", "M2-T02", "M8-T01"],
+      "invariant": "Filesystem/Git source is truth; retrieval indexes are fingerprinted, derived, and rebuildable."
+    },
+    {
+      "interface": "ContextPlanner",
+      "owner": "crates/sovereign-context",
+      "introduced_by": "M1-T06",
+      "extended_by": ["M2-T03", "M2-T04", "M4-T02", "M5-T02", "M7-T01"],
+      "invariant": "Every model call receives a fresh bounded projection; persistent knowledge size never implies prompt size."
+    },
+    {
+      "interface": "ModelBackend",
+      "owner": "crates/sovereign-model",
+      "introduced_by": "M1-T03",
+      "extended_by": ["M6-T07", "M7-T01", "M9-T03"],
+      "invariant": "Provider details never enter Plan IR or Controller semantics; the M1 normal profile uses one physical local model at a time."
+    },
+    {
+      "interface": "ToolAdapter",
+      "owner": "crates/sovereign-tools",
+      "introduced_by": "M1-T04",
+      "extended_by": ["M5-T03", "M6-T02", "M6-T04", "M7-T02", "M7-T03"],
+      "invariant": "Tools expose declared structured effects and cannot self-authorize or lower deterministic risk."
+    },
+    {
+      "interface": "AuthorizedAction",
+      "owner": "crates/sovereign-tools",
+      "introduced_by": "M1-T04",
+      "extended_by": ["M5-T03", "M6-T04"],
+      "invariant": "Exact action authorization is durable, policy/epoch bound, and checked again before mutation."
+    },
+    {
+      "interface": "EvidenceStore",
+      "owner": "crates/sovereign-evidence",
+      "introduced_by": "M0-T03",
+      "extended_by": ["M1-T05", "M6-T03"],
+      "invariant": "Retained raw evidence means immutable post-ingress/redacted CAS bytes under explicit quotas."
+    },
+    {
+      "interface": "EvidenceCompressor",
+      "owner": "crates/sovereign-evidence",
+      "introduced_by": "M1-T05",
+      "extended_by": ["M2-T04"],
+      "invariant": "Synopsis is bounded and derived, with expansion handles to retained evidence; expansion never reruns the tool."
+    },
+    {
+      "interface": "Verifier",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T07",
+      "extended_by": ["M3-T03", "M9-T02"],
+      "invariant": "Only fresh typed acceptance evidence can satisfy task or goal completion."
+    },
+    {
+      "interface": "CheckpointManager",
+      "owner": "crates/sovereign-state",
+      "introduced_by": "M1-T08",
+      "extended_by": ["M6-T06", "M8-T01"],
+      "invariant": "Checkpoints are monotonic hash/reference-verified snapshots over authoritative state and journal position."
+    },
+    {
+      "interface": "RecoveryManager",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T08",
+      "extended_by": ["M6-T04", "M6-T06"],
+      "invariant": "Recovery replays authoritative events, reconciles unknown actions, and never blindly repeats uncertain side effects."
+    },
+    {
+      "interface": "ResourceGovernor",
+      "owner": "crates/sovereign-policy",
+      "introduced_by": "M1-T04",
+      "extended_by": ["M6-T01"],
+      "invariant": "Heavy capability admission is lease based and preserves capability richness with runtime sparsity."
+    },
+    {
+      "interface": "MemoryManager",
+      "owner": "crates/sovereign-memory",
+      "introduced_by": "M4-T01",
+      "extended_by": ["M4-T02", "M4-T03", "M4-T04", "M7-T01"],
+      "invariant": "Memory is provenance/freshness governed evidence and never independent policy or repository truth."
+    },
+    {
+      "interface": "RoleRegistry",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M5-T01",
+      "extended_by": [],
+      "invariant": "Logical roles reuse the same physical model serially and cannot elevate permissions."
+    },
+    {
+      "interface": "SkillRegistry",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M5-T02",
+      "extended_by": [],
+      "invariant": "Skills are progressively loaded instructions/evidence and cannot grant authority."
+    },
+    {
+      "interface": "SecretBroker",
+      "owner": "crates/sovereign-policy",
+      "introduced_by": "M6-T03",
+      "extended_by": [],
+      "invariant": "Only SecretRef is durable/model-visible; resolved values are ephemeral action-only data and are redacted before persistence."
+    },
+    {
+      "interface": "ExternalIntelligenceGateway",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M6-T07",
+      "extended_by": [],
+      "invariant": "External intelligence is optional untrusted advisory evidence with explicit export policy and zero tool, approval, or completion authority."
+    }
+  ],
+  "global_task_resource_constraints": [
+    "Target the MacBook Air M1/8GB profile in output/RESOURCE_STRESS_TEST.md unless a task explicitly names a stricter optional-adapter calibration profile.",
+    "Normal operation uses at most one local LLM process and one mutation at a time; heavyweight capabilities require Controller leases and forbidden/unknown heavy pairs serialize.",
+    "No task may make cloud, internet, browser, semantic embeddings, CodeGraph/wiki, or a second resident local model a hidden prerequisite for core correctness.",
+    "Context is bounded: normal 8k input, 12k bounded planning/review only after calibration, and 16k un-overridden M1 ceiling with no automatic growth beyond it.",
+    "When live pressure, swap-out/compressor growth, thermal state, or measured process footprint is worse than the nominal arithmetic budget, the stricter live admission result wins."
+  ],
+  "schema_contracts_by_task": {
+    "M0-T02": ["SQLite state schema v1", "event journal schema v1", "migration metadata schema v1"],
+    "M0-T03": ["CAS artifact metadata schema v1"],
+    "M0-T04": ["interface-contract manifest v1"],
+    "M1-T01": ["Plan IR v1.2 JSON Schema", "canonical Plan IR digest serialization"],
+    "M1-T03": ["ModelRequest/ModelResponse v1", "ModelCapabilities v1"],
+    "M1-T04": ["CommandSpec v1", "AuthorizedAction v1", "ActionJournalEntry v1", "ExecutionIsolationPolicy v1"],
+    "M1-T05": ["ToolEvidence synopsis v1", "EvidenceExpandQuery v1", "FailureSignature v1"],
+    "M1-T06": ["ContextPacket v1", "EvidenceItem v1", "ContextBudget v1"],
+    "M1-T10": ["PlanCompilationInput v1", "PlanCompilationResult v1", "Plan IR v1.2 output"],
+    "M1-T07": ["typed ModelProposal v1", "VerificationResult v1", "task/attempt transition event schemas"],
+    "M1-T08": ["CheckpointManifest v1", "RecoveryDecision v1"],
+    "M1-T09": ["FailureRecord v1", "RepairPacket v1"],
+    "M2-T01": ["repository lexical IndexSnapshot v1"],
+    "M2-T02": ["SymbolRecord v1", "DependencyEdge v1"],
+    "M2-T03": ["RetrievalTrace v1", "ContextLevelPolicy v1"],
+    "M2-T04": ["ContextMetrics v1"],
+    "M3-T01": ["DepthFeatures v1", "DepthDecision v1"],
+    "M3-T02": ["PlanCompilationInput extended v1", "PlanCompilationResult extended v1", "Plan IR v1.2"],
+    "M3-T03": ["PlanRevisionDiff v1", "FailureClassification v1"],
+    "M3-T04": ["WorktreeLease v1", "ChangeSet v1"],
+    "M4-T01": ["MemoryRecord v1", "MemoryScope/Lifecycle v1"],
+    "M4-T02": ["MemorySynopsis v1", "memory retrieval result v1"],
+    "M4-T03": ["ProjectionOutbox row v1", "ProjectionRepair record v1"],
+    "M4-T04": ["EpisodeRecord v1", "ProcedureCandidate v1"],
+    "M5-T01": ["RoleProfile v1"],
+    "M5-T02": ["SkillManifest v1"],
+    "M5-T03": ["CapabilitySet v1", "PermissionDecision v1"],
+    "M6-T01": ["HardwareProfile v1", "ResourceLease v1", "resource pressure event v1"],
+    "M6-T02": ["filesystem/process/Git/package/network policy schemas v1"],
+    "M6-T03": ["SecretRef v1", "redaction event v1"],
+    "M6-T04": ["ApprovalClaim v1", "ActionReceipt v1", "ReconciliationPolicy v1"],
+    "M6-T05": ["TrustLabel v1", "PolicyViolationEvidence v1"],
+    "M6-T06": ["SecurityAuditEvent v1", "AutonomyBudget v1", "RollbackRecord v1"],
+    "M6-T07": ["ExternalEscalationManifest v1", "ExternalPayloadPolicy v1"],
+    "M7-T01": ["VectorProjectionMetadata v1", "embedding model/dimension version manifest"],
+    "M7-T02": ["WebAcquireRequest/Result v1"],
+    "M7-T03": ["BrowserAction/Receipt v1", "BrowserStateSynopsis v1"],
+    "M7-T04": ["AdaptiveBrowserStep/Result v1"],
+    "M8-T01": ["CrossRepoContract v1", "IntegrationCheckpoint v1"],
+    "M8-T02": ["CodeGraph adapter manifest v1"],
+    "M8-T03": ["KnowledgeAsset v1", "KnowledgeBuildJob v1"],
+    "M9-T01": ["EvalScenario v1", "EvalReport v1"],
+    "M9-T02": ["CompletionRecord v1"],
+    "M9-T03": ["migration compatibility manifest v1", "provider conformance report v1"],
+    "M9-T04": ["SoakReport v1"]
+  },
+  "resource_constraints_by_task": {
+    "M1-T03": ["One local 3B-4B model process maximum; record target-machine steady/peak/context growth and unload residual before M1 closes."],
+    "M1-T04": ["Repository-controlled code runs only when the configured local isolation backend enforces the declared boundary; otherwise the action fails closed."],
+    "M1-T05": ["Retained evidence and model-facing synopses are separately quota bounded; compression must not require an unbounded in-memory log."],
+    "M1-T06": ["Normal packet target is 8k input and the M1 ceiling is 16k; context insufficiency triggers better retrieval, compression, split, or replan rather than automatic growth."],
+    "M1-T10": ["Exactly one MODEL lease; no embedder/browser/knowledge adapter; compiler calls are charged to plan/controller model-call and wall-time budgets."],
+    "M1-T07": ["One mutation at a time and Controller outer budgets dominate provider/tool retry loops."],
+    "M1-T08": ["Recovery launches no new mutation until checkpoint, journal, process ownership, and unknown-action truth are reconciled."],
+    "M1-T09": ["Repair remains inside the same task budget and conjunctive max_attempts/same_failure_limit."],
+    "M2-T01": ["Index builds are bounded heavy jobs with measured batch/cache/WAL footprint; no resident embedder."],
+    "M2-T02": ["Parser/index batches never retain a whole large-repository AST; no resident embedder."],
+    "M2-T03": ["No semantic/embedder lease; retrieval stops after sufficient cheaper evidence."],
+    "M3-T02": ["Planning calls obey model-call, wall-time, context, task-count, plan-revision, and per-scope replan ceilings."],
+    "M4-T02": ["Memory retrieval remains filter/signature/lexical first and prompt-token bounded; no resident embedder."],
+    "M6-T01": ["Live pressure/swap-out/compressor/thermal state overrides arithmetic admission and unknown heavy pairs serialize."],
+    "M7-T01": ["Embedder is demand-loaded and normally serialized with MODEL, browser, and heavy build; <=50k hot vectors default and <=100k active corpus ceiling absent calibrated override."],
+    "M7-T03": ["Deterministic browser is demand-loaded, initially one-tab, normally serialized with MODEL/build/embedder, and zero-resident after lease release."],
+    "M7-T04": ["Adaptive browser is admitted only after measured combined calibration; its inner loop cannot exceed Controller budgets."],
+    "M8-T02": ["Use the provisional optional-knowledge admission ceiling until Apple-arm64 calibration replaces it; serialize with other heavy residents while uncalibrated."],
+    "M9-T04": ["Soak/checkpoint tests must preserve host headroom and may defer work under pressure; they must not intentionally require sustained swap thrash."]
+  },
+  "migration_steps_by_task": {
+    "M0-T02": [
+      "Initialize a fresh database through numbered transactional migrations and record the schema version.",
+      "Before a destructive/failed migration test, create an exact fixture backup and prove rollback leaves the previous version readable."
+    ],
+    "M1-T01": [
+      "Active writes emit Plan IR v1.2 only; retain explicit version dispatch so M9-T03 can read/migrate v1.1 fixtures without widening authority."
+    ],
+    "M2-T01": [
+      "Treat lexical index state as derived; incompatible index schema/version invalidates and rebuilds from current source rather than migrating canonical truth."
+    ],
+    "M2-T02": [
+      "Treat symbol/dependency graph state as derived; incompatible parser/schema versions trigger bounded source-fingerprint rebuild."
+    ],
+    "M4-T01": [
+      "Add memory tables through a numbered transactional SQLite migration with backup and rollback fixture.",
+      "Do not synthesize trust or provenance for ambiguous legacy data."
+    ],
+    "M4-T03": [
+      "Install projection-outbox schema before asynchronous projection writes; after upgrade, replay/rebuild projections from canonical memory."
+    ],
+    "M6-T03": [
+      "Migrate secret handles/provider metadata only; never copy resolved secret values into Sovereign durable state."
+    ],
+    "M7-T01": [
+      "Vector projection is disposable: model/dimension/version changes invalidate and rebuild vectors from canonical source/memory."
+    ],
+    "M7-T02": [
+      "Adapter install/remove leaves core durable state unchanged; adapter-owned caches are disposable."
+    ],
+    "M7-T03": [
+      "Default ephemeral browser profiles need no migration; explicitly granted persistent profile metadata is separately versioned."
+    ],
+    "M7-T04": [
+      "Adaptive adapter install/remove leaves core schema unchanged; adapter caches are disposable."
+    ],
+    "M8-T02": [
+      "CodeGraph state is derived and may be dropped/rebuilt across adapter version changes."
+    ],
+    "M8-T03": [
+      "Wiki/document assets are derived and rebuild from source hashes across incompatible versions."
+    ],
+    "M9-T03": [
+      "Back up durable SQLite/CAS metadata before upgrade.",
+      "Read and migrate Plan IR v1.1 under v1.2 without synthesizing broader authority absent from the source plan.",
+      "Apply numbered durable-state migrations transactionally and prove rollback/old-reader diagnostics on failure.",
+      "Rebuild disposable FTS/symbol/dependency/vector/wiki/CodeGraph projections from canonical state.",
+      "Run ModelBackend conformance before switching providers and roll provider configuration back independently of Plan IR/state."
+    ]
+  },
+  "milestones": [
+    {
+      "milestone_id": "M0",
+      "title": "Engineering foundation and durable state",
+      "depends_on": [],
+      "objective": "Create the minimal Rust workspace, durable state primitives, schema/version discipline, and test infrastructure required before autonomous behavior exists.",
+      "resource_constraints": [
+        "No model, browser, embedding model, Docker, or network service is required for this milestone.",
+        "Controller/state foundation should remain within the M1 profile's ~400 MB peak control-plane envelope on normal fixtures; a higher measured footprint is a calibration/engineering issue, not permission to consume the later model reserve."
+      ],
+      "tasks": [
+        {
+          "task_id": "M0-T01",
+          "title": "Bootstrap Rust workspace and quality gates",
+          "depends_on": [],
+          "targets": [
+            "Cargo.toml",
+            "crates/sovereign-types",
+            "apps/sovereign"
+          ],
+          "objective": "Create the workspace, common error/ID/time types, CLI skeleton, formatting/lint/test commands, and CI-compatible local verification without adding product behavior.",
+          "interfaces": [
+            "Typed opaque IDs for project/goal/plan/task/attempt/action/evidence/checkpoint",
+            "Versioned error codes"
+          ],
+          "artifacts": [
+            "Rust workspace",
+            "developer verification script",
+            "toolchain policy"
+          ],
+          "tests": [
+            "workspace compiles on arm64 macOS",
+            "opaque ID parse/format tests"
+          ],
+          "acceptance": [
+            "cargo fmt --check passes",
+            "cargo clippy --workspace --all-targets -- -D warnings passes",
+            "cargo test --workspace passes"
+          ],
+          "verification_commands": [
+            "cargo fmt --check",
+            "cargo clippy --workspace --all-targets -- -D warnings",
+            "cargo test --workspace"
+          ],
+          "completion_evidence": [
+            "command evidence for all verification commands",
+            "workspace manifest digest"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M0-T02",
+          "title": "Implement SQLite migration and state repository foundation",
+          "depends_on": [
+            "M0-T01"
+          ],
+          "targets": [
+            "crates/sovereign-state"
+          ],
+          "objective": "Create SQLite WAL initialization, migrations, transaction boundaries, current-state tables, append-only event journal, and schema-version metadata.",
+          "interfaces": [
+            "StateStore",
+            "MigrationRunner",
+            "EventJournal"
+          ],
+          "artifacts": [
+            "initial schema migration",
+            "state store contract"
+          ],
+          "tests": [
+            "fresh database creation",
+            "idempotent migration",
+            "migration rollback on failure",
+            "event order/durability",
+            "WAL restart test"
+          ],
+          "acceptance": [
+            "process kill/reopen preserves committed state",
+            "failed transaction never publishes partial state",
+            "schema version is explicit"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-state"
+          ],
+          "completion_evidence": [
+            "state test report",
+            "migration manifest"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M0-T03",
+          "title": "Implement content-addressed artifact store",
+          "depends_on": [
+            "M0-T02"
+          ],
+          "targets": [
+            "crates/sovereign-evidence",
+            "crates/sovereign-state"
+          ],
+          "objective": "Store immutable evidence by SHA-256 with temp-write + atomic publish semantics and database references.",
+          "interfaces": [
+            "ArtifactStore.put",
+            "ArtifactStore.open",
+            "ArtifactStore.range",
+            "ArtifactStore.gc_candidates"
+          ],
+          "artifacts": [
+            "CAS layout",
+            "artifact metadata table"
+          ],
+          "tests": [
+            "deduplicated writes",
+            "interrupted temp write",
+            "digest mismatch rejection",
+            "range read",
+            "unreferenced object grace-period selection"
+          ],
+          "acceptance": [
+            "database never references a missing object after successful commit",
+            "immutable artifacts survive process restart"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-evidence -p sovereign-state"
+          ],
+          "completion_evidence": [
+            "CAS crash test evidence"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M0-T04",
+          "title": "Materialize stable destination interface and dependency contracts",
+          "depends_on": [
+            "M0-T01"
+          ],
+          "targets": [
+            "crates/sovereign-types",
+            "schemas/interface-contracts/"
+          ],
+          "objective": "Encode stable_interface_contracts as versioned Rust-facing ownership/type boundaries and a machine-readable dependency manifest without implementing advanced milestone behavior early.",
+          "interfaces": [
+            "InterfaceContractManifest",
+            "InterfaceOwner",
+            "ContractVersion"
+          ],
+          "schemas": [
+            "schemas/interface-contracts/v1.json"
+          ],
+          "artifacts": [
+            "versioned interface ownership/dependency manifest",
+            "compile-time dependency-direction checks"
+          ],
+          "tests": [
+            "every stable interface has exactly one owning module",
+            "no duplicate authority interface exists",
+            "forbidden dependency directions are rejected by architecture test",
+            "every introduced_by/extended_by task ID resolves in the roadmap"
+          ],
+          "acceptance": [
+            "later milestones can deepen implementations behind declared owners without relocating Controller/plan/policy/state authority",
+            "manifest matches top-level stable_interface_contracts"
+          ],
+          "resource_constraints": [
+            "No model, browser, embedder, or network service; metadata/type-only work remains inside the M0 control-plane envelope."
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-types -- interface_contracts"
+          ],
+          "migration_steps": [],
+          "completion_evidence": [
+            "interface-contract manifest digest",
+            "dependency-direction test report"
+          ],
+          "required_for_core": true
+        }
+      ],
+      "milestone_gates": [
+        "All M0 tests pass without network access after the declared Rust toolchain and locked build dependencies have been acquired/cached (or vendored by the later implementation).",
+        "A forced process kill cannot corrupt committed SQLite state or a published CAS object.",
+        "Stable interface ownership/dependency manifest exists and matches the roadmap stable_interface_contracts."
+      ],
+      "required_for_core": true
+    },
+    {
+      "milestone_id": "M1",
+      "title": "Vertical slice: goal, Plan Compiler/IR, controller, local model, retrieval, tools, evidence, verify, resume, repair",
+      "depends_on": [
+        "M0"
+      ],
+      "objective": "Prove the smallest complete goal-to-verified-change Sovereign loop, including the canonical PlanCompiler, before advanced memory, roles/skills, richer repository indexes, semantic retrieval, browsers, or optional external intelligence are added.",
+      "resource_constraints": [
+        "Exactly one local model process at a time.",
+        "No semantic embedding service or browser.",
+        "The M1/8GB profile starts with a 4.75 GB normal controlled-working-set soft target, ~5.5 GB hard managed ceiling, and ~1.5 GB soft/~1.25 GB hard host headroom; live macOS pressure plus swap-out/compressor growth and measured lease footprints may impose stricter limits.",
+        "Default model input profile is 8k tokens with separate output reserve; 16k is the un-overridden M1/8GB ceiling and cannot be reached by automatic context growth.",
+        "No repository mutation is allowed until the M1 minimum deterministic security/resource kernel is active."
+      ],
+      "tasks": [
+        {
+          "task_id": "M1-T01",
+          "title": "Materialize Plan IR v1.2 types and validator",
+          "depends_on": [
+            "M0-T02"
+          ],
+          "targets": [
+            "crates/sovereign-plan",
+            "schemas/plan-ir-v1.json"
+          ],
+          "objective": "Implement the normative Plan IR schema, serialization, referential validation, hard-dependency cycle detection, acceptance/verification validation, capability/resource validation, and canonical plan digest.",
+          "interfaces": [
+            "PlanIr",
+            "PlanValidator",
+            "ValidationDiagnostic"
+          ],
+          "artifacts": [
+            "exported JSON schema matching output/plan-ir.schema.json"
+          ],
+          "tests": [
+            "valid trivial plan",
+            "cycle rejection",
+            "missing dependency",
+            "every hard dependency requires exactly one dependency binding and orphan/non-dependency bindings are rejected",
+            "dependency binding artifact/criterion references must resolve on the upstream task",
+            "execution evidence requirements require stable IDs, explicit satisfaction mode, and freshness domain",
+            "missing acceptance evidence",
+            "required acceptance criteria carry explicit evidence-freshness policy",
+            "unsafe permission mismatch",
+            "resource conflict",
+            "untrusted-code task rejected when required isolation boundary is unavailable",
+            "CommandSpec timeout greater than task max_single_tool_action_seconds rejected",
+            "model call deadline greater than task/global max_model_call_seconds rejected",
+            "write-like network/browser action without network_write/external_side_effect plus reconciliation rejected",
+            "external_intelligence provider/data/payload request broader than global/task policy rejected",
+            "task count, plan revision and per-scope replan ceilings enforced",
+            "mutating rollback none is rejected and non-none rollback requires typed verification",
+            "next-state failure routing contradictory to failure_policy is rejected",
+            "stable canonical digest"
+          ],
+          "acceptance": [
+            "invalid plans cannot enter active state",
+            "canonical serialization is deterministic"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-plan"
+          ],
+          "completion_evidence": [
+            "validator fixture results"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M1-T02",
+          "title": "Implement project and Git baseline manager",
+          "depends_on": [
+            "M0-T02"
+          ],
+          "targets": [
+            "crates/sovereign-repo"
+          ],
+          "objective": "Register a local repository, discover scoped instructions, capture HEAD/branch/staged/unstaged/untracked digests, and protect pre-existing changes.",
+          "interfaces": [
+            "ProjectRegistry",
+            "RepositorySnapshot",
+            "InstructionResolver",
+            "RepoDelta"
+          ],
+          "tests": [
+            "clean repo",
+            "dirty repo",
+            "nested AGENTS scope",
+            "symlink path rejection",
+            "snapshot changes after edit"
+          ],
+          "acceptance": [
+            "Sovereign can prove which changes existed before a task",
+            "instruction scope is deterministic"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-repo"
+          ],
+          "completion_evidence": [
+            "fixture snapshot manifests"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M1-T03",
+          "title": "Implement ModelBackend abstraction and first local provider",
+          "depends_on": [
+            "M0-T01"
+          ],
+          "targets": [
+            "crates/sovereign-model"
+          ],
+          "objective": "Define provider-neutral capabilities/load/complete/token-count/health/unload contracts and implement one llama.cpp/OpenAI-compatible local backend without leaking provider types into the Controller.",
+          "interfaces": [
+            "ModelBackend",
+            "ModelCapabilities",
+            "ModelRequest",
+            "ModelResponse",
+            "ModelLease"
+          ],
+          "tests": [
+            "fake backend contract",
+            "provider health timeout",
+            "structured response validation",
+            "unload/reload",
+            "single active lease",
+            "real 3B-4B local backend bounded smoke harness on target M1/8GB profile"
+          ],
+          "acceptance": [
+            "all Controller tests can use a deterministic fake model",
+            "local provider can be replaced without Plan IR changes",
+            "M1 cannot close until a real local 3B-4B-class tool-capable model completes a bounded local smoke path on the target 8GB machine; fake backend evidence alone is insufficient"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-model"
+          ],
+          "completion_evidence": [
+            "fake-backend contract report",
+            "mandatory target-machine real-model smoke report recording model name/version, parameter class, quantization, runtime/provider, weight artifact size, configured context, task/action result, startup/prefill peak, post-load steady footprint, observed 4k/8k and supported 12k/16k KV/context growth, token throughput, host pressure plus swap/compressor deltas, unload residual, and clean reload behavior"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M1-T04",
+          "title": "Implement minimum deterministic security/resource kernel, action journal, and process runner",
+          "depends_on": [
+            "M0-T03",
+            "M1-T02"
+          ],
+          "targets": [
+            "crates/sovereign-tools",
+            "crates/sovereign-policy",
+            "crates/sovereign-state"
+          ],
+          "objective": "Before any mutation, enforce canonical repository/worktree path jail and protected roots, sanitized environment, structured CommandSpec execution, deterministic risk floors, offline-by-default network, package/destructive/network denial unless explicitly task-authorized, durable capability/action authorization states, a minimum ExecutionIsolationBackend for repository-controlled code, minimal MODEL/BUILD_HEAVY lease exclusion, process/model deadlines and process-group cleanup, time/output/disk/subprocess ceilings, and unknown-outcome reconciliation for local commands.",
+          "interfaces": [
+            "ToolManifest",
+            "AuthorizedAction",
+            "ActionJournal",
+            "ProcessRunner",
+            "Reconciliation",
+            "PathPolicy",
+            "CommandPolicy",
+            "MinimalNetworkPolicy",
+            "ExecutionIsolationBackend",
+            "MinimalResourceLeaseAuthority",
+            "CheckpointIntegrityFloor"
+          ],
+          "tests": [
+            "path traversal and symlink escape denied",
+            "protected credential/controller/system roots denied",
+            "inherited environment is cleared except allowlist",
+            "repository-controlled fixture process cannot read protected home/credential roots",
+            "repository-controlled fixture process cannot open outbound network while task network is offline; if isolation cannot prove denial, execution is rejected before launch",
+            "ambient proxy, Git/SSH override, dynamic-loader injection, package auth, editor/pager and credential variables are absent unless individually authorized",
+            "opaque shell syntax cannot bypass structured command policy",
+            "PATH shim or repository-local executable cannot replace digest/version-pinned authorized executable",
+            "package install denied without task grant",
+            "destructive Git/system command denied without task grant",
+            "network denied by default and host outside task allowlist denied",
+            "no second MODEL lease and forbidden MODEL/BUILD_HEAVY overlap rejected by baseline profile",
+            "tool timeout/crash kills process group and reaps children or blocks recovery when a child cannot be proven dead",
+            "model timeout consumes outer model-call budget and cannot retry outside Controller counters",
+            "output/disk/subprocess ceilings enforced",
+            "crash after dispatch creates unknown action",
+            "safe idempotent read action reconciles; unsafe unknown action blocks replay",
+            "pre/post mutation checkpoint floor uses monotonic generation and hash-chain/reference validation",
+            "torn/broken newest checkpoint falls back only to last valid generation or blocks mutation",
+            "action-journal sequence mismatch blocks mutation"
+          ],
+          "acceptance": [
+            "no tool executes before exact action authorization is durably journaled",
+            "repository/web/model/skill/tool text cannot enlarge the effective capability set",
+            "process_exec never implies ambient filesystem/network/secret access for repository-controlled code",
+            "if required local isolation cannot be enforced, the corresponding untrusted-code action is unavailable rather than best-effort",
+            "side-effect state is never inferred from missing output",
+            "M1 repository writes cannot run with unrestricted inherited environment, network, path, package, destructive-command, or resource authority",
+            "mutation-capable tasks cannot disable the Controller checkpoint-integrity floor"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-tools -p sovereign-policy"
+          ],
+          "completion_evidence": [
+            "action-state transition traces"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M1-T05",
+          "title": "Implement deterministic evidence compression and expansion",
+          "depends_on": [
+            "M0-T03",
+            "M1-T04"
+          ],
+          "targets": [
+            "crates/sovereign-evidence"
+          ],
+          "objective": "Persist lossless retained tool bytes only after mandatory ingress secret/safety redaction, enforce per-action/task raw spool quotas with explicit segmentation/truncation evidence, and create bounded compiler/test/search/log/diff synopses with expansion handles and failure signatures.",
+          "interfaces": [
+            "EvidenceCompressor",
+            "ToolEvidence",
+            "EvidenceExpandQuery",
+            "FailureSignature"
+          ],
+          "tests": [
+            "10k-line log compresses within model-facing budget",
+            "retained post-ingress bytes are byte-for-byte recoverable",
+            "known/generic credential shapes are redacted before CAS persistence",
+            "spool quota exceedance records raw_complete=false, captured ranges/counts, and truncation reason",
+            "expansion reads retained raw artifact by digest/range without rerunning the tool",
+            "expansion beyond a truncated retained range returns explicit not_retained evidence",
+            "synopsis records compressor version, raw/synopsis digests, retained ranges, redaction event IDs, and raw_complete",
+            "historical retained raw artifact can be recompressed into a new synopsis version without rewriting raw evidence",
+            "compiler primary error extraction",
+            "test failure grouping",
+            "stable failure signature"
+          ],
+          "acceptance": [
+            "lossy synopsis never deletes retained post-ingress evidence",
+            "secret-bearing pre-redaction bytes are not persisted merely to preserve raw fidelity",
+            "runaway tool output cannot consume unbounded disk",
+            "model-facing output is bounded by configured limit"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-evidence"
+          ],
+          "completion_evidence": [
+            "compression ratio fixture report"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M1-T06",
+          "title": "Implement bounded context packet and simple exact retrieval",
+          "depends_on": [
+            "M1-T01",
+            "M1-T02",
+            "M1-T05"
+          ],
+          "targets": [
+            "crates/sovereign-context",
+            "crates/sovereign-repo"
+          ],
+          "objective": "Build C0/C1 context packets using exact path/rg evidence, instruction evidence, diffs, and compressed tool results with provenance/digests/token accounting.",
+          "interfaces": [
+            "ContextPacket",
+            "EvidenceItem",
+            "ContextBudget",
+            "ExactRetriever"
+          ],
+          "tests": [
+            "C0 cannot be evicted",
+            "duplicate evidence removed by digest",
+            "stale file hash rejected/refreshed",
+            "budget truncation produces expansion handles",
+            "packet uses stable weak-model order: controller prefix, C0 contract, current state, C1 evidence, routed expansion, tool/failure synopsis, typed output schema",
+            "full repository/chat history/raw logs/all tool schemas are absent by default",
+            "unused token allocation remains empty rather than backfilled with unrelated evidence",
+            "repair packet excludes prior-attempt transcript and keeps only current diff/failure/implicated evidence",
+            "reviewer packet excludes implementer hidden reasoning trajectory"
+          ],
+          "acceptance": [
+            "a task never receives full repository or full conversation history by default"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-context -p sovereign-repo"
+          ],
+          "completion_evidence": [
+            "context packet fixture under 8k profile"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M1-T10",
+          "title": "Implement canonical minimal PlanCompiler for the first vertical slice",
+          "depends_on": [
+            "M1-T01",
+            "M1-T03",
+            "M1-T06"
+          ],
+          "targets": [
+            "crates/sovereign-plan",
+            "crates/sovereign-controller"
+          ],
+          "objective": "Implement the one canonical PlanCompiler interface early. For a simple natural-language engineering goal, consume bounded exact repository evidence and one bounded local planning-model proposal, deterministically normalize it into an immutable one-task or short-linear Plan IR v1.2 revision, and require PlanValidator success before activation. M3 deepens this same compiler rather than introducing another compiler path.",
+          "interfaces": [
+            "PlanCompiler",
+            "PlanCompilationInput",
+            "PlanCompilationResult",
+            "CompilationEvidence"
+          ],
+          "schemas": [
+            "PlanCompilationInput v1",
+            "PlanCompilationResult v1",
+            "Plan IR v1.2 output"
+          ],
+          "artifacts": [
+            "compiled Plan IR v1.2 fixture corpus for simple goals",
+            "compilation evidence/provenance records",
+            "canonical compiler contract shared with later M3 deepening"
+          ],
+          "tests": [
+            "simple edit goal compiles to a bounded one-node Plan IR v1.2 task",
+            "simple two-step goal compiles to a short acyclic DAG only when evidence requires it",
+            "compiler uses exact repository evidence handles instead of repository dumps",
+            "unknown path or assumption becomes an explicit evidence requirement rather than a fabricated fact",
+            "malformed model proposal is rejected or boundedly retried within compiler/model-call budget",
+            "compiler output cannot self-grant permissions or widen global/project policy",
+            "PlanValidator rejection prevents plan activation",
+            "canonical compilation result is immutable and digest-addressed",
+            "fake backend deterministic compiler fixture passes",
+            "real local backend compiles the M1 smoke goal within configured context/deadline on the target machine"
+          ],
+          "acceptance": [
+            "M1 end-to-end execution starts from compiler-produced validated Plan IR rather than a hand-authored plan",
+            "there is exactly one PlanCompiler authority/interface and later milestones extend it rather than replace it",
+            "compiler cannot activate a plan or authorize tools; Controller remains authority"
+          ],
+          "resource_constraints": [
+            "Exactly one MODEL lease; no embedder, browser, CodeGraph/wiki, or external provider is required.",
+            "Use the normal 8k input profile for the M1 compiler smoke; bounded planning/review may use up to 12k only after target calibration and never auto-grow beyond the 16k M1 ceiling.",
+            "Compiler model/tool call counts and wall deadlines are charged to outer Controller/plan budgets."
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-plan -- minimal_compiler",
+            "cargo test -p sovereign-eval --test compiler_vertical_slice"
+          ],
+          "migration_steps": [],
+          "completion_evidence": [
+            "compiled simple-goal Plan IR v1.2 plus canonical digest",
+            "compiler evidence trace showing exact repository inputs, model call, and validator result",
+            "target-machine bounded local-model compiler smoke record"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M1-T07",
+          "title": "Implement Controller task/attempt loop and deterministic verifier",
+          "depends_on": [
+            "M1-T01",
+            "M1-T03",
+            "M1-T04",
+            "M1-T06",
+            "M1-T10"
+          ],
+          "targets": [
+            "crates/sovereign-controller"
+          ],
+          "objective": "Consume an active compiler-produced validated Plan IR task and execute it through bounded context, local model proposal, authorized tools, evidence, deterministic verification, and terminal state under Controller-owned counters.",
+          "interfaces": [
+            "Controller",
+            "Scheduler",
+            "TaskStateMachine",
+            "AttemptStateMachine",
+            "Verifier"
+          ],
+          "tests": [
+            "successful natural-language trivial edit fixture compiles through M1-T10 then executes; direct hand-authored Plan IR cannot satisfy the end-to-end gate",
+            "model malformed proposal",
+            "verification failure",
+            "same-failure circuit breaker",
+            "ready requires active/current plan, satisfied dependency bindings, execution evidence, fresh baseline, reconciled checkpoint, possible permissions, and admissible resources in one Controller epoch",
+            "execution_epoch change invalidates ready lease and not-yet-dispatched action authorization/approval before mutation",
+            "baseline drift invalidates a ready lease before mutation and enters stale-evidence revalidation",
+            "committed action receipt with nonzero tool result remains an execution result rather than action-state ambiguity",
+            "budget exhaustion blocks cleanly"
+          ],
+          "acceptance": [
+            "model cannot directly set succeeded",
+            "task only succeeds after acceptance evidence"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-controller",
+            "cargo test -p sovereign-eval --test vertical_slice"
+          ],
+          "completion_evidence": [
+            "end-to-end event journal",
+            "final repository diff",
+            "verification evidence IDs"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M1-T08",
+          "title": "Implement checkpoint and restart recovery vertical slice",
+          "depends_on": [
+            "M1-T07"
+          ],
+          "targets": [
+            "crates/sovereign-controller",
+            "crates/sovereign-state"
+          ],
+          "objective": "Persist plan/task/attempt/action/repository/evidence checkpoints and recover correctly after process termination.",
+          "interfaces": [
+            "CheckpointManifest",
+            "RecoveryManager"
+          ],
+          "tests": [
+            "kill before mutation",
+            "kill after local edit",
+            "kill during verification",
+            "kill after dispatch before observed",
+            "orphan process reap",
+            "checkpoint binds canonical plan/task contract digests, dependency bindings, evidence satisfactions, and action-journal sequence",
+            "checkpoint/recovery preserves monotonic execution_epoch and invalidates stale ready/action leases when reconciliation changes truth",
+            "fallback to older valid checkpoint replays authoritative later journal events and never replays an already committed edit",
+            "superseded plan checkpoint cannot resume without explicit N+1 carry-forward validation"
+          ],
+          "acceptance": [
+            "resume needs no chat replay",
+            "unknown dispatched action is reconciled or blocked before retry"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test crash_resume"
+          ],
+          "completion_evidence": [
+            "crash matrix report with state transitions"
+          ],
+          "required_for_core": true
+        },
+        {
+          "task_id": "M1-T09",
+          "title": "Implement first targeted repair loop",
+          "depends_on": [
+            "M1-T07",
+            "M1-T08"
+          ],
+          "targets": [
+            "crates/sovereign-controller",
+            "crates/sovereign-context"
+          ],
+          "objective": "On execution failure, build a failure-focused packet and permit a bounded new attempt without changing the task contract.",
+          "interfaces": [
+            "FailureRecord",
+            "RepairPacket"
+          ],
+          "tests": [
+            "compile error repaired on second attempt",
+            "identical failure stops at limit",
+            "max_attempts counts started attempts including initial attempt",
+            "same_failure_limit exhaustion blocks another identical repair even when total attempt capacity remains",
+            "pre-attempt resource admission retry does not fabricate an execution attempt",
+            "acceptance contract remains unchanged"
+          ],
+          "acceptance": [
+            "repair uses failure evidence and does not recompile the plan"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test repair_loop"
+          ],
+          "completion_evidence": [
+            "attempt 1/2 packet diff and verification result"
+          ],
+          "required_for_core": true
+        }
+      ],
+      "milestone_gates": [
+        "A simple natural-language fixture goal is compiled by M1-T10 from bounded exact repository evidence into validated Plan IR v1.2, then executed through the real Controller/tool/evidence/verifier loop, checkpointed, killed, and resumed successfully. Hand-authored Plan IR may test the validator but cannot close M1.",
+        "A failed implementation is repaired with targeted evidence under a bounded retry count without changing the task contract or recompiling the still-valid plan.",
+        "The minimum deterministic security/resource kernel is active before the first mutation and its path/env/network/package/destructive/action-journal/unknown-outcome/isolation/lease tests pass.",
+        "A real local 3B-4B-class tool-capable model compiles and executes the bounded smoke goal on the target MacBook Air M1/8GB and records the exact model/runtime/quantization/context plus measured resource observations.",
+        "Repository retrieval in the slice is exact/rg and bounded; FTS/tree-sitter are deliberately deferred to M2, while browser, vector/semantic, cloud API, external model, persistent memory, and a second resident local model are unnecessary."
+      ],
+      "required_for_core": true
+    },
+    {
+      "milestone_id": "M2",
+      "title": "Repository intelligence and context-as-cache",
+      "depends_on": [
+        "M1"
+      ],
+      "objective": "Make weak-model context precise by adding rebuildable lexical/symbol/dependency indexes and deterministic retrieval routing before semantic search.",
+      "resource_constraints": [
+        "Index builds resumable and bounded to one heavy index job.",
+        "No resident embedding model."
+      ],
+      "tasks": [
+        {
+          "task_id": "M2-T01",
+          "title": "Add SQLite FTS5/BM25 repository index",
+          "depends_on": [
+            "M1-T02"
+          ],
+          "targets": [
+            "crates/sovereign-repo"
+          ],
+          "objective": "Index bounded code/doc chunks and metadata with incremental changed-file refresh.",
+          "interfaces": [
+            "LexicalRetriever",
+            "IndexSnapshot"
+          ],
+          "tests": [
+            "incremental refresh",
+            "deleted file removal",
+            "dirty worktree indexing",
+            "large-file chunk cap",
+            "index hit with stale source hash is rejected and bounded source refresh or exact fallback occurs",
+            "repository delta invalidates affected projection rows before publishing a fresh index snapshot",
+            "medium/large fixture calibration records source bytes, FTS bytes, wall/CPU time, peak index memory, and bounded batch size",
+            "SQLite FTS connection/page-cache/WAL ceilings stay within the M1 resource profile or emit an explicit resource-health event"
+          ],
+          "acceptance": [
+            "index is fully rebuildable from source",
+            "source hash accompanies every hit"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-repo -- lexical"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "lexical-index fixture test report",
+            "rebuild/incremental-refresh evidence with source-hash manifest",
+            "target-machine repository-index calibration report with source:index disk ratio, CPU time, peak footprint, SQLite page-cache/WAL observations, and incremental refresh cost"
+          ]
+        },
+        {
+          "task_id": "M2-T02",
+          "title": "Add tree-sitter symbol and dependency graph",
+          "depends_on": [
+            "M2-T01"
+          ],
+          "targets": [
+            "crates/sovereign-repo"
+          ],
+          "objective": "Extract language-aware definitions/imports/module relations for initially supported languages and expose graph-neighborhood queries.",
+          "interfaces": [
+            "SymbolIndex",
+            "DependencyGraph",
+            "StructuralRetriever"
+          ],
+          "tests": [
+            "definition lookup",
+            "import neighborhood",
+            "changed symbol reindex",
+            "dependency-neighbor refresh is limited to affected imports/modules/tests",
+            "unsupported language graceful fallback",
+            "bounded parser batches never retain a whole large-repository AST",
+            "incremental structural refresh remains within the M1 index-worker and peak-memory profile"
+          ],
+          "acceptance": [
+            "exact source remains truth",
+            "graph records carry source/version fingerprints"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-repo -- structural"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "symbol/dependency graph fixture report",
+            "graph source/version fingerprint manifest"
+          ]
+        },
+        {
+          "task_id": "M2-T03",
+          "title": "Implement deterministic retrieval router and progressive context levels",
+          "depends_on": [
+            "M2-T01",
+            "M2-T02",
+            "M1-T06"
+          ],
+          "targets": [
+            "crates/sovereign-context"
+          ],
+          "objective": "Route path/symbol/behavior/impact/diff queries to exact, FTS, or structural graph channels and build C0-C3-capable packets without semantic escalation. Define history/memory as an optional provider hook that is absent/empty until M4 rather than a required M2 channel.",
+          "interfaces": [
+            "RetrievalRouter",
+            "ContextLevelPolicy"
+          ],
+          "tests": [
+            "known symbol avoids broad search",
+            "impact query uses graph",
+            "diff query prioritizes touched symbols",
+            "known path routes exact and stops without FTS/graph/semantic fanout",
+            "literal error routes exact then bounded lexical only if needed",
+            "graph is anchor expansion except explicit topology queries",
+            "episodic failure lookup keys normalized signature/repo/tool/symbol before text search when memory provider is present",
+            "semantic route is unavailable in M2 and later can activate only after an explicit lexical/structural gap or inherently fuzzy query",
+            "context dedupe",
+            "bounded iterative retrieval",
+            "router behaves deterministically when the optional memory/history provider is absent"
+          ],
+          "acceptance": [
+            "generic vector RAG is not a default route",
+            "M2 has no dependency on persistent memory; M4 later plugs into the optional history/memory retrieval interface",
+            "router records route/reason/candidate/freshness/stop-condition trace and never fans out to every retriever by default"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-context -- routing"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "deterministic routing trace fixtures",
+            "bounded context-packet evidence proving no required memory/semantic channel"
+          ]
+        },
+        {
+          "task_id": "M2-T04",
+          "title": "Add context/token telemetry",
+          "depends_on": [
+            "M2-T03"
+          ],
+          "targets": [
+            "crates/sovereign-context",
+            "crates/sovereign-eval"
+          ],
+          "objective": "Measure candidate/selected/serialized tokens and evidence use per attempt, plus per-route retrieval value, stale rejection, semantic escalation, packet fill, expansion, and reuse metrics against verified outcomes.",
+          "interfaces": [
+            "ContextMetrics",
+            "RetrievalTrace"
+          ],
+          "tests": [
+            "metric accounting deterministic",
+            "dedupe measured before/after",
+            "zero-success division handled",
+            "provider token usage preferred and pinned local tokenizer fallback is reproducible",
+            "tokens recorded before dedupe, after dedupe, by context level/evidence kind, tool schemas, stable prefix, and final serialized input",
+            "evidence is counted used when cited, action-linked, expanded, or verification/failure-linked",
+            "retrieval hit quality is reported separately for exact/lexical/symbol/dependency/diff/episodic/semantic routes",
+            "semantic escalation and incremental semantic hit rate are measurable",
+            "stale candidate rejection, memory conflict/revalidation, expansion/raw-drilldown, packet-fill, and cross-attempt carry metrics are reproducible"
+          ],
+          "acceptance": [
+            "metrics definitions match architecture document"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-context -p sovereign-eval"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "versioned context/token metric report",
+            "metric accounting fixture evidence"
+          ]
+        }
+      ],
+      "milestone_gates": [
+        "A medium fixture task succeeds without semantic retrieval and records evidence-routing/token metrics.",
+        "Known path/symbol and behavior-discovery fixtures prove deterministic route/stop behavior without all-retriever fanout; stale index hits are source-refreshed or bypassed.",
+        "Weak-model packet fixtures prove only C0/current-state/direct evidence/routed expansion/current tool synopses/relevant tool schemas enter context under the configured token ceiling."
+      ],
+      "required_for_core": true
+    },
+    {
+      "milestone_id": "M3",
+      "title": "Planning depth, rich compilation, execution-vs-plan failure, and bounded replanning",
+      "depends_on": [
+        "M2"
+      ],
+      "objective": "Deepen the canonical M1 PlanCompiler for larger and supplied plans, add autonomous depth selection, and prove the Controller changes only the smallest invalid plan scope when evidence falsifies assumptions.",
+      "tasks": [
+        {
+          "task_id": "M3-T01",
+          "title": "Implement deterministic depth feature extractor and classifier",
+          "depends_on": [
+            "M2-T03"
+          ],
+          "targets": [
+            "crates/sovereign-plan"
+          ],
+          "objective": "Compute D0-D4 using repository count, modules, security, migrations, APIs, uncertainty, coverage, blast radius, and prior failures with hard risk overrides.",
+          "interfaces": [
+            "DepthFeatures",
+            "DepthClassifier"
+          ],
+          "tests": [
+            "trivial edit D0/D1",
+            "auth D3/D4",
+            "multi-repo migration D4",
+            "risk override"
+          ],
+          "acceptance": [
+            "classification reason/features are persisted"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-plan -- depth"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "depth-classification fixture matrix with persisted feature vectors/reasons"
+          ]
+        },
+        {
+          "task_id": "M3-T02",
+          "title": "Deepen the canonical PlanCompiler for supplied plans and multi-module DAGs",
+          "depends_on": [
+            "M1-T10",
+            "M3-T01",
+            "M2-T03"
+          ],
+          "targets": [
+            "crates/sovereign-plan",
+            "crates/sovereign-controller"
+          ],
+          "objective": "Extend the M1 canonical PlanCompiler, without changing its authority boundary, to compile natural-language goals, architecture/spec documents, and supplied human/external plans into bounded multi-task DAGs using depth-aware bounded planner calls plus deterministic dependency, evidence, acceptance, and PlanValidator resolution.",
+          "interfaces": [
+            "PlanCompiler",
+            "PlanCompilationInput",
+            "CompilationEvidence"
+          ],
+          "tests": [
+            "M1 simple compiler fixtures remain compatible",
+            "multi-module DAG",
+            "supplied human plan normalization",
+            "supplied external-model plan remains untrusted input and cannot bypass validation or policy",
+            "downstream tasks bind consumed upstream artifacts/accepted criteria one-for-one with hard dependencies",
+            "negative/absence evidence uses evaluator_pass with a governed evaluator; query_completed alone cannot prove zero-hit semantics",
+            "supplied bad plan rejected/repaired within plan/model/revision budgets",
+            "unknown path becomes evidence requirement",
+            "task splitting respects global task/revision/replan ceilings"
+          ],
+          "acceptance": [
+            "planner model never bypasses PlanValidator",
+            "all task criteria are independently evaluable or explicitly manual",
+            "M3 uses the same PlanCompiler contract introduced in M1-T10; no parallel compiler path exists"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-plan -- compiler"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "compiled Plan IR fixture corpus",
+            "PlanValidator diagnostics for accepted/rejected supplied plans"
+          ]
+        },
+        {
+          "task_id": "M3-T03",
+          "title": "Implement failure classifier and smallest-scope replanner",
+          "depends_on": [
+            "M3-T02",
+            "M1-T09"
+          ],
+          "targets": [
+            "crates/sovereign-plan",
+            "crates/sovereign-controller"
+          ],
+          "objective": "Distinguish task execution failure from falsified plan assumptions and create immutable superseding revisions for task/branch/full-plan scope.",
+          "interfaces": [
+            "FailureClassifier",
+            "PlanAssumption",
+            "ReplanScope",
+            "PlanRevisionDiff"
+          ],
+          "tests": [
+            "compiler error stays execution failure",
+            "missing planned API triggers task replan",
+            "changed producer contract replans descendants",
+            "unaffected branch remains valid",
+            "replan_smallest_scope never underscopes the invalidated clause/binding",
+            "carry-forward requires identical task contract plus valid dependency/input fingerprints and acceptance freshness; matching task ID alone is rejected"
+          ],
+          "acceptance": [
+            "old plan revision remains auditable",
+            "new revision never mutates succeeded unaffected task evidence"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test plan_failure"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "failure-classification traces",
+            "immutable plan-revision diff showing smallest-scope supersession and unchanged-task carry-forward"
+          ]
+        },
+        {
+          "task_id": "M3-T04",
+          "title": "Add controller-owned worktrees for D3/D4",
+          "depends_on": [
+            "M3-T01",
+            "M1-T02"
+          ],
+          "targets": [
+            "crates/sovereign-repo",
+            "crates/sovereign-controller"
+          ],
+          "objective": "Create task/branch worktrees without disturbing user changes and provide merge/conflict evidence paths.",
+          "interfaces": [
+            "WorktreeLease",
+            "ChangeSet"
+          ],
+          "tests": [
+            "dirty primary repo protected",
+            "task worktree cleanup",
+            "conflict preserved as evidence",
+            "rollback removes only controller worktree"
+          ],
+          "acceptance": [
+            "no reset/clean of user worktree is used for recovery"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-repo -- worktree"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "worktree isolation/conflict/cleanup fixture report",
+            "protected-primary-worktree rollback evidence"
+          ]
+        }
+      ],
+      "milestone_gates": [
+        "Scenarios 1, 2, 4, 5, 6, 7 and 8 compile/validate and their M3-available behaviors execute as deterministic fixtures/simulations.",
+        "Scenario 3 cross-repository migration must compile and validate at M3, but its full multi-repository execution is deferred to required task M8-T01 and must not be pulled forward merely to close M3."
+      ],
+      "required_for_core": true
+    },
+    {
+      "milestone_id": "M4",
+      "title": "Persistent memory and learning",
+      "depends_on": [
+        "M2",
+        "M3"
+      ],
+      "objective": "Add uniform provenance-aware durable memory without making memory a second authority or requiring embeddings.",
+      "tasks": [
+        {
+          "task_id": "M4-T01",
+          "title": "Implement canonical memory schema and lifecycle",
+          "depends_on": [
+            "M0-T02",
+            "M2-T03"
+          ],
+          "targets": [
+            "crates/sovereign-memory"
+          ],
+          "objective": "Create governed/validated/episodic/procedural/preference records with uniform project/agent/shared scope, provenance, confidence, version, supersession, expiry, invalidation predicates, and trust.",
+          "interfaces": [
+            "MemoryRecord",
+            "MemoryScope",
+            "MemoryLifecycle"
+          ],
+          "tests": [
+            "project isolation",
+            "role isolation",
+            "supersession",
+            "conflict retention",
+            "expiry",
+            "source fingerprint invalidation",
+            "repository delta marks fingerprint-dependent validated memory stale before retrieval can inject it",
+            "same-subject incompatible fresh validated assertions create a conflict set rather than last-write-wins",
+            "governed replacement creates supersession rather than parallel contradictory active truth",
+            "observed/unreviewed contradiction with governed/fresh validated evidence is demoted from normal fact injection"
+          ],
+          "acceptance": [
+            "every durable memory type uses the same scope/provenance envelope"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-memory -- lifecycle"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "memory lifecycle/scope isolation test report",
+            "canonical memory schema/provenance/version manifest"
+          ]
+        },
+        {
+          "task_id": "M4-T02",
+          "title": "Implement FTS memory retrieval and compact expansion",
+          "depends_on": [
+            "M4-T01"
+          ],
+          "targets": [
+            "crates/sovereign-memory",
+            "crates/sovereign-context"
+          ],
+          "objective": "Retrieve compact lexical memory hits under trust/freshness/token filters and expand selected records by evidence ID.",
+          "interfaces": [
+            "MemoryRetriever",
+            "MemorySynopsis"
+          ],
+          "tests": [
+            "project filter",
+            "trust precedence",
+            "stale memory demotion",
+            "compact token cap",
+            "expansion provenance",
+            "episodic exact/failure-signature filters run before broad lexical memory search",
+            "stale/superseded/deprecated/expired/conflicted memories excluded from ordinary fact injection",
+            "explicit history/conflict query can retrieve excluded records with status/provenance",
+            "unresolved contradiction returns compact conflict statement plus both provenance handles",
+            "graph memory expansion requires an anchor and bounded neighborhood"
+          ],
+          "acceptance": [
+            "recalled memory enters context as evidence, never policy"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-memory -- retrieval"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "memory retrieval trace report",
+            "compact-to-expanded provenance evidence under token budget"
+          ]
+        },
+        {
+          "task_id": "M4-T03",
+          "title": "Implement durable projection outbox and projection repair",
+          "depends_on": [
+            "M4-T02"
+          ],
+          "targets": [
+            "crates/sovereign-memory",
+            "crates/sovereign-state"
+          ],
+          "objective": "Guarantee canonical memory writes and searchable projection updates cannot silently split; persist outbox work and rebuild derived indexes on mismatch.",
+          "interfaces": [
+            "ProjectionOutbox",
+            "ProjectionRepair"
+          ],
+          "tests": [
+            "crash after canonical commit before index update",
+            "duplicate outbox delivery",
+            "rebuild from canonical store",
+            "no writable fallback store"
+          ],
+          "acceptance": [
+            "search projections are explicitly derived/rebuildable"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-memory -- projection"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "projection crash/outbox replay/rebuild report",
+            "canonical-store versus derived-index consistency evidence"
+          ]
+        },
+        {
+          "task_id": "M4-T04",
+          "title": "Capture verified episodes and procedural candidates",
+          "depends_on": [
+            "M4-T03",
+            "M3-T03"
+          ],
+          "targets": [
+            "crates/sovereign-memory",
+            "crates/sovereign-controller"
+          ],
+          "objective": "Record failure/fix/verification episodes and propose reusable workflows only after verified outcomes; keep promotion governed.",
+          "interfaces": [
+            "EpisodeRecorder",
+            "ProcedureCandidate"
+          ],
+          "tests": [
+            "failed attempt not promoted as success",
+            "repeated verified pattern candidate",
+            "user/governed decision precedence"
+          ],
+          "acceptance": [
+            "learning cannot rewrite permissions or requirements"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-memory -- learning"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "verified episode/procedural-candidate fixture report",
+            "promotion-governance audit evidence"
+          ]
+        }
+      ],
+      "milestone_gates": [
+        "Restart preserves memory provenance and search coherence; source changes invalidate only affected memories.",
+        "Contradictory current memories form explicit conflict sets or supersession chains; stale/conflicted records cannot enter ordinary fact context unlabeled.",
+        "Episodic recall is deterministic-filter/lexical-first and compact-first; memory graph expansion requires an anchor and bounded neighborhood."
+      ],
+      "required_for_core": true
+    },
+    {
+      "milestone_id": "M5",
+      "title": "Role, skill, and tool specialization with runtime sparsity",
+      "depends_on": [
+        "M3",
+        "M4"
+      ],
+      "objective": "Add rich specialist behavior without extra resident models or dumping catalogues into context.",
+      "tasks": [
+        {
+          "task_id": "M5-T01",
+          "title": "Implement role registry and fresh reviewer contexts",
+          "depends_on": [
+            "M3-T02"
+          ],
+          "targets": [
+            "crates/sovereign-controller",
+            "crates/sovereign-context"
+          ],
+          "objective": "Define the small canonical role set, typed role outputs, and fresh reviewer/verifier context construction over the same model backend.",
+          "interfaces": [
+            "RoleProfile",
+            "RoleRegistry"
+          ],
+          "tests": [
+            "same model serial role switching",
+            "reviewer excludes implementer trajectory",
+            "role cannot elevate permissions"
+          ],
+          "acceptance": [
+            "no second model is required for independent review"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-controller -- roles"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "serial role-switch/fresh-reviewer fixture report",
+            "role-profile digest manifest proving no permission elevation"
+          ]
+        },
+        {
+          "task_id": "M5-T02",
+          "title": "Implement progressive skill registry",
+          "depends_on": [
+            "M5-T01"
+          ],
+          "targets": [
+            "crates/sovereign-controller",
+            "crates/sovereign-context"
+          ],
+          "objective": "Index skill frontmatter/manifest metadata, retrieve candidate skills cheaply, and load only selected full bodies/references under token budgets.",
+          "interfaces": [
+            "SkillManifest",
+            "SkillRegistry",
+            "SkillSelector"
+          ],
+          "tests": [
+            "metadata-only discovery",
+            "top-N body load",
+            "version/hash pinning",
+            "malicious skill permission request ignored"
+          ],
+          "acceptance": [
+            "catalogue size does not materially change base prompt size"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-controller -- skills"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "skill discovery/selection fixture report",
+            "selected skill version/digest and prompt-budget evidence"
+          ]
+        },
+        {
+          "task_id": "M5-T03",
+          "title": "Implement capability intersection and tool-schema filtering",
+          "depends_on": [
+            "M1-T04",
+            "M5-T02"
+          ],
+          "targets": [
+            "crates/sovereign-policy",
+            "crates/sovereign-tools",
+            "crates/sovereign-context"
+          ],
+          "objective": "Compute effective capabilities as the intersection of global/project/task/role/tool/user policy and expose only relevant tool schemas to the model.",
+          "interfaces": [
+            "CapabilitySet",
+            "PermissionDecision"
+          ],
+          "tests": [
+            "skill cannot grant network",
+            "role cannot grant destructive",
+            "irrelevant tools absent from packet",
+            "explicit grant scoped to exact task"
+          ],
+          "acceptance": [
+            "permission expansion always requires Controller policy/user authority"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-policy -p sovereign-tools"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "capability-intersection decision traces",
+            "model-visible filtered tool-schema manifest"
+          ]
+        }
+      ],
+      "milestone_gates": [
+        "A task can automatically select a role and one relevant skill while keeping the model/tool context bounded."
+      ],
+      "required_for_core": true
+    },
+    {
+      "milestone_id": "M6",
+      "title": "Resource governor, security hardening, and resilience",
+      "depends_on": [
+        "M5"
+      ],
+      "objective": "Deepen the already-mandatory M1 security/resource kernel with live pressure-aware governance, adversarial hardening, secret-provider integration, exact expiring approvals for consequential/external actions, and injection resilience.",
+      "tasks": [
+        {
+          "task_id": "M6-T01",
+          "title": "Implement resource leases and memory-pressure governor",
+          "depends_on": [
+            "M1-T03",
+            "M1-T04"
+          ],
+          "targets": [
+            "crates/sovereign-policy",
+            "crates/sovereign-controller"
+          ],
+          "objective": "Upgrade the M1 minimal lease authority into a pressure-aware governor using measured process RSS, macOS pressure/thermal signals, calibrated lease estimates, idle TTLs, hysteresis, and phase-aware eviction while preserving the one-model invariant.",
+          "interfaces": [
+            "ResourceGovernor",
+            "ResourceLease",
+            "HardwareProfile"
+          ],
+          "tests": [
+            "reject over-budget lease",
+            "evict idle optional process",
+            "unload/reload model around heavy build",
+            "pressure hysteresis",
+            "absolute swap-used alone does not permanently block launch when swap-out delta is stable, while positive swap-out/compressor growth tightens admission",
+            "120-second healthy-state recovery and reload cooldown prevent heavy-process oscillation",
+            "MODEL+EMBEDDER, MODEL+BUILD_HEAVY, browser+build, embedder+browser, optional-knowledge+model conflict matrix enforced unless an explicitly calibrated conditional pair is green",
+            "unknown heavy build first run is isolated with conservative subprocess/job cap",
+            "single model invariant",
+            "resource-pressure eviction scenario checkpoints/degrades optional capabilities before swap thrash"
+          ],
+          "acceptance": [
+            "governor checkpoints/defers instead of intentionally forcing sustained swap thrash"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-policy -- resources",
+            "cargo test -p sovereign-eval --test m1_8gb_resource_sim"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "M1/8GB pressure/lease/eviction test report",
+            "calibrated resource profile evidence with single-model invariant",
+            "pairwise heavy-capability admission matrix and pressure/swap/compressor/thermal hysteresis traces"
+          ]
+        },
+        {
+          "task_id": "M6-T02",
+          "title": "Harden filesystem, shell, Git, dependency, and network policy",
+          "depends_on": [
+            "M5-T03"
+          ],
+          "targets": [
+            "crates/sovereign-policy",
+            "crates/sovereign-tools",
+            "crates/sovereign-repo"
+          ],
+          "objective": "Adversarially harden the M1 path/process/isolation/Git/package/network kernel with atomic-replace/hard-link and symlink-race defenses, pinned executable resolution, ambient-capability stripping, Git hook/config/helper/filter/remote protections, package lifecycle/global-install controls, DNS/peer/redirect/private-range/loopback checks, and attack fixtures; do not defer the baseline deny-by-default controls to this milestone.",
+          "interfaces": [
+            "PathPolicy",
+            "CommandPolicy",
+            "GitPolicy",
+            "NetworkPolicy"
+          ],
+          "tests": [
+            "path traversal",
+            "symlink escape",
+            "symlink swap between authorization and commit invalidates action",
+            "hard-link fixture cannot mutate out-of-scope inode through in-place write",
+            "sibling registered repository write denied when absent from active task scope",
+            "secret path",
+            "PATH shim/repository executable cannot replace pinned authorized executable",
+            "ambient proxy, Git/SSH override, dynamic-loader and package-auth environment removed unless explicitly granted",
+            "untrusted repository process cannot read protected user/controller credential roots",
+            "untrusted repository process cannot open network under offline task policy and unavailable isolation backend blocks launch",
+            "git reset/clean denied",
+            "force push denied",
+            "Git hooks/global config/credential helper/external diff/filter/fsmonitor are not inherited",
+            "submodule/LFS/filter hidden network or execution requires explicit governed action",
+            "package install without grant denied",
+            "global package install denied and project-local isolated target required",
+            "package lifecycle script denied by default; explicitly enabled script remains sandboxed with exact capabilities",
+            "network host outside allowlist denied",
+            "DNS rebinding/redirect/connected-peer to private, loopback, link-local or metadata destination denied",
+            "ambient proxy and arbitrary localhost cannot bypass network policy"
+          ],
+          "acceptance": [
+            "repository text cannot alter these policies",
+            "process_exec alone never grants ambient network, secret, filesystem or sibling-repository authority"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-policy -- security"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "filesystem/shell/Git/package/network adversarial test report",
+            "policy-denial audit traces"
+          ]
+        },
+        {
+          "task_id": "M6-T03",
+          "title": "Implement secret broker and redaction",
+          "depends_on": [
+            "M6-T02",
+            "M0-T03"
+          ],
+          "targets": [
+            "crates/sovereign-policy",
+            "crates/sovereign-evidence"
+          ],
+          "objective": "Extend M1 ingress redaction into a scoped secret broker: persist only SecretRef handles, retrieve task-authorized values from macOS Keychain/provider, never expose resolved secret values to model context, inject ephemerally only into the exact authorized action, isolate temporary secret files, apply multi-pattern redaction before evidence/model/audit payload persistence, and audit scope/expiry/lease closure.",
+          "interfaces": [
+            "SecretBroker",
+            "SecretRef",
+            "Redactor"
+          ],
+          "tests": [
+            "secret absent from SQLite/CAS",
+            "resolved secret absent from local and external model packets",
+            "log redaction",
+            "scope expiration",
+            "unknown repository string cannot request secret",
+            "arbitrary child cannot invoke Secret Broker/Keychain simply from process_exec",
+            "temporary secret file is private, task-scoped, deleted and verified absent before secret-use action completes",
+            "ambient environment credential does not leak into child process"
+          ],
+          "acceptance": [
+            "test fixture proves injected secret does not appear in stored raw/synopsis/memory/model/audit payload artifacts"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-policy -p sovereign-evidence -- secret"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "secret injection/redaction test report",
+            "leakage scan proving secret values absent from SQLite/CAS/local-model/external-model/audit payload evidence"
+          ]
+        },
+        {
+          "task_id": "M6-T04",
+          "title": "Implement exact approval claims and unknown-outcome reconciliation",
+          "depends_on": [
+            "M1-T04",
+            "M6-T02"
+          ],
+          "targets": [
+            "crates/sovereign-controller",
+            "crates/sovereign-policy",
+            "crates/sovereign-tools"
+          ],
+          "objective": "Extend M1 exact action authorization/unknown-outcome handling with expiring payload/destination/executable/policy/epoch-bound user approval claims, adapter-specific reconciliation for consequential or external side effects, and identical claim/reconciliation semantics for rollback/compensation.",
+          "interfaces": [
+            "ApprovalClaim",
+            "ActionReceipt",
+            "ReconciliationPolicy"
+          ],
+          "tests": [
+            "edited payload invalidates approval",
+            "changed executable/destination/policy digest/execution epoch invalidates approval",
+            "expired approval",
+            "crash after external dispatch blocks replay",
+            "idempotent local action can reconcile",
+            "rollback is separately authorized and crash after rollback dispatch creates unknown rollback",
+            "missing persistence of pre-dispatch authorization denies dispatch"
+          ],
+          "acceptance": [
+            "no side-effectful unknown action or rollback can be automatically duplicated"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-controller -p sovereign-tools -- reconciliation"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "payload-bound approval fixture report",
+            "unknown-outcome reconciliation traces proving no duplicate side effect"
+          ]
+        },
+        {
+          "task_id": "M6-T05",
+          "title": "Implement prompt/tool injection trust boundaries",
+          "depends_on": [
+            "M5-T03",
+            "M6-T02"
+          ],
+          "targets": [
+            "crates/sovereign-context",
+            "crates/sovereign-policy"
+          ],
+          "objective": "Tag source/repository-instruction/tool/web/browser/download/memory/model/external-model evidence by trust, keep policy outside untrusted context, parse model proposals only through typed schemas, and reject any evidence/proposal/tool-manifest attempt to self-grant capabilities, suppress verification, alter completion, or masquerade as a Controller/tool message.",
+          "interfaces": [
+            "TrustLabel",
+            "PolicyViolationEvidence"
+          ],
+          "tests": [
+            "malicious AGENTS-like text in source file",
+            "web prompt injection",
+            "tool output asks for network",
+            "memory asks to disable tests",
+            "tool output contains fake system/tool/approval JSON envelope",
+            "model free-form text outside typed proposal cannot dispatch action",
+            "repository instruction attempts to widen permissions or suppress required acceptance criteria",
+            "third-party tool manifest under-declares write/network effect and cannot lower deterministic risk",
+            "external-model output asks to mark task successful or use tool and is treated as untrusted advice"
+          ],
+          "acceptance": [
+            "all injection attacks fail without policy/permission/acceptance/completion mutation"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test prompt_injection"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "prompt/tool-injection attack fixture report",
+            "trust-boundary denial evidence with unchanged policy state"
+          ]
+        },
+        {
+          "task_id": "M6-T06",
+          "title": "Implement tamper-evident audit, autonomy budgets, rollback execution, and recovery integrity gates",
+          "depends_on": [
+            "M1-T08",
+            "M6-T02",
+            "M6-T04"
+          ],
+          "targets": [
+            "crates/sovereign-controller",
+            "crates/sovereign-policy",
+            "crates/sovereign-state",
+            "crates/sovereign-eval"
+          ],
+          "objective": "Make operational resilience deterministic: hash-chain security/audit events with policy/provenance digests, enforce goal/plan/task/model/tool/browser/process outer budgets and cancellation, treat rollback as an authorized/reconciled/verifiable action, validate CAS/SQLite/checkpoint integrity after crashes, and block high-risk mutation when authoritative security state cannot be reconciled.",
+          "interfaces": [
+            "SecurityAuditLog",
+            "AutonomyBudget",
+            "CancellationTree",
+            "RollbackExecutor",
+            "RecoveryIntegrityGate"
+          ],
+          "tests": [
+            "tampered or missing audit-chain event detected before high-risk mutation",
+            "audit event binds action, execution epoch, policy/tool/config digests, approval and evidence provenance",
+            "model provider internal retry cannot exceed Controller model-call or per-call deadline",
+            "tool/browser recursive retry cannot exceed outer task/goal action and wall budgets",
+            "plan compiler cannot create tasks/revisions beyond governed plan/replan caps",
+            "budget exhaustion checkpoints then deterministically blocks/defers/fails/escalates without resetting counters",
+            "cancellation propagates to owned process tree and unresolved child blocks later mutation",
+            "rollback requires current preconditions, exact authorization and typed verification",
+            "crash after rollback dispatch produces unknown rollback and never blind repeat",
+            "CAS digest mismatch blocks use of corrupted evidence/checkpoint object",
+            "unclean-start SQLite/checkpoint/action-journal inconsistency enters read-only recovery or blocks mutation",
+            "PID reuse cannot be mistaken for reattaching a previously owned child"
+          ],
+          "acceptance": [
+            "no inner agent/provider/tool loop can outrun Controller budgets",
+            "rollback is never considered complete without verified postcondition evidence",
+            "authoritative-state corruption cannot be repaired from model memory or guessed state",
+            "security audit provides tamper evidence and durable provenance without storing chain-of-thought"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test security_resilience",
+            "cargo test -p sovereign-controller -p sovereign-state -- audit_budget_recovery"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "audit tamper/corruption/recovery fixture report",
+            "outer-budget/cancellation/runaway-loop traces",
+            "rollback authorization/reconciliation/verification matrix"
+          ]
+        },
+        {
+          "task_id": "M6-T07",
+          "title": "Implement optional external-intelligence policy gateway with no provider dependency",
+          "depends_on": [
+            "M6-T03",
+            "M6-T04",
+            "M6-T05",
+            "M6-T06"
+          ],
+          "targets": [
+            "crates/sovereign-controller",
+            "crates/sovereign-policy",
+            "crates/sovereign-model",
+            "crates/sovereign-context"
+          ],
+          "objective": "Define the L7 boundary even when no remote provider is installed: external intelligence is disabled by default, requires explicit provider/data-class policy and grant, sends only a minimized/redacted manifest-bound evidence packet, never sends resolved secrets or unrestricted repository/raw logs by default, enforces transport deadline/byte budget, and imports output as untrusted advisory evidence with zero tool/approval authority.",
+          "interfaces": [
+            "ExternalIntelligenceGateway",
+            "ExternalEscalationManifest",
+            "ExternalPayloadPolicy"
+          ],
+          "tests": [
+            "external escalation disabled by default and core path works with no provider configured",
+            "undeclared provider or missing external_intelligence grant denied",
+            "resolved secret, credential trace, unrestricted raw log and raw whole-repository export denied by default",
+            "payload/purpose/provider change invalidates manifest-bound approval",
+            "provider timeout/network bytes consume Controller budget",
+            "external response is tagged untrusted_external_model and cannot call tools, approve actions, mark success or change policy",
+            "offline/unavailable external provider results in governed block/defer/human path rather than hidden cloud dependency"
+          ],
+          "acceptance": [
+            "L7 can improve reasoning without becoming an authority or baseline dependency",
+            "data sent externally is explicit, minimized, redacted, provenance-recorded and reviewable"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test external_intelligence_policy"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "fake-provider external-escalation policy fixture report",
+            "payload manifest/redaction/provenance traces proving zero tool authority"
+          ]
+        }
+      ],
+      "milestone_gates": [
+        "Security attack fixture suite passes, including filesystem/process isolation, Git/package/network/secret/injection, unknown outcome, rollback, audit tamper, checkpoint/CAS corruption, runaway-budget, and fake external-intelligence attacks.",
+        "M1/8GB resource simulation never schedules a forbidden heavy-capability combination."
+      ],
+      "required_for_core": true
+    },
+    {
+      "milestone_id": "M7",
+      "title": "Optional semantic, browser, and acquisition adapters",
+      "depends_on": [
+        "M6"
+      ],
+      "objective": "Add advanced capabilities behind leases so they improve hard tasks without becoming mandatory residents.",
+      "tasks": [
+        {
+          "task_id": "M7-T01",
+          "title": "Add bounded local embedding and semantic retrieval",
+          "depends_on": [
+            "M2-T03",
+            "M4-T03",
+            "M6-T01"
+          ],
+          "targets": [
+            "crates/sovereign-repo",
+            "crates/sovereign-memory",
+            "crates/sovereign-context",
+            "crates/sovereign-model"
+          ],
+          "objective": "Load a small local embedding model only on semantic escalation, persist bounded derived vectors, fuse candidates with lexical results, and unload after idle TTL. The M1/8GB profile initially targets <=50k hot float32-equivalent vectors and hard-limits one admitted corpus to <=100k unless target calibration explicitly raises the profile.",
+          "interfaces": [
+            "EmbeddingBackend",
+            "SemanticRetriever",
+            "FusionPolicy"
+          ],
+          "tests": [
+            "system works with embeddings disabled",
+            "semantic fallback after lexical miss",
+            "semantic does not activate after a sufficient exact/lexical/symbol/dependency result",
+            "semantic requires C4 permission, recorded retrieval gap or inherently fuzzy query, fresh corpus, resource admission, and candidate budget",
+            "M1 profile reranks at most 12 semantic candidates and injects at most 4 semantic-derived evidence items unless an explicit calibrated profile lowers/changes the bound",
+            "semantic candidate must be source/provenance grounded before model injection",
+            "semantic-only hit cannot establish repository fact or destructive-action precondition",
+            "bounded corpus",
+            "50k default/100k hard active-corpus policy or explicit calibrated override",
+            "dimension/version migration",
+            "embedder eviction",
+            "semantic mappings can be closed/rebuilt with no canonical-data loss"
+          ],
+          "acceptance": [
+            "no task needs embeddings merely to navigate exact code"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test semantic_optional"
+          ],
+          "required_for_core": false,
+          "completion_evidence": [
+            "optional semantic retrieval fixture report",
+            "adapter-disabled core-suite evidence and embedder eviction trace"
+          ]
+        },
+        {
+          "task_id": "M7-T02",
+          "title": "Add Controller-governed HTTP plus optional Scrapling parsing/acquisition adapter",
+          "depends_on": [
+            "M6-T02",
+            "M6-T01"
+          ],
+          "targets": [
+            "adapters/scrapling",
+            "crates/sovereign-tools"
+          ],
+          "objective": "Acquire allowed public/static content with Sovereign-owned HTTP/network policy first, optionally parse returned HTML with Scrapling base parser, and activate Scrapling fetcher/browser extras only when explicitly justified.",
+          "interfaces": [
+            "WebAcquireAdapter"
+          ],
+          "tests": [
+            "offline denied",
+            "allowed-host Controller HTTP read",
+            "IDNA/IP normalization and DNS/connected-peer validation reject private/loopback/link-local rebinding",
+            "redirect to disallowed host/IP is re-authorized and denied",
+            "ambient proxy cannot bypass Controller host policy",
+            "HTML extraction with Scrapling base parser without browser extras",
+            "optional Scrapling fetcher dependencies are not required by the static parser path",
+            "adapter crash",
+            "raw response evidence"
+          ],
+          "acceptance": [
+            "browser is not launched or installed merely for static HTML parsing",
+            "Scrapling fetcher/browser extras remain optional and separately admitted"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test web_acquire"
+          ],
+          "required_for_core": false,
+          "completion_evidence": [
+            "optional static acquisition fixture report",
+            "offline/host-policy denial and acquired-response evidence"
+          ]
+        },
+        {
+          "task_id": "M7-T03",
+          "title": "Add isolated CDP browser lease",
+          "depends_on": [
+            "M7-T02",
+            "M6-T01",
+            "M6-T04"
+          ],
+          "targets": [
+            "adapters/browser",
+            "crates/sovereign-tools",
+            "crates/sovereign-policy"
+          ],
+          "objective": "Provide deterministic page navigation/DOM/actions/screenshots/downloads under domain/profile/download-root policy with browser process lifecycle controlled by ResourceGovernor.",
+          "interfaces": [
+            "BrowserAdapter",
+            "BrowserLease",
+            "BrowserStateSynopsis"
+          ],
+          "tests": [
+            "domain allowlist",
+            "pre-navigation, redirect, popup/new-tab and connected-peer checks all enforce domain/IP policy",
+            "file/custom privileged top-level navigation denied",
+            "isolated profile",
+            "persistent profile requires explicit persisted grant and does not leak unrelated storage into evidence",
+            "download root",
+            "download path escape denied; downloaded artifact is hashed/typed/size-bounded and never auto-opened or executed",
+            "credential-bearing page disables unsafe raw trace/screenshot retention unless redaction sink is proven",
+            "ambiguous form submission after browser crash enters unknown reconciliation and cannot auto-resubmit",
+            "browser kill/restart",
+            "memory pressure forces model unload when required",
+            "one-tab deterministic CDP budget is measured on target arm64 and browser is zero-resident after lease release",
+            "browser+BUILD_HEAVY and browser+EMBEDDER serialize under the M1 profile"
+          ],
+          "acceptance": [
+            "browser is demand-loaded and fully stoppable",
+            "browser state is compressed before model context",
+            "browser/DOM/download content cannot enlarge Controller authority or become executable merely by being acquired"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test browser_policy"
+          ],
+          "required_for_core": false,
+          "completion_evidence": [
+            "optional browser isolation/policy fixture report",
+            "browser lease lifecycle/resource trace"
+          ]
+        },
+        {
+          "task_id": "M7-T04",
+          "title": "Add optional adaptive browser-use-style adapter",
+          "depends_on": [
+            "M7-T03"
+          ],
+          "targets": [
+            "adapters/browser-use"
+          ],
+          "objective": "Support difficult adaptive visual interaction as a last browser tier without allowing the adapter to own Sovereign policy/state; override browser-use permissive/network-active defaults including domains, IP policy, downloads, clipboard/notifications/extensions, telemetry, update/version checks, and automatic extension acquisition.",
+          "interfaces": [
+            "AdaptiveBrowserAdapter"
+          ],
+          "tests": [
+            "adapter disabled by default",
+            "tool/domain permissions narrowed and allow-all default is not inherited",
+            "IP/private-range policy is Controller-owned",
+            "telemetry/version checks and automatic extension acquisition disabled in offline mode",
+            "clipboard/notifications/downloads/extensions obey Sovereign browser policy",
+            "page prompt injection cannot alter permissions, approval, completion or task budgets",
+            "adaptive inner steps are charged one-for-one or conservatively to outer tool/action/wall/network budgets",
+            "adaptive crash after possible side effect returns unknown/reconciliation rather than replay",
+            "adaptive browser MODEL+browser combined lease is admitted only from calibrated p95 under green pressure and no other heavyweight resident",
+            "adapter failure returns structured evidence",
+            "no provider SDK becomes required by core"
+          ],
+          "acceptance": [
+            "removing the adapter leaves all core tests passing",
+            "offline mode produces no adapter telemetry/version-check/extension-download network attempts"
+          ],
+          "verification_commands": [
+            "cargo test --workspace",
+            "cargo test -p sovereign-eval --test adaptive_browser_optional"
+          ],
+          "required_for_core": false,
+          "completion_evidence": [
+            "optional adaptive-browser fixture report",
+            "core-suite evidence with adapter removed/uninstalled"
+          ]
+        }
+      ],
+      "milestone_gates": [
+        "M7 is optional and never a prerequisite for core release. If any M7 adapter is selected, its own tests/acceptance must pass.",
+        "The complete core offline suite passes with every M7 adapter uninstalled."
+      ],
+      "required_for_core": false
+    },
+    {
+      "milestone_id": "M8",
+      "title": "Multi-repository execution and advanced knowledge adapters",
+      "depends_on": [
+        "M6"
+      ],
+      "objective": "Add required multi-repository execution while keeping richer CodeGraph/wiki knowledge capabilities as independent optional tracks that cannot gate core readiness.",
+      "tasks": [
+        {
+          "task_id": "M8-T01",
+          "title": "Implement cross-repository dependency contracts and checkpoints",
+          "depends_on": [
+            "M3-T03",
+            "M3-T04"
+          ],
+          "targets": [
+            "crates/sovereign-plan",
+            "crates/sovereign-controller",
+            "crates/sovereign-repo"
+          ],
+          "objective": "Compile and execute multi-repo DAGs with version/interface contracts, serial local mutations, and integration checkpoints.",
+          "interfaces": [
+            "CrossRepoContract",
+            "IntegrationCheckpoint"
+          ],
+          "tests": [
+            "backward-compatible migration order",
+            "producer contract change invalidates consumers",
+            "one repo restart recovery",
+            "integration gate"
+          ],
+          "acceptance": [
+            "five-repo plan does not imply five concurrent models"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test cross_repo"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "cross-repository migration fixture report",
+            "per-repository final revision/interface-contract/checkpoint manifests"
+          ]
+        },
+        {
+          "task_id": "M8-T02",
+          "title": "Add optional richer CodeGraph adapter",
+          "depends_on": [
+            "M2-T02",
+            "M6-T01"
+          ],
+          "targets": [
+            "adapters/codegraph",
+            "crates/sovereign-repo"
+          ],
+          "objective": "Expose callers/callees/impact queries through a lazy adapter after dependency license and arm64 resource checks are complete.",
+          "interfaces": [
+            "CodeGraphAdapter"
+          ],
+          "tests": [
+            "license manifest gate",
+            "lazy open/LRU",
+            "fallback to native symbol graph",
+            "adapter process memory cap",
+            "provisional 1.5GB admission ceiling is enforced until Apple-arm64 calibration publishes a replacement profile",
+            "model/embedder/browser/build serialize with uncalibrated CodeGraph open/build"
+          ],
+          "acceptance": [
+            "adapter remains optional and noncanonical"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test codegraph_optional"
+          ],
+          "required_for_core": false,
+          "completion_evidence": [
+            "dependency license audit result",
+            "Apple-arm64 adapter resource measurement and optional-fallback fixture report"
+          ]
+        },
+        {
+          "task_id": "M8-T03",
+          "title": "Add optional Wiki/document graph compilation",
+          "depends_on": [
+            "M4-T04",
+            "M6-T01",
+            "M2-T01"
+          ],
+          "targets": [
+            "adapters/wiki",
+            "crates/sovereign-repo"
+          ],
+          "objective": "Optionally compile source-hash-tracked document/wiki summaries and link edges as derived assets using Sovereign-owned durable build-job state. After crash, interrupted work is detected and marked for explicit retry/rebuild; no transparent replay of an in-memory third-party queue is assumed.",
+          "interfaces": [
+            "KnowledgeAsset",
+            "KnowledgeBuildJob"
+          ],
+          "tests": [
+            "source SHA incremental rebuild",
+            "crash marks/requeues durable job correctly",
+            "pool limit",
+            "raw docs remain truth",
+            "wiki/document build respects the same provisional optional-knowledge lease and never inherits an eager 300-connection pool"
+          ],
+          "acceptance": [
+            "no default 300-connection style pool or eager all-asset load"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test knowledge_assets"
+          ],
+          "required_for_core": false,
+          "completion_evidence": [
+            "knowledge-asset incremental build/restart fixture report",
+            "durable job-state and explicit retry/rebuild evidence"
+          ]
+        }
+      ],
+      "milestone_gates": [
+        "Required task M8-T01 executes the cross-repository migration fixture within the M1 resource policy with model/tool mutations serialized as required.",
+        "M8-T02 and M8-T03 are optional and may be absent without blocking M8 or core release."
+      ],
+      "required_for_core": true
+    },
+    {
+      "milestone_id": "M9",
+      "title": "Evaluation, completion governance, upgrade safety, and product readiness",
+      "depends_on": [
+        "M8"
+      ],
+      "objective": "Prove Sovereign is reliable, resumable, resource-aware, and evolvable rather than merely feature-complete.",
+      "tasks": [
+        {
+          "task_id": "M9-T01",
+          "title": "Build deterministic evaluation corpus and metric reports",
+          "depends_on": [
+            "M8-T01"
+          ],
+          "targets": [
+            "crates/sovereign-eval",
+            "fixtures/"
+          ],
+          "objective": "Create tiny/medium/large fixture repositories and tasks that measure verified success, false completion, tokens, retrieval use, retries, peak RSS, and restart recovery.",
+          "interfaces": [
+            "EvalScenario",
+            "EvalReport"
+          ],
+          "tests": [
+            "repeatable fake-model fixtures",
+            "local-model smoke suite",
+            "metric schema versioning"
+          ],
+          "acceptance": [
+            "evaluation distinguishes correctness from token minimization"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval",
+            "cargo run -p sovereign -- eval --profile m1-8gb --offline"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "versioned evaluation report covering tiny/medium/large fixtures",
+            "local-model smoke plus deterministic fake-model metric evidence"
+          ]
+        },
+        {
+          "task_id": "M9-T02",
+          "title": "Implement completion governance and final scope audit",
+          "depends_on": [
+            "M8-T01",
+            "M9-T01"
+          ],
+          "targets": [
+            "crates/sovereign-controller"
+          ],
+          "objective": "Require must-requirement coverage, fresh acceptance evidence, no unknown actions, no unexplained scope changes, and final repository revision manifests before goal completion.",
+          "interfaces": [
+            "CompletionGate",
+            "CompletionRecord"
+          ],
+          "tests": [
+            "model says done but test fails",
+            "missing requirement mapping",
+            "unknown action blocks completion",
+            "out-of-scope diff blocks completion",
+            "valid project completes"
+          ],
+          "acceptance": [
+            "false completion fixtures all fail closed"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test completion_governance"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "completion-governance false-positive/valid-completion fixture report",
+            "final scope/requirement/artifact/checkpoint/repository-revision evidence manifest"
+          ]
+        },
+        {
+          "task_id": "M9-T03",
+          "title": "Implement schema/provider migration and compatibility harness",
+          "depends_on": [
+            "M9-T02"
+          ],
+          "targets": [
+            "crates/sovereign-state",
+            "crates/sovereign-plan",
+            "crates/sovereign-model"
+          ],
+          "objective": "Guarantee old Plan IR/evidence/state remains readable across migrations and model-provider swaps do not alter controller semantics.",
+          "interfaces": [
+            "MigrationCompatibilitySuite",
+            "ProviderConformanceSuite"
+          ],
+          "tests": [
+            "upgrade old database fixture",
+            "read old plan revision",
+            "migrate/read Plan IR v1.1 under v1.2 without synthesizing broader isolation/network/package/browser/external-intelligence authority",
+            "numbered SQLite migration rollback preserves previous readable state",
+            "rebuild disposable FTS/symbol/dependency/vector/wiki/CodeGraph projections",
+            "vector model/dimension/version change rebuilds projection without canonical-data mutation",
+            "memory schema/outbox migration preserves provenance/conflict/supersession meaning",
+            "optional adapter install/remove leaves core durable state valid",
+            "swap local fake providers with identical Controller-visible semantics",
+            "rollback migration backup"
+          ],
+          "acceptance": [
+            "no durable plan/evidence is orphaned by a supported upgrade"
+          ],
+          "verification_commands": [
+            "cargo test -p sovereign-eval --test upgrade_compat"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "upgrade compatibility report across old state/Plan IR fixtures",
+            "provider conformance and migration rollback evidence"
+          ]
+        },
+        {
+          "task_id": "M9-T04",
+          "title": "Run final M1/8 GB soak and crash/security matrix",
+          "depends_on": [
+            "M9-T01",
+            "M9-T02",
+            "M9-T03"
+          ],
+          "targets": [
+            "crates/sovereign-eval",
+            "output/evidence/"
+          ],
+          "objective": "Execute representative tiny/medium/large tasks with measured RSS/CPU/disk/token data, forced kills, malicious-repository fixtures, and adapter on/off combinations.",
+          "interfaces": [
+            "SoakReport"
+          ],
+          "tests": [
+            "8-hour bounded soak or equivalent scenario loop",
+            "forced kill matrix",
+            "offline mode",
+            "optional adapter on/off matrix when installed; absence of browser/semantic/CodeGraph/wiki adapters is a valid core-release configuration",
+            "model/build/browser/embedder/optional-knowledge pairwise conflict and conditional-admission matrix",
+            "swap already occupied but stable versus active swap-out-growth pressure cases",
+            "context ceiling case proves refinement/decomposition instead of automatic >16k growth",
+            "malicious repo attempts protected filesystem read/write, sibling-repo write, outbound socket, Secret Broker/Keychain access, Git hook/helper/filter execution, PATH shim, package lifecycle script, prompt/tool injection and forked-child persistence",
+            "audit-chain/CAS/checkpoint tamper matrix blocks unsafe mutation and recovers only from authoritative evidence",
+            "rollback crash/unknown-outcome matrix never reports unverified rollback success or duplicates compensation",
+            "nested model/tool/browser/replan runaway loop is stopped by outer budgets without counter reset after restart",
+            "fake external-intelligence provider proves data minimization, provider/data-class policy, deadline/byte budget, untrusted output and zero tool authority while no provider remains a valid core configuration",
+            "disk-full simulation where feasible"
+          ],
+          "acceptance": [
+            "no unreconciled duplicate side effects",
+            "no policy escape",
+            "no untrusted-code execution occurs without an enforceable declared isolation boundary",
+            "no resolved secret is persisted or sent to model/external provider",
+            "no false completion",
+            "resource governor respects profile or checkpoints cleanly"
+          ],
+          "verification_commands": [
+            "cargo run -p sovereign -- eval --suite release --profile m1-8gb --offline"
+          ],
+          "required_for_core": true,
+          "completion_evidence": [
+            "final M1/8GB soak/crash/security report",
+            "exact versions/hardware/resource/token/failure/replan/recovery results"
+          ]
+        }
+      ],
+      "milestone_gates": [
+        "Release evaluation report contains exact versions, hardware profile, scenario outcomes, token metrics, peak RSS, failure/replan counts, and restart/security results.",
+        "Normal offline operation has no mandatory external intelligence dependency.",
+        "Core M9 release gating depends on required M8-T01, not M7 or optional M8-T02/M8-T03 adapters."
+      ],
+      "required_for_core": true
+    }
+  ],
+  "migration_and_evolution_rules": [
+    "All durable schemas carry explicit versions and forward migrations; every durable migration has a backup/rollback or explicit non-reversible fail-closed procedure before activation.",
+    "Plan IR active writes use v1.2. The compatibility reader/migration path accepts v1.1 fixtures without inventing authority absent from the original plan.",
+    "Plan revisions and retained post-ingress/redacted raw evidence are immutable historical artifacts; secret-bearing pre-redaction bytes are not persisted for fidelity.",
+    "FTS/symbol/dependency/vector/wiki/CodeGraph indexes are derived and rebuildable; migrate canonical metadata when needed and rebuild derived projections rather than treating them as truth.",
+    "Vector model/dimension/version changes invalidate the corresponding projection and rebuild it under a new version; old vector bytes are never reinterpreted as a new embedding space.",
+    "Memory migrations preserve provenance, scope, trust, freshness, supersession/conflict links, and outbox consistency; ambiguous legacy meaning is not silently promoted.",
+    "Provider-specific fields stay inside adapter-owned configuration, never Plan IR semantics; provider swaps must pass ModelBackend conformance before activation.",
+    "Optional adapter install/remove cannot make core state unreadable or core tests depend on the adapter; adapter caches/projections are disposable unless explicitly governed otherwise.",
+    "Experimental adapters launch out-of-process until their stability/security/resource behavior is established.",
+    "A new feature may not become always-resident on M1 merely because it exists; ResourceGovernor needs an explicit lease type and measured profile.",
+    "A new skill or role may narrow behavior but never grant permission.",
+    "A migration that changes task or memory meaning must preserve provenance and old-reader diagnostics.",
+    "Optional adapter milestones/tasks remain nonblocking until an explicit product profile promotes them to required; promotion must be recorded rather than inferred from dependency presence."
+  ],
+  "roadmap_completion_gate": [
+    "The Controller, rather than the model, owns every authoritative execution transition.",
+    "The first complete M1 vertical slice starts from a simple natural-language goal and canonical PlanCompiler output; hand-authored Plan IR alone cannot satisfy the vertical-slice proof, while FTS/semantic/browser/memory/roles remain later capabilities.",
+    "All core task execution works offline after required local model/tool acquisition with a replaceable local ModelBackend.",
+    "M1 closure includes a mandatory real local 3B-4B-class model smoke on the target 8GB machine; fake backends remain deterministic CI/unit-test tools only.",
+    "A weak local model completes the reference tasks using bounded evidence packets rather than repository/chat dumps.",
+    "Plan IR v1.2 dependency bindings, evidence-satisfaction/freshness rules, acceptance freshness, deterministic retry exhaustion, typed rollback verification, untrusted-code isolation, audit/external-intelligence policies, and per-call deadline fields are enforced by PlanValidator/Controller tests.",
+    "Plan validation, execution-vs-plan failure, bounded smallest-scope replanning, stale-plan revalidation, journal-based restart recovery, verification, checkpoint/corruption handling, and completion governance are proven by tests.",
+    "Memory is provenance-aware and never a silent policy authority.",
+    "Retained raw tool evidence means recoverable post-ingress/redacted bytes under explicit spool/storage quotas and truncation evidence; model-facing synopses are versioned and expandable by digest/range without rerunning the tool.",
+    "Repository/source fingerprints invalidate stale index and memory projections before they can be injected as current facts.",
+    "Retrieval routing is deterministic and gap-driven: exact/path, lexical, symbol, dependency, diff, and episodic routes stop when sufficient; optional semantic retrieval is bounded candidate generation only after a recorded cheaper-route gap or inherently fuzzy query.",
+    "Context telemetry records candidate/deduped/serialized tokens and verified-usefulness metrics by route so generic vector RAG cannot hide behind aggregate recall metrics.",
+    "The M1/8 GB resource governor prevents conflicting heavyweight residents and uses live host pressure plus swap/compressor deltas, calibrated lease footprints, and hysteresis as the final admission guard rather than additive RSS or absolute swap-used alone.",
+    "Security fixtures prove repository/web/tool/external-model content cannot self-grant permissions; repository-controlled code cannot bypass declared filesystem/network/secret boundaries; Git/package/browser hidden execution is governed; and audit/checkpoint corruption, rollback ambiguity, unknown side effects, or runaway budgets fail closed.",
+    "External intelligence is disabled by default, sends no resolved secrets or unrestricted repository/raw-log content by default, has no tool/approval/completion authority, and can be absent without changing core correctness.",
+    "Optional semantic/browser/knowledge/external-model adapters can be absent without breaking or blocking core tests/release."
+  ],
+  "freeze": {
+    "status": "frozen",
+    "revision": "2026-09-12.7",
+    "frozen_at": "2026-09-12T20:45:00+05:30",
+    "architecture_only": true,
+    "implementation_started": false,
+    "previous_revision": "2026-09-12.6",
+    "architecture_revision": "2026-09-12.7",
+    "resource_contract_revision": "2026-09-12.3",
+    "research_reaudit_revision": "2026-09-12.2",
+    "amendment_scope": "Sequencing-only architecture/roadmap/scenario alignment. Moves the canonical minimal PlanCompiler into the first complete M1 vertical slice, makes Controller execution consume compiler-produced Plan IR, declares stable destination interface ownership up front, and adds machine-resolved schema/artifact/resource/migration/completion semantics. M3 now deepens the same compiler rather than introducing it. The security/autonomy/runtime semantics established in 2026-09-12.6 are unchanged; Plan IR remains v1.2; RESOURCE_STRESS_TEST remains 2026-09-12.3; optional-track/local-first/one-model/security boundaries are unchanged."
+  }
+}

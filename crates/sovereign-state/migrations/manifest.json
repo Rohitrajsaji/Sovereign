@@ -1,0 +1,44 @@
+{
+  "schema": "sovereign-state-migrations-v1",
+  "current_version": 3,
+  "migrations": [
+    {
+      "version": 1,
+      "name": "foundation",
+      "path": "0001_foundation.sql",
+      "transactional": true,
+      "creates": [
+        "state_records",
+        "event_journal",
+        "event_journal_no_update",
+        "event_journal_no_delete"
+      ]
+    },
+    {
+      "version": 2,
+      "name": "artifact_metadata",
+      "path": "0002_artifacts.sql",
+      "transactional": true,
+      "creates": [
+        "artifact_metadata",
+        "artifact_references",
+        "artifact_references_digest_idx",
+        "artifact_metadata_created_idx"
+      ]
+    },
+    {
+      "version": 3,
+      "name": "security_kernel",
+      "path": "0003_security_kernel.sql",
+      "transactional": true,
+      "creates": [
+        "action_records",
+        "controller_runtime",
+        "checkpoint_integrity",
+        "action_records_no_delete",
+        "checkpoint_integrity_no_update",
+        "checkpoint_integrity_no_delete"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+# Build outputs and caches
+/target/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.next/
+**/node_modules/
+*.log
+
+# Local model/runtime artifacts
+/.models/
+/.tools/
+
+# Research/reference clones are evidence inputs, not product source history
+/research/
+
+# Local secrets and environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime databases/temp files
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.tmp
+*.swp
+.DS_Store
+

@@ -1,0 +1,603 @@
+{
+  "ir_version": "1.2",
+  "plan_id": "plan.fixture-trivial",
+  "revision": 1,
+  "supersedes_revision": null,
+  "compiled_at": "2026-09-12T16:00:00Z",
+  "compiler_version": "fixture-1",
+  "project": {
+    "project_id": "prj.fixture",
+    "name": "Fixture project",
+    "workspace_roots": [
+      "."
+    ]
+  },
+  "goal": {
+    "goal_id": "goal.fixture",
+    "statement": "Rename the Settings button from Save to Apply.",
+    "source": {
+      "kind": "user",
+      "locator": "fixture"
+    },
+    "invariants": [
+      "Do not alter submit behavior."
+    ]
+  },
+  "requirements": [
+    {
+      "requirement_id": "REQ.settings-label",
+      "priority": "must",
+      "kind": "functional",
+      "text": "Settings submit label is Apply.",
+      "source": {
+        "kind": "user",
+        "locator": "fixture"
+      },
+      "evidence_expectations": [
+        "diff_result",
+        "test_result"
+      ]
+    }
+  ],
+  "repositories": [
+    {
+      "repository_id": "repo.app",
+      "root": ".",
+      "baseline": {
+        "vcs": "git",
+        "head": "fixture-head",
+        "branch": "main",
+        "dirty_digest": "sha256:fixture-dirty",
+        "protected_changes_present": false
+      },
+      "instructions": [],
+      "index_snapshot_id": null,
+      "languages": [
+        "typescript"
+      ]
+    }
+  ],
+  "depth": {
+    "mode": "D1",
+    "reason": "One exact presentation-only edit.",
+    "features": {
+      "repository_count": 1,
+      "cross_repo": false
+    }
+  },
+  "policy": {
+    "capability_ceiling": [
+      "read",
+      "repo_write",
+      "process_exec"
+    ],
+    "filesystem": {
+      "canonical_roots_required": true,
+      "symlink_escape": "deny",
+      "controller_state_protected": true,
+      "atomic_replace_untrusted_targets": true,
+      "revalidate_before_commit": true,
+      "sibling_repo_requires_scope": true,
+      "protected_path_classes": [
+        "os_roots",
+        "sovereign_internal"
+      ]
+    },
+    "process": {
+      "structured_commands": true,
+      "shell_mode": "disabled",
+      "inherit_environment": false,
+      "allowed_env_names": [
+        "CI"
+      ],
+      "deny_hidden_execution": true,
+      "untrusted_code_isolation": "required_or_block",
+      "executable_resolution": "pinned_manifest_or_approved_path",
+      "strip_ambient_capabilities": true,
+      "kill_process_tree_on_timeout": true,
+      "default_max_subprocesses": 16
+    },
+    "network": {
+      "default": "offline",
+      "allowed_hosts": [],
+      "allowed_schemes": [],
+      "allowed_ports": [],
+      "allowed_methods": [],
+      "follow_redirects": false,
+      "max_redirects": 0,
+      "allow_private_ranges": false,
+      "dns_revalidation": true,
+      "connected_peer_validation": true,
+      "ambient_proxy": "deny",
+      "allow_task_loopback": false
+    },
+    "secrets": {
+      "allowed_providers": [
+        "macos_keychain"
+      ],
+      "persist_values": false,
+      "redact_evidence": true,
+      "redact_model_context": true,
+      "model_secret_values": "never",
+      "ephemeral_resolution": true,
+      "temporary_file_private": true
+    },
+    "approval": {
+      "exact_action_binding": true,
+      "reapprove_on_payload_change": true,
+      "max_ttl_seconds": 900,
+      "required_permissions": [
+        "package_install",
+        "network_write",
+        "external_side_effect",
+        "external_intelligence",
+        "destructive"
+      ]
+    },
+    "browser": {
+      "default_profile_mode": "isolated",
+      "persistent_profile_requires_explicit_grant": true,
+      "downloads": "deny",
+      "clipboard": "deny",
+      "notifications": "deny",
+      "extensions": "deny_by_default",
+      "disable_web_security": false,
+      "trace_policy": "off",
+      "auto_open_downloads": false,
+      "local_file_navigation": "deny",
+      "offline_telemetry": "deny"
+    },
+    "audit": {
+      "append_only_events": true,
+      "hash_chain": true,
+      "record_policy_digest": true,
+      "record_provenance": true,
+      "on_corruption": "block_high_risk_until_reconciled"
+    },
+    "external_intelligence": {
+      "enabled_by_default": false,
+      "requires_explicit_grant": true,
+      "allowed_providers": [],
+      "allow_resolved_secrets": false,
+      "raw_repository_export": "deny",
+      "allow_raw_logs": false,
+      "output_trust": "untrusted_external_model",
+      "tool_authority": "none"
+    },
+    "retry": {
+      "default_max_attempts": 3,
+      "same_failure_limit": 2,
+      "max_tasks_per_revision": 16,
+      "max_plan_revisions": 4,
+      "max_replans_per_scope": 2
+    },
+    "escalation": [
+      "L0",
+      "L1",
+      "L2",
+      "L3",
+      "L4"
+    ],
+    "checkpoint": {
+      "before_mutation": true,
+      "after_mutation": true,
+      "on_verification": true,
+      "periodic_seconds": 60,
+      "generation_required": true,
+      "verify_references": true,
+      "integrity": "hash_chain",
+      "on_corruption": "fallback_last_valid_or_block"
+    },
+    "resources": {
+      "max_wall_seconds": 3600,
+      "max_model_calls": 10,
+      "max_model_call_seconds": 180,
+      "max_tool_actions": 100,
+      "max_single_tool_action_seconds": 300,
+      "max_peak_rss_mb": 5500,
+      "max_output_bytes": 33554432,
+      "max_retained_raw_bytes": 33554432,
+      "max_disk_write_mb": 512,
+      "max_network_bytes": 0,
+      "max_subprocesses": 16,
+      "max_child_cpu_seconds": 1800,
+      "heavy_leases": [
+        "MODEL",
+        "BUILD_HEAVY"
+      ]
+    }
+  },
+  "tasks": [
+    {
+      "task_id": "task.rename-settings-label",
+      "title": "Rename Settings submit label",
+      "objective": "Change the rendered Settings submit label from Save to Apply without altering submit behavior.",
+      "rationale": "The user requested a presentation-only label change; exact discovery resolved one component and focused test.",
+      "requirement_ids": [
+        "REQ.settings-label"
+      ],
+      "dependencies": [],
+      "dependency_bindings": [],
+      "scope": {
+        "repositories": [
+          "repo.app"
+        ],
+        "files": [
+          "src/settings/SettingsForm.tsx",
+          "src/settings/SettingsForm.test.tsx"
+        ],
+        "symbols": [
+          "SettingsForm"
+        ],
+        "allow_create": [],
+        "allow_delete": [],
+        "scope_resolution": "exact"
+      },
+      "evidence_requirements": [
+        {
+          "requirement_id": "EVID.settings-unique",
+          "kind": "exact",
+          "query": "Resolve the unique rendered Save label and its focused test from the current repo.app baseline.",
+          "required_before": "execution",
+          "satisfaction": "exactly_one",
+          "freshness": "current_repository_snapshot",
+          "max_items": 8
+        }
+      ],
+      "role": {
+        "id": "role.implementer",
+        "version": "1.0.0",
+        "digest": "sha256:roleimplementer0001"
+      },
+      "skills": [
+        {
+          "id": "skill.focused-edit",
+          "version": "1.0.0",
+          "digest": "sha256:skillfocusededit001"
+        }
+      ],
+      "tools": [
+        {
+          "id": "tool.patch",
+          "version": "1.0.0",
+          "digest": "sha256:toolpatch000000001"
+        },
+        {
+          "id": "tool.process",
+          "version": "1.0.0",
+          "digest": "sha256:toolprocess000001"
+        }
+      ],
+      "permissions": [
+        "read",
+        "repo_write",
+        "process_exec"
+      ],
+      "action_policy": {
+        "write_roots": [
+          {
+            "repository_id": "repo.app",
+            "path": "src/settings"
+          }
+        ],
+        "network": {
+          "default": "offline",
+          "allowed_hosts": [],
+          "allowed_schemes": [],
+          "allowed_ports": [],
+          "allowed_methods": [],
+          "follow_redirects": false,
+          "max_redirects": 0,
+          "allow_private_ranges": false,
+          "dns_revalidation": true,
+          "connected_peer_validation": true,
+          "ambient_proxy": "deny",
+          "allow_task_loopback": false
+        },
+        "packages": {
+          "allowed": false,
+          "allowed_registries": [],
+          "lockfile_required": true,
+          "integrity_required": true,
+          "lifecycle_scripts": "deny",
+          "global_install": false,
+          "isolated_target_required": true
+        },
+        "browser": {
+          "allowed": false,
+          "allowed_domains": [],
+          "max_tabs": 1,
+          "downloads": "deny",
+          "persistent_profile": false,
+          "auto_open_downloads": false,
+          "allow_local_file_navigation": false,
+          "download_root": null
+        },
+        "external_intelligence": {
+          "allowed": false,
+          "allowed_providers": [],
+          "allowed_data_classes": [],
+          "whole_repository_export": "deny",
+          "raw_logs": false,
+          "resolved_secrets": false,
+          "tool_authority": "none",
+          "max_payload_bytes": 0
+        },
+        "secret_refs": [],
+        "approval_required_permissions": []
+      },
+      "implementation_contract": {
+        "preconditions": [
+          {
+            "clause_id": "PRE.settings-unique",
+            "text": "Current baseline discovery resolves exactly one intended Settings submit label.",
+            "evidence_requirements": [
+              {
+                "requirement_id": "EVID.pre.settings-unique",
+                "kind": "exact",
+                "query": "Save label in SettingsForm",
+                "required_before": "execution",
+                "satisfaction": "exactly_one",
+                "freshness": "current_repository_snapshot",
+                "max_items": 8
+              }
+            ]
+          }
+        ],
+        "assumptions": [
+          {
+            "assumption_id": "ASSUME.settings-label-presentation-only",
+            "text": "Changing the label does not require changing submit behavior.",
+            "invalidation_scope": "task",
+            "basis_evidence": [
+              {
+                "evidence_id": "ev.settings.focused-test",
+                "digest": "sha256:evidencefocusedtest001",
+                "locator": "repo.app:src/settings/SettingsForm.test.tsx",
+                "trust": "observed",
+                "freshness": "2026-09-12T19:45:00+05:30"
+              }
+            ],
+            "fingerprints": [
+              "repo.app:SettingsForm:test-baseline"
+            ]
+          }
+        ],
+        "inputs": [
+          "repo.app current baseline",
+          "ev.settings.focused-test"
+        ],
+        "outputs": [
+          "controller-owned patch changing Save to Apply"
+        ],
+        "invariants": [
+          {
+            "clause_id": "INV.submit-behavior",
+            "text": "Submit behavior remains unchanged."
+          }
+        ],
+        "non_goals": [
+          "Redesign Settings UI",
+          "Install packages",
+          "Use browser automation"
+        ]
+      },
+      "constraints": [
+        "Do not alter pre-existing user hunks."
+      ],
+      "expected_artifacts": [
+        {
+          "artifact_id": "artifact.settings.patch",
+          "kind": "patch",
+          "locator": "controller-change-set",
+          "required": true
+        },
+        {
+          "artifact_id": "artifact.settings.test",
+          "kind": "test_result",
+          "locator": "verification:verify.settings-test",
+          "required": true
+        }
+      ],
+      "acceptance_criteria": [
+        {
+          "criterion_id": "AC.settings-label",
+          "description": "The scoped component renders Apply instead of Save.",
+          "kind": "diff",
+          "verification_step_ids": [
+            "verify.settings-diff"
+          ],
+          "evidence_type": "diff_result",
+          "evidence_freshness": "current_attempt",
+          "required": true
+        },
+        {
+          "criterion_id": "AC.settings-behavior",
+          "description": "The existing focused Settings test passes.",
+          "kind": "command",
+          "verification_step_ids": [
+            "verify.settings-test"
+          ],
+          "evidence_type": "test_result",
+          "evidence_freshness": "current_attempt",
+          "required": true
+        }
+      ],
+      "verification": {
+        "steps": [
+          {
+            "step_id": "verify.settings-diff",
+            "criterion_ids": [
+              "AC.settings-label"
+            ],
+            "kind": "diff",
+            "evidence_type": "diff_result",
+            "evaluator": "builtin.diff.scope_and_literal.v1"
+          },
+          {
+            "step_id": "verify.settings-test",
+            "criterion_ids": [
+              "AC.settings-behavior"
+            ],
+            "kind": "command",
+            "evidence_type": "test_result",
+            "command_spec": {
+              "tool_id": "tool.process",
+              "mode": "exec",
+              "program": "npm",
+              "args": [
+                "test",
+                "--",
+                "SettingsForm"
+              ],
+              "repository_id": "repo.app",
+              "working_dir_relative": ".",
+              "literal_env": {
+                "CI": "1"
+              },
+              "secret_env": {},
+              "timeout_seconds": 180,
+              "output_limit_bytes": 1048576
+            },
+            "expected_exit_codes": [
+              0
+            ]
+          }
+        ],
+        "required_evidence_types": [
+          "diff_result",
+          "test_result"
+        ],
+        "fresh_reviewer_role": null
+      },
+      "failure_policy": {
+        "max_attempts": 2,
+        "same_failure_limit": 2,
+        "resource_retry_limit": 1,
+        "on_execution_failure": "repair",
+        "on_plan_failure": "replan_smallest_scope",
+        "on_resource_failure": "checkpoint_defer",
+        "on_unknown_action": "reconcile",
+        "on_attempts_exhausted": "block",
+        "on_same_failure_exhausted": "block"
+      },
+      "rollback": {
+        "mode": "patch_reverse",
+        "procedure": "Reverse only the Controller-owned patch recorded for this task.",
+        "preconditions": [
+          "Repository baseline and controller patch digest still match."
+        ],
+        "verification_steps": [
+          {
+            "step_id": "rollback.settings-diff",
+            "kind": "diff",
+            "evidence_type": "rollback_diff_result",
+            "evaluator": "builtin.diff.controller_patch_absent_and_user_hunks_preserved.v1"
+          }
+        ]
+      },
+      "resource_budget": {
+        "max_wall_seconds": 600,
+        "max_model_calls": 2,
+        "max_model_call_seconds": 180,
+        "max_tool_actions": 12,
+        "max_single_tool_action_seconds": 180,
+        "max_peak_rss_mb": 4608,
+        "max_output_bytes": 8388608,
+        "max_retained_raw_bytes": 8388608,
+        "max_disk_write_mb": 32,
+        "max_network_bytes": 0,
+        "max_subprocesses": 8,
+        "max_child_cpu_seconds": 300,
+        "heavy_leases": [
+          "MODEL"
+        ]
+      },
+      "context_budget": {
+        "max_input_tokens": 4096,
+        "reserve_output_tokens": 1024,
+        "max_evidence_items": 16,
+        "levels": [
+          "C0",
+          "C1"
+        ]
+      },
+      "checkpoint_policy": {
+        "before_mutation": true,
+        "after_mutation": true,
+        "on_attempt_end": true,
+        "on_verification": true,
+        "generation_required": true,
+        "verify_references": true,
+        "integrity": "hash_chain",
+        "on_corruption": "fallback_last_valid_or_block"
+      },
+      "next_state_rules": [
+        {
+          "event": "execution_complete",
+          "guards": [
+            "dependencies_satisfied",
+            "dependency_bindings_satisfied",
+            "execution_evidence_satisfied",
+            "baseline_fresh",
+            "task_contract_current",
+            "checkpoint_reconciled",
+            "permission_granted",
+            "plan_revision_active"
+          ],
+          "transition": "verify"
+        },
+        {
+          "event": "verification_passed",
+          "guards": [
+            "all_required_acceptance_passed",
+            "no_unknown_actions",
+            "baseline_fresh",
+            "task_contract_current",
+            "plan_revision_active"
+          ],
+          "transition": "succeed"
+        },
+        {
+          "event": "execution_failure",
+          "guards": [
+            "retry_budget_remaining",
+            "plan_revision_active"
+          ],
+          "transition": "repair"
+        }
+      ]
+    }
+  ],
+  "edges": [],
+  "completion_gate": {
+    "require_all_must_requirements": true,
+    "require_fresh_acceptance": true,
+    "require_all_required_tasks_resolved": true,
+    "require_no_unknown_actions": true,
+    "require_artifact_digests": true,
+    "require_scope_audit": true,
+    "require_final_checkpoint": true,
+    "require_final_repository_revisions": true,
+    "checks": [
+      {
+        "check_id": "check.acceptance",
+        "kind": "acceptance",
+        "required_evidence_types": [
+          "diff_result",
+          "test_result"
+        ]
+      }
+    ]
+  },
+  "provenance": [
+    {
+      "source": {
+        "kind": "generated",
+        "locator": "M1-T01 fixture"
+      },
+      "observed_at": "2026-09-12T16:00:00Z",
+      "notes": "Validator fixture only; not an M1 end-to-end gate."
+    }
+  ]
+}

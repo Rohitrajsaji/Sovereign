@@ -1,0 +1,14 @@
+[package]
+name = "sovereign-model"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+jsonschema.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

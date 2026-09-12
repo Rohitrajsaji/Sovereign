@@ -1,0 +1,145 @@
+{
+  "schema": "sovereign-task-evidence-v1",
+  "task": "M1-T03",
+  "status": "completed",
+  "dependency_evidence": [
+    "implementation/evidence/M0-T01.json"
+  ],
+  "artifacts": [
+    "crates/sovereign-model/Cargo.toml",
+    "crates/sovereign-model/src/lib.rs",
+    "crates/sovereign-model/tests/backend.rs",
+    "crates/sovereign-model/src/bin/model-smoke.rs",
+    "implementation/evidence/M1-T03-real-model-smoke.json",
+    "implementation/evidence/M1-T03-acquisition.json"
+  ],
+  "contract_tests": [
+    "fake_backend_contract_is_deterministic_and_reloadable",
+    "local_provider_maps_completion_and_token_count_without_provider_types_leaking",
+    "provider_health_obeys_transport_deadline",
+    "structured_response_validation_rejects_schema_violation",
+    "local_provider_unload_releases_lease_for_clean_reload",
+    "only_one_physical_local_model_lease_can_be_active"
+  ],
+  "real_model": {
+    "report": "implementation/evidence/M1-T03-real-model-smoke.json",
+    "sha256": "ee315dd52bc2d602de54e6985de16bd3025986ca3eae137370f9fc4d2eede811",
+    "acquisition": "implementation/evidence/M1-T03-acquisition.json",
+    "acquisition_sha256": "03e3396a11106188212bdcc976016f5f9b1c636d84ae21e65324d86eec2ebae6",
+    "runtime_version": "version: 0.1.2-dev (build 10516, commit b95502ba9)\nbuilt with AppleClang 21.0.0.21000101 for Darwin arm64",
+    "model": {
+      "name": "Qwen3-4B-Q4_K_M.gguf",
+      "parameter_class": "4B",
+      "quantization": "Q4_K_M",
+      "weight_artifact_size_bytes": 2497280256,
+      "weight_path": "/Users/rohitrajsaji/Desktop/Sovereign/.models/Qwen3-4B-Q4_K_M.gguf"
+    },
+    "configured_context_profile": {
+      "hard_m1_input_ceiling": 16384,
+      "normal_input_tokens": 8192,
+      "output_reserve_tokens": 1536
+    },
+    "task_action_result": {
+      "elapsed_ms": 6826,
+      "finish_reason": "tool_calls",
+      "input_tokens": 206,
+      "output_tokens": 123,
+      "passed": true,
+      "tool_call_arguments": {
+        "message": "local model ready",
+        "ok": true
+      },
+      "tool_call_name": "record_smoke"
+    },
+    "token_throughput": {
+      "elapsed_ms": 6826,
+      "output_tokens": 123,
+      "output_tokens_per_second_milli": 18019
+    },
+    "context_tiers": [
+      {
+        "context_tokens": 4096,
+        "supported": true,
+        "startup_peak_rss_kb": 3014496,
+        "post_load_steady_rss_kb": 3014576,
+        "prefill_decode_peak_rss_kb": null
+      },
+      {
+        "context_tokens": 8192,
+        "supported": true,
+        "startup_peak_rss_kb": 3669904,
+        "post_load_steady_rss_kb": 3669984,
+        "prefill_decode_peak_rss_kb": 3681968
+      },
+      {
+        "context_tokens": 12288,
+        "supported": true,
+        "startup_peak_rss_kb": 4250048,
+        "post_load_steady_rss_kb": 4228784,
+        "prefill_decode_peak_rss_kb": null
+      },
+      {
+        "context_tokens": 16384,
+        "supported": true,
+        "startup_peak_rss_kb": 4995136,
+        "post_load_steady_rss_kb": 4853408,
+        "prefill_decode_peak_rss_kb": null
+      }
+    ],
+    "host_observation_delta": {
+      "compressor_kib_after": 545968,
+      "compressor_kib_before": 693360,
+      "compressor_kib_delta": -147392,
+      "swap_used_kib_after": 4756992,
+      "swap_used_kib_before": 3476869,
+      "swap_used_kib_delta": 1280123
+    },
+    "unload_residuals": [
+      {
+        "context_tokens": 4096,
+        "process_absent": true,
+        "process_rss_kb_after_unload": null
+      },
+      {
+        "context_tokens": 8192,
+        "process_absent": true,
+        "process_rss_kb_after_unload": null
+      },
+      {
+        "context_tokens": 12288,
+        "process_absent": true,
+        "process_rss_kb_after_unload": null
+      },
+      {
+        "context_tokens": 16384,
+        "process_absent": true,
+        "process_rss_kb_after_unload": null
+      }
+    ],
+    "clean_reload": {
+      "passed": true,
+      "process_absent_after_second_unload": true,
+      "reload_post_load_rss_kb": 3721168,
+      "reload_startup_peak_rss_kb": 3721136
+    }
+  },
+  "acceptance": {
+    "deterministic_fake_for_controller_tests": true,
+    "provider_neutral_contract": true,
+    "plan_ir_provider_independent": true,
+    "real_3b_4b_local_tool_smoke_passed": true,
+    "single_active_physical_lease_enforced": true,
+    "8gb_profile_observed": true
+  },
+  "verification": [
+    "cargo fmt --check",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "cargo test --workspace",
+    "CARGO_NET_OFFLINE=true cargo test --workspace"
+  ],
+  "implementation_notes": [
+    "Controller-facing contracts expose no llama.cpp/OpenAI transport types.",
+    "Local backend binds loopback only and uses structured process launch without a shell.",
+    "The smoke harness initially emitted a blank runtime version because llama-server writes --version to stderr; harness was fixed to capture stdout or stderr and the smoke was rerun."
+  ]
+}

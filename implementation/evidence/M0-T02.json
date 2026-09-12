@@ -1,0 +1,42 @@
+{
+  "task_id": "M0-T02",
+  "completed_at": "2026-09-12T16:27:07Z",
+  "dependencies": ["M0-T01"],
+  "dependency_evidence": ["implementation/evidence/M0-T01.json"],
+  "verification": [
+    {
+      "command": "cargo test -p sovereign-state",
+      "status": "passed",
+      "unit_tests": 5,
+      "integration_tests": 1
+    },
+    {
+      "command": "cargo clippy -p sovereign-state --all-targets -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    }
+  ],
+  "acceptance_evidence": {
+    "process_kill_reopen_preserves_committed_state": "tests/process_kill.rs::committed_wal_event_survives_forced_process_kill_and_reopen",
+    "failed_transaction_no_partial_state": "tests::failed_transaction_publishes_no_partial_state",
+    "explicit_schema_version": 1,
+    "wal_mode": true,
+    "append_only_event_journal": true,
+    "failed_migration_rollback_and_backup_readability": "tests::failed_migration_rolls_back_and_prior_backup_remains_readable"
+  },
+  "migration_manifest": {
+    "path": "crates/sovereign-state/migrations/manifest.json",
+    "sha256": "d02e31ed2020fc95f9549335d0c3f38382e7f13ccf70649bcf1a769cf042ed8f"
+  },
+  "migration_0001": {
+    "path": "crates/sovereign-state/migrations/0001_foundation.sql",
+    "sha256": "29f6c69c1254cb6b999b1c6551dacbedb64c9bbc3d70340343f5a2ae39290e48"
+  },
+  "dependency_lock": {
+    "path": "Cargo.lock",
+    "sha256": "cc8ddd386ea4044f5017be38b802fbb3847ff6791b685be0e04ddb59e9ed7c04"
+  }
+}

@@ -1,0 +1,281 @@
+{
+  "schema": "sovereign-interface-contract-manifest-v1",
+  "contract_version": {
+    "major": 1,
+    "minor": 0
+  },
+  "stable_interface_contracts": [
+    {
+      "interface": "Controller",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T07",
+      "extended_by": [
+        "M3-T03",
+        "M5-T01",
+        "M6-T04",
+        "M6-T06",
+        "M6-T07",
+        "M8-T01",
+        "M9-T02"
+      ],
+      "invariant": "Only deterministic Controller code owns authoritative execution transitions, authorization, budgets, verification, recovery truth, and completion."
+    },
+    {
+      "interface": "TaskStateMachine",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T07",
+      "extended_by": [
+        "M3-T03",
+        "M9-T02"
+      ],
+      "invariant": "ready/blocked are derived views and mutation dispatch is rechecked inside one current execution epoch."
+    },
+    {
+      "interface": "AttemptStateMachine",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T07",
+      "extended_by": [
+        "M1-T09",
+        "M3-T03"
+      ],
+      "invariant": "Started attempts are immutable history; repair creates a new bounded attempt."
+    },
+    {
+      "interface": "Scheduler",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T07",
+      "extended_by": [
+        "M3-T03",
+        "M6-T01",
+        "M8-T01"
+      ],
+      "invariant": "Dispatch requires current dependencies, evidence, baseline, checkpoint, permission possibility, and resource admission in one Controller epoch."
+    },
+    {
+      "interface": "PlanCompiler",
+      "owner": "crates/sovereign-plan",
+      "introduced_by": "M1-T10",
+      "extended_by": [
+        "M3-T01",
+        "M3-T02",
+        "M3-T03",
+        "M8-T01"
+      ],
+      "invariant": "Compiler produces immutable candidate Plan IR revisions; PlanValidator and Controller activation remain deterministic authority."
+    },
+    {
+      "interface": "PlanValidator",
+      "owner": "crates/sovereign-plan",
+      "introduced_by": "M1-T01",
+      "extended_by": [
+        "M3-T02",
+        "M3-T03",
+        "M9-T03"
+      ],
+      "invariant": "No plan revision becomes active without deterministic Plan IR v1.2 structural, policy, evidence, and resource validation."
+    },
+    {
+      "interface": "RepositoryIntelligence",
+      "owner": "crates/sovereign-repo",
+      "introduced_by": "M1-T02",
+      "extended_by": [
+        "M2-T01",
+        "M2-T02",
+        "M8-T01"
+      ],
+      "invariant": "Filesystem/Git source is truth; retrieval indexes are fingerprinted, derived, and rebuildable."
+    },
+    {
+      "interface": "ContextPlanner",
+      "owner": "crates/sovereign-context",
+      "introduced_by": "M1-T06",
+      "extended_by": [
+        "M2-T03",
+        "M2-T04",
+        "M4-T02",
+        "M5-T02",
+        "M7-T01"
+      ],
+      "invariant": "Every model call receives a fresh bounded projection; persistent knowledge size never implies prompt size."
+    },
+    {
+      "interface": "ModelBackend",
+      "owner": "crates/sovereign-model",
+      "introduced_by": "M1-T03",
+      "extended_by": [
+        "M6-T07",
+        "M7-T01",
+        "M9-T03"
+      ],
+      "invariant": "Provider details never enter Plan IR or Controller semantics; the M1 normal profile uses one physical local model at a time."
+    },
+    {
+      "interface": "ToolAdapter",
+      "owner": "crates/sovereign-tools",
+      "introduced_by": "M1-T04",
+      "extended_by": [
+        "M5-T03",
+        "M6-T02",
+        "M6-T04",
+        "M7-T02",
+        "M7-T03"
+      ],
+      "invariant": "Tools expose declared structured effects and cannot self-authorize or lower deterministic risk."
+    },
+    {
+      "interface": "AuthorizedAction",
+      "owner": "crates/sovereign-tools",
+      "introduced_by": "M1-T04",
+      "extended_by": [
+        "M5-T03",
+        "M6-T04"
+      ],
+      "invariant": "Exact action authorization is durable, policy/epoch bound, and checked again before mutation."
+    },
+    {
+      "interface": "EvidenceStore",
+      "owner": "crates/sovereign-evidence",
+      "introduced_by": "M0-T03",
+      "extended_by": [
+        "M1-T05",
+        "M6-T03"
+      ],
+      "invariant": "Retained raw evidence means immutable post-ingress/redacted CAS bytes under explicit quotas."
+    },
+    {
+      "interface": "EvidenceCompressor",
+      "owner": "crates/sovereign-evidence",
+      "introduced_by": "M1-T05",
+      "extended_by": [
+        "M2-T04"
+      ],
+      "invariant": "Synopsis is bounded and derived, with expansion handles to retained evidence; expansion never reruns the tool."
+    },
+    {
+      "interface": "Verifier",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T07",
+      "extended_by": [
+        "M3-T03",
+        "M9-T02"
+      ],
+      "invariant": "Only fresh typed acceptance evidence can satisfy task or goal completion."
+    },
+    {
+      "interface": "CheckpointManager",
+      "owner": "crates/sovereign-state",
+      "introduced_by": "M1-T08",
+      "extended_by": [
+        "M6-T06",
+        "M8-T01"
+      ],
+      "invariant": "Checkpoints are monotonic hash/reference-verified snapshots over authoritative state and journal position."
+    },
+    {
+      "interface": "RecoveryManager",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M1-T08",
+      "extended_by": [
+        "M6-T04",
+        "M6-T06"
+      ],
+      "invariant": "Recovery replays authoritative events, reconciles unknown actions, and never blindly repeats uncertain side effects."
+    },
+    {
+      "interface": "ResourceGovernor",
+      "owner": "crates/sovereign-policy",
+      "introduced_by": "M1-T04",
+      "extended_by": [
+        "M6-T01"
+      ],
+      "invariant": "Heavy capability admission is lease based and preserves capability richness with runtime sparsity."
+    },
+    {
+      "interface": "MemoryManager",
+      "owner": "crates/sovereign-memory",
+      "introduced_by": "M4-T01",
+      "extended_by": [
+        "M4-T02",
+        "M4-T03",
+        "M4-T04",
+        "M7-T01"
+      ],
+      "invariant": "Memory is provenance/freshness governed evidence and never independent policy or repository truth."
+    },
+    {
+      "interface": "RoleRegistry",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M5-T01",
+      "extended_by": [],
+      "invariant": "Logical roles reuse the same physical model serially and cannot elevate permissions."
+    },
+    {
+      "interface": "SkillRegistry",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M5-T02",
+      "extended_by": [],
+      "invariant": "Skills are progressively loaded instructions/evidence and cannot grant authority."
+    },
+    {
+      "interface": "SecretBroker",
+      "owner": "crates/sovereign-policy",
+      "introduced_by": "M6-T03",
+      "extended_by": [],
+      "invariant": "Only SecretRef is durable/model-visible; resolved values are ephemeral action-only data and are redacted before persistence."
+    },
+    {
+      "interface": "ExternalIntelligenceGateway",
+      "owner": "crates/sovereign-controller",
+      "introduced_by": "M6-T07",
+      "extended_by": [],
+      "invariant": "External intelligence is optional untrusted advisory evidence with explicit export policy and zero tool, approval, or completion authority."
+    }
+  ],
+  "forbidden_dependency_rules": [
+    {
+      "subject": "crates/sovereign-types",
+      "must_not_depend_on": [
+        "crates/sovereign-context",
+        "crates/sovereign-controller",
+        "crates/sovereign-evidence",
+        "crates/sovereign-memory",
+        "crates/sovereign-model",
+        "crates/sovereign-plan",
+        "crates/sovereign-policy",
+        "crates/sovereign-repo",
+        "crates/sovereign-state",
+        "crates/sovereign-tools"
+      ],
+      "rationale": "Foundation types are authority-neutral and cannot depend on product authority owners."
+    },
+    {
+      "subject": "crates/sovereign-state",
+      "must_not_depend_on": [
+        "crates/sovereign-controller",
+        "crates/sovereign-plan",
+        "crates/sovereign-repo",
+        "crates/sovereign-context",
+        "crates/sovereign-model",
+        "crates/sovereign-tools",
+        "crates/sovereign-evidence",
+        "crates/sovereign-policy",
+        "crates/sovereign-memory"
+      ],
+      "rationale": "Authoritative persistence is a lower layer and cannot depend on execution, planning, policy, model, tool, retrieval, context, evidence, or memory behavior."
+    },
+    {
+      "subject": "crates/sovereign-evidence",
+      "must_not_depend_on": [
+        "crates/sovereign-controller",
+        "crates/sovereign-plan",
+        "crates/sovereign-repo",
+        "crates/sovereign-context",
+        "crates/sovereign-model",
+        "crates/sovereign-tools",
+        "crates/sovereign-policy",
+        "crates/sovereign-memory"
+      ],
+      "rationale": "Evidence storage may depend on state/types but cannot depend on higher-level authority or execution subsystems."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "milestone_id": "M0",
+  "completed_at": "2026-09-12T16:33:04Z",
+  "required_tasks": ["M0-T01", "M0-T02", "M0-T03", "M0-T04"],
+  "all_required_tasks_completed": true,
+  "milestone_gates": {
+    "offline_after_acquisition": {
+      "command": "CARGO_NET_OFFLINE=true ./scripts/verify.sh",
+      "status": "passed"
+    },
+    "forced_process_kill_preserves_committed_state": "passed via sovereign-state process_kill integration test",
+    "published_cas_objects_are_restart_durable": "passed via sovereign-evidence restart test",
+    "stable_interface_manifest_matches_roadmap": "passed"
+  },
+  "network_runtime_dependency": false
+}

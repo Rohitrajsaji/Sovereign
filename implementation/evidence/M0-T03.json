@@ -1,0 +1,44 @@
+{
+  "task_id": "M0-T03",
+  "completed_at": "2026-09-12T16:30:34Z",
+  "dependencies": ["M0-T02"],
+  "dependency_evidence": ["implementation/evidence/M0-T02.json"],
+  "verification": [
+    {
+      "command": "cargo test -p sovereign-evidence -p sovereign-state",
+      "status": "passed",
+      "evidence_unit_tests": 6,
+      "state_unit_tests": 5,
+      "state_integration_tests": 1
+    },
+    {
+      "command": "cargo clippy -p sovereign-evidence -p sovereign-state --all-targets -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "cargo fmt --check",
+      "status": "passed"
+    }
+  ],
+  "acceptance_evidence": {
+    "deduplicated_restart_durable_objects": "tests::writes_are_deduplicated_and_survive_restart",
+    "interrupted_temp_write_not_published": "tests::interrupted_temp_write_is_never_published_or_registered",
+    "digest_mismatch_rejected": "tests::expected_digest_mismatch_is_rejected_without_publish",
+    "range_read": "tests::range_reads_exact_bytes_and_rejects_overflow",
+    "grace_period_gc_selection": "tests::gc_candidates_select_only_old_unreferenced_objects",
+    "corrupt_object_rejected": "tests::corrupted_published_object_is_rejected_on_read",
+    "publish_order": "CAS object fsync+atomic rename precedes StateStore metadata registration"
+  },
+  "migration_manifest": {
+    "path": "crates/sovereign-state/migrations/manifest.json",
+    "sha256": "0071e3b5d83b3fa64c059a53b44601a9dbb969f4a5c6b03a92d2d12b115d1d6a"
+  },
+  "artifact_migration": {
+    "path": "crates/sovereign-state/migrations/0002_artifacts.sql",
+    "sha256": "d6b7507cd0c1ffff583f71260e247801e0195ad3f28713c782b551b6b32d745b"
+  },
+  "cas_source": {
+    "path": "crates/sovereign-evidence/src/lib.rs",
+    "sha256": "905f99ddfb1d866a4ce4d2906a36e3e3ace143244ab8b3e34d314f7ba6e1c31a"
+  }
+}

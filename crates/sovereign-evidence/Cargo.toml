@@ -1,0 +1,13 @@
+[package]
+name = "sovereign-evidence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2.workspace = true
+sovereign-state = { path = "../sovereign-state" }
+
+[lints]
+workspace = true
