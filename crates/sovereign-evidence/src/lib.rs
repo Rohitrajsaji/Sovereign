@@ -1,7 +1,9 @@
 //! Immutable content-addressed artifact storage for Sovereign evidence.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sovereign_state::{StateError, StateStore};
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
@@ -39,6 +41,11 @@ pub enum EvidenceError {
         size: u64,
     },
     SizeOverflow(usize),
+    InvalidInput(String),
+    NotRetained {
+        offset: u64,
+        length: usize,
+    },
     Clock(std::time::SystemTimeError),
 }
 
@@ -73,8 +80,730 @@ impl Display for EvidenceError {
                     "artifact byte length cannot fit durable size type: {size}"
                 )
             }
+            Self::InvalidInput(message) => write!(f, "invalid evidence input: {message}"),
+            Self::NotRetained { offset, length } => write!(
+                f,
+                "requested evidence range offset={offset} length={length} was not retained"
+            ),
             Self::Clock(error) => write!(f, "artifact clock error: {error}"),
         }
+    }
+}
+
+/// Versioned deterministic evidence kind used to select a synopsis strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    Compiler,
+    Test,
+    Search,
+    Log,
+    Diff,
+    Json,
+}
+
+/// One retained interval in the post-ingress/redacted raw artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedRange {
+    pub offset: u64,
+    pub length: u64,
+}
+
+impl RetainedRange {
+    #[must_use]
+    pub const fn end(self) -> u64 {
+        self.offset.saturating_add(self.length)
+    }
+}
+
+/// Stable normalized signature used by repair/circuit-breaker logic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureSignature(pub String);
+
+/// Metadata describing one mandatory ingress-redaction event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedactionEvent {
+    pub event_id: String,
+    pub class: String,
+}
+
+/// Bounded immutable evidence derived from one retained post-ingress artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolEvidence {
+    pub schema: String,
+    pub action_id: String,
+    pub tool: String,
+    pub kind: EvidenceKind,
+    pub compressor_id: String,
+    pub compressor_version: u32,
+    pub source_bytes_observed: u64,
+    pub post_ingress_bytes: u64,
+    pub retained_bytes: u64,
+    pub retained_ranges: Vec<RetainedRange>,
+    pub redaction_event_ids: Vec<String>,
+    pub raw_complete: bool,
+    pub truncation_reason: Option<String>,
+    pub raw_artifact_digest: String,
+    pub synopsis_artifact_digest: String,
+    pub synopsis: String,
+    pub failure_signature: Option<FailureSignature>,
+}
+
+/// Input to deterministic post-ingress evidence capture/compression.
+#[derive(Debug, Clone)]
+pub struct EvidenceCapture<'a> {
+    pub action_id: &'a str,
+    pub tool: &'a str,
+    pub kind: EvidenceKind,
+    pub bytes: &'a [u8],
+    pub known_secret_values: &'a [&'a str],
+    pub action_raw_spool_limit_bytes: u64,
+    pub task_raw_spool_remaining_bytes: u64,
+    pub synopsis_limit_bytes: usize,
+}
+
+/// Query used to expand already-retained evidence without rerunning a tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvidenceExpandQuery {
+    Range { offset: u64, length: usize },
+    Query { text: String, max_bytes: usize },
+}
+
+/// Result of bounded evidence expansion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceExpansion {
+    pub raw_artifact_digest: String,
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+    pub compressor_id: String,
+    pub compressor_version: u32,
+    pub not_retained: bool,
+}
+
+/// Deterministic M1 evidence compressor. It never executes tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceCompressor {
+    id: String,
+    version: u32,
+}
+
+impl EvidenceCompressor {
+    #[must_use]
+    pub fn new(id: impl Into<String>, version: u32) -> Self {
+        Self {
+            id: id.into(),
+            version,
+        }
+    }
+
+    /// Redacts ingress, publishes quota-bounded retained bytes, and publishes a bounded synopsis.
+    ///
+    /// # Errors
+    /// Returns an evidence error for malformed budgets or CAS/state failures.
+    pub fn capture(
+        &self,
+        store: &ArtifactStore,
+        state: &mut StateStore,
+        input: &EvidenceCapture<'_>,
+    ) -> Result<ToolEvidence, EvidenceError> {
+        if self.id.trim().is_empty()
+            || self.version == 0
+            || input.action_id.trim().is_empty()
+            || input.tool.trim().is_empty()
+            || input.action_raw_spool_limit_bytes == 0
+            || input.synopsis_limit_bytes == 0
+        {
+            return Err(EvidenceError::InvalidInput(
+                "compressor identity, evidence identity, action spool budget, and synopsis budget must be non-empty/positive"
+                    .to_owned(),
+            ));
+        }
+        let (redacted, redactions) = redact_ingress(input.bytes, input.known_secret_values);
+        let effective_raw_limit = input
+            .action_raw_spool_limit_bytes
+            .min(input.task_raw_spool_remaining_bytes);
+        let retain_limit = usize::try_from(effective_raw_limit).unwrap_or(usize::MAX);
+        let retained_len = redacted.len().min(retain_limit);
+        let retained = &redacted[..retained_len];
+        let raw = store.put(state, retained)?;
+        let raw_complete = retained_len == redacted.len();
+        let retained_ranges = if retained_len == 0 {
+            Vec::new()
+        } else {
+            vec![RetainedRange {
+                offset: 0,
+                length: u64::try_from(retained_len).unwrap_or(u64::MAX),
+            }]
+        };
+        let failure_signature = failure_signature(input.kind, retained);
+        let synopsis = build_synopsis(
+            input.kind,
+            retained,
+            input.synopsis_limit_bytes,
+            failure_signature.as_ref(),
+        );
+        let redaction_event_ids = redactions
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>();
+        let mut evidence = ToolEvidence {
+            schema: "sovereign-tool-evidence-v1".to_owned(),
+            action_id: input.action_id.to_owned(),
+            tool: input.tool.to_owned(),
+            kind: input.kind,
+            compressor_id: self.id.clone(),
+            compressor_version: self.version,
+            source_bytes_observed: u64::try_from(input.bytes.len()).unwrap_or(u64::MAX),
+            post_ingress_bytes: u64::try_from(redacted.len()).unwrap_or(u64::MAX),
+            retained_bytes: u64::try_from(retained_len).unwrap_or(u64::MAX),
+            retained_ranges,
+            redaction_event_ids,
+            raw_complete,
+            truncation_reason: (!raw_complete).then(|| {
+                match input
+                    .action_raw_spool_limit_bytes
+                    .cmp(&input.task_raw_spool_remaining_bytes)
+                {
+                    std::cmp::Ordering::Less => "action_raw_spool_quota_exceeded",
+                    std::cmp::Ordering::Greater => "task_raw_spool_quota_exceeded",
+                    std::cmp::Ordering::Equal => "action_and_task_raw_spool_quota_exceeded",
+                }
+                .to_owned()
+            }),
+            raw_artifact_digest: raw.digest,
+            synopsis_artifact_digest: String::new(),
+            synopsis,
+            failure_signature,
+        };
+        let synopsis_bytes = canonical_synopsis_bytes(&evidence)?;
+        let synopsis_artifact = store.put(state, &synopsis_bytes)?;
+        evidence.synopsis_artifact_digest = synopsis_artifact.digest;
+        Ok(evidence)
+    }
+
+    /// Rebuilds a synopsis from immutable historical retained bytes without rewriting raw evidence.
+    ///
+    /// # Errors
+    /// Returns an evidence error if the retained raw artifact cannot be read or republished.
+    pub fn recompress(
+        &self,
+        store: &ArtifactStore,
+        state: &mut StateStore,
+        prior: &ToolEvidence,
+        synopsis_limit_bytes: usize,
+    ) -> Result<ToolEvidence, EvidenceError> {
+        let retained_len = usize::try_from(prior.retained_bytes).map_err(|_| {
+            EvidenceError::InvalidInput("retained byte count overflows usize".to_owned())
+        })?;
+        let retained = store.range(state, &prior.raw_artifact_digest, 0, retained_len)?;
+        let failure_signature = failure_signature(prior.kind, &retained);
+        let synopsis = build_synopsis(
+            prior.kind,
+            &retained,
+            synopsis_limit_bytes,
+            failure_signature.as_ref(),
+        );
+        let mut next = prior.clone();
+        next.compressor_id.clone_from(&self.id);
+        next.compressor_version = self.version;
+        next.synopsis = synopsis;
+        next.failure_signature = failure_signature;
+        next.synopsis_artifact_digest.clear();
+        let bytes = canonical_synopsis_bytes(&next)?;
+        next.synopsis_artifact_digest = store.put(state, &bytes)?.digest;
+        Ok(next)
+    }
+
+    /// Expands retained evidence by exact range or bounded textual query. No command is rerun.
+    ///
+    /// # Errors
+    /// Returns an evidence error on malformed query/CAS failure. Requests beyond a truncated
+    /// retained boundary return an explicit `not_retained` expansion rather than fabricated data.
+    pub fn expand(
+        &self,
+        store: &ArtifactStore,
+        state: &StateStore,
+        evidence: &ToolEvidence,
+        query: &EvidenceExpandQuery,
+    ) -> Result<EvidenceExpansion, EvidenceError> {
+        match query {
+            EvidenceExpandQuery::Range { offset, length } => {
+                let requested_end = offset
+                    .checked_add(u64::try_from(*length).unwrap_or(u64::MAX))
+                    .unwrap_or(u64::MAX);
+                if !range_is_retained(&evidence.retained_ranges, *offset, requested_end) {
+                    if evidence.raw_complete {
+                        return Err(EvidenceError::RangeOutOfBounds {
+                            offset: *offset,
+                            length: *length,
+                            size: evidence.retained_bytes,
+                        });
+                    }
+                    return Ok(EvidenceExpansion {
+                        raw_artifact_digest: evidence.raw_artifact_digest.clone(),
+                        offset: *offset,
+                        bytes: Vec::new(),
+                        compressor_id: self.id.clone(),
+                        compressor_version: self.version,
+                        not_retained: true,
+                    });
+                }
+                Ok(EvidenceExpansion {
+                    raw_artifact_digest: evidence.raw_artifact_digest.clone(),
+                    offset: *offset,
+                    bytes: store.range(state, &evidence.raw_artifact_digest, *offset, *length)?,
+                    compressor_id: self.id.clone(),
+                    compressor_version: self.version,
+                    not_retained: false,
+                })
+            }
+            EvidenceExpandQuery::Query { text, max_bytes } => {
+                if text.is_empty() || *max_bytes == 0 {
+                    return Err(EvidenceError::InvalidInput(
+                        "expansion query and max_bytes must be non-empty/positive".to_owned(),
+                    ));
+                }
+                let retained_len = usize::try_from(evidence.retained_bytes).map_err(|_| {
+                    EvidenceError::InvalidInput("retained byte count overflows usize".to_owned())
+                })?;
+                let bytes = store.range(state, &evidence.raw_artifact_digest, 0, retained_len)?;
+                let haystack = String::from_utf8_lossy(&bytes);
+                let Some(found) = haystack.find(text) else {
+                    return Ok(EvidenceExpansion {
+                        raw_artifact_digest: evidence.raw_artifact_digest.clone(),
+                        offset: 0,
+                        bytes: Vec::new(),
+                        compressor_id: self.id.clone(),
+                        compressor_version: self.version,
+                        not_retained: !evidence.raw_complete,
+                    });
+                };
+                let start = found.saturating_sub(*max_bytes / 4);
+                let end = bytes.len().min(start.saturating_add(*max_bytes));
+                Ok(EvidenceExpansion {
+                    raw_artifact_digest: evidence.raw_artifact_digest.clone(),
+                    offset: u64::try_from(start).unwrap_or(u64::MAX),
+                    bytes: bytes[start..end].to_vec(),
+                    compressor_id: self.id.clone(),
+                    compressor_version: self.version,
+                    not_retained: false,
+                })
+            }
+        }
+    }
+}
+
+fn canonical_synopsis_bytes(evidence: &ToolEvidence) -> Result<Vec<u8>, EvidenceError> {
+    serde_json::to_vec(evidence)
+        .map_err(|error| EvidenceError::InvalidInput(format!("synopsis serialization: {error}")))
+}
+
+fn range_is_retained(ranges: &[RetainedRange], start: u64, end: u64) -> bool {
+    start <= end
+        && ranges
+            .iter()
+            .any(|range| start >= range.offset && end <= range.end())
+}
+
+fn redact_ingress(bytes: &[u8], known_secret_values: &[&str]) -> (Vec<u8>, Vec<RedactionEvent>) {
+    let mut current = bytes.to_vec();
+    let mut events = Vec::new();
+    for (index, secret) in known_secret_values.iter().enumerate() {
+        if secret.is_empty() {
+            continue;
+        }
+        let (next, count) = replace_all(&current, secret.as_bytes(), b"[REDACTED]");
+        current = next;
+        if count > 0 {
+            events.push(redaction_event("known_secret", index, count));
+        }
+    }
+
+    let generic_prefixes: &[(&[u8], &str)] = &[
+        (b"authorization: bearer ", "bearer_token"),
+        (b"api_key=", "api_key"),
+        (b"apikey=", "api_key"),
+        (b"token=", "token"),
+        (b"password=", "password"),
+        (b"secret=", "secret"),
+        (b"npm_token=", "package_token"),
+        (b"\"api_key\":\"", "json_api_key"),
+        (b"\"token\":\"", "json_token"),
+        (b"\"password\":\"", "json_password"),
+        (b"\"secret\":\"", "json_secret"),
+    ];
+    for (index, (prefix, class)) in generic_prefixes.iter().enumerate() {
+        let (next, count) = redact_value_after_prefix(&current, prefix);
+        current = next;
+        if count > 0 {
+            events.push(redaction_event(class, index, count));
+        }
+    }
+    let (next, count) = redact_sk_tokens(&current);
+    current = next;
+    if count > 0 {
+        events.push(redaction_event("api_token_shape", 0, count));
+    }
+    (current, events)
+}
+
+fn replace_all(source: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec<u8>, usize) {
+    if needle.is_empty() {
+        return (source.to_vec(), 0);
+    }
+    let mut result = Vec::with_capacity(source.len());
+    let mut cursor = 0;
+    let mut count = 0;
+    while cursor < source.len() {
+        if source[cursor..].starts_with(needle) {
+            result.extend_from_slice(replacement);
+            cursor += needle.len();
+            count += 1;
+        } else {
+            result.push(source[cursor]);
+            cursor += 1;
+        }
+    }
+    (result, count)
+}
+
+fn redact_value_after_prefix(source: &[u8], prefix: &[u8]) -> (Vec<u8>, usize) {
+    let mut result = Vec::with_capacity(source.len());
+    let mut cursor = 0;
+    let mut count = 0;
+    while cursor < source.len() {
+        if ascii_starts_with_ignore_case(&source[cursor..], prefix) {
+            result.extend_from_slice(&source[cursor..cursor + prefix.len()]);
+            cursor += prefix.len();
+            let value_start = cursor;
+            while cursor < source.len()
+                && !source[cursor].is_ascii_whitespace()
+                && !matches!(source[cursor], b'"' | b'\'' | b',' | b';' | b'}' | b']')
+            {
+                cursor += 1;
+            }
+            if cursor > value_start {
+                result.extend_from_slice(b"[REDACTED]");
+                count += 1;
+            }
+        } else {
+            result.push(source[cursor]);
+            cursor += 1;
+        }
+    }
+    (result, count)
+}
+
+fn ascii_starts_with_ignore_case(source: &[u8], prefix: &[u8]) -> bool {
+    source.len() >= prefix.len()
+        && source[..prefix.len()]
+            .iter()
+            .zip(prefix)
+            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn redact_sk_tokens(source: &[u8]) -> (Vec<u8>, usize) {
+    let mut result = Vec::with_capacity(source.len());
+    let mut cursor = 0;
+    let mut count = 0;
+    while cursor < source.len() {
+        if source[cursor..].starts_with(b"sk-") {
+            let mut end = cursor + 3;
+            while end < source.len()
+                && (source[end].is_ascii_alphanumeric() || matches!(source[end], b'_' | b'-'))
+            {
+                end += 1;
+            }
+            if end.saturating_sub(cursor) >= 19 {
+                result.extend_from_slice(b"[REDACTED]");
+                cursor = end;
+                count += 1;
+                continue;
+            }
+        }
+        result.push(source[cursor]);
+        cursor += 1;
+    }
+    (result, count)
+}
+
+fn redaction_event(class: &str, ordinal: usize, count: usize) -> RedactionEvent {
+    let seed = format!("{class}:{ordinal}:{count}");
+    RedactionEvent {
+        event_id: format!("redact_{}", &sha256_hex(seed.as_bytes())[..16]),
+        class: class.to_owned(),
+    }
+}
+
+fn failure_signature(kind: EvidenceKind, bytes: &[u8]) -> Option<FailureSignature> {
+    let text = String::from_utf8_lossy(bytes);
+    let primary = primary_failure_line(kind, &text)?;
+    let normalized = normalize_failure(&primary);
+    let kind_name = evidence_kind_name(kind);
+    let digest = sha256_hex(normalized.as_bytes());
+    Some(FailureSignature(format!(
+        "{kind_name}:{}:{}",
+        compact_failure_label(&normalized),
+        &digest[..16]
+    )))
+}
+
+fn primary_failure_line(kind: EvidenceKind, text: &str) -> Option<String> {
+    match kind {
+        EvidenceKind::Compiler => text
+            .lines()
+            .find(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.contains("error[") || lower.trim_start().starts_with("error:")
+            })
+            .map(str::trim)
+            .map(str::to_owned),
+        EvidenceKind::Test => text
+            .lines()
+            .find(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.contains(" failed")
+                    || lower.starts_with("failed ")
+                    || lower.contains("failures:")
+                    || lower.contains("assertion failed")
+            })
+            .map(str::trim)
+            .map(str::to_owned),
+        _ => text
+            .lines()
+            .find(|line| {
+                let lower = line.to_ascii_lowercase();
+                lower.contains("error") || lower.contains("failed") || lower.contains("panic")
+            })
+            .map(str::trim)
+            .map(str::to_owned),
+    }
+}
+
+fn normalize_failure(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut in_digits = false;
+    for character in value.chars() {
+        if character.is_ascii_digit() {
+            if !in_digits {
+                result.push('#');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            if !character.is_whitespace() || !result.ends_with(' ') {
+                result.push(if character.is_whitespace() {
+                    ' '
+                } else {
+                    character
+                });
+            }
+        }
+    }
+    result.trim().to_ascii_lowercase()
+}
+
+fn compact_failure_label(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        .take(32)
+        .collect::<String>()
+}
+
+const fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::Compiler => "compiler",
+        EvidenceKind::Test => "test",
+        EvidenceKind::Search => "search",
+        EvidenceKind::Log => "log",
+        EvidenceKind::Diff => "diff",
+        EvidenceKind::Json => "json",
+    }
+}
+
+fn build_synopsis(
+    kind: EvidenceKind,
+    bytes: &[u8],
+    limit: usize,
+    signature: Option<&FailureSignature>,
+) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines = Vec::new();
+    lines.push(format!("kind={}", evidence_kind_name(kind)));
+    lines.push(format!("retained_bytes={}", bytes.len()));
+    if let Some(signature) = signature {
+        lines.push(format!("failure_signature={}", signature.0));
+    }
+    match kind {
+        EvidenceKind::Compiler => compiler_synopsis(&text, &mut lines),
+        EvidenceKind::Test => test_synopsis(&text, &mut lines),
+        EvidenceKind::Search => search_synopsis(&text, &mut lines),
+        EvidenceKind::Diff => diff_synopsis(&text, &mut lines),
+        EvidenceKind::Json => json_synopsis(&text, &mut lines),
+        EvidenceKind::Log => log_synopsis(&text, &mut lines),
+    }
+    bounded_lines(lines, limit)
+}
+
+fn compiler_synopsis(text: &str, output: &mut Vec<String>) {
+    let errors = text
+        .lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("error[") || lower.trim_start().starts_with("error:")
+        })
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    output.push(format!("error_count={}", errors.len()));
+    if let Some(primary) = errors.first() {
+        output.push(format!("primary_error={primary}"));
+    }
+    for line in text
+        .lines()
+        .filter(|line| line.contains("-->") || line.contains("warning:"))
+        .take(6)
+    {
+        output.push(line.trim().to_owned());
+    }
+}
+
+fn test_synopsis(text: &str, output: &mut Vec<String>) {
+    let mut failures = BTreeSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed
+            .strip_prefix("test ")
+            .and_then(|rest| rest.strip_suffix(" ... FAILED"))
+        {
+            failures.insert(name.to_owned());
+        } else if let Some(name) = trimmed.strip_prefix("FAILED ") {
+            failures.insert(name.to_owned());
+        }
+    }
+    output.push(format!("failed_test_count={}", failures.len()));
+    for failure in failures.into_iter().take(12) {
+        output.push(format!("failed_test={failure}"));
+    }
+    for line in text
+        .lines()
+        .filter(|line| line.to_ascii_lowercase().contains("assertion"))
+        .take(4)
+    {
+        output.push(line.trim().to_owned());
+    }
+}
+
+fn search_synopsis(text: &str, output: &mut Vec<String>) {
+    let mut per_file = BTreeMap::<String, usize>::new();
+    for line in text.lines() {
+        if let Some((file, _)) = line.split_once(':') {
+            *per_file.entry(file.to_owned()).or_default() += 1;
+        }
+    }
+    output.push(format!("matched_file_count={}", per_file.len()));
+    for (file, count) in per_file.into_iter().take(12) {
+        output.push(format!("match={file}:{count}"));
+    }
+}
+
+fn diff_synopsis(text: &str, output: &mut Vec<String>) {
+    let files = text
+        .lines()
+        .filter(|line| line.starts_with("diff --git "))
+        .count();
+    let additions = text
+        .lines()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count();
+    let deletions = text
+        .lines()
+        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+        .count();
+    output.push(format!("changed_files={files}"));
+    output.push(format!("additions={additions}"));
+    output.push(format!("deletions={deletions}"));
+    for line in text.lines().filter(|line| line.starts_with("@@")).take(8) {
+        output.push(line.to_owned());
+    }
+}
+
+fn json_synopsis(text: &str, output: &mut Vec<String>) {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(map)) => {
+            output.push(format!("json_kind=object keys={}", map.len()));
+            output.push(format!(
+                "keys={}",
+                map.keys().take(16).cloned().collect::<Vec<_>>().join(",")
+            ));
+        }
+        Ok(serde_json::Value::Array(values)) => {
+            output.push(format!("json_kind=array items={}", values.len()));
+        }
+        Ok(_) => output.push("json_kind=scalar".to_owned()),
+        Err(_) => output.push("json_kind=invalid".to_owned()),
+    }
+}
+
+fn log_synopsis(text: &str, output: &mut Vec<String>) {
+    let all = text.lines().collect::<Vec<_>>();
+    let error_count = all
+        .iter()
+        .filter(|line| line.to_ascii_lowercase().contains("error"))
+        .count();
+    let warning_count = all
+        .iter()
+        .filter(|line| line.to_ascii_lowercase().contains("warning"))
+        .count();
+    output.push(format!("line_count={}", all.len()));
+    output.push(format!("error_lines={error_count}"));
+    output.push(format!("warning_lines={warning_count}"));
+    for line in all.iter().take(6) {
+        output.push(format!("head={}", line.trim()));
+    }
+    for line in all
+        .iter()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("error") || lower.contains("warning") || lower.contains("panic")
+        })
+        .take(10)
+    {
+        output.push(format!("signal={}", line.trim()));
+    }
+    for line in all
+        .iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        output.push(format!("tail={}", line.trim()));
+    }
+}
+
+fn bounded_lines(lines: Vec<String>, limit: usize) -> String {
+    let mut result = String::new();
+    for line in lines {
+        let separator = usize::from(!result.is_empty());
+        if result
+            .len()
+            .saturating_add(separator)
+            .saturating_add(line.len())
+            > limit
+        {
+            break;
+        }
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(&line);
+    }
+    if result.is_empty() && limit > 0 {
+        "truncated".chars().take(limit).collect()
+    } else {
+        result
     }
 }
 

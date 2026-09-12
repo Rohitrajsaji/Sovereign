@@ -1,0 +1,48 @@
+{
+  "schema": "sovereign-task-evidence-v1",
+  "task": "M1-T05",
+  "status": "completed",
+  "completed_at_utc": "2026-09-12T18:04:39Z",
+  "title": "Implement deterministic evidence compression and expansion",
+  "dependency_evidence": [
+    "implementation/evidence/M0-T03.json",
+    "implementation/evidence/M1-T04.json"
+  ],
+  "source_hashes": {
+    "crates/sovereign-evidence/Cargo.toml": "sha256:41c136654b9243bdc99d90abc93b9400afeeb6318ae636fd7772d86dc5ac362e",
+    "crates/sovereign-evidence/src/lib.rs": "sha256:f7d22ffceaf86350427384a1f7d60cb9d9ea3ddc4446ebd6915f431a5fd72f63",
+    "crates/sovereign-evidence/tests/compression.rs": "sha256:e6de12bdfc5da94347f325add9c03c3157f3432da3b9905707934502ceb0e4ec"
+  },
+  "implementation": {
+    "ingress_redaction": "Known secret values and deterministic generic credential shapes are redacted before CAS persistence; persisted evidence records redaction events.",
+    "raw_spool_bounds": "Per-action and remaining per-task raw byte quotas bound retained post-redaction bytes. Truncation records raw_complete=false, retained ranges/counts and an explicit reason, including the zero-remaining-task-quota case.",
+    "synopses": "Compiler, test, search, log, diff and JSON evidence produce deterministic bounded model-facing synopses with version/digests and stable failure signatures.",
+    "expansion": "Expansion reads retained CAS bytes by digest/range without rerunning the tool and returns explicit not_retained evidence for truncated ranges.",
+    "recompression": "Historical retained raw evidence can be recompressed into a new synopsis version without rewriting the immutable raw artifact."
+  },
+  "tests": [
+    "ten_thousand_line_log_compresses_within_model_facing_budget",
+    "retained_post_ingress_bytes_are_byte_for_byte_recoverable",
+    "known_and_generic_credentials_are_redacted_before_cas_persistence",
+    "spool_quota_exceedance_records_explicit_truncation_metadata",
+    "task_spool_remaining_budget_can_be_stricter_than_action_budget",
+    "exhausted_task_spool_budget_records_zero_retained_bytes",
+    "expansion_reads_retained_artifact_without_rerunning_tool",
+    "expansion_beyond_truncated_range_returns_explicit_not_retained",
+    "synopsis_records_required_provenance_and_digests",
+    "historical_raw_can_be_recompressed_without_rewriting_raw_artifact",
+    "compiler_synopsis_extracts_primary_error",
+    "test_synopsis_groups_failed_tests_deterministically",
+    "failure_signature_is_stable_across_incidental_line_number_changes"
+  ],
+  "verification": {
+    "cargo_fmt_workspace": "passed",
+    "cargo_clippy_workspace_all_targets_deny_warnings": "passed",
+    "cargo_test_sovereign_evidence": "passed: 6 unit + 13 compression",
+    "cargo_test_workspace_offline": "passed"
+  },
+  "completion_evidence": {
+    "compression_fixture": "10,000-line log bounded by configured synopsis budget",
+    "current_code_verified": true
+  }
+}
