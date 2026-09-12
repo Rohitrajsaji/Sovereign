@@ -7,6 +7,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
 ## M1 closure gates
 
 1. **Context accounting and absolute model deadlines**
+   - Status: implementation and short real-model accounting smoke verified in `implementation/evidence/M1-model-accounting-remediation.json`; representative full engineering packet remains part of gate 6.
    - Status: **OPEN — required before M1 closure.**
    - Current source owner: `crates/sovereign-model/src/lib.rs`.
    - Reconcile llama.cpp runtime window with explicit input allowance plus generation reserve.
@@ -56,6 +57,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
    - Required tests/evidence: runtime Seatbelt probe, nested protected-root fixture, PATH-shim fixture, offline network fixture, selective-network request fail-closed fixture.
 
 6. **Representative M1 model qualification**
+   - Status: open until the compiler/controller/repair/restart vertical slice produces representative full-packet evidence.
    - Status: **OPEN — required before M1 closure.** Historical M1-T03 short smoke remains valid only for short tool-call viability.
    - Planned proof owners: M1-T10, M1-T07, M1-T08, M1-T09 plus a current real-model full-packet report.
    - Preserve M1-T03 short real tool-call smoke as valid evidence only for short tool-call viability (206 input tokens); do not represent it as an 8k engineering packet.

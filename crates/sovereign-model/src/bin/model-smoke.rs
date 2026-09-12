@@ -52,7 +52,8 @@ struct ToolSmokeOutcome {
     action: Value,
     throughput: Value,
     peak_rss_kb: Option<u64>,
-    counted_tokens: u32,
+    raw_prompt_tokens: u32,
+    admission: Value,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -177,7 +178,8 @@ fn run_context_tier(
     let (action, throughput) = if context_tokens == 8_192 {
         let smoke = run_tool_smoke(&backend)?;
         tier["prefill_decode_peak_rss_kb"] = json!(smoke.peak_rss_kb);
-        tier["counted_prompt_tokens"] = json!(smoke.counted_tokens);
+        tier["raw_prompt_tokens"] = json!(smoke.raw_prompt_tokens);
+        tier["request_token_admission"] = smoke.admission;
         (Some(smoke.action), Some(smoke.throughput))
     } else {
         (None, None)
@@ -200,8 +202,10 @@ fn run_context_tier(
 
 fn run_tool_smoke(backend: &LocalOpenAiBackend) -> Result<ToolSmokeOutcome, Box<dyn Error>> {
     let prompt = "Call record_smoke exactly once with ok=true and message='local model ready'. Do not answer in prose.";
-    let counted_tokens = backend.count_tokens(prompt)?;
-    let response = backend.complete(&smoke_request(prompt))?;
+    let raw_prompt_tokens = backend.count_tokens(prompt)?;
+    let request = smoke_request(prompt);
+    let admission = backend.token_admission(&request)?;
+    let response = backend.complete(&request)?;
     let call = response
         .tool_calls
         .iter()
@@ -225,6 +229,13 @@ fn run_tool_smoke(backend: &LocalOpenAiBackend) -> Result<ToolSmokeOutcome, Box<
         "input_tokens": response.usage.input_tokens,
         "output_tokens": response.usage.output_tokens,
         "elapsed_ms": response.elapsed_ms,
+        "preflight": {
+            "rendered_input_tokens": admission.rendered_input_tokens,
+            "structured_output_tokens": admission.structured_output_tokens,
+            "admitted_input_tokens": admission.admitted_input_tokens,
+            "reserved_output_tokens": admission.reserved_output_tokens,
+            "server_context_tokens": admission.server_context_tokens,
+        },
     });
     let throughput = json!({
         "output_tokens_per_second_milli": throughput_milli,
@@ -235,7 +246,8 @@ fn run_tool_smoke(backend: &LocalOpenAiBackend) -> Result<ToolSmokeOutcome, Box<
         action,
         throughput,
         peak_rss_kb: response.peak_rss_kb_during_call,
-        counted_tokens,
+        raw_prompt_tokens,
+        admission: serde_json::to_value(admission)?,
     })
 }
 

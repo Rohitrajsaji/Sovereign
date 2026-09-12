@@ -78,12 +78,9 @@ pub struct ModelLoadProfile {
 
 impl ModelLoadProfile {
     fn validate(&self, capabilities: &ModelCapabilities) -> Result<(), ModelError> {
-        if self.context_tokens == 0
-            || self.context_tokens > capabilities.max_context_tokens
-            || self.context_tokens > M1_HARD_INPUT_CONTEXT_TOKENS
-        {
+        if self.context_tokens == 0 || self.context_tokens > M1_HARD_INPUT_CONTEXT_TOKENS {
             return Err(ModelError::InvalidContract(format!(
-                "requested context {} exceeds model/M1 ceiling",
+                "requested input allowance {} exceeds M1 input ceiling",
                 self.context_tokens
             )));
         }
@@ -95,7 +92,19 @@ impl ModelLoadProfile {
                 "load profile budgets must be positive".to_owned(),
             ));
         }
+        if self.server_context_tokens()? > capabilities.max_context_tokens {
+            return Err(ModelError::InvalidContract(format!(
+                "input allowance {} plus output reserve {} exceeds model context {}",
+                self.context_tokens, self.output_reserve_tokens, capabilities.max_context_tokens
+            )));
+        }
         Ok(())
+    }
+
+    fn server_context_tokens(self) -> Result<u32, ModelError> {
+        self.context_tokens
+            .checked_add(self.output_reserve_tokens)
+            .ok_or_else(|| ModelError::InvalidContract("model context budget overflow".to_owned()))
     }
 }
 
@@ -105,9 +114,24 @@ pub struct ModelLease {
     pub lease_id: String,
     pub model_id: String,
     pub context_tokens: u32,
+    pub server_context_tokens: u32,
     pub process_id: Option<u32>,
     pub startup_peak_rss_kb: Option<u64>,
     pub post_load_rss_kb: Option<u64>,
+}
+
+/// Provider-neutral admission record for one completely rendered request.
+///
+/// `rendered_input_tokens` is the provider's exact chat-template prompt count.
+/// `structured_output_tokens` is a conservative tokenizer charge for a typed
+/// output contract when the provider enforces that schema outside the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelTokenAdmission {
+    pub rendered_input_tokens: u32,
+    pub structured_output_tokens: u32,
+    pub admitted_input_tokens: u32,
+    pub reserved_output_tokens: u32,
+    pub server_context_tokens: u32,
 }
 
 /// Stable role for one model-facing message.
@@ -530,6 +554,157 @@ impl LocalOpenAiBackend {
         body
     }
 
+    fn template_body(request: &ModelRequest) -> Value {
+        let messages: Vec<Value> = request
+            .messages
+            .iter()
+            .map(|message| {
+                let mut value = json!({
+                    "role": message.role.as_openai(),
+                    "content": message.content,
+                });
+                if let Some(tool_call_id) = &message.tool_call_id {
+                    value["tool_call_id"] = json!(tool_call_id);
+                }
+                value
+            })
+            .collect();
+        let mut body = json!({
+            "messages": messages,
+            "add_generation_prompt": true,
+        });
+        if !request.tools.is_empty() {
+            body["tools"] = Value::Array(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        json!({
+                            "type": "function",
+                            "function": {
+                                "name": tool.name,
+                                "description": tool.description,
+                                "parameters": tool.input_schema,
+                            }
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        body
+    }
+
+    fn tokenize_until(&self, content: &str, deadline: Instant) -> Result<u32, ModelError> {
+        let body = serde_json::to_vec(&json!({"content": content, "add_special": false}))?;
+        let response = http_request_until(
+            SocketAddr::new(self.config.host, self.config.port),
+            "POST",
+            "/tokenize",
+            Some(&body),
+            deadline,
+            self.config.max_http_response_bytes,
+        )?;
+        if !(200..300).contains(&response.status) {
+            return Err(ModelError::ProviderStatus {
+                status: response.status,
+                body: String::from_utf8_lossy(&response.body).into_owned(),
+            });
+        }
+        token_count_from_response(&response.body)
+    }
+
+    fn token_admission_until(
+        &self,
+        request: &ModelRequest,
+        profile: ModelLoadProfile,
+        deadline: Instant,
+    ) -> Result<ModelTokenAdmission, ModelError> {
+        let template_body = serde_json::to_vec(&Self::template_body(request))?;
+        let template_response = http_request_until(
+            SocketAddr::new(self.config.host, self.config.port),
+            "POST",
+            "/apply-template",
+            Some(&template_body),
+            deadline,
+            self.config.max_http_response_bytes,
+        )?;
+        if !(200..300).contains(&template_response.status) {
+            return Err(ModelError::ProviderStatus {
+                status: template_response.status,
+                body: String::from_utf8_lossy(&template_response.body).into_owned(),
+            });
+        }
+        let rendered: Value = serde_json::from_slice(&template_response.body)?;
+        let prompt = rendered
+            .get("prompt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ModelError::InvalidResponse("apply-template response missing prompt".to_owned())
+            })?;
+        let rendered_input_tokens = self.tokenize_until(prompt, deadline)?;
+        let structured_output_tokens = match &request.output_contract {
+            ModelOutputContract::Text => 0,
+            contract @ ModelOutputContract::JsonSchema { .. } => {
+                let contract_json = serde_json::to_string(contract)?;
+                self.tokenize_until(&contract_json, deadline)?
+            }
+        };
+        let admitted_input_tokens = rendered_input_tokens
+            .checked_add(structured_output_tokens)
+            .ok_or_else(|| {
+                ModelError::InvalidContract("request token count overflow".to_owned())
+            })?;
+        if admitted_input_tokens > request.input_token_ceiling
+            || admitted_input_tokens > profile.context_tokens
+        {
+            return Err(ModelError::InvalidContract(format!(
+                "fully rendered request requires {admitted_input_tokens} input tokens but ceiling is {}",
+                request.input_token_ceiling.min(profile.context_tokens)
+            )));
+        }
+        let server_context_tokens = profile.server_context_tokens()?;
+        let required_total = admitted_input_tokens
+            .checked_add(request.max_output_tokens)
+            .ok_or_else(|| {
+                ModelError::InvalidContract("request total token count overflow".to_owned())
+            })?;
+        if required_total > server_context_tokens {
+            return Err(ModelError::InvalidContract(format!(
+                "rendered input {admitted_input_tokens} plus output reserve {} exceeds server context {server_context_tokens}",
+                request.max_output_tokens
+            )));
+        }
+        Ok(ModelTokenAdmission {
+            rendered_input_tokens,
+            structured_output_tokens,
+            admitted_input_tokens,
+            reserved_output_tokens: request.max_output_tokens,
+            server_context_tokens,
+        })
+    }
+
+    /// Measures the exact provider-rendered request before inference and applies
+    /// the same admission rules used by [`ModelBackend::complete`].
+    ///
+    /// # Errors
+    /// Returns a contract, deadline, transport, or provider error when the fully
+    /// rendered request cannot be safely admitted.
+    pub fn token_admission(
+        &self,
+        request: &ModelRequest,
+    ) -> Result<ModelTokenAdmission, ModelError> {
+        let profile = self.loaded_profile()?;
+        request.validate(&self.config.capabilities, profile)?;
+        let timeout = Duration::from_millis(
+            request
+                .deadline_ms
+                .min(profile.provider_call_timeout_ms)
+                .min(self.config.request_timeout_ms),
+        );
+        let deadline = Instant::now() + timeout;
+        self.token_admission_until(request, profile, deadline)
+    }
+
     fn parse_completion(
         request: &ModelRequest,
         bytes: &[u8],
@@ -617,6 +792,7 @@ impl LocalOpenAiBackend {
         profile: ModelLoadProfile,
     ) -> Result<Child, ModelError> {
         let path = std::env::var_os("PATH").unwrap_or_default();
+        let server_context_tokens = profile.server_context_tokens()?;
         let child = Command::new(&launch.executable)
             .env_clear()
             .env("PATH", path)
@@ -627,7 +803,7 @@ impl LocalOpenAiBackend {
             .arg("--port")
             .arg(self.config.port.to_string())
             .arg("-c")
-            .arg(profile.context_tokens.to_string())
+            .arg(server_context_tokens.to_string())
             .arg("--jinja")
             .args(&launch.extra_args)
             .stdin(Stdio::null())
@@ -720,6 +896,7 @@ impl ModelBackend for LocalOpenAiBackend {
             lease_id,
             model_id: self.config.capabilities.model_id.clone(),
             context_tokens: profile.context_tokens,
+            server_context_tokens: profile.server_context_tokens()?,
             process_id,
             startup_peak_rss_kb,
             post_load_rss_kb: process_id.and_then(process_rss_kb),
@@ -745,14 +922,16 @@ impl ModelBackend for LocalOpenAiBackend {
                 .min(profile.provider_call_timeout_ms)
                 .min(self.config.request_timeout_ms),
         );
-        let body = serde_json::to_vec(&self.completion_body(request))?;
         let started = Instant::now();
-        let result = http_request(
+        let deadline = started + timeout;
+        self.token_admission_until(request, profile, deadline)?;
+        let body = serde_json::to_vec(&self.completion_body(request))?;
+        let result = http_request_until(
             SocketAddr::new(self.config.host, self.config.port),
             "POST",
             "/v1/chat/completions",
             Some(&body),
-            timeout,
+            deadline,
             self.config.max_http_response_bytes,
         );
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -769,34 +948,12 @@ impl ModelBackend for LocalOpenAiBackend {
 
     fn count_tokens(&self, content: &str) -> Result<u32, ModelError> {
         let profile = self.loaded_profile()?;
-        let body = serde_json::to_vec(&json!({"content": content, "add_special": false}))?;
-        let response = http_request(
-            SocketAddr::new(self.config.host, self.config.port),
-            "POST",
-            "/tokenize",
-            Some(&body),
-            Duration::from_millis(
-                profile
-                    .provider_call_timeout_ms
-                    .min(self.config.request_timeout_ms),
-            ),
-            self.config.max_http_response_bytes,
-        )?;
-        if !(200..300).contains(&response.status) {
-            return Err(ModelError::ProviderStatus {
-                status: response.status,
-                body: String::from_utf8_lossy(&response.body).into_owned(),
-            });
-        }
-        let root: Value = serde_json::from_slice(&response.body)?;
-        let tokens = root
-            .get("tokens")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                ModelError::InvalidResponse("tokenize response missing tokens".to_owned())
-            })?;
-        u32::try_from(tokens.len())
-            .map_err(|_| ModelError::InvalidResponse("token count exceeds u32".to_owned()))
+        let timeout = Duration::from_millis(
+            profile
+                .provider_call_timeout_ms
+                .min(self.config.request_timeout_ms),
+        );
+        self.tokenize_until(content, Instant::now() + timeout)
     }
 
     fn health(&self) -> Result<BackendHealth, ModelError> {
@@ -870,6 +1027,7 @@ impl ModelBackend for DeterministicFakeBackend {
             ),
             model_id: self.capabilities.model_id.clone(),
             context_tokens: profile.context_tokens,
+            server_context_tokens: profile.server_context_tokens()?,
             process_id: None,
             startup_peak_rss_kb: None,
             post_load_rss_kb: None,
@@ -989,36 +1147,86 @@ fn http_request(
     timeout: Duration,
     max_response_bytes: u64,
 ) -> Result<HttpResponse, ModelError> {
-    let mut stream = TcpStream::connect_timeout(&address, timeout).map_err(map_io_deadline)?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(ModelError::Io)?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(ModelError::Io)?;
+    http_request_until(
+        address,
+        method,
+        path,
+        body,
+        Instant::now() + timeout,
+        max_response_bytes,
+    )
+}
+
+fn http_request_until(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    deadline: Instant,
+    max_response_bytes: u64,
+) -> Result<HttpResponse, ModelError> {
+    let mut stream =
+        TcpStream::connect_timeout(&address, remaining(deadline)?).map_err(map_io_deadline)?;
     let payload = body.unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         payload.len()
     );
     stream
+        .set_write_timeout(Some(remaining(deadline)?))
+        .map_err(ModelError::Io)?;
+    stream
         .write_all(request.as_bytes())
         .map_err(map_io_deadline)?;
     if !payload.is_empty() {
+        stream
+            .set_write_timeout(Some(remaining(deadline)?))
+            .map_err(ModelError::Io)?;
         stream.write_all(payload).map_err(map_io_deadline)?;
     }
+    stream
+        .set_write_timeout(Some(remaining(deadline)?))
+        .map_err(ModelError::Io)?;
     stream.flush().map_err(map_io_deadline)?;
 
     let read_cap = max_response_bytes.saturating_add(65_536);
     let mut bytes = Vec::new();
-    let mut limited = stream.take(read_cap.saturating_add(1));
-    limited.read_to_end(&mut bytes).map_err(map_io_deadline)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > read_cap {
-        return Err(ModelError::HttpProtocol(
-            "provider response exceeds configured byte ceiling".to_owned(),
-        ));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        stream
+            .set_read_timeout(Some(remaining(deadline)?))
+            .map_err(ModelError::Io)?;
+        let count = stream.read(&mut buffer).map_err(map_io_deadline)?;
+        if count == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > read_cap {
+            return Err(ModelError::HttpProtocol(
+                "provider response exceeds configured byte ceiling".to_owned(),
+            ));
+        }
     }
     parse_http_response(&bytes, max_response_bytes)
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, ModelError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or(ModelError::DeadlineExceeded("wall"))
+}
+
+fn token_count_from_response(bytes: &[u8]) -> Result<u32, ModelError> {
+    let root: Value = serde_json::from_slice(bytes)?;
+    let tokens = root
+        .get("tokens")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ModelError::InvalidResponse("tokenize response missing tokens".to_owned())
+        })?;
+    u32::try_from(tokens.len())
+        .map_err(|_| ModelError::InvalidResponse("token count exceeds u32".to_owned()))
 }
 
 fn parse_http_response(bytes: &[u8], max_body_bytes: u64) -> Result<HttpResponse, ModelError> {

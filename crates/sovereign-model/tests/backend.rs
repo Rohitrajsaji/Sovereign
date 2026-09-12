@@ -67,6 +67,35 @@ fn json_request(request_id: &str) -> ModelRequest {
     }
 }
 
+fn text_request(request_id: &str) -> ModelRequest {
+    ModelRequest {
+        schema_version: MODEL_SCHEMA_VERSION,
+        request_id: request_id.to_owned(),
+        messages: vec![ModelMessage {
+            role: ModelMessageRole::User,
+            content: "Use the declared tool if needed.".to_owned(),
+            tool_call_id: None,
+        }],
+        tools: Vec::new(),
+        output_contract: ModelOutputContract::Text,
+        input_token_ceiling: 4_096,
+        max_output_tokens: 128,
+        deadline_ms: 500,
+        temperature_milli: 0,
+    }
+}
+
+fn template_reply() -> TestReply {
+    TestReply::json(
+        200,
+        &json!({"prompt":"<|im_start|>user\nrendered fixture<|im_end|>\n<|im_start|>assistant\n"}),
+    )
+}
+
+fn token_reply(count: usize) -> TestReply {
+    TestReply::json(200, &json!({"tokens": vec![1_u32; count]}))
+}
+
 fn response_template(content: &str) -> ModelResponse {
     ModelResponse {
         schema_version: MODEL_SCHEMA_VERSION,
@@ -134,8 +163,14 @@ fn fake_backend_contract_is_deterministic_and_reloadable() {
 #[test]
 fn local_provider_maps_completion_and_token_count_without_provider_types_leaking() {
     let _guard = local_test_guard();
-    let server = TestServer::spawn(3, |request| match request.path.as_str() {
+    let server = TestServer::spawn(6, |request| match request.path.as_str() {
         "/health" => TestReply::json(200, &json!({"status":"ok"})),
+        "/apply-template" => {
+            let body: Value = serde_json::from_slice(&request.body)
+                .unwrap_or_else(|error| panic!("template request JSON: {error}"));
+            assert!(body["messages"].is_array());
+            template_reply()
+        }
         "/v1/chat/completions" => {
             let body: Value = serde_json::from_slice(&request.body)
                 .unwrap_or_else(|error| panic!("completion request JSON: {error}"));
@@ -155,8 +190,11 @@ fn local_provider_maps_completion_and_token_count_without_provider_types_leaking
         "/tokenize" => {
             let body: Value = serde_json::from_slice(&request.body)
                 .unwrap_or_else(|error| panic!("tokenize request JSON: {error}"));
-            assert_eq!(body["content"], "bounded context");
-            TestReply::json(200, &json!({"tokens":[1,2,3,4]}))
+            if body["content"] == "bounded context" {
+                token_reply(4)
+            } else {
+                token_reply(11)
+            }
         }
         _ => TestReply::json(404, &json!({"error":"not found"})),
     });
@@ -204,8 +242,10 @@ fn provider_health_obeys_transport_deadline() {
 #[test]
 fn structured_response_validation_rejects_schema_violation() {
     let _guard = local_test_guard();
-    let server = TestServer::spawn(2, |request| match request.path.as_str() {
+    let server = TestServer::spawn(5, |request| match request.path.as_str() {
         "/health" => TestReply::json(200, &json!({"status":"ok"})),
+        "/apply-template" => template_reply(),
+        "/tokenize" => token_reply(8),
         "/v1/chat/completions" => TestReply::json(
             200,
             &json!({
@@ -230,6 +270,140 @@ fn structured_response_validation_rejects_schema_violation() {
         .unload()
         .unwrap_or_else(|error| panic!("unload: {error}"));
     server.finish();
+}
+
+#[test]
+fn rendered_request_admission_counts_template_tools_schema_and_output_reserve() {
+    let _guard = local_test_guard();
+    let server = TestServer::spawn(4, |request| match request.path.as_str() {
+        "/health" => TestReply::json(200, &json!({"status":"ok"})),
+        "/apply-template" => {
+            let body: Value = serde_json::from_slice(&request.body)
+                .unwrap_or_else(|error| panic!("template JSON: {error}"));
+            assert!(body["messages"].is_array());
+            template_reply()
+        }
+        "/tokenize" => {
+            let body: Value = serde_json::from_slice(&request.body)
+                .unwrap_or_else(|error| panic!("tokenize JSON: {error}"));
+            let content = body["content"].as_str().unwrap_or_default();
+            if content.contains("rendered fixture") {
+                token_reply(100)
+            } else {
+                assert!(content.contains("json_schema"));
+                token_reply(20)
+            }
+        }
+        _ => TestReply::json(404, &json!({"error":"not found"})),
+    });
+    let backend = attached_backend(server.address(), 500);
+    backend
+        .load(profile())
+        .unwrap_or_else(|error| panic!("load: {error}"));
+    let admission = backend
+        .token_admission(&json_request("request.accounting"))
+        .unwrap_or_else(|error| panic!("admission: {error}"));
+    assert_eq!(admission.rendered_input_tokens, 100);
+    assert_eq!(admission.structured_output_tokens, 20);
+    assert_eq!(admission.admitted_input_tokens, 120);
+    assert_eq!(admission.reserved_output_tokens, 128);
+    assert_eq!(admission.server_context_tokens, 5_120);
+    backend
+        .unload()
+        .unwrap_or_else(|error| panic!("unload: {error}"));
+    server.finish();
+}
+
+#[test]
+fn oversized_fully_rendered_request_is_rejected_before_completion_dispatch() {
+    let _guard = local_test_guard();
+    let server = TestServer::spawn(3, |request| match request.path.as_str() {
+        "/health" => TestReply::json(200, &json!({"status":"ok"})),
+        "/apply-template" => template_reply(),
+        "/tokenize" => token_reply(129),
+        "/v1/chat/completions" => panic!("oversized request reached completion endpoint"),
+        _ => TestReply::json(404, &json!({"error":"not found"})),
+    });
+    let backend = attached_backend(server.address(), 500);
+    let small_profile = ModelLoadProfile {
+        context_tokens: 128,
+        output_reserve_tokens: 64,
+        startup_timeout_ms: 1_000,
+        provider_call_timeout_ms: 500,
+    };
+    backend
+        .load(small_profile)
+        .unwrap_or_else(|error| panic!("load: {error}"));
+    let mut request = text_request("request.oversized");
+    request.input_token_ceiling = 128;
+    request.max_output_tokens = 32;
+    assert!(matches!(
+        backend.complete(&request),
+        Err(ModelError::InvalidContract(_))
+    ));
+    backend
+        .unload()
+        .unwrap_or_else(|error| panic!("unload: {error}"));
+    server.finish();
+}
+
+#[test]
+fn completion_deadline_is_absolute_across_preflight_and_inference() {
+    let _guard = local_test_guard();
+    let server = TestServer::spawn(4, |request| match request.path.as_str() {
+        "/health" => TestReply::json(200, &json!({"status":"ok"})),
+        "/apply-template" => {
+            thread::sleep(Duration::from_millis(25));
+            template_reply()
+        }
+        "/tokenize" => {
+            thread::sleep(Duration::from_millis(25));
+            token_reply(8)
+        }
+        "/v1/chat/completions" => {
+            thread::sleep(Duration::from_millis(25));
+            TestReply::json(
+                200,
+                &json!({
+                    "choices": [{"message": {"content":"ok"}, "finish_reason":"stop"}],
+                    "usage": {"prompt_tokens":8,"completion_tokens":1}
+                }),
+            )
+        }
+        _ => TestReply::json(404, &json!({"error":"not found"})),
+    });
+    let backend = attached_backend(server.address(), 500);
+    backend
+        .load(profile())
+        .unwrap_or_else(|error| panic!("load: {error}"));
+    let mut request = text_request("request.absolute-deadline");
+    request.deadline_ms = 65;
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        backend.complete(&request),
+        Err(ModelError::DeadlineExceeded(_))
+    ));
+    assert!(started.elapsed() < Duration::from_millis(100));
+    backend
+        .unload()
+        .unwrap_or_else(|error| panic!("unload: {error}"));
+    server.finish();
+}
+
+#[test]
+fn load_profile_reserves_server_context_for_generation() {
+    let backend = DeterministicFakeBackend::new(capabilities(), Vec::new())
+        .unwrap_or_else(|error| panic!("fake backend: {error}"));
+    let too_large = ModelLoadProfile {
+        context_tokens: 16_000,
+        output_reserve_tokens: 1_000,
+        startup_timeout_ms: 1_000,
+        provider_call_timeout_ms: 500,
+    };
+    assert!(matches!(
+        backend.load(too_large),
+        Err(ModelError::InvalidContract(_))
+    ));
 }
 
 #[test]
@@ -410,10 +584,7 @@ fn write_reply(stream: &mut TcpStream, reply: &TestReply) {
         reply.status,
         reply.body.len()
     );
-    stream
-        .write_all(headers.as_bytes())
-        .unwrap_or_else(|error| panic!("write test headers: {error}"));
-    stream
-        .write_all(&reply.body)
-        .unwrap_or_else(|error| panic!("write test body: {error}"));
+    if stream.write_all(headers.as_bytes()).is_ok() {
+        let _ = stream.write_all(&reply.body);
+    }
 }

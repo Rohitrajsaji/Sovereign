@@ -1,0 +1,45 @@
+{
+  "schema": "sovereign-remediation-evidence-v1",
+  "recorded_at_utc": "2026-09-12T18:03:55Z",
+  "scope": "M1 closure remediation: exact local-model context accounting and absolute wall deadlines",
+  "status": "implemented_and_short_smoke_verified",
+  "source_hashes": {
+    "crates/sovereign-model/src/lib.rs": "sha256:ed27864834c79da439e457b58b4692254353040e5b8a276d64e93929228f529d",
+    "crates/sovereign-model/tests/backend.rs": "sha256:3ce0b72d8cd57aaec160fc81f23a3cc21bbd0e49a66666e5ceced802a9e6b193",
+    "crates/sovereign-model/src/bin/model-smoke.rs": "sha256:14e80882a85492ada137a769310f2c580ce3654d4d9702cff3de9fa0ea126b33",
+    "implementation/evidence/M1-model-accounting-smoke.json": "sha256:ce4f6b06026d10b488ece4d3990fde5823e8ab4e960460b863d3bb30b1a43be5"
+  },
+  "implementation": {
+    "context_semantics": "ModelLoadProfile.context_tokens is an input allowance. Managed llama.cpp server context is input allowance plus output_reserve_tokens and must fit ModelCapabilities.max_context_tokens.",
+    "preflight": "LocalOpenAiBackend renders the exact provider chat template through /apply-template, tokenizes the rendered prompt, conservatively token-charges a structured-output contract, and rejects the request before inference when admitted input or input-plus-output exceeds the active budgets.",
+    "wall_deadline": "One Instant deadline is shared by template rendering, tokenization, connect/write/read and completion. Socket operation timeouts are recomputed from remaining wall time instead of resetting the full timeout per operation.",
+    "provider_independence": "The provider-specific rendering/tokenization stays inside LocalOpenAiBackend; Controller-facing ModelRequest/ModelResponse authority semantics remain provider-neutral."
+  },
+  "tests": [
+    "load_profile_reserves_server_context_for_generation",
+    "rendered_request_admission_counts_template_tools_schema_and_output_reserve",
+    "oversized_fully_rendered_request_is_rejected_before_completion_dispatch",
+    "completion_deadline_is_absolute_across_preflight_and_inference",
+    "existing ModelBackend contract/health/structured-output/unload/single-lease tests"
+  ],
+  "verification": {
+    "cargo_clippy_sovereign_model_all_targets_deny_warnings": "passed",
+    "cargo_test_sovereign_model": "passed",
+    "tests_passed": 10
+  },
+  "real_short_smoke": {
+    "report": "implementation/evidence/M1-model-accounting-smoke.json",
+    "passed": true,
+    "raw_prompt_tokens": 22,
+    "rendered_input_tokens": 206,
+    "provider_reported_input_tokens": 206,
+    "normal_input_allowance_tokens": 8192,
+    "output_reserve_tokens": 1536,
+    "server_context_tokens": 9728,
+    "prefill_decode_peak_rss_kb": 3905840,
+    "host_swap_used_delta_kib": 2370437,
+    "clean_reload": true,
+    "qualification": "This remains a short tool-call viability/accounting smoke, not the representative full engineering packet required for M1 closure."
+  },
+  "remaining_gate": "Representative compiler/controller engineering packets, real edit/verification, repair, checkpoint and restart must still be qualified under M1-T10/T07/T08/T09 before M1 closes."
+}
