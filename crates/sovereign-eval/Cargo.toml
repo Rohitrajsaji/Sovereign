@@ -1,18 +1,17 @@
 [package]
-name = "sovereign-plan"
+name = "sovereign-eval"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[dependencies]
-jsonschema.workspace = true
-serde.workspace = true
+[dev-dependencies]
 serde_json.workspace = true
-sha2.workspace = true
 sovereign-context = { path = "../sovereign-context" }
 sovereign-model = { path = "../sovereign-model" }
+sovereign-plan = { path = "../sovereign-plan" }
 sovereign-policy = { path = "../sovereign-policy" }
+sovereign-repo = { path = "../sovereign-repo" }
 
 [lints]
 workspace = true

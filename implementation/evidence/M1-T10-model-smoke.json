@@ -1,0 +1,35 @@
+{
+  "compilation_evidence_digest": "sha256:2a45002e56889cba04ab2354a13a53a3c25a3214f010cbc3d3367d10c55b0f41",
+  "context_packet_selected_tokens": 281,
+  "elapsed_ms": 22033,
+  "host_after": {
+    "memory_pressure": "The system has 8589934592 (524288 pages with a page size of 16384).\n\nStats: \nPages free: 23963 \nPages purgeable: 2 \nPages purged: 2333649 \n\nSwap I/O:\nSwapins: 1168353 \nSwapouts: 1614389 \n\nPage Q counts:\nPages active: 35451 \nPages inactive: 59519 \nPages speculative: 2815 \nPages throttled: 0 \nPages wired down: 292172 \n\nCompressor Stats:\nPages used by compressor: 74496 \nPages decompressed: 37959717 \nPages compressed: 42405940 \n\nFile I/O:\nPageins: 11393058 \nPageouts: 64398 \n\nSystem-wide memory free percentage: 24%",
+    "swapusage": "vm.swapusage: total = 6144.00M  used = 5781.31M  free = 362.69M  (encrypted)",
+    "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               23693.\nPages active:                             35652.\nPages inactive:                           88191.\nPages speculative:                         2859.\nPages throttled:                              0.\nPages wired down:                        263500.\nPages purgeable:                              2.\n\"Translation faults\":                 104097978.\nPages copy-on-write:                    2979997.\nPages zero filled:                     22297358.\nPages reactivated:                     41664701.\nPages purged:                           2333649.\nFile-backed pages:                        95219.\nAnonymous pages:                          31483.\nPages stored in compressor:              882243.\nPages occupied by compressor:             74425.\nDecompressions:                        37959881.\nCompressions:                          42405940.\nPageins:                               11393125.\nPageouts:                                 64398.\nSwapins:                                1168361.\nSwapouts:                               1614389."
+  },
+  "host_before": {
+    "memory_pressure": "The system has 8589934592 (524288 pages with a page size of 16384).\n\nStats: \nPages free: 6621 \nPages purgeable: 4145 \nPages purged: 2289784 \n\nSwap I/O:\nSwapins: 1064142 \nSwapouts: 1452745 \n\nPage Q counts:\nPages active: 171478 \nPages inactive: 160682 \nPages speculative: 10446 \nPages throttled: 0 \nPages wired down: 90447 \n\nCompressor Stats:\nPages used by compressor: 48629 \nPages decompressed: 36039758 \nPages compressed: 40247539 \n\nFile I/O:\nPageins: 10826323 \nPageouts: 63205 \n\nSystem-wide memory free percentage: 71%",
+    "swapusage": "vm.swapusage: total = 6144.00M  used = 4879.94M  free = 1264.06M  (encrypted)",
+    "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                6642.\nPages active:                            171480.\nPages inactive:                          160683.\nPages speculative:                        10443.\nPages throttled:                              0.\nPages wired down:                         90447.\nPages purgeable:                           4143.\n\"Translation faults\":                 100194160.\nPages copy-on-write:                    2814057.\nPages zero filled:                     21948609.\nPages reactivated:                     39895275.\nPages purged:                           2289784.\nFile-backed pages:                       109984.\nAnonymous pages:                         232622.\nPages stored in compressor:              710346.\nPages occupied by compressor:             48629.\nDecompressions:                        36039758.\nCompressions:                          40247539.\nPageins:                               10826333.\nPageouts:                                 63205.\nSwapins:                                1064142.\nSwapouts:                               1452745."
+  },
+  "model_calls_used": 2,
+  "plan_digest": "sha256:2aeb924e858847cb98c51e3a234d3a449d477023463004e257c712e7bc858d94",
+  "post_load_steady_rss_kb": 3741280,
+  "prefill_decode_peak_rss_kb": 3931072,
+  "process_absent_after_unload": true,
+  "provider_usage": {
+    "input_tokens": 434,
+    "output_tokens": 405
+  },
+  "request_token_admission": {
+    "admitted_input_tokens": 697,
+    "rendered_input_tokens": 434,
+    "reserved_output_tokens": 768,
+    "server_context_tokens": 9728,
+    "structured_output_tokens": 263
+  },
+  "schema": "sovereign-m1-t10-real-compiler-smoke-v1",
+  "server_context_tokens": 9728,
+  "startup_peak_rss_kb": 3741120,
+  "validator_passed": true
+}

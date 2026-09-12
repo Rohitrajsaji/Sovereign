@@ -1,5 +1,13 @@
 //! Normative Plan IR v1.2 representation and deterministic validation.
 
+mod compiler;
+
+pub use compiler::{
+    CompilationEvidence, CompilationEvidenceHandle, ModelAttemptEvidence,
+    PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationError, PlanCompilationInput,
+    PlanCompilationRepository, PlanCompilationResult, PlanCompiler,
+};
+
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

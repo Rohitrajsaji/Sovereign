@@ -61,7 +61,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
    - Required tests/evidence: runtime Seatbelt probe, nested protected-root fixture, PATH-shim fixture, offline network fixture, selective-network request fail-closed fixture.
 
 6. **Representative M1 model qualification**
-   - Status: open until the compiler/controller/repair/restart vertical slice produces representative full-packet evidence.
+   - Status: M1-T10 compiler qualification passed on the target machine with exact rendered/schema/output-reserve accounting and current evidence in `implementation/evidence/M1-T10-model-smoke.json`; Controller/edit/verification/repair/restart qualification remains open.
    - Status: **OPEN — required before M1 closure.** Historical M1-T03 short smoke remains valid only for short tool-call viability.
    - Planned proof owners: M1-T10, M1-T07, M1-T08, M1-T09 plus a current real-model full-packet report.
    - Preserve M1-T03 short real tool-call smoke as valid evidence only for short tool-call viability (206 input tokens); do not represent it as an 8k engineering packet.

@@ -1,0 +1,88 @@
+{
+  "schema": "sovereign-task-evidence-v1",
+  "task": "M1-T10",
+  "status": "completed",
+  "completed_at_utc": "2026-09-12T18:41:28Z",
+  "title": "Implement canonical minimal PlanCompiler for the first vertical slice",
+  "dependency_evidence": [
+    "implementation/evidence/M1-T01.json",
+    "implementation/evidence/M1-T03.json",
+    "implementation/evidence/M1-T06.json"
+  ],
+  "source_hashes": {
+    "Cargo.toml": "sha256:71918830d7c0a18274f1798ac0ea457471380c98bb001702766f38ae6957b8e4",
+    "Cargo.lock": "sha256:9f7d669cd04800772a046d6fc07716dc8953738cc94991711e12678dff86fe2a",
+    "crates/sovereign-plan/Cargo.toml": "sha256:30c7d7ed4a430b160f3a1df99fd1bbf73c6cc90149b19b728013e69a27736bc7",
+    "crates/sovereign-plan/src/lib.rs": "sha256:3076e21d86d8ab2557f8e9bf40eb3f4473d25b1a0be233e37aaced8b4d646b70",
+    "crates/sovereign-plan/src/compiler.rs": "sha256:688a890b6effb69e248e8ef15271e13b37734e74d7a226dd0fdd7a40db248b39",
+    "crates/sovereign-plan/tests/minimal_compiler.rs": "sha256:780bda7f264bf9a52cd0febc90352887c93dda3cbfef61ed8a29829bbc898bbc",
+    "crates/sovereign-eval/Cargo.toml": "sha256:2bb38ef3f6ad9a8d75b8b51ffdd2e981efadff269e32ee534c70364631d4b9b8",
+    "crates/sovereign-eval/src/lib.rs": "sha256:cad36e00970d10e801e984767b7577d81ba6bb1a50d9d471ab485e21e30eb60a",
+    "crates/sovereign-eval/tests/compiler_vertical_slice.rs": "sha256:002ba23b406cc20461968bb2b30e82c54a1106f14825159c4b51dd172495f21e",
+    "crates/sovereign-eval/tests/compiler_real_smoke.rs": "sha256:628dc4b6a5570ac18143668ee367fe8e0283a11072489f6b6b09650040ed1239",
+    "crates/sovereign-eval/tests/fixtures/scenario1/policy.json": "sha256:67f22c99808b4d8a257fde9fa0d02883967495077c7e3655c72f3cb2ccb1a35b",
+    "crates/sovereign-eval/tests/fixtures/scenario1/src/settings/SettingsForm.tsx": "sha256:c93f475bdc8649abd72e4f8dabc021341b1b47a8338d29ba0c0c43b0123acd70",
+    "crates/sovereign-eval/tests/fixtures/scenario1/src/settings/SettingsForm.test.tsx": "sha256:a69dd0131933d2888aacb9c1e1a5a707829f9bd0f8564c4113ba37a6b0c0b95a",
+    "implementation/evidence/M1-T10-model-smoke.json": "sha256:44f535648a0e3433d542637e710e3a91fb71410a50cdd7d192c43b770de2422a"
+  },
+  "implementation": {
+    "canonical_authority": "sovereign-plan exposes the single M1 PlanCompiler. It creates validated immutable candidates only; it has no plan-activation or tool-authorization surface.",
+    "bounded_inputs": "PlanCompilationInput consumes a bounded ContextPacket and exact source handles produced by M1-T06 rather than full repository or chat history.",
+    "provider_neutrality": "PlanCompiler calls only dyn ModelBackend::complete. Provider-specific rendering/tokenization/admission stays inside the model backend and is observed only by the test-only real-model qualification harness.",
+    "outer_budget": "Every proposal call, including the one bounded malformed-proposal retry, consumes the caller-owned ModelCallBudget before provider dispatch.",
+    "deterministic_normalization": "A simple proposal becomes one task; a two-task short-linear Plan IR is permitted only when explicit evidence queries justify the split. PlanValidator must pass before a PlanCompilationResult exists.",
+    "authority_non_widening": "Role, skill, tool and evaluator identities are caller-supplied pinned values. Model output cannot replace them, grant permissions, activate a plan, or authorize an action. Unknown paths become explicit evidence requirements.",
+    "eval_harness_scope": "sovereign-eval is materialized early only as the frozen M1 test/fixture harness required by roadmap verification commands; it exposes no M2 telemetry or production evaluation API."
+  },
+  "tests": [
+    "minimal_compiler_simple_edit_is_one_valid_bounded_task_and_calls_only_complete",
+    "minimal_compiler_two_task_split_requires_evidence_and_is_linear",
+    "minimal_compiler_uses_bounded_exact_handles_not_repository_dump",
+    "minimal_compiler_unknown_path_becomes_explicit_evidence_requirement",
+    "minimal_compiler_malformed_proposal_retries_once_and_charges_outer_budget",
+    "minimal_compiler_outer_budget_blocks_hidden_retry_before_backend_dispatch",
+    "minimal_compiler_model_cannot_widen_permissions_or_replace_pins",
+    "minimal_compiler_validator_rejection_returns_no_candidate",
+    "minimal_compiler_result_and_compilation_evidence_are_digest_deterministic",
+    "minimal_compiler_deterministic_fake_backend_fixture_passes",
+    "compiler_vertical_slice_starts_from_natural_language_and_exact_repository_evidence",
+    "compiler_real_local_8k_smoke"
+  ],
+  "verification": {
+    "cargo_fmt_workspace": "passed",
+    "cargo_clippy_workspace_all_targets_offline_deny_warnings": "passed",
+    "cargo_test_sovereign_plan_minimal_compiler_offline": "passed: 10/10",
+    "cargo_test_sovereign_eval_compiler_vertical_slice_offline": "passed: 1/1",
+    "cargo_test_workspace_offline": "passed",
+    "real_model_smoke": "passed separately with ignored test compiler_real_local_8k_smoke on target MacBook Air M1 / 8 GB profile",
+    "git_diff_check": "passed"
+  },
+  "real_model_qualification": {
+    "evidence": "implementation/evidence/M1-T10-model-smoke.json",
+    "model": "Qwen3-4B-Q4_K_M",
+    "runtime": "managed llama.cpp loopback backend",
+    "normal_input_profile_tokens": 8192,
+    "server_context_tokens": 9728,
+    "context_packet_selected_tokens": 281,
+    "rendered_input_tokens": 434,
+    "structured_output_tokens": 263,
+    "admitted_input_tokens": 697,
+    "reserved_output_tokens": 768,
+    "model_calls_used": 2,
+    "validator_passed": true,
+    "plan_digest": "sha256:2aeb924e858847cb98c51e3a234d3a449d477023463004e257c712e7bc858d94",
+    "compilation_evidence_digest": "sha256:2a45002e56889cba04ab2354a13a53a3c25a3214f010cbc3d3367d10c55b0f41",
+    "post_load_steady_rss_kb": 3741280,
+    "prefill_decode_peak_rss_kb": 3931072,
+    "process_absent_after_unload": true
+  },
+  "completion_evidence": {
+    "natural_language_goal_to_validated_digest_addressed_plan": true,
+    "exact_source_handles_preserved": true,
+    "bounded_context_at_or_below_8k": true,
+    "supplied_pinned_authorities_preserved": true,
+    "compiler_has_no_activation_or_tool_authorization": true,
+    "hand_authored_plan_ir_not_used_for_e2e_gate": true,
+    "current_code_verified": true
+  }
+}
