@@ -6,6 +6,7 @@ use sovereign_model::{
 };
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -491,6 +492,7 @@ impl TestReply {
 
 struct TestServer {
     address: SocketAddr,
+    stop: Arc<AtomicBool>,
     handle: JoinHandle<()>,
 }
 
@@ -504,21 +506,37 @@ impl TestServer {
         let address = listener
             .local_addr()
             .unwrap_or_else(|error| panic!("test server address: {error}"));
+        listener
+            .set_nonblocking(true)
+            .unwrap_or_else(|error| panic!("set test server nonblocking: {error}"));
         let handler = Arc::new(handler);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            for _ in 0..expected_requests {
-                let (mut stream, _) = listener
-                    .accept()
-                    .unwrap_or_else(|error| panic!("accept test request: {error}"));
+            let mut served = 0;
+            while served < expected_requests && !thread_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("accept test request: {error}"),
+                };
                 stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap_or_else(|error| panic!("set read timeout: {error}"));
                 let request = read_request(&mut stream);
                 let reply = handler(request);
                 write_reply(&mut stream, &reply);
+                served += 1;
             }
         });
-        Self { address, handle }
+        Self {
+            address,
+            stop,
+            handle,
+        }
     }
 
     const fn address(&self) -> SocketAddr {
@@ -526,6 +544,7 @@ impl TestServer {
     }
 
     fn finish(self) {
+        self.stop.store(true, Ordering::Release);
         self.handle
             .join()
             .unwrap_or_else(|_| panic!("test server thread panicked"));
