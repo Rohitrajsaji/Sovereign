@@ -714,15 +714,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-controller"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "sovereign-context",
+ "sovereign-evidence",
+ "sovereign-model",
+ "sovereign-plan",
+ "sovereign-policy",
+ "sovereign-repo",
+ "sovereign-state",
+ "sovereign-tools",
+]
+
+[[package]]
 name = "sovereign-eval"
 version = "0.1.0"
 dependencies = [
  "serde_json",
  "sovereign-context",
+ "sovereign-controller",
+ "sovereign-evidence",
  "sovereign-model",
  "sovereign-plan",
  "sovereign-policy",
  "sovereign-repo",
+ "sovereign-state",
+ "sovereign-tools",
 ]
 
 [[package]]

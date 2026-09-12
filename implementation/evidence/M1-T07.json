@@ -1,0 +1,93 @@
+{
+  "schema": "sovereign-task-evidence-v1",
+  "task": "M1-T07",
+  "status": "completed",
+  "completed_at_utc": "2026-09-12T20:06:11Z",
+  "title": "Implement Controller task/attempt loop and deterministic verifier",
+  "dependency_evidence": [
+    "implementation/evidence/M1-T01.json",
+    "implementation/evidence/M1-T03.json",
+    "implementation/evidence/M1-T04.json",
+    "implementation/evidence/M1-T06.json",
+    "implementation/evidence/M1-T10.json"
+  ],
+  "source_hashes": {
+    "Cargo.toml": "sha256:70b8b196d14dd6381b050bc5c627e0c25969cf94c9b551e92f6f3b198d516a1d",
+    "Cargo.lock": "sha256:5af6faf02c79c143ede4b258bc4ee6c702872b771e4a6c518fc00708d9ce7758",
+    "crates/sovereign-controller/Cargo.toml": "sha256:7bfd1e74bcc9122f8eb0eafb7c42574cae7c41c7d77ce255d38b7cceb5f5db4f",
+    "crates/sovereign-controller/src/lib.rs": "sha256:32b55126e88398c2289a0eabe2fa4c6c7372ac282ccfe239d72e98e3938dedb3",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:7b98855d80cc1b4a8fcf6977967790e31bc7db8e936cbf73c17ef6e19086e449",
+    "crates/sovereign-eval/Cargo.toml": "sha256:ea4a9c486fa8ec4a5d4514d248fdab6b8ded60c7d377bd80af74576e1f4b1c11",
+    "crates/sovereign-eval/tests/vertical_slice.rs": "sha256:11ec3dffd0e56caa90f789a4587bd456b86b545eff53afcd6736b25d1160ed05"
+  },
+  "implementation": {
+    "activation_provenance": "Controller activation accepts only the opaque owned PlanCompilationResult and revalidates canonical plan/evidence digests and validator success; there is no raw PlanIr activation surface.",
+    "controller_authority": "Controller exclusively owns task/attempt state, counters, permissions and legal transitions. ModelProposalV1 cannot assert success, task state or permissions.",
+    "derived_readiness": "ready is never persisted. ReadyLease is derived from the current plan/task contract, baseline, durable evidence/dependency bindings, checkpoint generation/action sequence/hash, effective permissions, resource admission and execution_epoch.",
+    "durable_evidence": "EvidenceSatisfactionV1 binds the exact requirement/query digest, retained current evidence IDs/digests, active plan/task contract and repository snapshot. Machine-executable exact path/literal requirements are supported; arbitrary free-form evidence semantics fail closed. Verified upstream artifact/criterion bindings are created only from passing deterministic verification.",
+    "model_budget": "TaskRuntime persists model_calls_consumed and the Controller enforces the compiled resource_budget.max_model_calls before provider dispatch. Caller ModelCallBudget can narrow but cannot refill the task budget. The compiled model deadline is also enforced before dispatch.",
+    "authorized_mutation": "The single M1 mutation lowers to the existing T04 AuthorizedAction/ActionJournal/ProcessRunner path with pinned /usr/bin/python3, no shell, no action-supplied PATH and offline isolation. Atomic replacement preserves target mode.",
+    "verification": "Deterministic verification binds required acceptance criteria to current-attempt verification steps/evidence types/evaluator, verifies the exact compiled old-to-new relation, exact authorized postimage and repository scope, and is the sole route to task succeeded.",
+    "user_work_preservation": "Each attempt captures the pre-attempt repository snapshot/diff and fingerprints all staged/unstaged/untracked protected changes. Verification proves the exact Controller patch is separable while same-target user hunks and unrelated dirty/untracked work remain unchanged.",
+    "result_semantics": "A committed action with a durable nonzero process result is execution failure evidence, not an unknown action outcome.",
+    "milestone_boundary": "M1-T07 routes eligible failures only to repair_pending. It does not implement M1-T08 RecoveryManager/restart replay or M1-T09's actual second repair model attempt."
+  },
+  "tests": [
+    "strict_model_proposal_rejects_injected_state_success_and_permissions",
+    "readiness_requires_all_guard_classes_and_never_persists_ready_bit",
+    "exact_evidence_satisfaction_rejects_unrelated_retained_evidence",
+    "stale_evidence_record_invalidates_ready_lease_before_model_dispatch",
+    "verified_upstream_bindings_make_dependent_task_ready_and_misbound_record_blocks_it",
+    "permission_context_is_controller_owned_and_can_deny_repo_write",
+    "constrained_pressure_defers_before_ready_lease_is_issued",
+    "checkpoint_sequence_gap_blocks_readiness",
+    "baseline_drift_invalidates_ready_lease_and_advances_epoch",
+    "malformed_model_output_cannot_set_success_or_authority",
+    "wrong_literal_relation_cannot_satisfy_compiled_acceptance_contract",
+    "verifier_failure_cannot_transition_task_to_succeeded",
+    "preexisting_dirty_target_hunk_is_preserved_by_verified_controller_edit",
+    "verified_atomic_replace_preserves_target_file_mode",
+    "committed_nonzero_process_result_is_execution_failure_not_unknown",
+    "epoch_change_after_authorization_blocks_dispatch_before_mutation",
+    "exhausted_model_budget_defers_cleanly_before_backend_dispatch",
+    "compiled_task_model_call_ceiling_cannot_be_refilled_by_caller_budget",
+    "compiled_literal_relation_requires_old_to_new_relation_not_cooccurrence",
+    "exact_requirement_query_is_machine_executable_or_fails_closed",
+    "same_failure_circuit_breaker_requires_both_counters_below_limits",
+    "natural_language_goal_compiles_then_controller_edits_and_deterministically_verifies"
+  ],
+  "verification": {
+    "cargo_fmt_workspace_check": "passed",
+    "cargo_clippy_workspace_all_targets_offline_deny_warnings": "passed",
+    "cargo_test_sovereign_controller_offline": "passed: 3 unit + 18 integration",
+    "cargo_test_sovereign_eval_vertical_slice_offline": "passed: 1/1",
+    "cargo_test_workspace_offline": "passed; historical sovereign-model backend-test hang did not reproduce",
+    "git_diff_check": "passed",
+    "independent_current_source_audit": "passed: worker-7 re-audited the four prior counterexamples and reported M1-T07 closable with no blocker"
+  },
+  "completion_evidence": {
+    "end_to_end_event_journal": [
+      "controller:plan_activated",
+      "controller:task_model_call_consumed",
+      "controller:attempt_started",
+      "action:authorized",
+      "action:dispatched",
+      "action:observed",
+      "action:committed",
+      "controller:verification_recorded",
+      "controller:attempt_succeeded",
+      "controller:task_succeeded"
+    ],
+    "final_repository_diff": "eval vertical slice asserts only src/settings/SettingsForm.tsx changes from Save to Apply and the focused test file remains untouched",
+    "verification_evidence_ids": "eval vertical slice requires evidence.verification.* and a durable action_result_digest",
+    "controller_owned_model_call_counter": "eval vertical slice persists exactly one consumed task model call; refill test proves compiled zero-call ceiling blocks with caller budget still untouched",
+    "dirty_hunk_preservation": "integration test proves same-target user hunk plus unrelated staged, unstaged and untracked work remain byte/diff exact",
+    "target_mode_preservation": "integration test proves a 0755 target remains 0755 after verified atomic replacement",
+    "dependency_bindings": "compiler-produced short-linear plan is blocked before upstream verification, becomes ready after fresh verified bindings, and blocks again when a binding is misbound",
+    "current_code_verified": true
+  },
+  "m1_gate_6": {
+    "status": "open",
+    "reason": "T07 proves Controller/tool/edit/verification behavior with a deterministic local fake model backend and real local isolated mutation. Representative real-Qwen repair plus restart/resume qualification remains owned by T08/T09 and final M1 engineering qualification."
+  }
+}

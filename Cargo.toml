@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "apps/sovereign",
     "crates/sovereign-context",
+    "crates/sovereign-controller",
     "crates/sovereign-eval",
     "crates/sovereign-evidence",
     "crates/sovereign-model",

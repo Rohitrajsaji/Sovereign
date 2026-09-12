@@ -61,12 +61,20 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
    - Required tests/evidence: runtime Seatbelt probe, nested protected-root fixture, PATH-shim fixture, offline network fixture, selective-network request fail-closed fixture.
 
 6. **Representative M1 model qualification**
-   - Status: M1-T10 compiler qualification passed on the target machine with exact rendered/schema/output-reserve accounting and current evidence in `implementation/evidence/M1-T10-model-smoke.json`; Controller/edit/verification/repair/restart qualification remains open.
+   - Status: M1-T10 compiler qualification passed on the target machine with exact rendered/schema/output-reserve accounting and current evidence in `implementation/evidence/M1-T10-model-smoke.json`. M1-T07 Controller/edit/deterministic-verification behavior is now closed with current evidence in `implementation/evidence/M1-T07.json`, using the deterministic local fake model backend plus a real isolated local repository mutation. Real-Qwen repair and restart/resume qualification remain open under M1-T08/M1-T09 and the final M1 engineering packet.
    - Status: **OPEN — required before M1 closure.** Historical M1-T03 short smoke remains valid only for short tool-call viability.
    - Planned proof owners: M1-T10, M1-T07, M1-T08, M1-T09 plus a current real-model full-packet report.
    - Preserve M1-T03 short real tool-call smoke as valid evidence only for short tool-call viability (206 input tokens); do not represent it as an 8k engineering packet.
    - Before M1 closure, exercise representative fully rendered packets with measured total tokens, actual prefill, peak/steady RSS, compressor/swap deltas, a real repository edit, deterministic verification, one bounded repair, and restart/resume.
    - Required evidence is produced by the compiler/controller/repair/restart vertical-slice tasks, not by context-tier loading alone.
+
+## M1-T07 closure update
+
+- M1-T07 is durably complete; current evidence is `implementation/evidence/M1-T07.json` and `BUILD_STATE.json` advances only to M1-T08.
+- Current verification includes strict workspace Clippy, 3 Controller unit tests, 18 Controller integration tests, the natural-language compiler→Controller→real local isolated edit→deterministic verifier eval slice, and the full offline workspace suite.
+- Revalidated remediation properties include durable action-result semantics, no persisted `ready` bit, Controller-owned compiled model-call ceilings, exact current evidence/dependency bindings, ReadyLease checkpoint/evidence/epoch recomputation before dispatch, and exact preservation of pre-existing staged/unstaged/untracked user work and target file mode.
+- M1-T07 does not implement restart/recovery replay or a second repair attempt; those remain M1-T08 and M1-T09 respectively.
+- Representative real-model gate 6 remains OPEN; T07 closure must not be represented as the final M1 local-model engineering qualification.
 
 ## Product delivery steering
 
