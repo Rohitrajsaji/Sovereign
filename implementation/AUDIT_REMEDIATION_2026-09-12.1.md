@@ -17,6 +17,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
    - Required tests/evidence: model backend request accounting tests, tool/schema/template overhead fixture, oversized complete request pre-dispatch rejection, stalled/slow HTTP wall-deadline test, representative full-packet real-model evidence.
 
 2. **Durable action outcomes**
+   - Status: resolved for the T04 minimum; current evidence is `implementation/evidence/M1-T04.json` and committed source checkpoint `1884f86`.
    - Status: **RESOLVED for M1-T04; revalidated again in Controller/crash-resume integration before M1 closure.**
    - Source: `crates/sovereign-tools/src/lib.rs`, `crates/sovereign-state/migrations/0003_security_kernel.sql`.
    - Tests: `process_runner_refuses_execution_until_exact_action_is_durably_authorized`, `published_receipt_before_state_observation_never_creates_false_commit`, `observed_receipt_survives_restart_and_can_then_commit`, `committed_action_requires_durable_result_reference`.
@@ -26,6 +27,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
    - Required tests/evidence: crash during execution, after evidence publication/before action-state commit, and after commit; recovery must never expose a committed action without recoverable result evidence.
 
 3. **Cleanup proof**
+   - Status: resolved for the T04 minimum with fail-closed recovery blocking when descendant death cannot be proven; richer recovery remains M1-T08.
    - Status: **RESOLVED for M1-T04 minimum.**
    - Source: `crates/sovereign-tools/src/lib.rs`, `crates/sovereign-policy/src/lib.rs`.
    - Tests: `timeout_kills_and_reaps_the_entire_process_group`, `escaped_descendant_holding_output_pipe_is_bounded_and_recovery_blocked`, `output_disk_and_subprocess_ceilings_terminate_bounded_commands`.
@@ -36,6 +38,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
    - Required tests/evidence: normal descendant cleanup, escaped-session child fixture, inherited-pipe holder fixture, bounded drain timeout, `unknown`/recovery-blocked transition trace.
 
 4. **Version-3 state migration reconciliation**
+   - Status: resolved; exactly one canonical runtime/manifest v3 remains and v2→v3 compatibility is tested.
    - Status: **RESOLVED.**
    - Source: canonical `crates/sovereign-state/migrations/0003_security_kernel.sql` plus `manifest.json` and runtime `MIGRATIONS`.
    - Compatibility decision: no persistent project v3 DB existed; v2 is upgraded in place, while a conflicting recorded v3 checksum fails closed.
@@ -46,6 +49,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
    - Required tests/evidence: fresh schema v3, reopen/idempotence, explicit old-v2-to-v3 upgrade, duplicate-version rejection/absence, failed v4 fixture rollback, manifest/runtime agreement.
 
 5. **Isolation capability truthfulness**
+   - Status: resolved for the M1 offline macOS profile; selective task networking and a complete read namespace jail remain unavailable rather than best-effort.
    - Status: **RESOLVED for M1-T04 minimum.**
    - Source: `crates/sovereign-policy/src/lib.rs`, `crates/sovereign-tools/src/lib.rs`.
    - Tests: `mac_sandbox_denies_protected_home_read_and_offline_network`, `inherited_sensitive_environment_is_absent_unless_individually_authorized`, `process_exec_does_not_imply_repository_write_and_isolation_binding_is_exact`, pinned-executable tests.
