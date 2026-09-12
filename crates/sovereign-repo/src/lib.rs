@@ -31,6 +31,13 @@ pub enum RepoError {
     InvalidRelativePath(PathBuf),
     NonUtf8GitOutput(&'static str),
     MalformedGitStatus(String),
+    StaleFileHash {
+        path: PathBuf,
+        expected: String,
+        actual: String,
+    },
+    NotRegularFile(PathBuf),
+    InvalidSearch(String),
     GitFailed {
         operation: &'static str,
         status: Option<i32>,
@@ -71,6 +78,19 @@ impl Display for RepoError {
                 write!(f, "Git {operation} returned a non-UTF-8 path/output")
             }
             Self::MalformedGitStatus(record) => write!(f, "malformed Git status record {record:?}"),
+            Self::StaleFileHash {
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "stale file hash for {}: expected {expected}, current {actual}",
+                path.display()
+            ),
+            Self::NotRegularFile(path) => {
+                write!(f, "{} is not a regular file", path.display())
+            }
+            Self::InvalidSearch(message) => write!(f, "invalid exact search: {message}"),
             Self::GitFailed {
                 operation,
                 status,
@@ -186,6 +206,191 @@ pub struct InstructionDocument {
     pub relative_path: PathBuf,
     pub digest: String,
     pub content: String,
+}
+
+/// Exact, current source evidence for one repository-relative file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactFileEvidence {
+    pub repository_id: String,
+    pub relative_path: PathBuf,
+    pub digest: String,
+    pub content: String,
+    pub byte_len: u64,
+}
+
+/// One deterministic literal-search hit over current repository source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactSearchHit {
+    pub repository_id: String,
+    pub relative_path: PathBuf,
+    pub source_digest: String,
+    pub line_number: u64,
+    pub line: String,
+}
+
+/// Bounded literal-search request. This is the M1 exact/`rg`-equivalent path;
+/// it has no semantic/vector dependency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactSearchQuery<'a> {
+    pub text: &'a str,
+    pub max_hits: usize,
+    pub max_files: usize,
+    pub max_file_bytes: u64,
+    pub max_line_bytes: usize,
+}
+
+/// Current tracked-worktree diff evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExactDiffEvidence {
+    pub repository_id: String,
+    pub digest: String,
+    pub content: String,
+}
+
+/// Deterministic exact repository retriever used by the M1 context planner.
+pub struct ExactRetriever<'a> {
+    registry: &'a ProjectRegistry,
+}
+
+impl<'a> ExactRetriever<'a> {
+    #[must_use]
+    pub const fn new(registry: &'a ProjectRegistry) -> Self {
+        Self { registry }
+    }
+
+    /// Reads one current file, optionally requiring a previously observed hash.
+    /// A stale expected hash is rejected; callers may then deliberately refresh
+    /// by reading again without the stale expectation.
+    ///
+    /// # Errors
+    /// Returns [`RepoError`] for unknown repositories, unsafe paths, symlinks,
+    /// non-files, non-UTF-8 source, I/O failure, or stale expected hashes.
+    pub fn read_path(
+        &self,
+        repository_id: &str,
+        relative_path: &Path,
+        expected_digest: Option<&str>,
+    ) -> Result<ExactFileEvidence, RepoError> {
+        let repository = self.registry.registered(repository_id)?;
+        validate_relative_path(relative_path)?;
+        reject_existing_symlink_components(&repository.root, relative_path)?;
+        let absolute = repository.root.join(relative_path);
+        let metadata = fs::symlink_metadata(&absolute)?;
+        if metadata.file_type().is_symlink() {
+            return Err(RepoError::SymlinkPath(absolute));
+        }
+        if !metadata.is_file() {
+            return Err(RepoError::NotRegularFile(absolute));
+        }
+        let bytes = fs::read(&absolute)?;
+        let digest = sha256_prefixed(&bytes);
+        if let Some(expected) = expected_digest
+            && expected != digest
+        {
+            return Err(RepoError::StaleFileHash {
+                path: relative_path.to_path_buf(),
+                expected: expected.to_owned(),
+                actual: digest,
+            });
+        }
+        let content =
+            String::from_utf8(bytes).map_err(|_| RepoError::NonUtf8GitOutput("exact file read"))?;
+        Ok(ExactFileEvidence {
+            repository_id: repository_id.to_owned(),
+            relative_path: relative_path.to_path_buf(),
+            digest,
+            byte_len: u64::try_from(content.len()).unwrap_or(u64::MAX),
+            content,
+        })
+    }
+
+    /// Performs bounded literal search over regular UTF-8 files in stable path
+    /// order, skipping `.git` and all symlinks.
+    ///
+    /// # Errors
+    /// Returns [`RepoError`] for invalid bounds, unknown repositories, or I/O
+    /// failures while traversing the current source tree.
+    pub fn search_literal(
+        &self,
+        repository_id: &str,
+        query: &ExactSearchQuery<'_>,
+    ) -> Result<Vec<ExactSearchHit>, RepoError> {
+        if query.text.is_empty()
+            || query.max_hits == 0
+            || query.max_files == 0
+            || query.max_file_bytes == 0
+            || query.max_line_bytes == 0
+        {
+            return Err(RepoError::InvalidSearch(
+                "text and all search bounds must be non-empty/positive".to_owned(),
+            ));
+        }
+        let repository = self.registry.registered(repository_id)?;
+        let mut paths = Vec::new();
+        collect_regular_files(&repository.root, Path::new(""), query.max_files, &mut paths)?;
+        paths.sort();
+
+        let mut hits = Vec::new();
+        for relative_path in paths {
+            if hits.len() >= query.max_hits {
+                break;
+            }
+            let absolute = repository.root.join(&relative_path);
+            let metadata = fs::metadata(&absolute)?;
+            if metadata.len() > query.max_file_bytes {
+                continue;
+            }
+            let bytes = fs::read(&absolute)?;
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let digest = sha256_prefixed(&bytes);
+            for (line_index, line) in text.lines().enumerate() {
+                if !line.contains(query.text) {
+                    continue;
+                }
+                let bounded = truncate_utf8_bytes(line, query.max_line_bytes);
+                hits.push(ExactSearchHit {
+                    repository_id: repository_id.to_owned(),
+                    relative_path: relative_path.clone(),
+                    source_digest: digest.clone(),
+                    line_number: u64::try_from(line_index.saturating_add(1)).unwrap_or(u64::MAX),
+                    line: bounded,
+                });
+                if hits.len() >= query.max_hits {
+                    break;
+                }
+            }
+        }
+        Ok(hits)
+    }
+
+    /// Captures the current tracked Git diff for the registered repository.
+    ///
+    /// # Errors
+    /// Returns [`RepoError`] for unknown repositories or Git failures.
+    pub fn current_diff(&self, repository_id: &str) -> Result<ExactDiffEvidence, RepoError> {
+        let repository = self.registry.registered(repository_id)?;
+        let output = git_required(
+            &repository.root,
+            "read current diff",
+            &[
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-color",
+                "HEAD",
+                "--",
+            ],
+        )?;
+        let content = String::from_utf8(output.stdout)
+            .map_err(|_| RepoError::NonUtf8GitOutput("current diff"))?;
+        Ok(ExactDiffEvidence {
+            repository_id: repository_id.to_owned(),
+            digest: sha256_prefixed(content.as_bytes()),
+            content,
+        })
+    }
 }
 
 /// Deterministically resolves root-to-leaf `AGENTS.md` instruction scope.
@@ -645,6 +850,51 @@ fn reject_existing_symlink_components(root: &Path, path: &Path) -> Result<(), Re
         }
     }
     Ok(())
+}
+
+fn collect_regular_files(
+    root: &Path,
+    relative_dir: &Path,
+    max_files: usize,
+    output: &mut Vec<PathBuf>,
+) -> Result<(), RepoError> {
+    if output.len() >= max_files {
+        return Ok(());
+    }
+    let absolute_dir = root.join(relative_dir);
+    let mut entries = fs::read_dir(&absolute_dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        if output.len() >= max_files {
+            break;
+        }
+        let name = entry.file_name();
+        if relative_dir.as_os_str().is_empty() && name == ".git" {
+            continue;
+        }
+        let relative = relative_dir.join(&name);
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            collect_regular_files(root, &relative, max_files, output)?;
+        } else if metadata.is_file() {
+            output.push(relative);
+        }
+    }
+    Ok(())
+}
+
+fn truncate_utf8_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 fn valid_repository_id(id: &str) -> bool {

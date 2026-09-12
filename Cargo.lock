@@ -703,6 +703,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-context"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "sovereign-evidence",
+ "sovereign-repo",
+]
+
+[[package]]
 name = "sovereign-evidence"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,55 @@
+{
+  "schema": "sovereign-task-evidence-v1",
+  "task": "M1-T06",
+  "status": "completed",
+  "completed_at_utc": "2026-09-12T18:11:01Z",
+  "title": "Implement bounded context packet and simple exact retrieval",
+  "dependency_evidence": [
+    "implementation/evidence/M1-T01.json",
+    "implementation/evidence/M1-T02.json",
+    "implementation/evidence/M1-T05.json"
+  ],
+  "source_hashes": {
+    "Cargo.toml": "sha256:fc3693c6329f79f5014f018529243775cd917b273cb491ee7ff3a9ee0f77c6c0",
+    "Cargo.lock": "sha256:985dd1a9086b38bb9a547d036283e6a76809731b168a05f35529a0b9bdd92e01",
+    "crates/sovereign-context/Cargo.toml": "sha256:4f6b9bb5d12c7f97f61d40d4113cc54c5000f7a81c176e9721c746dacd852745",
+    "crates/sovereign-context/src/lib.rs": "sha256:9afe143b235ee3e4dab1129ec2be149561991c74160c3f4491e61171a6cecf7c",
+    "crates/sovereign-context/tests/context_packet.rs": "sha256:0f851e1762f89b373a8ae904f7ba071df93cb72d5c4e7d9a3731badb017c0697",
+    "crates/sovereign-repo/src/lib.rs": "sha256:c2b26b603aad91d51917038579e2078d216c15c816b86f4c5ed59d30b3d67507",
+    "crates/sovereign-repo/tests/exact_retrieval.rs": "sha256:f5c86e5f2f375d0f5506d46bcc2748b930fac55d92fcfd939e178494fb18590f"
+  },
+  "implementation": {
+    "bounded_packets": "ContextPlanner rebuilds C0/C1 projections per invocation with separate ceilings for mandatory controller/task/state/output-schema content, routed evidence, tool schemas, and tool/failure synopses; unused budget is not backfilled with unrelated evidence.",
+    "stable_order": "Weak-model packet order is controller prefix, relevant tool schema, task contract, current state, direct C1 evidence, routed expansion, tool/failure synopsis, then typed output schema.",
+    "exact_retrieval": "ExactRetriever performs current path reads, bounded stable literal search, and current Git diff retrieval without embeddings or semantic indexes; stale expected file hashes fail closed and may then be deliberately refreshed.",
+    "provenance_and_dedup": "Evidence items carry source/content digests, provenance/trust/routing metadata, repository locators, token costs, and digest-based duplicate removal.",
+    "expansion": "Budget truncation emits source-bound expansion handles; compressed tool evidence exposes retained CAS expansion handles rather than raw logs in the model packet.",
+    "mode_exclusions": "Full repository dumps, conversation/prior-attempt transcripts, raw tool logs, and hidden reasoning are excluded by default. Repair mode keeps current diff/failure/implicated evidence; reviewer mode excludes implementer reasoning trajectory."
+  },
+  "tests": [
+    "c0_cannot_be_evicted_when_required_contract_exceeds_its_ceiling",
+    "duplicate_evidence_is_removed_by_content_digest",
+    "budget_truncation_produces_an_expansion_handle",
+    "packet_uses_frozen_weak_model_section_order",
+    "instruction_diff_and_compressed_tool_evidence_keep_provenance_and_handles",
+    "forbidden_bulk_context_is_absent_by_default",
+    "unused_budget_stays_empty_instead_of_backfilling_unrelated_evidence",
+    "repair_packet_excludes_prior_transcript_and_keeps_diff_failure_implicated_evidence",
+    "reviewer_packet_excludes_implementer_hidden_reasoning",
+    "stale_file_hash_is_rejected_then_current_read_refreshes",
+    "literal_search_is_bounded_current_and_stably_ordered",
+    "current_diff_returns_source_bearing_digest_without_index_dependency"
+  ],
+  "verification": {
+    "cargo_fmt_workspace": "passed",
+    "cargo_clippy_workspace_all_targets_deny_warnings": "passed",
+    "cargo_test_sovereign_context_repo_offline": "passed: 9 context packet + 5 repo baseline + 3 exact retrieval",
+    "cargo_test_workspace_offline": "passed",
+    "git_diff_check": "passed"
+  },
+  "completion_evidence": {
+    "context_packet_fixture_under_8k": "passed via packet_uses_frozen_weak_model_section_order using ContextBudget::m1_8k()",
+    "full_repository_or_conversation_absent_by_default": true,
+    "current_code_verified": true
+  }
+}
