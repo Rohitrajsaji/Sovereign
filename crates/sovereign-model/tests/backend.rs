@@ -524,6 +524,9 @@ impl TestServer {
                     Err(error) => panic!("accept test request: {error}"),
                 };
                 stream
+                    .set_nonblocking(false)
+                    .unwrap_or_else(|error| panic!("set accepted stream blocking: {error}"));
+                stream
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap_or_else(|error| panic!("set read timeout: {error}"));
                 let request = read_request(&mut stream);
