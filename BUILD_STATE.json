@@ -9,6 +9,8 @@
   "current_gate": "M1-real-model-qualification",
   "active_steering": {
     "audit_remediation": "implementation/AUDIT_REMEDIATION_2026-09-12.1.md",
+    "codex_release_audit": "output/CODEX_RELEASE_AUDIT_2026-09-13.md",
+    "codex_release_audit_acknowledged_at": "2026-09-13T04:46:15Z",
     "product_delivery_amendment": "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md",
     "ordering": "finish core M1 before product-delivery profile",
     "release_boundary": "local verified release only; publication/spending/secret access/destructive external actions require explicit approval"
