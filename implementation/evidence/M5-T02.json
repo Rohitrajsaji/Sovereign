@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "task_id": "M5-T02",
+  "title": "Implement progressive skill registry",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "39b2f810f7b8518c11ac70d523b5cba2ce1fafc5",
+  "status": "completed",
+  "completed_at": "2026-09-13T19:33:35Z",
+  "verified_at": "2026-09-13T19:33:35Z",
+  "dependencies": [
+    "M5-T01"
+  ],
+  "interfaces": [
+    "SkillManifest",
+    "SkillRegistry",
+    "SkillSelector"
+  ],
+  "schema_contract": {
+    "name": "SkillManifest",
+    "version": 1,
+    "typed": true,
+    "metadata_only_registry": true,
+    "multiple_versions_coexist": true,
+    "pin_shape": "{id,version,digest}",
+    "pin_digest_semantics": "SHA256 over the complete typed manifest after validation requires one canonical lexical relative body_path; manifest semantics include id/version/path/body SHA256 and all typed metadata",
+    "body_digest_reverified_independently": true
+  },
+  "discovery_and_selection": {
+    "manifest_glob": "*.skill.json",
+    "manifest_count_ceiling": 4096,
+    "manifest_byte_ceiling": 32768,
+    "full_bodies_read_during_discovery": 0,
+    "selector": "deterministic metadata-only top-N",
+    "default_max_selected": 4,
+    "hard_max_selected": 16,
+    "execution_resolves_frozen_pins_without_reselection": true,
+    "catalogue_size_fixture": {
+      "small_catalogue_entries": 1,
+      "large_catalogue_entries": 1001,
+      "selected_metadata_identical": true,
+      "context_packet_identical": true,
+      "final_serialized_input_token_count_identical": true,
+      "unselected_body_text_present_in_metadata": false
+    }
+  },
+  "selected_skill_fixture": {
+    "query": "rust",
+    "top_n": 2,
+    "body_reads": 2,
+    "tokenizer_id": "utf8-ceil4-v1",
+    "selected_metadata_bytes": 442,
+    "selected_metadata_tokens": 111,
+    "selected_body_bytes": 21,
+    "selected_body_tokens": 6,
+    "skills": [
+      {
+        "id": "rust-repair",
+        "version": "1.0.0",
+        "pin_digest": "sha256:426a9269b1a0ad0bd778bcf2f90e9da55464b7610c432cb97b933c41437210f6",
+        "body_path": "rust-repair.md",
+        "body_digest": "sha256:264fd37cf7fdaaf30b1eb057d14bfec42d0ee1e1f65550a580c1fde81bd8fc44",
+        "body_tokens": 3
+      },
+      {
+        "id": "rust-style",
+        "version": "1.0.0",
+        "pin_digest": "sha256:acfc54501209671b10675f7dd61a65343fc87c0cae172937015a3e963600875c",
+        "body_path": "rust-style.md",
+        "body_digest": "sha256:20fa9af0d274ac31e8676ecb14eb777c5517f1c44a133d7026e83576d2cd34cb",
+        "body_tokens": 3
+      }
+    ]
+  },
+  "budgets": {
+    "default_per_body_bytes": 32768,
+    "hard_per_body_bytes": 131072,
+    "default_total_body_bytes": 65536,
+    "default_total_body_tokens": 1600,
+    "hard_total_body_tokens": 3200,
+    "default_selected_metadata_tokens": 512,
+    "final_context_planner_budget_remains_authoritative": true,
+    "bounded_file_read": "take(byte_ceiling + 1) followed by explicit overflow rejection"
+  },
+  "path_and_integrity_guards": {
+    "absolute_path_denied": true,
+    "parent_traversal_denied": true,
+    "symlink_escape_denied": true,
+    "noncanonical_equivalent_spellings_denied": [
+      "a//b.md",
+      "a/./b.md",
+      "a/b.md/"
+    ],
+    "canonical_equivalent_spelling_accepted": "a/b.md",
+    "invalid_utf8_denied": true,
+    "body_digest_mismatch_denied": true,
+    "byte_budget_overrun_denied": true,
+    "token_budget_overrun_denied": true
+  },
+  "authority_contract": {
+    "loaded_body_evidence_kind": "instruction",
+    "loaded_body_trust": "untrusted",
+    "loaded_body_context_level": "C1",
+    "tool_hints_are_descriptive_only": true,
+    "resource_hints_are_descriptive_only": true,
+    "skill_can_mutate_permission_context": false,
+    "skill_can_grant_network_write": false,
+    "skill_can_grant_destructive": false,
+    "skill_can_mark_task_success": false,
+    "skill_can_mark_task_completion": false,
+    "skill_can_activate_or_rewrite_plan_ir": false,
+    "new_database": false,
+    "new_state_store": false,
+    "new_lifecycle_writer": false
+  },
+  "acceptance_tests": [
+    "skills_body_hash_and_token_budget_fail_closed",
+    "skills_plan_pin_commits_path_manifest_and_body_and_old_versions_remain_resolvable",
+    "skills_manifest_and_filesystem_paths_fail_closed_and_body_read_is_bounded",
+    "skills_malicious_permission_request_is_untrusted_and_cannot_elevate",
+    "skills_top_n_body_load_reads_only_selected_exact_pins_deterministically",
+    "skills_metadata_only_discovery_does_not_read_bodies",
+    "skills_catalogue_size_does_not_change_selected_metadata_or_context_packet"
+  ],
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --offline -- skills",
+      "result": "passed",
+      "detail": "7/7 focused skill regressions"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy -p sovereign-controller --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test --workspace --offline",
+      "result": "passed",
+      "detail": "all non-ignored workspace tests passed on the repaired exact source; controller unit 27/27 and t07 33/33"
+    }
+  ],
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "independent_audit": {
+    "worker": "worker-34",
+    "initial_result": "NOT CLOSABLE",
+    "initial_blocker": "equivalent lexical body-path spellings were accepted while raw path strings produced distinct manifest/pin digests",
+    "repair": "require canonical_relative_body_path(path) to equal the raw manifest body_path; equivalent noncanonical spellings fail closed",
+    "final_result": "CLOSABLE",
+    "final_blockers": [],
+    "final_source_hash": "sha256:d137b9a8778ab6220beb213f7d139e40d6ed4caaa535b0b24aa055a2c63ed273",
+    "notes": "Fresh read-only exact-tree re-audit reconfirmed discovery, bounded loading, version/hash/path pinning, authority isolation, token/byte budgets, and canonical path semantics."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429"
+  },
+  "source_hashes": {
+    "crates/sovereign-controller/src/skills.rs": "sha256:d137b9a8778ab6220beb213f7d139e40d6ed4caaa535b0b24aa055a2c63ed273",
+    "crates/sovereign-controller/src/lib.rs": "sha256:48c00ae003b77f2405548129a2dfc024e00add04174efa6a90fc353274d80d1c"
+  },
+  "network_runtime_dependency": false
+}

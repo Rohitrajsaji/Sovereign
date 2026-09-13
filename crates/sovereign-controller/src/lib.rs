@@ -51,10 +51,20 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod roles;
+mod skills;
 
 pub use roles::{
     ROLE_OUTPUT_SCHEMA_VERSION, ROLE_PROFILE_SCHEMA_VERSION, RoleDisposition, RoleId, RoleOutputV1,
     RoleProfile, RoleRegistry, RoleToolClass,
+};
+pub use skills::{
+    DEFAULT_MAX_DISCOVERED_MANIFESTS, DEFAULT_MAX_SELECTED_BODY_BYTES,
+    DEFAULT_MAX_SELECTED_BODY_TOKENS, DEFAULT_MAX_SELECTED_METADATA_TOKENS,
+    DEFAULT_MAX_SELECTED_SKILLS, DEFAULT_MAX_SKILL_BODY_BYTES, FilesystemSkillBodySource,
+    HARD_MAX_SELECTED_BODY_TOKENS, HARD_MAX_SELECTED_SKILLS, HARD_MAX_SKILL_BODY_BYTES,
+    HARD_MAX_SKILL_MANIFEST_BYTES, LoadedSkill, SKILL_MANIFEST_SCHEMA_VERSION, SkillBodySource,
+    SkillCandidate, SkillError, SkillLoadBudget, SkillManifest, SkillPin, SkillRegistry,
+    SkillSelection, SkillSelectionInput, SkillSelector,
 };
 
 pub const MODEL_PROPOSAL_SCHEMA_VERSION: u32 = 1;
