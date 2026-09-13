@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "task_id": "M2-T04",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "2a1e14f",
+  "status": "completed",
+  "completed_at": "2026-09-13T08:29:49Z",
+  "scope": [
+    "crates/sovereign-context immutable per-attempt context/token telemetry over final ContextPacket + RetrievalTrace + typed outcome/use facts",
+    "crates/sovereign-eval deterministic versioned aggregation by task/depth/role"
+  ],
+  "interfaces": [
+    "ContextMetrics",
+    "ContextTelemetry",
+    "AttemptContextMetrics",
+    "AttemptOutcomeFacts",
+    "EvidenceUseFacts",
+    "ProviderTokenUsage",
+    "MetricRatio",
+    "RetrievalRouteKind",
+    "RouteContextMetrics",
+    "EvaluationAttemptRecord",
+    "EvaluationMetricReport",
+    "aggregate_context_metrics"
+  ],
+  "metric_contract": {
+    "attempt_schema": "sovereign-context-metrics-v1",
+    "report_schema": "sovereign-context-token-report-v1",
+    "ratio_representation": "numerator + denominator + optional integer parts_per_million; denominator zero or not-applicable => parts_per_million null",
+    "token_accounting": "Provider input/output usage is authoritative independently when present. A missing side uses the injected pinned TokenCounter; the default fallback is utf8-ceil4-v1 and the accounting source/tokenizer identity is recorded.",
+    "packet_accounting": [
+      "candidate tokens before dedupe",
+      "evidence-only candidate tokens before dedupe",
+      "selected tokens after dedupe",
+      "duplicate tokens removed",
+      "tokens by context level",
+      "tokens by evidence kind",
+      "tokens by packet section",
+      "stable prefix tokens",
+      "reused evidence tokens",
+      "tool schema tokens",
+      "final serialized input tokens"
+    ],
+    "injected_evidence_denominator": "Only final packet DirectEvidence/RoutedExpansion/ToolEvidence items participate; C0 and tool schemas are excluded.",
+    "used_evidence": "Unique typed union of cited, authorized-action-linked, expanded, deterministic-verification-linked, and failure-linked evidence IDs, intersected with final injected evidence. No model prose scraping is used.",
+    "context_precision": "used evidence tokens / injected evidence tokens",
+    "context_waste": "injected evidence tokens not in the typed used union / injected evidence tokens",
+    "duplicate_context_ratio": "duplicate-digest tokens / total candidate tokens before dedupe, including required C0, exactly as architecture section 16 defines it",
+    "context_reuse_and_cross_attempt_carry": "reused injected evidence tokens / injected evidence tokens",
+    "packet_fill": "final serialized input tokens / max input tokens",
+    "tool_schema_ratio": "tool schema tokens / final serialized input tokens",
+    "tool_compression": "supplied raw output bytes / supplied synopsis bytes; telemetry never reopens tool artifacts",
+    "route_hit_quality": "verified-success useful selected evidence / raw route selected evidence; failure-linked evidence remains valid overall context use but is not route-useful without verified success"
+  },
+  "retrieval_routes": {
+    "taxonomy": [
+      "exact",
+      "lexical",
+      "symbol",
+      "dependency",
+      "diff",
+      "episodic",
+      "semantic"
+    ],
+    "channel_mapping": {
+      "Exact": "exact",
+      "Lexical": "lexical",
+      "Symbol": "symbol",
+      "Structural": "dependency",
+      "Diff": "diff",
+      "History": "episodic",
+      "Semantic": "semantic"
+    },
+    "per_route_facts": [
+      "attempts",
+      "steps",
+      "candidates",
+      "selected",
+      "injected tokens",
+      "verified-useful selected",
+      "stale rejected as Option",
+      "refreshes",
+      "expansions",
+      "retrieval hit quality"
+    ],
+    "final_packet_join": "EvidenceChannelLink now binds evidence_id + channel + source_digest + content_digest. Route attribution joins only to the deduplicated final packet and assigns each injected item once to its earliest valid trace link, preventing cross-channel token/use double counting.",
+    "unavailable_notes": "HistoryUnavailable and SemanticUnavailable remain trace steps but are not counted as actual retrieval attempts. SemanticUnavailable therefore is not semantic escalation.",
+    "stale_unknown": "Unknown stale-rejection counts remain null/None rather than fabricated zero and poison aggregate stale-rate observability for that route group.",
+    "semantic_incremental": "Only verified-success attempts can contribute useful semantic items. Useful semantic injected items are content-digest-compared against cheaper injected routes. Failed attempts therefore cannot create semantic incremental value. M2 has no real semantic route, so SemanticUnavailable leaves semantic incremental denominator zero/null."
+  },
+  "evaluation_aggregation": {
+    "ordering": "BTreeMap deterministic grouping/route ordering with stable attempt ordering",
+    "group_key": [
+      "task_id",
+      "depth",
+      "role"
+    ],
+    "aggregates": [
+      "attempt count",
+      "total model tokens",
+      "tokens per verified task",
+      "tokens per verified change",
+      "reasoning retries per verified task",
+      "context escalation distribution",
+      "first-pass verification rate",
+      "per-route attempts/steps/candidates/selected/tokens/usefulness/stale rates",
+      "semantic escalation rate",
+      "semantic incremental hit rate"
+    ],
+    "zero_success": "Verified-task/change/retry/first-pass denominators remain zero with null fixed-point result when there is no verified success/accepted change."
+  },
+  "fixture_evidence": {
+    "provider_precedence_and_fallback": "context_metrics_provider_usage_wins_and_typed_use_is_unique_after_packet_dedupe proves input provider count 777 wins exactly while missing output usage falls back to utf8-ceil4-v1.",
+    "dedupe": "Final packet evidence is deduplicated by content digest before telemetry; evidence-only candidate tokens and duplicate removed tokens make the before/after denominator reproducible.",
+    "single_route_ownership": "A trace linking the same final item through multiple channels attributes that item once; a source/content digest mismatch rejects the trace-to-packet join.",
+    "route_quality": "context_metrics_retrieval_hit_quality_uses_route_selected_not_injected_denominator proves selected=2, injected=1, useful=1 => 500000 ppm rather than 1000000 ppm.",
+    "failed_attempt_use": "Failure-linked evidence contributes to overall context use while route useful_selected remains zero and hit-quality fixed point is not applicable without verified success.",
+    "unavailable_routes": "Explicit regressions prove both SemanticUnavailable and HistoryUnavailable notes are steps but not actual semantic/episodic retrieval attempts.",
+    "medium_success_without_semantic": {
+      "test": "m2_medium_d2_goal_succeeds_with_real_routing_and_context_token_metrics_without_semantic",
+      "milestone_gate_proof": true,
+      "fixture_kind": "real local Git repository with production lexical/structural derived indexes, RepositoryRetrievalBackend, RetrievalRouter, bounded ContextPacket, canonical PlanCompiler, authoritative Controller execution, ContextTelemetry, and aggregate_context_metrics",
+      "plan_depth": "D2",
+      "controller_tasks": 2,
+      "edits": [
+        "src/settings/SettingsForm.tsx Save -> Apply",
+        "src/settings/SettingsForm.test.tsx Save -> Apply"
+      ],
+      "exact_upstream_evidence_anchor": "exact:path=src/settings/SettingsForm.tsx;contains=Save",
+      "verified_success": true,
+      "semantic_attempts": 0,
+      "semantic_escalation_numerator": 0,
+      "semantic_incremental_denominator": 0,
+      "exact_route_attempts_positive": true,
+      "exact_route_injected_tokens_positive": true,
+      "total_model_tokens_positive": true,
+      "final_source_and_test_verified": true
+    },
+    "deterministic_report": "metrics_report_is_versioned_btree_deterministic_and_aggregates_task_depth_role serializes identical JSON for the same attempts supplied in different orders.",
+    "stale_unknown_aggregation": "metrics_route_stale_unknown_is_preserved_across_aggregation proves one unobservable route attempt keeps aggregate stale_rejected/rate unknown.",
+    "duplicate_ratio_total_candidate_denominator": "context_metrics_provider_usage_wins_and_typed_use_is_unique_after_packet_dedupe asserts duplicate_context_ratio denominator equals packet.metrics.candidate_tokens_before_dedupe, not the evidence-only diagnostic candidate-token count.",
+    "failed_semantic_incremental": "context_metrics_failed_semantic_evidence_is_not_verified_incremental_value proves typed semantic evidence use on a failed attempt cannot contribute verified incremental semantic value.",
+    "synthetic_medium_telemetry_fixture": {
+      "test": "context_metrics_medium_fixture_succeeds_without_semantic_and_records_route_tokens",
+      "role": "unit-level synthetic telemetry coverage only; not the M2 milestone gate proof"
+    }
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-context -p sovereign-eval --offline",
+      "result": "passed",
+      "detail": "sovereign-context: context_metrics 9/9, context_packet 9/9, routing 18/18; sovereign-eval: compiler_vertical_slice 1/1, crash_resume 20/20, metrics 3/3, repair_loop 2/2, vertical_slice 2/2. compiler_real_smoke and m1_real_qualification remain ignored by their explicit local-Qwen guards."
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-context -p sovereign-eval --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "independent_audit": {
+    "worker": "worker-13",
+    "result": "CLOSABLE",
+    "blockers": [],
+    "notes": "Fresh independent read-only final audit of the exact current dirty tree/evidence found no remaining blocker. It re-read frozen M2-T04 and architecture section 16; verified the corrected duplicate-context denominator, the real D2 Controller/routing/telemetry milestone fixture, immutable packet+trace+typed-outcome telemetry semantics, provider/fallback accounting, typed evidence-use union, route taxonomy/quality/stale semantics, digest-bound single-route attribution, failed-attempt semantic gating, deterministic evaluation aggregation, evidence prose/test counts, and all nine source hashes. Independent package tests, strict clippy, fmt, and git diff checks passed."
+  },
+  "source_hashes": {
+    "Cargo.lock": "sha256:1febae5db1056544e98816fb4c3e6597d81576bdd981d105048ef8545db3d572",
+    "crates/sovereign-context/src/lib.rs": "sha256:e3b953f24976b533679a1a4c6540741ac05f87d244c303e028549f5ea1b209ae",
+    "crates/sovereign-context/src/routing.rs": "sha256:f1e400dc239c223bf8513d04be64e4f9537dd5be1224484c2342724c14592727",
+    "crates/sovereign-context/src/telemetry.rs": "sha256:c45017e6d0567c6ca7dc00550e0cf7f74a62f2af9af5a1457b9c477c5145391f",
+    "crates/sovereign-context/tests/context_metrics.rs": "sha256:280f10260d0401f500ea610ec1c83d4845a2c18b1efe47f9a525cf091de6ebe4",
+    "crates/sovereign-eval/Cargo.toml": "sha256:79e4b69756cae4c873a68c2377eff45d92b238875d9618d1dea719e7cc02a177",
+    "crates/sovereign-eval/src/lib.rs": "sha256:fa3bbb66bb3b0e42ce8ddff5b05b8fe857b3c2f6895925beb345d4c1d325158c",
+    "crates/sovereign-eval/tests/metrics.rs": "sha256:34a8a46d74c2f5a2048152d216049210ff046d35031641aa3ae89aa574e3c09c",
+    "crates/sovereign-eval/tests/vertical_slice.rs": "sha256:2abed474b45d0180f5a294c435458e6e0c65364ae43e34b2baf5031da3a83d00"
+  }
+}

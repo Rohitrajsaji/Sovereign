@@ -132,6 +132,8 @@ pub struct RouteBoundFact {
 pub struct EvidenceChannelLink {
     pub evidence_id: String,
     pub channel: Channel,
+    pub source_digest: String,
+    pub content_digest: String,
 }
 
 /// Freshness and source identity returned by one bounded channel invocation.
@@ -1058,6 +1060,8 @@ impl TraceCollector {
             self.evidence_channels.push(EvidenceChannelLink {
                 evidence_id: item.evidence_id.clone(),
                 channel,
+                source_digest: item.source_digest.clone(),
+                content_digest: item.content_digest.clone(),
             });
             self.evidence.push(item);
         }

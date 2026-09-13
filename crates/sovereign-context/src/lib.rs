@@ -13,11 +13,17 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 mod routing;
+mod telemetry;
 
 pub use routing::{
     Channel, ChannelResult, ContextLevelPolicy, DiffResult, EvidenceChannelLink, FailureHistoryKey,
     HistoryProvider, RepositoryRetrievalBackend, RetrievalBackend, RetrievalIntent,
     RetrievalOutcome, RetrievalRouter, RetrievalTrace, RouteBoundFact, RouteStep, StopCondition,
+};
+pub use telemetry::{
+    AccountedTokens, AttemptContextMetrics, AttemptOutcomeFacts, ContextTelemetry,
+    EvidenceUseFacts, MemoryTelemetryFacts, MetricRatio, ProviderTokenUsage, RetrievalRouteKind,
+    RouteContextMetrics, TokenAccountingSource, ToolCompressionFact,
 };
 
 /// Progressive context levels implemented through M2; broader semantic/project-plan levels remain
@@ -397,10 +403,12 @@ pub struct ContextPacketInput {
 pub struct ContextMetrics {
     pub tokenizer_id: String,
     pub candidate_tokens_before_dedupe: u32,
+    pub evidence_candidate_tokens_before_dedupe: u32,
     pub selected_tokens_after_dedupe: u32,
     pub duplicate_tokens_removed: u32,
     pub tokens_by_level: BTreeMap<String, u32>,
     pub tokens_by_kind: BTreeMap<String, u32>,
+    pub tokens_by_section: BTreeMap<String, u32>,
     pub stable_prefix_tokens: u32,
     pub reused_evidence_tokens: u32,
     pub tool_schema_tokens: u32,
@@ -598,9 +606,10 @@ impl<C: TokenCounter> ContextPlanner<C> {
                 &right.evidence_id,
             ))
         });
-        let candidate_tokens = candidates.iter().fold(required_c0, |sum, item| {
+        let evidence_candidate_tokens = candidates.iter().fold(0_u32, |sum, item| {
             sum.saturating_add(self.counter.count(&item.text))
         });
+        let candidate_tokens = required_c0.saturating_add(evidence_candidate_tokens);
 
         let mut seen = BTreeSet::new();
         let mut deduped = Vec::new();
@@ -658,6 +667,7 @@ impl<C: TokenCounter> ContextPlanner<C> {
             .fold(0_u32, |sum, item| sum.saturating_add(item.token_cost));
         let mut tokens_by_level = BTreeMap::new();
         let mut tokens_by_kind = BTreeMap::new();
+        let mut tokens_by_section = BTreeMap::new();
         let mut stable_prefix_tokens = 0_u32;
         let mut reused_evidence_tokens = 0_u32;
         let mut tool_schema_tokens = 0_u32;
@@ -670,6 +680,11 @@ impl<C: TokenCounter> ContextPlanner<C> {
             add_tokens(
                 &mut tokens_by_kind,
                 format!("{:?}", item.kind).to_ascii_lowercase(),
+                item.token_cost,
+            );
+            add_tokens(
+                &mut tokens_by_section,
+                format!("{:?}", item.section).to_ascii_lowercase(),
                 item.token_cost,
             );
             if item.section == PacketSection::ControllerPrefix {
@@ -691,10 +706,12 @@ impl<C: TokenCounter> ContextPlanner<C> {
             metrics: ContextMetrics {
                 tokenizer_id: self.counter.tokenizer_id().to_owned(),
                 candidate_tokens_before_dedupe: candidate_tokens,
+                evidence_candidate_tokens_before_dedupe: evidence_candidate_tokens,
                 selected_tokens_after_dedupe: selected_tokens,
                 duplicate_tokens_removed,
                 tokens_by_level,
                 tokens_by_kind,
+                tokens_by_section,
                 stable_prefix_tokens,
                 reused_evidence_tokens,
                 tool_schema_tokens,

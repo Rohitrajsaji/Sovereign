@@ -1,0 +1,67 @@
+{
+  "milestone_id": "M2",
+  "roadmap_version": "1.4-frozen",
+  "completed_at": "2026-09-13T08:29:49Z",
+  "required_tasks": [
+    "M2-T01",
+    "M2-T02",
+    "M2-T03",
+    "M2-T04"
+  ],
+  "all_required_tasks_completed": true,
+  "task_evidence": {
+    "implementation/evidence/M2-T01.json": "sha256:b447352621c0cdba0250a714ffb5e4de933b014605e867d0cb2b7201641226a8",
+    "implementation/evidence/M2-T02.json": "sha256:2fd410bd3c643b6cba09a5dbf4451afa6a4cc877457e9a7468579093e74049bf",
+    "implementation/evidence/M2-T03.json": "sha256:9929c60755d61816c9ae03d7e714cecb9ea2f66a0538cf95a8c3a3507bdaa31d",
+    "implementation/evidence/M2-T04.json": "sha256:e98c9656c8fc8be32f1746369e3f1eb659782685815d2b7ee6e352a631974c45"
+  },
+  "milestone_gates": {
+    "medium_fixture_without_semantic_with_routing_token_metrics": {
+      "status": "passed",
+      "proof": "crates/sovereign-eval/tests/vertical_slice.rs::m2_medium_d2_goal_succeeds_with_real_routing_and_context_token_metrics_without_semantic",
+      "detail": "Real local Git fixture compiles a D2 two-task plan, routes through production RepositoryRetrievalBackend/RetrievalRouter, executes two Controller-owned verified edits, records ContextTelemetry and deterministic aggregate_context_metrics, with zero semantic retrieval/escalation."
+    },
+    "deterministic_routes_without_all_retriever_fanout_and_stale_source_authority": {
+      "status": "passed",
+      "proof": "implementation/evidence/M2-T03.json",
+      "detail": "Known path/symbol/behavior/diff/impact routing is deterministic and bounded; stale derived hits are validated against exact current source, refreshed/bypassed/fail-closed as appropriate; no all-retriever fanout."
+    },
+    "weak_model_bounded_packet_projection": {
+      "status": "passed",
+      "proof": "implementation/evidence/M2-T03.json + crates/sovereign-context/tests/context_packet.rs + crates/sovereign-context/tests/routing.rs",
+      "detail": "C0/current state/direct evidence/routed C2-C3/current tool evidence/relevant tool schemas remain bounded under configured token ceilings; persistent history and semantic retrieval are not required in M2."
+    }
+  },
+  "telemetry_contract": {
+    "report_schema": "sovereign-context-token-report-v1",
+    "duplicate_context_ratio_denominator": "total candidate tokens before dedupe",
+    "semantic_unavailable_is_not_escalation": true,
+    "history_unavailable_is_not_attempt": true,
+    "unknown_stale_rejections_preserved": true,
+    "repository_requery_during_metrics": false
+  },
+  "independent_read_only_audit": {
+    "worker": "worker-13",
+    "result": "CLOSABLE",
+    "blockers": []
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test --workspace --offline",
+      "status": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "network_runtime_dependency": false
+}
