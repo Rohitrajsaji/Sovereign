@@ -1,6 +1,6 @@
 {
   "schema": "sovereign-state-migrations-v1",
-  "current_version": 5,
+  "current_version": 6,
   "migrations": [
     {
       "version": 1,
@@ -81,6 +81,22 @@
         "memory_records_confidence_consistent_update",
         "memory_conflict_sets_conflict_key_required_insert",
         "memory_fts_projection"
+      ]
+    },
+    {
+      "version": 6,
+      "name": "memory_projection_outbox",
+      "path": "0006_memory_projection_outbox.sql",
+      "transactional": true,
+      "creates": [
+        "memory_projection_outbox",
+        "memory_projection_repairs",
+        "memory_projection_outbox_enqueue_idx",
+        "memory_projection_repairs_state_idx",
+        "memory_projection_repairs_one_pending_idx",
+        "memory_projection_repairs_no_delete",
+        "memory_projection_outbox_after_insert",
+        "memory_projection_outbox_after_searchable_update"
       ]
     }
   ]

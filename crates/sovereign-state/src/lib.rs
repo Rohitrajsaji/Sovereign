@@ -18,9 +18,11 @@ const ARTIFACTS_SQL: &str = include_str!("../migrations/0002_artifacts.sql");
 const SECURITY_KERNEL_SQL: &str = include_str!("../migrations/0003_security_kernel.sql");
 const MEMORY_SQL: &str = include_str!("../migrations/0004_memory.sql");
 const MEMORY_RETRIEVAL_SQL: &str = include_str!("../migrations/0005_memory_retrieval.sql");
+const MEMORY_PROJECTION_OUTBOX_SQL: &str =
+    include_str!("../migrations/0006_memory_projection_outbox.sql");
 
 /// Current durable schema version implemented by this crate.
-pub const CURRENT_SCHEMA_VERSION: i64 = 5;
+pub const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 /// One numbered, transactional durable-state migration.
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +67,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 5,
         name: "memory_retrieval",
         sql: MEMORY_RETRIEVAL_SQL,
+    },
+    Migration {
+        version: 6,
+        name: "memory_projection_outbox",
+        sql: MEMORY_PROJECTION_OUTBOX_SQL,
     },
 ];
 
@@ -1765,6 +1772,114 @@ mod tests {
             migrated_backup.schema_version().unwrap_or(-1),
             CURRENT_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn projection_outbox_migration_seeds_v5_memory_and_rolls_back_atomically() {
+        const BROKEN_MEMORY_V6: Migration = Migration {
+            version: 6,
+            name: "broken_memory_v6_fixture",
+            sql: "CREATE TABLE projection_partial(value TEXT); INSERT INTO definitely_missing_projection_table VALUES (1);",
+        };
+
+        let temp = TestDir::new("projection-outbox-migration");
+        let db = temp.db();
+        let backup = temp.0.join("pre-projection-v5.sqlite3");
+        let mut connection =
+            Connection::open(&db).unwrap_or_else(|error| panic!("open v5 fixture: {error}"));
+        configure_connection(&connection).unwrap_or_else(|error| panic!("configure: {error}"));
+        MigrationRunner::apply(&mut connection, &MIGRATIONS[..5])
+            .unwrap_or_else(|error| panic!("apply v5: {error}"));
+        connection
+            .execute(
+                "INSERT INTO memory_records(\
+                    memory_id, kind, project_id, scope_kind, subject, predicate, conflict_key, assertion, \
+                    trust, confidence_legacy_real, confidence, status, created_at_ms, updated_at_ms, \
+                    version, normal_injection, lineage_id, content_digest\
+                 ) VALUES (\
+                    'mem.v5', 'episodic', 'project-a', 'project', 'subject', 'fact', 'subject'||char(31)||'fact', \
+                    'canonical projection seed', 'observed', 0.8, 80, 'active', 10, 10, 1, 1, 'mem.v5', 'sha256:v5'\
+                 )",
+                [],
+            )
+            .unwrap_or_else(|error| panic!("seed v5 memory: {error}"));
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap_or_else(|error| panic!("checkpoint v5: {error}"));
+        drop(connection);
+        fs::copy(&db, &backup).unwrap_or_else(|error| panic!("backup v5: {error}"));
+
+        let mut failed =
+            Connection::open(&db).unwrap_or_else(|error| panic!("open broken v6: {error}"));
+        configure_connection(&failed)
+            .unwrap_or_else(|error| panic!("configure broken v6: {error}"));
+        let mut broken_path = MIGRATIONS[..5].to_vec();
+        broken_path.push(BROKEN_MEMORY_V6);
+        assert!(MigrationRunner::apply(&mut failed, &broken_path).is_err());
+        let partial: i64 = failed
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projection_partial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        assert_eq!(partial, 0);
+        let outbox_after_failure: i64 = failed
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_projection_outbox'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        assert_eq!(outbox_after_failure, 0);
+        let version_after_failure: i64 = failed
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(-1);
+        assert_eq!(version_after_failure, 5);
+        drop(failed);
+
+        let mut upgraded =
+            Connection::open(&db).unwrap_or_else(|error| panic!("open real v6: {error}"));
+        configure_connection(&upgraded)
+            .unwrap_or_else(|error| panic!("configure real v6: {error}"));
+        MigrationRunner::apply(&mut upgraded, MIGRATIONS)
+            .unwrap_or_else(|error| panic!("apply real v6: {error}"));
+        let seeded: i64 = upgraded
+            .query_row(
+                "SELECT COUNT(*) FROM memory_projection_outbox WHERE projection_kind='memory_fts_v1' AND memory_id='mem.v5'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        assert_eq!(seeded, 1);
+        let projection_rows: i64 = upgraded
+            .query_row("SELECT COUNT(*) FROM memory_fts_projection", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(-1);
+        assert_eq!(
+            projection_rows, 0,
+            "v6 must rebuild only from durable outbox/canonical state"
+        );
+        drop(upgraded);
+
+        let migrated_backup =
+            StateStore::open(&backup).unwrap_or_else(|error| panic!("migrate v5 backup: {error}"));
+        assert_eq!(
+            migrated_backup.schema_version().unwrap_or(-1),
+            CURRENT_SCHEMA_VERSION
+        );
+        let seeded_backup: i64 = migrated_backup
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_projection_outbox WHERE memory_id='mem.v5'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        assert_eq!(seeded_backup, 1);
     }
 
     #[test]

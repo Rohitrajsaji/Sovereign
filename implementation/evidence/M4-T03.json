@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "task_id": "M4-T03",
+  "title": "Implement durable projection outbox and projection repair",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "34a51279d6eb073f32cb2580e7b287dcd9ebf54e",
+  "status": "completed",
+  "completed_at": "2026-09-13T16:37:25Z",
+  "verified_at": "2026-09-13T16:37:25Z",
+  "dependencies": [
+    "M4-T02"
+  ],
+  "interfaces": [
+    "ProjectionOutbox",
+    "ProjectionRepair"
+  ],
+  "state_schema_version": 6,
+  "projection_contract": {
+    "canonical_authority": "memory_records and lifecycle/event-journal rows remain canonical inside the single sovereign_state::StateStore SQLite authority",
+    "projection_kind": "memory_fts_v1",
+    "projection_is_derived": true,
+    "second_database_or_pool": false,
+    "outbox_schema_version": 1,
+    "repair_schema_version": 1,
+    "outbox_key": [
+      "projection_kind",
+      "memory_id"
+    ],
+    "outbox_payload_authority": false,
+    "outbox_semantics": "refresh intent only; replay always rereads the current canonical memory row and never treats queued payload as truth",
+    "one_pending_repair_per_projection_kind": "partial UNIQUE index memory_projection_repairs_one_pending_idx enforces at most one pending repair for memory_fts_v1",
+    "searchable_trigger_fields": [
+      "project_id",
+      "repository_id",
+      "kind",
+      "trust",
+      "status",
+      "conflict_key",
+      "subject",
+      "predicate",
+      "assertion"
+    ],
+    "non_projection_fields_do_not_enqueue": [
+      "access_count",
+      "last_accessed_at_ms",
+      "conflict_set_id",
+      "normal_injection"
+    ],
+    "migration_bootstrap": "v5->v6 clears disposable FTS rows and seeds one coalesced memory_fts_v1 outbox intent for every canonical memory row",
+    "migration_failure_semantics": "v6 DDL/data changes are transactional; a deliberately failing v6 fixture leaves the v5 database/version intact and an exact v5 backup remains readable/upgradeable"
+  },
+  "transaction_boundaries": {
+    "canonical_txn_a": "canonical lifecycle mutation + append-only lifecycle journal + SQLite-triggered outbox enqueue/coalesce commit together before projection delivery",
+    "projection_txn_b": "bounded replay rereads the CURRENT canonical row, deletes all FTS rows for that memory_id, inserts the exact canonical projection row, and deletes the matching outbox intent in one transaction",
+    "post_commit_failure": "projection delivery failure is returned as MemoryError::ProjectionPending so a caller cannot infer that already-committed canonical truth rolled back",
+    "missing_canonical": "an outbox reference whose canonical row is absent is treated as integrity corruption; replay fails closed and does not consume the durable intent",
+    "duplicate_delivery": "DELETE-all + INSERT-from-current-canonical + same-transaction outbox deletion converges idempotently even after repeated/coalesced delivery",
+    "batch_bound": 128
+  },
+  "startup_and_repair": {
+    "startup": "resume any durable pending repair first, then drain pending outbox refreshes; startup does not perform an unconditional whole-corpus consistency scan",
+    "pending_repair_retry": "repair_projection completes an already-pending repair before considering a new R1 record, so an R1-committed/R2-failed same-process retry cannot collide with the one-pending invariant",
+    "explicit_consistency_repair": "repair_projection performs an explicit integrity-suspicion consistency check and creates a durable pending repair only when canonical/projection rows disagree",
+    "repair_r1": "pending ProjectionRepair record commits durably before rebuild",
+    "repair_r2": "full derived FTS rebuild from canonical memory + covered outbox clear + exact repair transition to completed commit atomically",
+    "repair_source": "canonical memory only",
+    "writable_fallback_store": false,
+    "semantic_or_embedder": false
+  },
+  "crash_and_corruption_proof": {
+    "crash_after_canonical_before_projection": "integration-test child removes only the disposable derived FTS table to force post-canonical projection delivery failure through the production MemoryManager path; capture returns ProjectionPending after canonical/outbox commit, test-only child then aborts, and parent proves canonical row + outbox survive before recreating the derived table and reopening for startup replay",
+    "production_kill_switch": false,
+    "missing_canonical_corruption_fixture": "a separate test connection disables foreign_keys only to manufacture an impossible/corrupt outbox reference; normal StateStore connections retain foreign_keys=ON and replay fails closed while retaining that intent",
+    "damaged_projection_rebuild": "missing, mismatched, and orphan FTS rows are detected by explicit repair_projection and rebuilt solely from canonical memory"
+  },
+  "retrieval_compatibility": {
+    "synchronous_search_visibility": "normal lifecycle APIs synchronously drain the durable outbox after canonical commit when projection service is healthy",
+    "query_time_full_projection_rewrite": false,
+    "v4_to_current_searchability": "legacy v4 memory migrates through v5/v6, startup outbox replay rebuilds FTS, and retrieval remains searchable",
+    "access_count_updates_enqueue_projection": false,
+    "m4_t02_filters_scope_and_bounds_preserved": true
+  },
+  "resource_ownership": {
+    "m4_adds_second_sqlite_pool": false,
+    "m4_uses_authoritative_state_store_connection": true,
+    "m6_t01_owns_process_resource_governor": true,
+    "nuance": "M4-T03 does not claim that StateStore connection defaults prove architecture-wide aggregate SQLite cache/mmap/WAL-health hard limits; broader process resource enforcement remains separately owned."
+  },
+  "acceptance_tests": [
+    "projection_canonical_survives_forced_kill_then_startup_replay",
+    "projection_duplicate_delivery_is_idempotent",
+    "projection_damaged_missing_orphan_fts_rebuilds_from_canonical",
+    "projection_no_fallback_db_or_store",
+    "projection_status_refresh_reflects_latest_canonical_state",
+    "projection_pending_repair_is_resumed_instead_of_duplicated",
+    "projection_missing_canonical_outbox_reference_fails_closed_and_is_retained",
+    "projection_outbox_migration_seeds_v5_memory_and_rolls_back_atomically",
+    "retrieval_lexical_lookup_does_not_rewrite_the_full_projection",
+    "retrieval_v4_memory_is_searchable_after_one_time_v5_projection_migration"
+  ],
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-memory --offline -- projection",
+      "result": "passed",
+      "detail": "8/8 projection integration tests; 2/2 projection-named retrieval regressions"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-memory --offline",
+      "result": "passed",
+      "detail": "lifecycle 25/25; projection 8/8; retrieval 18/18; doc tests pass"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-state --offline",
+      "result": "passed",
+      "detail": "7 unit + 1 process-kill + 6 security + doc tests"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test --workspace --offline",
+      "result": "passed",
+      "detail": "all workspace tests passed; only intentional local-model qualification/smoke tests ignored"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "independent_audit": {
+    "worker": "worker-23",
+    "initial_result": "NOT CLOSABLE",
+    "initial_blockers": [
+      "test crash environment variable could abort ordinary production builds",
+      "missing canonical row during outbox delivery was silently consumed",
+      "repair retry did not reuse a durable pending repair",
+      "startup performed an unconditional full consistency scan with poor FTS lookup scaling"
+    ],
+    "repairs": [
+      "removed production crash/abort seam; forced crash now exists only in integration-test child code after the production API reports post-commit ProjectionPending",
+      "missing canonical outbox references now fail closed and retain reconciliation evidence",
+      "repair_projection resumes an existing pending repair before creating any new repair",
+      "startup is bounded to pending-repair resume + outbox drain; whole-projection integrity scan/rebuild is explicit"
+    ],
+    "final_result": "CLOSABLE",
+    "final_blockers": [],
+    "notes": "Fresh exact-tree read-only re-audit confirmed all four blockers repaired, v6 schema/outbox/repair semantics coherent, focused tests and strict quality gates green, and no second DB/fallback/vector authority introduced."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429"
+  },
+  "source_hashes": {
+    "Cargo.lock": "sha256:b2300f38a9352c7cf9ff6e5af46a49460dab48b34b4b228300ed2123f6f6cbf8",
+    "crates/sovereign-memory/src/lib.rs": "sha256:7f84a5a623573d18d9e8ef158cd0b3bd852b68651502b254395392b79c3d2d11",
+    "crates/sovereign-memory/src/projection.rs": "sha256:05be23478af65377bd88347d64393bfdfc31337d64179b4021eb75286c8e0659",
+    "crates/sovereign-memory/tests/projection.rs": "sha256:73e959a6eb08d44dcc654221ddb957003b888db212f149dc1b0af46343d16ad1",
+    "crates/sovereign-memory/src/retrieval.rs": "sha256:0653491d8b5077d589b15e1aae3c8017a38eccfefd2dba39c85ad996554c1d21",
+    "crates/sovereign-memory/tests/retrieval.rs": "sha256:147004ea5f49ffc2ab07d2e9c07e107f9ff66323c678a9186159eb3afe4f1d8a",
+    "crates/sovereign-state/src/lib.rs": "sha256:6ec5c0fa266a1549ab91e431170b4d74f70bf06c549eff02a09d7b348dc447f6",
+    "crates/sovereign-state/migrations/0005_memory_retrieval.sql": "sha256:518d34acb6ca32a05f092b03f0ee8c535e7c7bd69e5107b90681c4ec835e3c91",
+    "crates/sovereign-state/migrations/0006_memory_projection_outbox.sql": "sha256:91e56904e7033640cc9875184d111bed2fab4edd78b9975a352f91294ac56633",
+    "crates/sovereign-state/migrations/manifest.json": "sha256:186c0ff8e3e0c5ede6c0b2bfab56901a6420b2836591acbb89d54bbff00343e8",
+    "schemas/memory-record-v1.json": "sha256:c609a3d9e9ecbe7723ca33a83a55acb921037e7fc3ba598027076eeadf7a79aa"
+  },
+  "network_runtime_dependency": false
+}

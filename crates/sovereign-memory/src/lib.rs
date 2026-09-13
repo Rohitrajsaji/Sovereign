@@ -17,7 +17,10 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
+mod projection;
 mod retrieval;
+
+pub use projection::{ProjectionOutbox, ProjectionRepair};
 
 pub use retrieval::{
     FailureSignatureFilter, MemoryConflictSynopsis, MemoryExpansion, MemoryExpansionHandle,
@@ -30,7 +33,7 @@ pub use retrieval::{
 pub const MEMORY_RECORD_SCHEMA_VERSION: u32 = 1;
 
 /// `SQLite` schema version that first contains canonical memory tables.
-pub const MEMORY_STATE_SCHEMA_VERSION: i64 = 5;
+pub const MEMORY_STATE_SCHEMA_VERSION: i64 = 6;
 
 /// Typed durable memory classes from the frozen architecture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -391,6 +394,7 @@ pub enum MemoryError {
     InvalidRecord(String),
     NotFound(String),
     InvalidTransition(String),
+    ProjectionPending(String),
     State(StateError),
 }
 
@@ -402,6 +406,10 @@ impl Display for MemoryError {
             Self::InvalidTransition(message) => {
                 write!(f, "invalid memory lifecycle transition: {message}")
             }
+            Self::ProjectionPending(message) => write!(
+                f,
+                "canonical memory committed; projection refresh remains pending: {message}"
+            ),
             Self::State(error) => write!(f, "memory durable-state error: {error}"),
         }
     }
@@ -500,7 +508,15 @@ impl MemoryManager {
             )));
         }
         state.transaction(backfill_memory_envelope_tx)?;
-        Ok(Self { state })
+        let mut manager = Self { state };
+        projection::initialize_projection(&mut manager)?;
+        Ok(manager)
+    }
+
+    fn finish_projection_after_canonical_commit(&mut self) -> Result<(), MemoryError> {
+        self.drain_projection_outbox()
+            .map(|_| ())
+            .map_err(|error| MemoryError::ProjectionPending(error.to_string()))
     }
 
     /// Returns one durable record by ID.
@@ -604,6 +620,7 @@ impl MemoryManager {
             reconsider_demotions_tx(tx, &current, now_ms)?;
             Ok(())
         })?;
+        self.finish_projection_after_canonical_commit()?;
         Ok(())
     }
 }
@@ -623,6 +640,7 @@ impl MemoryLifecycle for MemoryManager {
             journal_memory_record_tx(tx, &id, "captured", "capture", now_ms)?;
             Ok(())
         })?;
+        self.finish_projection_after_canonical_commit()?;
         self.record(&id)?.ok_or_else(|| {
             MemoryError::State(StateError::Integrity(format!(
                 "captured memory {id} is missing"
@@ -709,6 +727,7 @@ impl MemoryLifecycle for MemoryManager {
             }
             Ok(())
         })?;
+        self.finish_projection_after_canonical_commit()?;
         self.record(&replacement_id)?.ok_or_else(|| {
             MemoryError::State(StateError::Integrity(format!(
                 "replacement memory {replacement_id} is missing"
@@ -813,6 +832,7 @@ impl MemoryLifecycle for MemoryManager {
             }
             Ok(stale_ids.into_iter().collect::<Vec<_>>())
         })?;
+        self.finish_projection_after_canonical_commit()?;
         Ok(stale_ids)
     }
 
@@ -853,6 +873,7 @@ impl MemoryLifecycle for MemoryManager {
             }
             Ok(expired)
         })?;
+        self.finish_projection_after_canonical_commit()?;
         Ok(expired)
     }
 
@@ -1260,27 +1281,6 @@ fn insert_record_tx(
             ],
         )?;
     }
-    insert_projection_tx(tx, record)?;
-    Ok(())
-}
-
-fn insert_projection_tx(tx: &Transaction<'_>, record: &NewMemoryRecord) -> Result<(), StateError> {
-    tx.execute(
-        "INSERT INTO memory_fts_projection(\
-             memory_id, project_id, repository_id, kind, trust, status, conflict_key, subject, predicate, assertion\
-         ) VALUES (?1, ?2, COALESCE(?3, ''), ?4, ?5, 'active', ?6, ?7, ?8, ?9)",
-        params![
-            record.id,
-            record.scope.project_id,
-            record.scope.repository_id,
-            record.kind.as_str(),
-            record.trust.as_str(),
-            record.conflict_key,
-            record.subject,
-            record.predicate,
-            record.assertion,
-        ],
-    )?;
     Ok(())
 }
 
