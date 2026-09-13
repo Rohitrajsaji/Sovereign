@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "task_id": "M2-T02",
+  "roadmap_version": "1.4-frozen",
+  "head": "ae03240",
+  "status": "completed",
+  "scope": "crates/sovereign-repo structural tree-sitter projection only",
+  "dependencies": {
+    "direct": {
+      "tree-sitter": "0.25.10",
+      "tree-sitter-rust": "0.24.0",
+      "tree-sitter-typescript": "0.23.2"
+    },
+    "transitive_msrv_pin": {
+      "tree-sitter-language": "0.1.7"
+    },
+    "rust_toolchain": "1.89.0",
+    "acquisition": "Initial network acquisition performed narrowly; all verification commands below ran with CARGO_NET_OFFLINE=true."
+  },
+  "interfaces": [
+    "SymbolIndex",
+    "DependencyGraph",
+    "StructuralRetriever"
+  ],
+  "languages": [
+    "rust",
+    "typescript",
+    "tsx"
+  ],
+  "derived_projection": {
+    "authority": "Git/filesystem exact source remains authoritative; structural SQLite rows are disposable derived state.",
+    "schema_fingerprint": "sha256:2ef8f2108fc5eb706b79881294c476f2896b4ad4e601f192cb87ae9154239e84",
+    "parser_fingerprint": "sha256:e1d0c487f058b36234e140f828134794462cfe92a4c31dfa2855078bbe514a7c",
+    "parser_version_manifest": "tree-sitter=0.25.10;rust=0.24.0;typescript=0.23.2;languages=rust,typescript,tsx",
+    "fixture_source_manifest_digest": "sha256:3ea08f92146ee3e0d22f92a630003400a6e33bbe1b12754f221834672533924e",
+    "rebuild": "Schema-version, schema-fingerprint, or parser-fingerprint mismatch drops structural metadata/files/symbols/edges and rebuilds from current exact source fingerprints.",
+    "freshness": "Every structural query preflights the complete supported-source manifest, including Git-ignored files; candidate paths are re-read and digest-validated before return; and the full supported-source manifest is revalidated after the query even for zero-hit results. Source races retry at most 2 times then fail closed."
+  },
+  "fixture_report": {
+    "supported_files": 5,
+    "unsupported_files": 1,
+    "symbols": 7,
+    "dependency_edges": 4,
+    "coverage": [
+      "Rust definition/module/use",
+      "TypeScript definition/import",
+      "TSX definition/import",
+      "changed-symbol reindex",
+      "zero-hit refresh",
+      "post-query zero-hit manifest race rejection",
+      "ignored-file refresh",
+      "affected-neighbor refresh",
+      "unsupported-language fallback",
+      "schema-version/parser/schema-fingerprint incompatibility rebuild"
+    ]
+  },
+  "resource_telemetry": {
+    "fixture_parsed_files": 101,
+    "parser_batch_file_limit": 8,
+    "max_live_asts": 1,
+    "peak_source_bytes": 92,
+    "peak_process_rss_bytes": 8683520,
+    "frozen_index_worker_peak_limit_bytes": 536870912,
+    "within_profile": true
+  },
+  "incremental_refresh": {
+    "rule": "Reparse changed supported files plus only previously indexed import/module/test neighbors whose targets/stem family match changed/deleted modules; unrelated files are excluded.",
+    "unsupported_language": "Returns StructuralLookup::UnsupportedLanguage so callers can use exact/lexical fallback; no guessed parse is attempted."
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-repo -- structural",
+      "result": "passed",
+      "tests": "1 structural unit regression + 8/8 structural integration tests"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-repo",
+      "result": "passed",
+      "tests": "2 lib + 5 baseline + 3 exact + 9 lexical + 8 structural"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-repo --test structural -- --nocapture",
+      "result": "passed",
+      "evidence": "Current-tree snapshot and telemetry emitted: 5 supported files, 1 unsupported file, 7 symbols, 4 dependency edges, max_live_asts=1, peak_source_bytes=92, peak_process_rss_bytes=8683520."
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo clippy -p sovereign-repo --all-targets -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "independent_audit": {
+    "result": "closable",
+    "blockers": [],
+    "notes": "Fresh read-only audit on the current dirty tree verified complete source preflight plus returned-row digest validation plus post-query full supported-source manifest revalidation (including zero-hit results), bounded retry/fail-closed behavior, physical rebuild on schema-version/parser-fingerprint/schema-fingerprint mismatch, bounded source/AST lifetime, affected-neighbor-only refresh, unsupported-language fallback, Rust 1.89-compatible tree-sitter pins, frozen command coverage, current source hashes, and resource telemetry. Auditor rerun RSS varied to 8,962,048 bytes; the recorded 8,683,520-byte current evidence run is valid runtime variation and remains far below the 536,870,912-byte ceiling."
+  },
+  "source_hashes": {
+    "Cargo.toml": "sha256:77c120b7c1d5eaaefcb510bbfc85384bb1bdce357009b95b3e597346937c6ecb",
+    "Cargo.lock": "sha256:4f601cb449b1d109a592730652b2ba6ed77fc3253b5b23319e7ffc3132c39688",
+    "crates/sovereign-repo/Cargo.toml": "sha256:301df1cd93b694d4e0b3b5ecae770ed644f25489f37d8b0830512b6b32be7ebc",
+    "crates/sovereign-repo/src/lib.rs": "sha256:2c69a14b4504e7141634a1799cba13b8686a3e3517ede1918c0c33fdb3221bd2",
+    "crates/sovereign-repo/src/structural.rs": "sha256:5578f4b9ac7346ebd7cfb5e7c5dd8bff9f4fdec623389784f445061cb77ec45f",
+    "crates/sovereign-repo/tests/structural.rs": "sha256:c2734d78662e067d9ca792f9cff5654f18c65dcf9dd1880661d0097158ba1051"
+  }
+}

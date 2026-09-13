@@ -5,10 +5,16 @@
 //! they never replace source files or Git as repository truth.
 
 mod lexical;
+mod structural;
 
 pub use lexical::{
     IndexCalibration, IndexConfig, IndexResourceHealth, IndexSnapshot, LexicalHit, LexicalQuery,
     LexicalRetriever, RefreshReport, ResourceHealthLevel,
+};
+pub use structural::{
+    DependencyEdge, DependencyGraph, StructuralConfig, StructuralIndex, StructuralLookup,
+    StructuralRefreshReport, StructuralRetriever, StructuralSnapshot, StructuralTelemetry,
+    SymbolIndex, SymbolRecord,
 };
 
 use serde::{Deserialize, Serialize};
