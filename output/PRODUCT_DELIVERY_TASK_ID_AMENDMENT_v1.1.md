@@ -1,7 +1,7 @@
 # Sovereign Product Delivery Task-ID Amendment v1.1
 
 Date: 2026-09-13
-Status: accepted narrow implementation amendment; additive to `output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md` and roadmap `1.4-frozen`.
+Status: superseded by `output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md`; retained as historical scheduling evidence.
 
 ## Purpose
 
@@ -93,4 +93,3 @@ The selected profile does **not** promote `M7-T01`, `M7-T04`, `M8-T02`, or `M8-T
 ## Execution order consequence
 
 Core dependency order continues unchanged from M2 onward. Product-profile work may be implemented when its explicit prerequisites become satisfied, but final `PD-T04` cannot close until the required core release gate `M9-T04` and the complete selected-profile chain are current-tree verified.
-
