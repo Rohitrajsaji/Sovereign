@@ -8,6 +8,7 @@
 
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use sovereign_state::{StateError, StateStore};
 use std::cmp::Ordering;
@@ -16,11 +17,20 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
+mod retrieval;
+
+pub use retrieval::{
+    FailureSignatureFilter, MemoryConflictSynopsis, MemoryExpansion, MemoryExpansionHandle,
+    MemoryGraphNeighborhood, MemoryQuery, MemoryQueryMode, MemoryRetrievalPhase,
+    MemoryRetrievalResult, MemoryRetrievalStage, MemoryRetrievalTrace, MemoryRetriever,
+    MemorySynopsis,
+};
+
 /// Durable schema version for the public `MemoryRecord` contract.
 pub const MEMORY_RECORD_SCHEMA_VERSION: u32 = 1;
 
 /// `SQLite` schema version that first contains canonical memory tables.
-pub const MEMORY_STATE_SCHEMA_VERSION: i64 = 4;
+pub const MEMORY_STATE_SCHEMA_VERSION: i64 = 5;
 
 /// Typed durable memory classes from the frozen architecture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -96,6 +106,8 @@ impl MemoryScopeKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryScope {
     pub project_id: String,
+    /// Optional repository boundary inside the project. `None` is project-wide.
+    pub repository_id: Option<String>,
     pub kind: MemoryScopeKind,
     pub agent_id: Option<String>,
     /// Empty means visible to every role otherwise permitted by this scope.
@@ -272,7 +284,6 @@ pub struct MemoryProvenance {
     pub source_evidence_ids: Vec<String>,
     pub producing_task_id: Option<String>,
     pub producing_attempt_id: Option<String>,
-    pub repository_id: Option<String>,
     pub repository_revision: Option<String>,
     pub source_fingerprints: Vec<SourceFingerprint>,
 }
@@ -282,13 +293,17 @@ pub struct MemoryProvenance {
 pub struct MemoryRecord {
     pub schema_version: u32,
     pub id: String,
+    pub lineage_id: String,
     pub kind: MemoryKind,
     pub scope: MemoryScope,
     pub subject: String,
     pub predicate: String,
+    pub conflict_key: String,
     pub assertion: String,
+    pub content_digest: String,
     pub trust: MemoryTrust,
-    pub confidence: f64,
+    /// Integer confidence percentage in the inclusive range `0..=100`.
+    pub confidence: u8,
     pub status: MemoryStatus,
     pub provenance: MemoryProvenance,
     pub created_at_ms: i64,
@@ -314,9 +329,12 @@ pub struct NewMemoryRecord {
     pub scope: MemoryScope,
     pub subject: String,
     pub predicate: String,
+    /// Stable scoped contradiction key. Records sharing this key are compared.
+    pub conflict_key: String,
     pub assertion: String,
     pub trust: MemoryTrust,
-    pub confidence: f64,
+    /// Integer confidence percentage in the inclusive range `0..=100`.
+    pub confidence: u8,
     pub provenance: MemoryProvenance,
     pub expires_at_ms: Option<i64>,
     pub invalidation_predicates: Vec<InvalidationPredicate>,
@@ -327,6 +345,7 @@ pub struct NewMemoryRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryAccessScope<'a> {
     pub project_id: &'a str,
+    pub repository_id: Option<&'a str>,
     pub agent_id: Option<&'a str>,
     pub role_id: Option<&'a str>,
 }
@@ -336,9 +355,10 @@ pub struct MemoryAccessScope<'a> {
 pub struct FingerprintChange {
     pub kind: SourceFingerprintKind,
     pub key: String,
-    /// `None` means the source disappeared and every record bound to this key
-    /// is stale.  `Some` only invalidates records whose stored digest differs.
-    pub current_digest: Option<String>,
+    /// Exact prior digest. `None` means the source was newly added.
+    pub old_digest: Option<String>,
+    /// Exact current digest. `None` means the source disappeared.
+    pub new_digest: Option<String>,
 }
 
 /// Memory-facing repository delta publication.  It carries only exact
@@ -356,6 +376,7 @@ pub struct MemoryConflictSet {
     pub id: String,
     pub project_id: String,
     pub repository_id: Option<String>,
+    pub conflict_key: String,
     pub subject: String,
     pub predicate: String,
     pub created_at_ms: i64,
@@ -471,13 +492,14 @@ impl MemoryManager {
     ///
     /// # Errors
     /// Fails closed if the required memory migration is not present.
-    pub fn new(state: StateStore) -> Result<Self, MemoryError> {
+    pub fn new(mut state: StateStore) -> Result<Self, MemoryError> {
         let version = state.schema_version()?;
         if version < MEMORY_STATE_SCHEMA_VERSION {
             return Err(MemoryError::InvalidRecord(format!(
                 "state schema {version} predates required memory schema {MEMORY_STATE_SCHEMA_VERSION}"
             )));
         }
+        state.transaction(backfill_memory_envelope_tx)?;
         Ok(Self { state })
     }
 
@@ -561,7 +583,7 @@ impl MemoryManager {
     ) -> Result<(), MemoryError> {
         validate_timestamp(now_ms)?;
         let id = memory_id.to_owned();
-        let conflict_id = self.state.transaction(|tx| {
+        self.state.transaction(|tx| {
             let current = load_record_tx(tx, &id)?
                 .ok_or_else(|| StateError::Integrity(format!("unknown memory {id}")))?;
             if !allowed_current.contains(&current.status) {
@@ -575,12 +597,13 @@ impl MemoryManager {
                 "UPDATE memory_records SET status=?2, updated_at_ms=?3, normal_injection=0, exclusion_reason=?4 WHERE memory_id=?1",
                 params![id, next.as_str(), now_ms, reason],
             )?;
-            Ok(current.conflict_set_id)
+            journal_memory_record_tx(tx, &id, "status_transition", reason, now_ms)?;
+            if let Some(conflict_id) = current.conflict_set_id.as_deref() {
+                resolve_conflict_if_unambiguous(tx, conflict_id, now_ms)?;
+            }
+            reconsider_demotions_tx(tx, &current, now_ms)?;
+            Ok(())
         })?;
-        if let Some(conflict_id) = conflict_id {
-            self.state
-                .transaction(|tx| resolve_conflict_if_unambiguous(tx, &conflict_id, now_ms))?;
-        }
         Ok(())
     }
 }
@@ -597,6 +620,7 @@ impl MemoryLifecycle for MemoryManager {
         self.state.transaction(|tx| {
             insert_record_tx(tx, &record, now_ms, 1, None)?;
             reconcile_contradictions_tx(tx, &id, now_ms)?;
+            journal_memory_record_tx(tx, &id, "captured", "capture", now_ms)?;
             Ok(())
         })?;
         self.record(&id)?.ok_or_else(|| {
@@ -628,7 +652,7 @@ impl MemoryLifecycle for MemoryManager {
                 "replacement must use a new immutable memory id".to_owned(),
             ));
         }
-        let conflict_to_reconcile = self.state.transaction(|tx| {
+        self.state.transaction(|tx| {
             let previous = load_record_tx(tx, &previous_id)?
                 .ok_or_else(|| StateError::Integrity(format!("unknown memory {previous_id}")))?;
             if previous.kind != MemoryKind::GovernedKnowledge
@@ -643,10 +667,10 @@ impl MemoryLifecycle for MemoryManager {
             if previous.scope != replacement.scope
                 || previous.subject != replacement.subject
                 || previous.predicate != replacement.predicate
-                || previous.provenance.repository_id != replacement.provenance.repository_id
+                || previous.conflict_key != replacement.conflict_key
             {
                 return Err(StateError::Integrity(
-                    "governed replacement must retain scope/repository/subject/predicate identity"
+                    "governed replacement must retain scope/subject/predicate/conflict identity"
                         .to_owned(),
                 ));
             }
@@ -665,13 +689,26 @@ impl MemoryLifecycle for MemoryManager {
                 "UPDATE memory_records SET status='superseded', superseded_by_id=?2, updated_at_ms=?3, normal_injection=0, exclusion_reason='superseded' WHERE memory_id=?1",
                 params![previous_id, replacement_id, now_ms],
             )?;
+            journal_memory_record_tx(
+                tx,
+                &previous_id,
+                "superseded",
+                "governed_replacement",
+                now_ms,
+            )?;
             reconcile_contradictions_tx(tx, &replacement_id, now_ms)?;
-            Ok(previous.conflict_set_id)
+            journal_memory_record_tx(
+                tx,
+                &replacement_id,
+                "governed_replacement",
+                "supersession",
+                now_ms,
+            )?;
+            if let Some(conflict_id) = previous.conflict_set_id.as_deref() {
+                resolve_conflict_if_unambiguous(tx, conflict_id, now_ms)?;
+            }
+            Ok(())
         })?;
-        if let Some(conflict_id) = conflict_to_reconcile {
-            self.state
-                .transaction(|tx| resolve_conflict_if_unambiguous(tx, &conflict_id, now_ms))?;
-        }
         self.record(&replacement_id)?.ok_or_else(|| {
             MemoryError::State(StateError::Integrity(format!(
                 "replacement memory {replacement_id} is missing"
@@ -688,23 +725,37 @@ impl MemoryLifecycle for MemoryManager {
         validate_nonempty("repository_id", &delta.repository_id)?;
         for change in &delta.changed_fingerprints {
             validate_nonempty("fingerprint key", &change.key)?;
-            if let Some(digest) = change.current_digest.as_deref() {
-                validate_nonempty("current fingerprint digest", digest)?;
+            if change.old_digest.is_none() && change.new_digest.is_none() {
+                return Err(MemoryError::InvalidRecord(
+                    "fingerprint change must carry an old or new digest".to_owned(),
+                ));
+            }
+            if let Some(digest) = change.old_digest.as_deref() {
+                validate_nonempty("old fingerprint digest", digest)?;
+            }
+            if let Some(digest) = change.new_digest.as_deref() {
+                validate_nonempty("new fingerprint digest", digest)?;
             }
         }
         let repository_id = delta.repository_id.clone();
         let current_revision = delta.current_revision.clone();
         let changes = delta.changed_fingerprints.clone();
-        let (stale_ids, conflict_ids) = self.state.transaction(|tx| {
+        let stale_ids = self.state.transaction(|tx| {
             let mut stale_ids = BTreeSet::new();
             for change in &changes {
+                let Some(old_digest) = change.old_digest.as_deref() else {
+                    continue;
+                };
+                if change.new_digest.as_deref() == Some(old_digest) {
+                    continue;
+                }
                 let mut statement = tx.prepare(
                     "SELECT r.memory_id \
                      FROM memory_records r \
                      JOIN memory_source_fingerprints f ON f.memory_id=r.memory_id \
                      WHERE r.repository_id=?1 AND r.status='active' \
                        AND f.fingerprint_kind=?2 AND f.fingerprint_key=?3 \
-                       AND (?4 IS NULL OR f.fingerprint_digest<>?4) \
+                       AND f.fingerprint_digest=?4 \
                      ORDER BY r.memory_id ASC",
                 )?;
                 let rows = statement.query_map(
@@ -712,7 +763,7 @@ impl MemoryLifecycle for MemoryManager {
                         repository_id,
                         change.kind.as_str(),
                         change.key,
-                        change.current_digest
+                        old_digest
                     ],
                     |row| row.get::<_, String>(0),
                 )?;
@@ -736,36 +787,38 @@ impl MemoryLifecycle for MemoryManager {
                 }
             }
 
-            let mut conflicts = BTreeSet::new();
+            let mut transitioned = Vec::new();
             for id in &stale_ids {
-                let conflict_id: Option<String> = tx
-                    .query_row(
-                        "SELECT conflict_set_id FROM memory_records WHERE memory_id=?1",
-                        [id],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                    .flatten();
-                if let Some(conflict_id) = conflict_id {
-                    conflicts.insert(conflict_id);
-                }
+                let current = load_record_tx(tx, id)?.ok_or_else(|| {
+                    StateError::Integrity(format!("memory {id} disappeared before staling"))
+                })?;
                 tx.execute(
                     "UPDATE memory_records SET status='stale', updated_at_ms=?2, normal_injection=0, exclusion_reason='source_fingerprint_changed' WHERE memory_id=?1",
                     params![id, now_ms],
                 )?;
+                journal_memory_record_tx(
+                    tx,
+                    id,
+                    "stale",
+                    "source_fingerprint_changed",
+                    now_ms,
+                )?;
+                transitioned.push(current);
             }
-            Ok((stale_ids.into_iter().collect::<Vec<_>>(), conflicts))
+            for current in &transitioned {
+                if let Some(conflict_id) = current.conflict_set_id.as_deref() {
+                    resolve_conflict_if_unambiguous(tx, conflict_id, now_ms)?;
+                }
+                reconsider_demotions_tx(tx, current, now_ms)?;
+            }
+            Ok(stale_ids.into_iter().collect::<Vec<_>>())
         })?;
-        for conflict_id in conflict_ids {
-            self.state
-                .transaction(|tx| resolve_conflict_if_unambiguous(tx, &conflict_id, now_ms))?;
-        }
         Ok(stale_ids)
     }
 
     fn expire_due(&mut self, now_ms: i64) -> Result<Vec<String>, MemoryError> {
         validate_timestamp(now_ms)?;
-        let (expired, conflicts) = self.state.transaction(|tx| {
+        let expired = self.state.transaction(|tx| {
             let mut statement = tx.prepare(
                 "SELECT memory_id, conflict_set_id FROM memory_records \
                  WHERE status='active' AND expires_at_ms IS NOT NULL AND expires_at_ms<=?1 \
@@ -775,26 +828,31 @@ impl MemoryLifecycle for MemoryManager {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?;
             let mut expired = Vec::new();
-            let mut conflicts = BTreeSet::new();
+            let mut transitioned = Vec::new();
             for row in rows {
-                let (id, conflict_id) = row?;
+                let (id, _) = row?;
                 expired.push(id);
-                if let Some(conflict_id) = conflict_id {
-                    conflicts.insert(conflict_id);
-                }
             }
+            drop(statement);
             for id in &expired {
+                let current = load_record_tx(tx, id)?.ok_or_else(|| {
+                    StateError::Integrity(format!("memory {id} disappeared before expiry"))
+                })?;
                 tx.execute(
                     "UPDATE memory_records SET status='expired', updated_at_ms=?2, normal_injection=0, exclusion_reason='expired' WHERE memory_id=?1",
                     params![id, now_ms],
                 )?;
+                journal_memory_record_tx(tx, id, "expired", "expiry", now_ms)?;
+                transitioned.push(current);
             }
-            Ok((expired, conflicts))
+            for current in &transitioned {
+                if let Some(conflict_id) = current.conflict_set_id.as_deref() {
+                    resolve_conflict_if_unambiguous(tx, conflict_id, now_ms)?;
+                }
+                reconsider_demotions_tx(tx, current, now_ms)?;
+            }
+            Ok(expired)
         })?;
-        for conflict_id in conflicts {
-            self.state
-                .transaction(|tx| resolve_conflict_if_unambiguous(tx, &conflict_id, now_ms))?;
-        }
         Ok(expired)
     }
 
@@ -842,6 +900,7 @@ fn validate_new_record(record: &NewMemoryRecord, now_ms: i64) -> Result<(), Memo
         ("project_id", record.scope.project_id.as_str()),
         ("subject", record.subject.as_str()),
         ("predicate", record.predicate.as_str()),
+        ("conflict_key", record.conflict_key.as_str()),
         ("assertion", record.assertion.as_str()),
     ] {
         validate_nonempty(field, value)?;
@@ -864,9 +923,9 @@ fn validate_new_record(record: &NewMemoryRecord, now_ms: i64) -> Result<(), Memo
     for role in &record.scope.role_visibility {
         validate_nonempty("role_visibility", role)?;
     }
-    if !record.confidence.is_finite() || !(0.0..=1.0).contains(&record.confidence) {
+    if record.confidence > 100 {
         return Err(MemoryError::InvalidRecord(
-            "confidence must be finite and within 0..=1".to_owned(),
+            "confidence must be within 0..=100".to_owned(),
         ));
     }
     if record.kind == MemoryKind::GovernedKnowledge && record.trust != MemoryTrust::Governed {
@@ -887,15 +946,14 @@ fn validate_new_record(record: &NewMemoryRecord, now_ms: i64) -> Result<(), Memo
         ));
     }
     if record.trust == MemoryTrust::Validated
-        && record.provenance.repository_id.is_some()
+        && record.scope.repository_id.is_some()
         && record.provenance.source_fingerprints.is_empty()
     {
         return Err(MemoryError::InvalidRecord(
             "repository-backed validated memory requires a source fingerprint".to_owned(),
         ));
     }
-    if record.provenance.repository_revision.is_some() && record.provenance.repository_id.is_none()
-    {
+    if record.provenance.repository_revision.is_some() && record.scope.repository_id.is_none() {
         return Err(MemoryError::InvalidRecord(
             "repository_revision requires repository_id".to_owned(),
         ));
@@ -938,6 +996,165 @@ fn validate_timestamp(value: i64) -> Result<(), MemoryError> {
     Ok(())
 }
 
+fn decode_confidence(value: i64, legacy_value: f64, memory_id: &str) -> Result<u8, StateError> {
+    let confidence = u8::try_from(value).map_err(|_| {
+        StateError::Integrity(format!(
+            "memory {memory_id} has confidence outside 0..=100 durable range"
+        ))
+    })?;
+    if confidence > 100 || !legacy_value.is_finite() {
+        return Err(StateError::Integrity(format!(
+            "memory {memory_id} has invalid durable confidence"
+        )));
+    }
+    if ((legacy_value * 100.0) - f64::from(confidence)).abs() > 1e-9 {
+        return Err(StateError::Integrity(format!(
+            "memory {memory_id} durable confidence representations disagree"
+        )));
+    }
+    Ok(confidence)
+}
+
+fn lineage_root_tx(
+    tx: &Transaction<'_>,
+    memory_id: &str,
+    supersedes: Option<&str>,
+) -> Result<String, StateError> {
+    let mut root = memory_id.to_owned();
+    let mut cursor = supersedes.map(str::to_owned);
+    let mut seen = BTreeSet::from([memory_id.to_owned()]);
+    while let Some(current) = cursor {
+        if !seen.insert(current.clone()) {
+            return Err(StateError::Integrity(format!(
+                "memory lineage cycle detected at {current}"
+            )));
+        }
+        root.clone_from(&current);
+        cursor = tx
+            .query_row(
+                "SELECT supersedes_id FROM memory_records WHERE memory_id=?1",
+                [&current],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StateError::Integrity(format!(
+                    "memory lineage references missing predecessor {current}"
+                ))
+            })?;
+    }
+    Ok(root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_content_digest(
+    kind: MemoryKind,
+    scope: &MemoryScope,
+    subject: &str,
+    predicate: &str,
+    conflict_key: &str,
+    assertion: &str,
+    trust: MemoryTrust,
+    confidence: u8,
+    provenance: &MemoryProvenance,
+) -> Result<String, StateError> {
+    let payload = json!({
+        "kind": kind.as_str(),
+        "scope": scope,
+        "subject": subject,
+        "predicate": predicate,
+        "conflict_key": conflict_key,
+        "assertion": assertion,
+        "trust": trust.as_str(),
+        "confidence": confidence,
+        "provenance": provenance,
+    });
+    let encoded = serde_json::to_vec(&payload).map_err(|error| {
+        StateError::Integrity(format!(
+            "memory content digest serialization failed: {error}"
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(encoded);
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn append_memory_event_tx(
+    tx: &Transaction<'_>,
+    entity_id: &str,
+    entity_type: &str,
+    event_kind: &str,
+    payload: &serde_json::Value,
+    now_ms: i64,
+) -> Result<(), StateError> {
+    let payload_json = serde_json::to_string(payload).map_err(|error| {
+        StateError::Integrity(format!(
+            "memory journal payload serialization failed: {error}"
+        ))
+    })?;
+    let next_sequence: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(sequence), 0) + 1 FROM event_journal",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut hasher = Sha256::new();
+    for part in [
+        entity_type.as_bytes(),
+        entity_id.as_bytes(),
+        event_kind.as_bytes(),
+        &now_ms.to_be_bytes(),
+        &next_sequence.to_be_bytes(),
+        payload_json.as_bytes(),
+    ] {
+        hasher.update(part);
+        hasher.update([0]);
+    }
+    let event_id = format!("memory-event:sha256:{:x}", hasher.finalize());
+    tx.execute(
+        "INSERT INTO event_journal(event_id, entity_type, entity_id, event_kind, payload_json, occurred_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            event_id,
+            entity_type,
+            entity_id,
+            event_kind,
+            payload_json,
+            now_ms
+        ],
+    )?;
+    Ok(())
+}
+
+fn journal_memory_record_tx(
+    tx: &Transaction<'_>,
+    memory_id: &str,
+    event_kind: &str,
+    reason: &str,
+    now_ms: i64,
+) -> Result<(), StateError> {
+    let record = load_record_tx(tx, memory_id)?
+        .ok_or_else(|| StateError::Integrity(format!("unknown memory {memory_id} for journal")))?;
+    append_memory_event_tx(
+        tx,
+        memory_id,
+        "memory",
+        event_kind,
+        &json!({
+            "memory_id": record.id,
+            "lineage_id": record.lineage_id,
+            "kind": record.kind.as_str(),
+            "trust": record.trust.as_str(),
+            "status": record.status.as_str(),
+            "content_digest": record.content_digest,
+            "conflict_set_id": record.conflict_set_id,
+            "normal_injection": record.normal_injection,
+            "reason": reason,
+            "schema_version": record.schema_version,
+        }),
+        now_ms,
+    )
+}
+
 fn insert_record_tx(
     tx: &Transaction<'_>,
     record: &NewMemoryRecord,
@@ -948,13 +1165,41 @@ fn insert_record_tx(
     let version = i64::try_from(version)
         .map_err(|_| StateError::Integrity("memory version exceeds SQLite INTEGER".to_owned()))?;
     let validated_at = (record.trust == MemoryTrust::Validated).then_some(now_ms);
+    let confidence = i64::from(record.confidence);
+    let confidence_legacy_real = f64::from(record.confidence) / 100.0;
+    let lineage_id = if let Some(previous_id) = supersedes {
+        let lineage: String = tx.query_row(
+            "SELECT lineage_id FROM memory_records WHERE memory_id=?1",
+            [previous_id],
+            |row| row.get(0),
+        )?;
+        if lineage.is_empty() {
+            return Err(StateError::Integrity(format!(
+                "memory predecessor {previous_id} has no durable lineage"
+            )));
+        }
+        lineage
+    } else {
+        record.id.clone()
+    };
+    let content_digest = record_content_digest(
+        record.kind,
+        &record.scope,
+        &record.subject,
+        &record.predicate,
+        &record.conflict_key,
+        &record.assertion,
+        record.trust,
+        record.confidence,
+        &record.provenance,
+    )?;
     tx.execute(
         "INSERT INTO memory_records(\
-            memory_id, kind, project_id, scope_kind, agent_id, subject, predicate, assertion, \
-            trust, confidence, status, repository_id, repository_revision, producing_task_id, \
+            memory_id, kind, project_id, scope_kind, agent_id, subject, predicate, conflict_key, assertion, \
+            trust, confidence_legacy_real, confidence, status, repository_id, repository_revision, producing_task_id, \
             producing_attempt_id, created_at_ms, updated_at_ms, validated_at_ms, version, \
-            supersedes_id, expires_at_ms, normal_injection\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'active', ?11, ?12, ?13, ?14, ?15, ?15, ?16, ?17, ?18, ?19, 1)",
+            supersedes_id, expires_at_ms, normal_injection, lineage_id, content_digest\
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'active', ?13, ?14, ?15, ?16, ?17, ?17, ?18, ?19, ?20, ?21, 1, ?22, ?23)",
         params![
             record.id,
             record.kind.as_str(),
@@ -963,10 +1208,12 @@ fn insert_record_tx(
             record.scope.agent_id,
             record.subject,
             record.predicate,
+            record.conflict_key,
             record.assertion,
             record.trust.as_str(),
-            record.confidence,
-            record.provenance.repository_id,
+            confidence_legacy_real,
+            confidence,
+            record.scope.repository_id,
             record.provenance.repository_revision,
             record.provenance.producing_task_id,
             record.provenance.producing_attempt_id,
@@ -975,6 +1222,8 @@ fn insert_record_tx(
             version,
             supersedes,
             record.expires_at_ms,
+            lineage_id,
+            content_digest,
         ],
     )?;
     for role in &record.scope.role_visibility {
@@ -1011,6 +1260,27 @@ fn insert_record_tx(
             ],
         )?;
     }
+    insert_projection_tx(tx, record)?;
+    Ok(())
+}
+
+fn insert_projection_tx(tx: &Transaction<'_>, record: &NewMemoryRecord) -> Result<(), StateError> {
+    tx.execute(
+        "INSERT INTO memory_fts_projection(\
+             memory_id, project_id, repository_id, kind, trust, status, conflict_key, subject, predicate, assertion\
+         ) VALUES (?1, ?2, COALESCE(?3, ''), ?4, ?5, 'active', ?6, ?7, ?8, ?9)",
+        params![
+            record.id,
+            record.scope.project_id,
+            record.scope.repository_id,
+            record.kind.as_str(),
+            record.trust.as_str(),
+            record.conflict_key,
+            record.subject,
+            record.predicate,
+            record.assertion,
+        ],
+    )?;
     Ok(())
 }
 
@@ -1022,9 +1292,11 @@ struct StoredMemoryRow {
     agent_id: Option<String>,
     subject: String,
     predicate: String,
+    conflict_key: String,
     assertion: String,
     trust: String,
-    confidence: f64,
+    confidence_legacy_real: f64,
+    confidence: i64,
     status: String,
     repository_id: Option<String>,
     repository_revision: Option<String>,
@@ -1042,6 +1314,8 @@ struct StoredMemoryRow {
     conflict_set_id: Option<String>,
     normal_injection: i64,
     exclusion_reason: Option<String>,
+    lineage_id: String,
+    content_digest: String,
 }
 
 fn stored_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemoryRow> {
@@ -1053,45 +1327,142 @@ fn stored_memory_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMemoryRo
         agent_id: row.get(4)?,
         subject: row.get(5)?,
         predicate: row.get(6)?,
-        assertion: row.get(7)?,
-        trust: row.get(8)?,
-        confidence: row.get(9)?,
-        status: row.get(10)?,
-        repository_id: row.get(11)?,
-        repository_revision: row.get(12)?,
-        producing_task_id: row.get(13)?,
-        producing_attempt_id: row.get(14)?,
-        created_at_ms: row.get(15)?,
-        updated_at_ms: row.get(16)?,
-        validated_at_ms: row.get(17)?,
-        version: row.get(18)?,
-        supersedes: row.get(19)?,
-        superseded_by: row.get(20)?,
-        expires_at_ms: row.get(21)?,
-        access_count: row.get(22)?,
-        last_accessed_at_ms: row.get(23)?,
-        conflict_set_id: row.get(24)?,
-        normal_injection: row.get(25)?,
-        exclusion_reason: row.get(26)?,
+        conflict_key: row.get(7)?,
+        assertion: row.get(8)?,
+        trust: row.get(9)?,
+        confidence_legacy_real: row.get(10)?,
+        confidence: row.get(11)?,
+        status: row.get(12)?,
+        repository_id: row.get(13)?,
+        repository_revision: row.get(14)?,
+        producing_task_id: row.get(15)?,
+        producing_attempt_id: row.get(16)?,
+        created_at_ms: row.get(17)?,
+        updated_at_ms: row.get(18)?,
+        validated_at_ms: row.get(19)?,
+        version: row.get(20)?,
+        supersedes: row.get(21)?,
+        superseded_by: row.get(22)?,
+        expires_at_ms: row.get(23)?,
+        access_count: row.get(24)?,
+        last_accessed_at_ms: row.get(25)?,
+        conflict_set_id: row.get(26)?,
+        normal_injection: row.get(27)?,
+        exclusion_reason: row.get(28)?,
+        lineage_id: row.get(29)?,
+        content_digest: row.get(30)?,
     })
+}
+
+fn load_stored_memory_row_tx(
+    tx: &Transaction<'_>,
+    memory_id: &str,
+) -> Result<Option<StoredMemoryRow>, StateError> {
+    Ok(tx
+        .query_row(
+            "SELECT memory_id, kind, project_id, scope_kind, agent_id, subject, predicate, conflict_key, assertion, \
+                    trust, confidence_legacy_real, confidence, status, repository_id, repository_revision, producing_task_id, \
+                    producing_attempt_id, created_at_ms, updated_at_ms, validated_at_ms, version, \
+                    supersedes_id, superseded_by_id, expires_at_ms, access_count, last_accessed_at_ms, \
+                    conflict_set_id, normal_injection, exclusion_reason, lineage_id, content_digest \
+             FROM memory_records WHERE memory_id=?1",
+            [memory_id],
+            stored_memory_row,
+        )
+        .optional()?)
+}
+
+fn backfill_memory_envelope_tx(tx: &Transaction<'_>) -> Result<(), StateError> {
+    let mut statement = tx.prepare(
+        "SELECT memory_id FROM memory_records \
+         WHERE lineage_id='' OR content_digest='' ORDER BY memory_id ASC",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    drop(statement);
+
+    for id in ids {
+        let row = load_stored_memory_row_tx(tx, &id)?.ok_or_else(|| {
+            StateError::Integrity(format!(
+                "memory {id} disappeared during v5 envelope backfill"
+            ))
+        })?;
+        let confidence = decode_confidence(row.confidence, row.confidence_legacy_real, &row.id)?;
+        let lineage_id = lineage_root_tx(tx, &row.id, row.supersedes.as_deref())?;
+        if !row.lineage_id.is_empty() && row.lineage_id != lineage_id {
+            return Err(StateError::Integrity(format!(
+                "memory {} lineage changed during v5 envelope backfill",
+                row.id
+            )));
+        }
+        let scope = MemoryScope {
+            project_id: row.project_id.clone(),
+            repository_id: row.repository_id.clone(),
+            kind: MemoryScopeKind::parse(&row.scope_kind)?,
+            agent_id: row.agent_id.clone(),
+            role_visibility: string_children(
+                tx,
+                "SELECT role_id FROM memory_role_visibility WHERE memory_id=?1 ORDER BY role_id ASC",
+                &row.id,
+            )?,
+        };
+        let provenance = MemoryProvenance {
+            source_evidence_ids: string_children(
+                tx,
+                "SELECT evidence_id FROM memory_source_evidence WHERE memory_id=?1 ORDER BY evidence_id ASC",
+                &row.id,
+            )?,
+            producing_task_id: row.producing_task_id.clone(),
+            producing_attempt_id: row.producing_attempt_id.clone(),
+            repository_revision: row.repository_revision.clone(),
+            source_fingerprints: fingerprint_children(tx, &row.id)?,
+        };
+        let content_digest = record_content_digest(
+            MemoryKind::parse(&row.kind)?,
+            &scope,
+            &row.subject,
+            &row.predicate,
+            &row.conflict_key,
+            &row.assertion,
+            MemoryTrust::parse(&row.trust)?,
+            confidence,
+            &provenance,
+        )?;
+        if !row.content_digest.is_empty() && row.content_digest != content_digest {
+            return Err(StateError::Integrity(format!(
+                "memory {} content changed during v5 envelope backfill",
+                row.id
+            )));
+        }
+        tx.execute(
+            "UPDATE memory_records SET lineage_id=?2, content_digest=?3 WHERE memory_id=?1",
+            params![row.id, lineage_id, content_digest],
+        )?;
+        append_memory_event_tx(
+            tx,
+            &row.id,
+            "memory",
+            "canonical_envelope_backfilled",
+            &json!({
+                "memory_id": row.id,
+                "lineage_id": lineage_id,
+                "content_digest": content_digest,
+                "schema_version": MEMORY_RECORD_SCHEMA_VERSION,
+            }),
+            row.updated_at_ms,
+        )?;
+    }
+    Ok(())
 }
 
 fn load_record_tx(
     tx: &Transaction<'_>,
     memory_id: &str,
 ) -> Result<Option<MemoryRecord>, StateError> {
-    let stored = tx
-        .query_row(
-            "SELECT memory_id, kind, project_id, scope_kind, agent_id, subject, predicate, assertion, \
-                    trust, confidence, status, repository_id, repository_revision, producing_task_id, \
-                    producing_attempt_id, created_at_ms, updated_at_ms, validated_at_ms, version, \
-                    supersedes_id, superseded_by_id, expires_at_ms, access_count, last_accessed_at_ms, \
-                    conflict_set_id, normal_injection, exclusion_reason \
-             FROM memory_records WHERE memory_id=?1",
-            [memory_id],
-            stored_memory_row,
-        )
-        .optional()?;
+    let stored = load_stored_memory_row_tx(tx, memory_id)?;
     stored.map(|row| build_memory_record(tx, row)).transpose()
 }
 
@@ -1116,30 +1487,64 @@ fn build_memory_record(
     let access_count = u64::try_from(row.access_count).map_err(|_| {
         StateError::Integrity(format!("negative memory access count for {}", row.id))
     })?;
+    let confidence = decode_confidence(row.confidence, row.confidence_legacy_real, &row.id)?;
+    let expected_lineage_id = lineage_root_tx(tx, &row.id, row.supersedes.as_deref())?;
+    if row.lineage_id != expected_lineage_id {
+        return Err(StateError::Integrity(format!(
+            "memory {} durable lineage mismatch: stored={:?} expected={:?}",
+            row.id, row.lineage_id, expected_lineage_id
+        )));
+    }
+    let kind = MemoryKind::parse(&row.kind)?;
+    let scope_kind = MemoryScopeKind::parse(&row.scope_kind)?;
+    let trust = MemoryTrust::parse(&row.trust)?;
+    let status = MemoryStatus::parse(&row.status)?;
+    let scope = MemoryScope {
+        project_id: row.project_id,
+        repository_id: row.repository_id,
+        kind: scope_kind,
+        agent_id: row.agent_id,
+        role_visibility,
+    };
+    let provenance = MemoryProvenance {
+        source_evidence_ids,
+        producing_task_id: row.producing_task_id,
+        producing_attempt_id: row.producing_attempt_id,
+        repository_revision: row.repository_revision,
+        source_fingerprints,
+    };
+    let expected_content_digest = record_content_digest(
+        kind,
+        &scope,
+        &row.subject,
+        &row.predicate,
+        &row.conflict_key,
+        &row.assertion,
+        trust,
+        confidence,
+        &provenance,
+    )?;
+    if row.content_digest != expected_content_digest {
+        return Err(StateError::Integrity(format!(
+            "memory {} durable content digest mismatch",
+            row.id
+        )));
+    }
     Ok(MemoryRecord {
         schema_version: MEMORY_RECORD_SCHEMA_VERSION,
         id: row.id,
-        kind: MemoryKind::parse(&row.kind)?,
-        scope: MemoryScope {
-            project_id: row.project_id,
-            kind: MemoryScopeKind::parse(&row.scope_kind)?,
-            agent_id: row.agent_id,
-            role_visibility,
-        },
+        lineage_id: row.lineage_id,
+        kind,
+        scope,
         subject: row.subject,
         predicate: row.predicate,
+        conflict_key: row.conflict_key,
         assertion: row.assertion,
-        trust: MemoryTrust::parse(&row.trust)?,
-        confidence: row.confidence,
-        status: MemoryStatus::parse(&row.status)?,
-        provenance: MemoryProvenance {
-            source_evidence_ids,
-            producing_task_id: row.producing_task_id,
-            producing_attempt_id: row.producing_attempt_id,
-            repository_id: row.repository_id,
-            repository_revision: row.repository_revision,
-            source_fingerprints,
-        },
+        content_digest: row.content_digest,
+        trust,
+        confidence,
+        status,
+        provenance,
         created_at_ms: row.created_at_ms,
         updated_at_ms: row.updated_at_ms,
         validated_at_ms: row.validated_at_ms,
@@ -1195,6 +1600,7 @@ fn fingerprint_children(
             digest,
         });
     }
+    values.sort();
     Ok(values)
 }
 
@@ -1231,12 +1637,13 @@ fn reconcile_contradictions_tx(
     memory_id: &str,
     now_ms: i64,
 ) -> Result<(), StateError> {
-    let current = load_record_tx(tx, memory_id)?
+    let mut current = load_record_tx(tx, memory_id)?
         .ok_or_else(|| StateError::Integrity(format!("unknown memory {memory_id}")))?;
     let mut statement = tx.prepare(
         "SELECT memory_id FROM memory_records \
          WHERE memory_id<>?1 AND project_id=?2 AND scope_kind=?3 AND agent_id IS ?4 \
-           AND repository_id IS ?5 AND subject=?6 AND predicate=?7 AND status='active' \
+           AND repository_id IS ?5 AND status='active' \
+           AND ((subject=?6 AND predicate=?7) OR conflict_key=?8) \
          ORDER BY memory_id ASC",
     )?;
     let rows = statement.query_map(
@@ -1245,9 +1652,10 @@ fn reconcile_contradictions_tx(
             current.scope.project_id,
             current.scope.kind.as_str(),
             current.scope.agent_id,
-            current.provenance.repository_id,
+            current.scope.repository_id,
             current.subject,
             current.predicate,
+            current.conflict_key,
         ],
         |row| row.get::<_, String>(0),
     )?;
@@ -1280,6 +1688,11 @@ fn reconcile_contradictions_tx(
                     )));
                 }
                 create_or_extend_conflict_tx(tx, &current, &related, now_ms)?;
+                current = load_record_tx(tx, memory_id)?.ok_or_else(|| {
+                    StateError::Integrity(format!(
+                        "memory {memory_id} disappeared while reconciling contradictions"
+                    ))
+                })?;
             }
             Ordering::Greater => {
                 exclude_lower_trust_tx(tx, &related.id, current.trust, now_ms)?;
@@ -1299,10 +1712,13 @@ fn exclude_lower_trust_tx(
     now_ms: i64,
 ) -> Result<(), StateError> {
     let reason = format!("contradicts_{}", higher_trust.as_str());
-    tx.execute(
+    let changed = tx.execute(
         "UPDATE memory_records SET normal_injection=0, exclusion_reason=?2, updated_at_ms=?3 WHERE memory_id=?1 AND status='active'",
         params![memory_id, reason, now_ms],
     )?;
+    if changed != 0 {
+        journal_memory_record_tx(tx, memory_id, "trust_demoted", &reason, now_ms)?;
+    }
     Ok(())
 }
 
@@ -1312,22 +1728,45 @@ fn create_or_extend_conflict_tx(
     right: &MemoryRecord,
     now_ms: i64,
 ) -> Result<(), StateError> {
-    let conflict_id = left
-        .conflict_set_id
-        .clone()
-        .or_else(|| right.conflict_set_id.clone())
-        .unwrap_or_else(|| conflict_set_id(left));
+    let relation_key = contradiction_relation_key(left, right)?;
+    let conflict_id = match (&left.conflict_set_id, &right.conflict_set_id) {
+        (Some(left_id), Some(right_id)) if left_id != right_id => {
+            let (target, source) = if left_id <= right_id {
+                (left_id.as_str(), right_id.as_str())
+            } else {
+                (right_id.as_str(), left_id.as_str())
+            };
+            merge_conflict_sets_tx(tx, target, source, now_ms)?;
+            target.to_owned()
+        }
+        (Some(id), _) | (_, Some(id)) => id.clone(),
+        (None, None) => conflict_set_id(left, right, &relation_key),
+    };
     tx.execute(
-        "INSERT OR IGNORE INTO memory_conflict_sets(conflict_set_id, project_id, repository_id, subject, predicate, created_at_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT OR IGNORE INTO memory_conflict_sets(conflict_set_id, project_id, repository_id, conflict_key, subject, predicate, created_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             conflict_id,
             left.scope.project_id,
-            left.provenance.repository_id,
+            left.scope.repository_id,
+            relation_key,
             left.subject,
             left.predicate,
             now_ms,
         ],
+    )?;
+    append_memory_event_tx(
+        tx,
+        &conflict_id,
+        "memory_conflict",
+        "created_or_extended",
+        &json!({
+            "conflict_set_id": conflict_id,
+            "conflict_key": relation_key,
+            "left_memory_id": left.id,
+            "right_memory_id": right.id,
+        }),
+        now_ms,
     )?;
     for id in [&left.id, &right.id] {
         tx.execute(
@@ -1338,7 +1777,88 @@ fn create_or_extend_conflict_tx(
             "UPDATE memory_records SET conflict_set_id=?2, normal_injection=0, exclusion_reason=COALESCE(exclusion_reason, 'conflict'), updated_at_ms=?3 WHERE memory_id=?1",
             params![id, conflict_id, now_ms],
         )?;
+        journal_memory_record_tx(tx, id, "conflict_member", "unresolved_conflict", now_ms)?;
     }
+    Ok(())
+}
+
+fn merge_conflict_sets_tx(
+    tx: &Transaction<'_>,
+    target_id: &str,
+    source_id: &str,
+    now_ms: i64,
+) -> Result<(), StateError> {
+    if target_id == source_id {
+        return Ok(());
+    }
+    for conflict_id in [target_id, source_id] {
+        let state: Option<Option<i64>> = tx
+            .query_row(
+                "SELECT resolved_at_ms FROM memory_conflict_sets WHERE conflict_set_id=?1",
+                [conflict_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?;
+        match state {
+            Some(None) => {}
+            Some(Some(_)) => {
+                return Err(StateError::Integrity(format!(
+                    "cannot merge resolved memory conflict set {conflict_id}"
+                )));
+            }
+            None => {
+                return Err(StateError::Integrity(format!(
+                    "missing memory conflict set {conflict_id} during merge"
+                )));
+            }
+        }
+    }
+
+    let mut statement = tx.prepare(
+        "SELECT memory_id FROM memory_conflict_members WHERE conflict_set_id=?1 ORDER BY memory_id ASC",
+    )?;
+    let rows = statement.query_map([source_id], |row| row.get::<_, String>(0))?;
+    let mut source_members = Vec::new();
+    for row in rows {
+        source_members.push(row?);
+    }
+    drop(statement);
+
+    for memory_id in &source_members {
+        tx.execute(
+            "INSERT OR IGNORE INTO memory_conflict_members(conflict_set_id, memory_id) VALUES (?1, ?2)",
+            params![target_id, memory_id],
+        )?;
+        let changed = tx.execute(
+            "UPDATE memory_records SET conflict_set_id=?2, updated_at_ms=?3 \
+             WHERE memory_id=?1 AND status='active' AND conflict_set_id=?4",
+            params![memory_id, target_id, now_ms, source_id],
+        )?;
+        if changed != 0 {
+            journal_memory_record_tx(
+                tx,
+                memory_id,
+                "conflict_member_merged",
+                "connected_conflict_sets_merged",
+                now_ms,
+            )?;
+        }
+    }
+    tx.execute(
+        "UPDATE memory_conflict_sets SET resolved_at_ms=?2 WHERE conflict_set_id=?1 AND resolved_at_ms IS NULL",
+        params![source_id, now_ms],
+    )?;
+    append_memory_event_tx(
+        tx,
+        source_id,
+        "memory_conflict",
+        "merged",
+        &json!({
+            "source_conflict_set_id": source_id,
+            "target_conflict_set_id": target_id,
+        }),
+        now_ms,
+    )?;
     Ok(())
 }
 
@@ -1369,6 +1889,14 @@ fn resolve_conflict_if_unambiguous(
         "UPDATE memory_conflict_sets SET resolved_at_ms=COALESCE(resolved_at_ms, ?2) WHERE conflict_set_id=?1",
         params![conflict_set_id, now_ms],
     )?;
+    append_memory_event_tx(
+        tx,
+        conflict_set_id,
+        "memory_conflict",
+        "resolved",
+        &json!({"conflict_set_id": conflict_set_id}),
+        now_ms,
+    )?;
     if let Some((remaining_id, reason)) = active.first() {
         let was_only_conflict = reason.as_deref() == Some("conflict");
         tx.execute(
@@ -1380,6 +1908,111 @@ fn resolve_conflict_if_unambiguous(
                 now_ms
             ],
         )?;
+        journal_memory_record_tx(
+            tx,
+            remaining_id,
+            "conflict_resolved_member",
+            "conflict_resolved",
+            now_ms,
+        )?;
+    }
+    Ok(())
+}
+
+fn reconsider_demotions_tx(
+    tx: &Transaction<'_>,
+    departed: &MemoryRecord,
+    now_ms: i64,
+) -> Result<(), StateError> {
+    let mut statement = tx.prepare(
+        "SELECT memory_id FROM memory_records \
+         WHERE project_id=?1 AND scope_kind=?2 AND agent_id IS ?3 AND repository_id IS ?4 \
+           AND status='active' AND exclusion_reason LIKE 'contradicts_%' \
+           AND ((subject=?5 AND predicate=?6) OR conflict_key=?7) \
+         ORDER BY memory_id ASC",
+    )?;
+    let rows = statement.query_map(
+        params![
+            departed.scope.project_id,
+            departed.scope.kind.as_str(),
+            departed.scope.agent_id,
+            departed.scope.repository_id,
+            departed.subject,
+            departed.predicate,
+            departed.conflict_key,
+        ],
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        candidates.push(row?);
+    }
+    drop(statement);
+
+    for candidate_id in candidates {
+        let Some(candidate) = load_record_tx(tx, &candidate_id)? else {
+            continue;
+        };
+        if candidate.conflict_set_id.is_some() {
+            continue;
+        }
+        let mut related_statement = tx.prepare(
+            "SELECT memory_id FROM memory_records \
+             WHERE memory_id<>?1 AND project_id=?2 AND scope_kind=?3 AND agent_id IS ?4 \
+               AND repository_id IS ?5 AND status='active' \
+               AND ((subject=?6 AND predicate=?7) OR conflict_key=?8) \
+             ORDER BY memory_id ASC",
+        )?;
+        let related_rows = related_statement.query_map(
+            params![
+                candidate.id,
+                candidate.scope.project_id,
+                candidate.scope.kind.as_str(),
+                candidate.scope.agent_id,
+                candidate.scope.repository_id,
+                candidate.subject,
+                candidate.predicate,
+                candidate.conflict_key,
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut related_ids = Vec::new();
+        for row in related_rows {
+            related_ids.push(row?);
+        }
+        drop(related_statement);
+
+        let candidate_assertion = normalized_assertion(&candidate.assertion);
+        let mut still_demoted = false;
+        for related_id in related_ids {
+            let Some(related) = load_record_tx(tx, &related_id)? else {
+                continue;
+            };
+            if related.trust.precedence() > candidate.trust.precedence()
+                && role_scopes_overlap(
+                    &candidate.scope.role_visibility,
+                    &related.scope.role_visibility,
+                )
+                && normalized_assertion(&related.assertion) != candidate_assertion
+            {
+                still_demoted = true;
+                break;
+            }
+        }
+        if !still_demoted {
+            tx.execute(
+                "UPDATE memory_records SET normal_injection=1, exclusion_reason=NULL, updated_at_ms=?2 \
+                 WHERE memory_id=?1 AND status='active' AND conflict_set_id IS NULL",
+                params![candidate.id, now_ms],
+            )?;
+            journal_memory_record_tx(
+                tx,
+                &candidate.id,
+                "trust_demotion_cleared",
+                "higher_trust_evidence_no_longer_current",
+                now_ms,
+            )?;
+        }
     }
     Ok(())
 }
@@ -1394,12 +2027,13 @@ fn load_conflict_set_tx(
         Option<String>,
         String,
         String,
+        String,
         i64,
         Option<i64>,
     );
     let scalar: Option<ConflictScalar> = tx
         .query_row(
-            "SELECT conflict_set_id, project_id, repository_id, subject, predicate, created_at_ms, resolved_at_ms \
+            "SELECT conflict_set_id, project_id, repository_id, conflict_key, subject, predicate, created_at_ms, resolved_at_ms \
              FROM memory_conflict_sets WHERE conflict_set_id=?1",
             [conflict_set_id],
             |row| {
@@ -1411,12 +2045,21 @@ fn load_conflict_set_tx(
                     row.get(4)?,
                     row.get(5)?,
                     row.get(6)?,
+                    row.get(7)?,
                 ))
             },
         )
         .optional()?;
-    let Some((id, project_id, repository_id, subject, predicate, created_at_ms, resolved_at_ms)) =
-        scalar
+    let Some((
+        id,
+        project_id,
+        repository_id,
+        conflict_key,
+        subject,
+        predicate,
+        created_at_ms,
+        resolved_at_ms,
+    )) = scalar
     else {
         return Ok(None);
     };
@@ -1429,6 +2072,7 @@ fn load_conflict_set_tx(
         id,
         project_id,
         repository_id,
+        conflict_key,
         subject,
         predicate,
         created_at_ms,
@@ -1437,15 +2081,37 @@ fn load_conflict_set_tx(
     }))
 }
 
-fn conflict_set_id(record: &MemoryRecord) -> String {
+fn contradiction_relation_key(
+    left: &MemoryRecord,
+    right: &MemoryRecord,
+) -> Result<String, StateError> {
+    if left.conflict_key == right.conflict_key {
+        return Ok(left.conflict_key.clone());
+    }
+    if left.subject == right.subject && left.predicate == right.predicate {
+        return Ok(format!("{}\u{1f}{}", left.subject, left.predicate));
+    }
+    Err(StateError::Integrity(format!(
+        "memories {} and {} do not share a contradiction relation",
+        left.id, right.id
+    )))
+}
+
+fn conflict_set_id(left: &MemoryRecord, right: &MemoryRecord, relation_key: &str) -> String {
     let mut hasher = Sha256::new();
+    let (first_id, second_id) = if left.id <= right.id {
+        (left.id.as_str(), right.id.as_str())
+    } else {
+        (right.id.as_str(), left.id.as_str())
+    };
     for part in [
-        record.scope.project_id.as_str(),
-        record.scope.kind.as_str(),
-        record.scope.agent_id.as_deref().unwrap_or(""),
-        record.provenance.repository_id.as_deref().unwrap_or(""),
-        record.subject.as_str(),
-        record.predicate.as_str(),
+        left.scope.project_id.as_str(),
+        left.scope.kind.as_str(),
+        left.scope.agent_id.as_deref().unwrap_or(""),
+        left.scope.repository_id.as_deref().unwrap_or(""),
+        relation_key,
+        first_id,
+        second_id,
     ] {
         hasher.update(part.as_bytes());
         hasher.update([0]);
@@ -1467,6 +2133,11 @@ fn role_scopes_overlap(left: &[String], right: &[String]) -> bool {
 
 fn scope_permits(scope: &MemoryScope, access: MemoryAccessScope<'_>) -> bool {
     if scope.project_id != access.project_id {
+        return false;
+    }
+    if let Some(repository_id) = access.repository_id
+        && scope.repository_id.as_deref() != Some(repository_id)
+    {
         return false;
     }
     if scope.kind == MemoryScopeKind::Agent && scope.agent_id.as_deref() != access.agent_id {

@@ -17,9 +17,10 @@ const FOUNDATION_SQL: &str = include_str!("../migrations/0001_foundation.sql");
 const ARTIFACTS_SQL: &str = include_str!("../migrations/0002_artifacts.sql");
 const SECURITY_KERNEL_SQL: &str = include_str!("../migrations/0003_security_kernel.sql");
 const MEMORY_SQL: &str = include_str!("../migrations/0004_memory.sql");
+const MEMORY_RETRIEVAL_SQL: &str = include_str!("../migrations/0005_memory_retrieval.sql");
 
 /// Current durable schema version implemented by this crate.
-pub const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub const CURRENT_SCHEMA_VERSION: i64 = 5;
 
 /// One numbered, transactional durable-state migration.
 #[derive(Debug, Clone, Copy)]
@@ -59,6 +60,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 4,
         name: "memory_lifecycle",
         sql: MEMORY_SQL,
+    },
+    Migration {
+        version: 5,
+        name: "memory_retrieval",
+        sql: MEMORY_RETRIEVAL_SQL,
     },
 ];
 
@@ -1605,7 +1611,7 @@ mod tests {
     #[test]
     fn failed_migration_rolls_back_and_prior_backup_remains_readable() {
         const BROKEN: Migration = Migration {
-            version: 4,
+            version: CURRENT_SCHEMA_VERSION + 1,
             name: "broken_fixture",
             sql: "CREATE TABLE should_rollback(value TEXT); INSERT INTO missing_table VALUES (1);",
         };
@@ -1653,9 +1659,9 @@ mod tests {
 
     #[test]
     fn memory_migration_has_exact_v3_backup_and_transactional_rollback_fixture() {
-        const BROKEN_AFTER_MEMORY: Migration = Migration {
-            version: 5,
-            name: "broken_after_memory_fixture",
+        const BROKEN_MEMORY_V4: Migration = Migration {
+            version: 4,
+            name: "broken_memory_v4_fixture",
             sql: "CREATE TABLE memory_partial(value TEXT); INSERT INTO definitely_missing_memory_table VALUES (1);",
         };
 
@@ -1674,6 +1680,12 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("seed v3: {error}"));
         connection
+            .execute(
+                "INSERT INTO state_records(namespace, record_key, value_json, version, updated_at_ms) VALUES ('memory', 'ambiguous-pre-v4', '{\"subject\":\"must-not-import\"}', 1, 1)",
+                [],
+            )
+            .unwrap_or_else(|error| panic!("seed ambiguous pre-v4 state: {error}"));
+        connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .unwrap_or_else(|error| panic!("checkpoint: {error}"));
         drop(connection);
@@ -1689,6 +1701,37 @@ mod tests {
         assert_eq!(backup_version, 3);
         drop(backup_connection);
 
+        let mut failed_v4 =
+            Connection::open(&db).unwrap_or_else(|error| panic!("open failed-v4: {error}"));
+        configure_connection(&failed_v4)
+            .unwrap_or_else(|error| panic!("configure failed-v4: {error}"));
+        let mut broken_v4_path = MIGRATIONS[..3].to_vec();
+        broken_v4_path.push(BROKEN_MEMORY_V4);
+        assert!(MigrationRunner::apply(&mut failed_v4, &broken_v4_path).is_err());
+        let partial: i64 = failed_v4
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_partial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        assert_eq!(partial, 0);
+        let version_after_failed_v4: i64 = failed_v4
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(-1);
+        assert_eq!(version_after_failed_v4, 3);
+        let preserved_after_failed_v4: String = failed_v4
+            .query_row(
+                "SELECT value_json FROM state_records WHERE namespace='fixture' AND record_key='before-memory'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        assert_eq!(preserved_after_failed_v4, "{\"preserved\":true}");
+        drop(failed_v4);
+
         let mut upgraded =
             Connection::open(&db).unwrap_or_else(|error| panic!("open upgrade: {error}"));
         configure_connection(&upgraded)
@@ -1703,18 +1746,11 @@ mod tests {
             )
             .unwrap_or(-1);
         assert_eq!(memory_table, 1);
-
-        let mut with_broken = MIGRATIONS.to_vec();
-        with_broken.push(BROKEN_AFTER_MEMORY);
-        assert!(MigrationRunner::apply(&mut upgraded, &with_broken).is_err());
-        let partial: i64 = upgraded
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_partial'",
-                [],
-                |row| row.get(0),
-            )
+        let fabricated_memory: i64 = upgraded
+            .query_row("SELECT COUNT(*) FROM memory_records", [], |row| row.get(0))
             .unwrap_or(-1);
-        assert_eq!(partial, 0);
+        assert_eq!(fabricated_memory, 0);
+
         drop(upgraded);
 
         let migrated_backup =

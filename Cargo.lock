@@ -724,6 +724,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sovereign-evidence",
+ "sovereign-memory",
  "sovereign-repo",
 ]
 

@@ -12,9 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+mod memory;
 mod routing;
 mod telemetry;
 
+pub use memory::MemoryHistoryProvider;
 pub use routing::{
     Channel, ChannelResult, ContextLevelPolicy, DiffResult, EvidenceChannelLink, FailureHistoryKey,
     HistoryProvider, RepositoryRetrievalBackend, RetrievalBackend, RetrievalIntent,

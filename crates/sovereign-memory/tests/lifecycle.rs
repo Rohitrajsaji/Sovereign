@@ -1,3 +1,4 @@
+use rusqlite::Connection;
 use sovereign_memory::{
     FingerprintChange, InvalidationPredicate, InvalidationPredicateKind, MemoryAccessScope,
     MemoryKind, MemoryLifecycle, MemoryManager, MemoryProvenance, MemoryRepositoryDelta,
@@ -45,6 +46,7 @@ fn manager(label: &str) -> (TestDir, MemoryManager) {
 fn scope(project_id: &str) -> MemoryScope {
     MemoryScope {
         project_id: project_id.to_owned(),
+        repository_id: None,
         kind: MemoryScopeKind::Project,
         agent_id: None,
         role_visibility: Vec::new(),
@@ -56,7 +58,6 @@ fn provenance(repository_id: Option<&str>, evidence_id: &str) -> MemoryProvenanc
         source_evidence_ids: vec![evidence_id.to_owned()],
         producing_task_id: Some("task.fixture".to_owned()),
         producing_attempt_id: Some("attempt.fixture".to_owned()),
-        repository_id: repository_id.map(str::to_owned),
         repository_revision: repository_id.map(|_| "rev-a".to_owned()),
         source_fingerprints: repository_id.map_or_else(Vec::new, |_| {
             vec![SourceFingerprint {
@@ -82,9 +83,10 @@ fn record(
         scope: scope(project_id),
         subject: subject.to_owned(),
         predicate: "has_value".to_owned(),
+        conflict_key: format!("{subject}\u{1f}has_value"),
         assertion: assertion.to_owned(),
         trust,
-        confidence: 0.9,
+        confidence: 90,
         provenance: provenance(None, &format!("evidence.{id}")),
         expires_at_ms: None,
         invalidation_predicates: Vec::new(),
@@ -129,6 +131,7 @@ fn lifecycle_project_isolation_is_fail_closed() {
         .injectable_records(
             MemoryAccessScope {
                 project_id: "project-a",
+                repository_id: None,
                 agent_id: None,
                 role_id: None,
             },
@@ -172,6 +175,7 @@ fn lifecycle_role_and_agent_isolation_are_uniform_scope_rules() {
         .injectable_records(
             MemoryAccessScope {
                 project_id: "project-a",
+                repository_id: None,
                 agent_id: Some("agent-a"),
                 role_id: Some("implementer"),
             },
@@ -184,6 +188,7 @@ fn lifecycle_role_and_agent_isolation_are_uniform_scope_rules() {
         .injectable_records(
             MemoryAccessScope {
                 project_id: "project-a",
+                repository_id: None,
                 agent_id: Some("agent-b"),
                 role_id: Some("reviewer"),
             },
@@ -226,11 +231,14 @@ fn lifecycle_governed_replacement_is_versioned_supersession() {
     assert_eq!(old.superseded_by.as_deref(), Some("mem.governed.v2"));
     assert_eq!(new.version, 2);
     assert_eq!(new.supersedes.as_deref(), Some("mem.governed.v1"));
+    assert_eq!(new.lineage_id, old.lineage_id);
+    assert_eq!(new.lineage_id, "mem.governed.v1");
 
     let visible = memory
         .injectable_records(
             MemoryAccessScope {
                 project_id: "project-a",
+                repository_id: None,
                 agent_id: None,
                 role_id: None,
             },
@@ -238,6 +246,361 @@ fn lifecycle_governed_replacement_is_versioned_supersession() {
         )
         .unwrap_or_else(|error| panic!("visible: {error}"));
     assert_eq!(ids(&visible), vec!["mem.governed.v2"]);
+}
+
+#[test]
+fn lifecycle_repository_scope_isolates_records_inside_one_project() {
+    let (_temp, mut memory) = manager("repository-isolation");
+    for repository_id in ["repo-a", "repo-b"] {
+        let mut fixture = record(
+            &format!("mem.{repository_id}"),
+            "project-a",
+            MemoryKind::ValidatedProjectFact,
+            MemoryTrust::Validated,
+            repository_id,
+            "present",
+        );
+        fixture.scope.repository_id = Some(repository_id.to_owned());
+        fixture.provenance = provenance(Some(repository_id), &format!("evidence.{repository_id}"));
+        memory
+            .capture(fixture, NOW)
+            .unwrap_or_else(|error| panic!("capture {repository_id}: {error}"));
+    }
+    let visible = memory
+        .injectable_records(
+            MemoryAccessScope {
+                project_id: "project-a",
+                repository_id: Some("repo-a"),
+                agent_id: None,
+                role_id: None,
+            },
+            NOW,
+        )
+        .unwrap_or_else(|error| panic!("repository view: {error}"));
+    assert_eq!(ids(&visible), vec!["mem.repo-a"]);
+}
+
+#[test]
+fn lifecycle_integer_confidence_and_content_digest_are_durable_and_bound() {
+    let (temp, mut memory) = manager("durable-envelope");
+    let mut fixture = record(
+        "mem.envelope",
+        "project-a",
+        MemoryKind::Episodic,
+        MemoryTrust::Observed,
+        "durability",
+        "bound content",
+    );
+    fixture.confidence = 73;
+    let stored = memory
+        .capture(fixture, NOW)
+        .unwrap_or_else(|error| panic!("capture: {error}"));
+    assert_eq!(stored.confidence, 73);
+    assert_eq!(stored.lineage_id, "mem.envelope");
+    assert!(stored.content_digest.starts_with("sha256:"));
+
+    let connection = Connection::open(temp.db()).unwrap_or_else(|error| panic!("sqlite: {error}"));
+    let (kind, confidence, lineage_id, content_digest): (String, i64, String, String) = connection
+        .query_row(
+            "SELECT typeof(confidence), confidence, lineage_id, content_digest FROM memory_records WHERE memory_id='mem.envelope'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap_or_else(|error| panic!("durable envelope: {error}"));
+    assert_eq!(kind, "integer");
+    assert_eq!(confidence, 73);
+    assert_eq!(lineage_id, stored.lineage_id);
+    assert_eq!(content_digest, stored.content_digest);
+    connection
+        .execute(
+            "UPDATE memory_records SET assertion='tampered' WHERE memory_id='mem.envelope'",
+            [],
+        )
+        .unwrap_or_else(|error| panic!("tamper: {error}"));
+    drop(connection);
+    assert!(memory.record("mem.envelope").is_err());
+}
+
+#[test]
+fn lifecycle_integer_confidence_rejects_values_above_percentage_domain() {
+    let (_temp, mut memory) = manager("confidence-bounds");
+    let mut invalid = record(
+        "mem.invalid-confidence",
+        "project-a",
+        MemoryKind::Episodic,
+        MemoryTrust::Observed,
+        "confidence",
+        "invalid",
+    );
+    invalid.confidence = 101;
+    assert!(memory.capture(invalid, NOW).is_err());
+}
+
+#[test]
+fn lifecycle_same_subject_predicate_cannot_bypass_conflict_with_a_different_key() {
+    let (_temp, mut memory) = manager("subject-predicate-conflict");
+    let mut first = record(
+        "mem.key.first",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "same-subject",
+        "alpha",
+    );
+    first.conflict_key = "invariant-a".to_owned();
+    let mut second = record(
+        "mem.key.second",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "same-subject",
+        "beta",
+    );
+    second.conflict_key = "invariant-b".to_owned();
+
+    memory
+        .capture(first, NOW)
+        .unwrap_or_else(|error| panic!("first: {error}"));
+    let second = memory
+        .capture(second, NOW + 1)
+        .unwrap_or_else(|error| panic!("second: {error}"));
+    let first = memory
+        .record("mem.key.first")
+        .unwrap_or_else(|error| panic!("read first: {error}"))
+        .unwrap_or_else(|| panic!("first missing"));
+    assert_eq!(second.conflict_set_id, first.conflict_set_id);
+    assert!(second.conflict_set_id.is_some());
+}
+
+#[test]
+fn lifecycle_shared_invariant_key_compares_different_subject_predicates() {
+    let (_temp, mut memory) = manager("shared-invariant-key");
+    let mut first = record(
+        "mem.key.first",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "subject-a",
+        "alpha",
+    );
+    first.conflict_key = "invariant-shared".to_owned();
+    let mut alias = record(
+        "mem.key.alias",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "different-subject",
+        "gamma",
+    );
+    alias.conflict_key = "invariant-shared".to_owned();
+
+    memory
+        .capture(first, NOW)
+        .unwrap_or_else(|error| panic!("first: {error}"));
+    let alias = memory
+        .capture(alias, NOW + 1)
+        .unwrap_or_else(|error| panic!("alias: {error}"));
+    let first = memory
+        .record("mem.key.first")
+        .unwrap_or_else(|error| panic!("read first: {error}"))
+        .unwrap_or_else(|| panic!("first missing"));
+    assert_eq!(alias.conflict_set_id, first.conflict_set_id);
+    assert!(alias.conflict_set_id.is_some());
+}
+
+#[test]
+fn lifecycle_unrelated_subject_predicate_and_invariant_key_do_not_conflict() {
+    let (_temp, mut memory) = manager("unrelated-conflict-domain");
+    let mut first = record(
+        "mem.key.first",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "subject-a",
+        "alpha",
+    );
+    first.conflict_key = "invariant-a".to_owned();
+    let mut independent = record(
+        "mem.key.independent",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "subject-b",
+        "beta",
+    );
+    independent.conflict_key = "invariant-b".to_owned();
+
+    memory
+        .capture(first, NOW)
+        .unwrap_or_else(|error| panic!("first: {error}"));
+    let independent = memory
+        .capture(independent, NOW + 1)
+        .unwrap_or_else(|error| panic!("independent: {error}"));
+    assert!(independent.conflict_set_id.is_none());
+}
+
+#[test]
+fn lifecycle_wrong_old_fingerprint_digest_cannot_invalidate_unrelated_memory() {
+    let (_temp, mut memory) = manager("wrong-old-digest");
+    let mut fixture = record(
+        "mem.digest-bound",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "source",
+        "bound",
+    );
+    fixture.scope.repository_id = Some("repo.app".to_owned());
+    fixture.provenance = provenance(Some("repo.app"), "evidence.digest-bound");
+    memory
+        .capture(fixture, NOW)
+        .unwrap_or_else(|error| panic!("capture: {error}"));
+    let stale = memory
+        .apply_repository_delta(
+            &MemoryRepositoryDelta {
+                repository_id: "repo.app".to_owned(),
+                current_revision: None,
+                changed_fingerprints: vec![FingerprintChange {
+                    kind: SourceFingerprintKind::FileBlob,
+                    key: "src/lib.rs".to_owned(),
+                    old_digest: Some("sha256:not-the-preimage".to_owned()),
+                    new_digest: Some("sha256:new".to_owned()),
+                }],
+            },
+            NOW + 1,
+        )
+        .unwrap_or_else(|error| panic!("wrong-old delta: {error}"));
+    assert!(stale.is_empty());
+    assert_eq!(
+        memory
+            .record("mem.digest-bound")
+            .unwrap_or_else(|error| panic!("read: {error}"))
+            .unwrap_or_else(|| panic!("missing"))
+            .status,
+        MemoryStatus::Active
+    );
+}
+
+#[test]
+fn lifecycle_lower_trust_demotion_is_reconsidered_when_higher_truth_deprecates() {
+    let (_temp, mut memory) = manager("demotion-reconsidered");
+    memory
+        .capture(
+            record(
+                "mem.lower",
+                "project-a",
+                MemoryKind::Episodic,
+                MemoryTrust::Observed,
+                "policy",
+                "online",
+            ),
+            NOW,
+        )
+        .unwrap_or_else(|error| panic!("lower: {error}"));
+    memory
+        .capture(
+            record(
+                "mem.higher",
+                "project-a",
+                MemoryKind::GovernedKnowledge,
+                MemoryTrust::Governed,
+                "policy",
+                "offline",
+            ),
+            NOW + 1,
+        )
+        .unwrap_or_else(|error| panic!("higher: {error}"));
+    let demoted = memory
+        .record("mem.lower")
+        .unwrap_or_else(|error| panic!("read demoted: {error}"))
+        .unwrap_or_else(|| panic!("lower missing"));
+    assert!(!demoted.normal_injection);
+    memory
+        .deprecate("mem.higher", NOW + 2)
+        .unwrap_or_else(|error| panic!("deprecate: {error}"));
+    let restored = memory
+        .record("mem.lower")
+        .unwrap_or_else(|error| panic!("read restored: {error}"))
+        .unwrap_or_else(|| panic!("lower missing"));
+    assert!(restored.normal_injection);
+    assert!(restored.exclusion_reason.is_none());
+}
+
+#[test]
+fn lifecycle_mutation_and_event_journal_commit_atomically() {
+    let (temp, mut memory) = manager("journal-atomic-present");
+    memory
+        .capture(
+            record(
+                "mem.journaled",
+                "project-a",
+                MemoryKind::Episodic,
+                MemoryTrust::Observed,
+                "journal",
+                "present",
+            ),
+            NOW,
+        )
+        .unwrap_or_else(|error| panic!("capture: {error}"));
+    memory
+        .deprecate("mem.journaled", NOW + 1)
+        .unwrap_or_else(|error| panic!("deprecate: {error}"));
+    let connection = Connection::open(temp.db()).unwrap_or_else(|error| panic!("sqlite: {error}"));
+    let events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM event_journal WHERE entity_type='memory' AND entity_id='mem.journaled'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    assert!(events >= 2);
+}
+
+#[test]
+fn lifecycle_failed_journal_write_rolls_back_memory_mutation() {
+    let temp = TestDir::new("journal-atomic-rollback");
+    drop(MemoryManager::open(temp.db()).unwrap_or_else(|error| panic!("prime db: {error}")));
+    let connection = Connection::open(temp.db()).unwrap_or_else(|error| panic!("sqlite: {error}"));
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_memory_journal BEFORE INSERT ON event_journal \
+             WHEN NEW.entity_type='memory' BEGIN SELECT RAISE(ABORT, 'fixture rejects memory event'); END;",
+        )
+        .unwrap_or_else(|error| panic!("fixture trigger: {error}"));
+    drop(connection);
+
+    let mut memory =
+        MemoryManager::open(temp.db()).unwrap_or_else(|error| panic!("memory open: {error}"));
+    let result = memory.capture(
+        record(
+            "mem.rollback",
+            "project-a",
+            MemoryKind::Episodic,
+            MemoryTrust::Observed,
+            "rollback",
+            "must-not-persist",
+        ),
+        NOW,
+    );
+    assert!(result.is_err());
+    drop(memory);
+    let connection = Connection::open(temp.db()).unwrap_or_else(|error| panic!("verify: {error}"));
+    let records: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM memory_records WHERE memory_id='mem.rollback'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    let events: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM event_journal WHERE entity_type='memory' AND entity_id='mem.rollback'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(-1);
+    assert_eq!(records, 0);
+    assert_eq!(events, 0);
 }
 
 #[test]
@@ -287,6 +650,7 @@ fn lifecycle_fresh_validated_contradiction_retains_conflict_set_not_last_write()
         "database",
         "sqlite",
     );
+    left.scope.repository_id = Some("repo.app".to_owned());
     left.provenance = provenance(Some("repo.app"), "evidence.left");
     let mut right = record(
         "mem.fact.right",
@@ -296,6 +660,7 @@ fn lifecycle_fresh_validated_contradiction_retains_conflict_set_not_last_write()
         "database",
         "postgres",
     );
+    right.scope.repository_id = Some("repo.app".to_owned());
     right.provenance = provenance(Some("repo.app"), "evidence.right");
     memory
         .capture(left, NOW)
@@ -330,6 +695,7 @@ fn lifecycle_fresh_validated_contradiction_retains_conflict_set_not_last_write()
         .injectable_records(
             MemoryAccessScope {
                 project_id: "project-a",
+                repository_id: None,
                 agent_id: None,
                 role_id: None,
             },
@@ -378,6 +744,7 @@ fn lifecycle_observed_contradiction_is_demoted_below_governed_truth() {
         .injectable_records(
             MemoryAccessScope {
                 project_id: "project-a",
+                repository_id: None,
                 agent_id: None,
                 role_id: None,
             },
@@ -411,6 +778,7 @@ fn lifecycle_expiry_is_durable_before_injection() {
         .injectable_records(
             MemoryAccessScope {
                 project_id: "project-a",
+                repository_id: None,
                 agent_id: None,
                 role_id: None,
             },
@@ -422,6 +790,7 @@ fn lifecycle_expiry_is_durable_before_injection() {
         .injectable_records(
             MemoryAccessScope {
                 project_id: "project-a",
+                repository_id: None,
                 agent_id: None,
                 role_id: None,
             },
@@ -447,6 +816,7 @@ fn lifecycle_repository_delta_stales_exact_fingerprint_before_injection() {
         "storage-layer",
         "state-store",
     );
+    affected.scope.repository_id = Some("repo.app".to_owned());
     affected.provenance = provenance(Some("repo.app"), "evidence.affected");
     affected.invalidation_predicates = vec![InvalidationPredicate {
         kind: InvalidationPredicateKind::FingerprintChanged,
@@ -465,11 +835,11 @@ fn lifecycle_repository_delta_stales_exact_fingerprint_before_injection() {
         "other-fact",
         "stable",
     );
+    unaffected.scope.repository_id = Some("repo.app".to_owned());
     unaffected.provenance = MemoryProvenance {
         source_evidence_ids: vec!["evidence.unaffected".to_owned()],
         producing_task_id: Some("task.fixture".to_owned()),
         producing_attempt_id: Some("attempt.fixture".to_owned()),
-        repository_id: Some("repo.app".to_owned()),
         repository_revision: Some("rev-a".to_owned()),
         source_fingerprints: vec![SourceFingerprint {
             kind: SourceFingerprintKind::FileBlob,
@@ -489,7 +859,8 @@ fn lifecycle_repository_delta_stales_exact_fingerprint_before_injection() {
                 changed_fingerprints: vec![FingerprintChange {
                     kind: SourceFingerprintKind::FileBlob,
                     key: "src/lib.rs".to_owned(),
-                    current_digest: Some("sha256:new".to_owned()),
+                    old_digest: Some("sha256:old".to_owned()),
+                    new_digest: Some("sha256:new".to_owned()),
                 }],
             },
             NOW + 1,
@@ -506,6 +877,7 @@ fn lifecycle_repository_delta_stales_exact_fingerprint_before_injection() {
         .injectable_records(
             MemoryAccessScope {
                 project_id: "project-a",
+                repository_id: None,
                 agent_id: None,
                 role_id: None,
             },
@@ -551,6 +923,7 @@ fn lifecycle_all_memory_classes_share_one_scope_and_provenance_envelope() {
             "value",
         );
         if trust == MemoryTrust::Validated {
+            fixture.scope.repository_id = Some("repo.app".to_owned());
             fixture.provenance = provenance(Some("repo.app"), &format!("evidence.{id}"));
         }
         let stored = memory
@@ -579,6 +952,7 @@ fn lifecycle_conflict_resolves_when_one_source_becomes_stale() {
         "runtime",
         "rust-1",
     );
+    left.scope.repository_id = Some("repo.app".to_owned());
     left.provenance = provenance(Some("repo.app"), "evidence.left");
     let mut right = record(
         "mem.right",
@@ -588,11 +962,11 @@ fn lifecycle_conflict_resolves_when_one_source_becomes_stale() {
         "runtime",
         "rust-2",
     );
+    right.scope.repository_id = Some("repo.app".to_owned());
     right.provenance = MemoryProvenance {
         source_evidence_ids: vec!["evidence.right".to_owned()],
         producing_task_id: Some("task.fixture".to_owned()),
         producing_attempt_id: Some("attempt.fixture".to_owned()),
-        repository_id: Some("repo.app".to_owned()),
         repository_revision: Some("rev-a".to_owned()),
         source_fingerprints: vec![SourceFingerprint {
             kind: SourceFingerprintKind::FileBlob,
@@ -619,7 +993,8 @@ fn lifecycle_conflict_resolves_when_one_source_becomes_stale() {
                 changed_fingerprints: vec![FingerprintChange {
                     kind: SourceFingerprintKind::FileBlob,
                     key: "src/right.rs".to_owned(),
-                    current_digest: Some("sha256:right-new".to_owned()),
+                    old_digest: Some("sha256:right".to_owned()),
+                    new_digest: Some("sha256:right-new".to_owned()),
                 }],
             },
             NOW + 2,
@@ -731,4 +1106,173 @@ fn lifecycle_conflict_never_erases_existing_higher_trust_demotion() {
         Some("contradicts_governed")
     );
     assert!(!first.normal_injection);
+}
+
+#[test]
+fn lifecycle_demotion_reconsideration_uses_subject_or_invariant_relation() {
+    let (_temp, mut memory) = manager("demotion-reconsider-or-relation");
+    let mut governed = record(
+        "mem.governed",
+        "project-a",
+        MemoryKind::GovernedKnowledge,
+        MemoryTrust::Governed,
+        "network-policy",
+        "offline",
+    );
+    governed.conflict_key = "invariant.governed-only".to_owned();
+    memory
+        .capture(governed, NOW)
+        .unwrap_or_else(|error| panic!("capture governed: {error}"));
+
+    let mut observed = record(
+        "mem.observed",
+        "project-a",
+        MemoryKind::Episodic,
+        MemoryTrust::Observed,
+        "network-policy",
+        "online",
+    );
+    observed.conflict_key = "invariant.observed-only".to_owned();
+    let observed = memory
+        .capture(observed, NOW + 1)
+        .unwrap_or_else(|error| panic!("capture observed: {error}"));
+    assert!(!observed.normal_injection);
+    assert_eq!(
+        observed.exclusion_reason.as_deref(),
+        Some("contradicts_governed")
+    );
+
+    memory
+        .deprecate("mem.governed", NOW + 2)
+        .unwrap_or_else(|error| panic!("deprecate governed: {error}"));
+    let reconsidered = memory
+        .record("mem.observed")
+        .unwrap_or_else(|error| panic!("read observed: {error}"))
+        .unwrap_or_else(|| panic!("observed missing"));
+    assert!(reconsidered.normal_injection);
+    assert!(reconsidered.exclusion_reason.is_none());
+}
+
+#[test]
+fn lifecycle_same_subject_different_keys_have_order_independent_conflict_identity() {
+    fn conflict_id(order: [&str; 2]) -> String {
+        let (_temp, mut memory) = manager(&format!("conflict-order-{}-{}", order[0], order[1]));
+        for id in order {
+            let mut fixture = record(
+                id,
+                "project-a",
+                MemoryKind::ValidatedProjectFact,
+                MemoryTrust::Validated,
+                "runtime-version",
+                if id == "mem.a" { "1.89" } else { "1.90" },
+            );
+            fixture.conflict_key = format!("caller-selected-{id}");
+            memory
+                .capture(fixture, NOW)
+                .unwrap_or_else(|error| panic!("capture {id}: {error}"));
+        }
+        memory
+            .record("mem.a")
+            .unwrap_or_else(|error| panic!("read mem.a: {error}"))
+            .and_then(|record| record.conflict_set_id)
+            .unwrap_or_else(|| panic!("missing conflict id"))
+    }
+
+    let forward = conflict_id(["mem.a", "mem.b"]);
+    let reverse = conflict_id(["mem.b", "mem.a"]);
+    assert_eq!(forward, reverse);
+}
+
+#[test]
+fn lifecycle_bridge_merges_connected_unresolved_conflict_sets() {
+    let (_temp, mut memory) = manager("conflict-bridge");
+
+    let mut a = record(
+        "mem.a",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "subject-one",
+        "A",
+    );
+    a.conflict_key = "key-a".to_owned();
+    let mut b = record(
+        "mem.b",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "subject-one",
+        "B",
+    );
+    b.conflict_key = "key-b".to_owned();
+
+    let mut c = record(
+        "mem.c",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "subject-two",
+        "C",
+    );
+    c.conflict_key = "shared-key".to_owned();
+    let mut d = record(
+        "mem.d",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "subject-three",
+        "D",
+    );
+    d.conflict_key = "shared-key".to_owned();
+
+    for (index, fixture) in [a, b, c, d].into_iter().enumerate() {
+        memory
+            .capture(fixture, NOW + i64::try_from(index).unwrap_or(0))
+            .unwrap_or_else(|error| panic!("seed conflict fixture: {error}"));
+    }
+    let first_set = memory
+        .record("mem.a")
+        .unwrap_or_else(|error| panic!("read a: {error}"))
+        .and_then(|record| record.conflict_set_id)
+        .unwrap_or_else(|| panic!("first conflict set missing"));
+    let second_set = memory
+        .record("mem.c")
+        .unwrap_or_else(|error| panic!("read c: {error}"))
+        .and_then(|record| record.conflict_set_id)
+        .unwrap_or_else(|| panic!("second conflict set missing"));
+    assert_ne!(first_set, second_set);
+
+    let mut bridge = record(
+        "mem.bridge",
+        "project-a",
+        MemoryKind::ValidatedProjectFact,
+        MemoryTrust::Validated,
+        "subject-one",
+        "BRIDGE",
+    );
+    bridge.conflict_key = "shared-key".to_owned();
+    memory
+        .capture(bridge, NOW + 10)
+        .unwrap_or_else(|error| panic!("capture bridge: {error}"));
+
+    let ids = ["mem.a", "mem.b", "mem.c", "mem.d", "mem.bridge"];
+    let mut active_set_ids = ids
+        .into_iter()
+        .map(|id| {
+            memory
+                .record(id)
+                .unwrap_or_else(|error| panic!("read {id}: {error}"))
+                .and_then(|record| record.conflict_set_id)
+                .unwrap_or_else(|| panic!("{id} missing conflict set"))
+        })
+        .collect::<Vec<_>>();
+    active_set_ids.sort();
+    active_set_ids.dedup();
+    assert_eq!(active_set_ids.len(), 1);
+    assert!(
+        memory
+            .conflict_set(&active_set_ids[0])
+            .unwrap_or_else(|error| panic!("read merged set: {error}"))
+            .is_some()
+    );
 }

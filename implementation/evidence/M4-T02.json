@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "task_id": "M4-T02",
+  "title": "Implement FTS memory retrieval and compact expansion",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "28a56a935b75f0369d8284b41b86eb579a9df206",
+  "status": "completed",
+  "completed_at": "2026-09-13T16:14:37Z",
+  "verified_at": "2026-09-13T16:14:37Z",
+  "dependencies": [
+    "M4-T01"
+  ],
+  "interfaces": [
+    "MemoryRetriever",
+    "MemorySynopsis"
+  ],
+  "state_schema_version": 5,
+  "repaired_m4_t01_current_tree_proof": {
+    "historical_evidence_note": "implementation/evidence/M4-T01.json remains historical and its old schema-v4/source hashes are not used as proof of the repaired current tree",
+    "state_authority": "one sovereign_state::StateStore / SQLite authority; sovereign-memory opens no second database or pool",
+    "confidence_contract": "public u8 and durable INTEGER 0..100 with legacy representation consistency checks",
+    "scope_repository_id": true,
+    "lineage_and_content_digest": "lineage_id/content_digest are durable, recomputed, and verified on read; caller cannot supply arbitrary durable content digest",
+    "conflict_key": true,
+    "contradiction_relation": "same scoped subject/predicate OR same conflict_key, with scope/role overlap",
+    "demotion_reconsideration": "uses the same contradiction relation and can restore normal injection when higher-trust truth becomes noncurrent",
+    "conflict_identity": "initial equal-trust conflict IDs are pair-order independent",
+    "conflict_bridge_merge": "connected unresolved conflict sets merge deterministically; historical membership is retained while current active pointers converge",
+    "fingerprint_invalidation": "repository delta carries old->new and only exact old fingerprint digest matches are invalidated",
+    "atomic_lifecycle_journal": "canonical lifecycle mutation and append-only event journal publication share the same StateStore transaction",
+    "migration_rollback": "fixture creates true v3, copies/verifies v3 backup, applies deliberately failing v4, proves partial DDL/version/data rollback, then proves both original and backup remain readable/upgradeable"
+  },
+  "retrieval_contract": {
+    "projection": "memory_fts_projection is derived FTS5 state sharing the canonical StateStore connection",
+    "bootstrap": "v4->v5 migration performs one-time canonical-to-FTS population",
+    "query_time_full_rewrite": false,
+    "filters": [
+      "project",
+      "repository",
+      "agent",
+      "role",
+      "kind",
+      "minimum_trust",
+      "freshness/status"
+    ],
+    "modes": [
+      "ordinary",
+      "history",
+      "conflict"
+    ],
+    "ordinary_mode": "active + normal_injection + no unresolved conflict + unexpired only",
+    "history_mode": "explicitly permits noncurrent historical records while preserving scope/kind/trust filtering",
+    "conflict_mode": "explicit unresolved conflict path; kind/minimum_trust filtering preserved; ordinary fact injection bypassed",
+    "episodic_order": "exact normalized failure signature/repository/tool/runtime/symbol/task filters run before broad lexical fallback",
+    "trust_order": "governed > validated > observed > unreviewed before lexical rank/confidence/id",
+    "hard_bounds": {
+      "results": 32,
+      "tokens": 2048,
+      "candidates": 128,
+      "graph_neighbors": 16,
+      "synopsis_tokens": 192,
+      "provenance_evidence_ids_per_handle": 4,
+      "conflict_member_handles": 16,
+      "conflict_member_validation_scan": 128,
+      "over_scan_window": "fail closed with no conflict result",
+      "truncation": "member_handles_truncated is explicit when additional matching members exist within the fully validated window"
+    },
+    "conflict_scope_fail_closed": "for <=128 members every active member is scope-validated even after 16 retained handles; a later invisible role/agent member suppresses the result",
+    "compact_expansion": "scope + current durable content_digest + exact full expansion handle + selected durable provenance evidence ID are validated before access counters mutate",
+    "graph": "anchor required; candidate materialization and returned neighbors are hard bounded",
+    "context_integration": "production MemoryHistoryProvider routes exact episodic key before optional lexical fallback and emits only C3 TrustClass::Derived evidence",
+    "memory_policy_authority": false,
+    "semantic_or_embedder": false,
+    "second_database_or_pool": false
+  },
+  "resource_ownership": {
+    "m4_adds_second_sqlite_pool": false,
+    "m4_uses_authoritative_state_store_connection": true,
+    "m2_t01_records_repo_fts_contribution_bounds": true,
+    "m6_t01_owns_process_resource_governor": true,
+    "nuance": "StateStore WAL/FULL-sync/wal_autocheckpoint defaults are not evidence of architecture-wide aggregate cache_size/mmap/WAL-health hard enforcement; this broader ownership point is not falsely claimed as M4 proof."
+  },
+  "acceptance_tests": [
+    "retrieval_episodic_exact_signature_filters_precede_broad_lexical_search",
+    "retrieval_lexical_lookup_does_not_rewrite_the_full_projection",
+    "retrieval_project_and_repository_filters_are_fail_closed",
+    "retrieval_trust_precedence_dominates_lexical_rank",
+    "retrieval_compact_results_respect_hard_token_budget",
+    "retrieval_expansion_is_bound_to_scope_digest_and_provenance_handle",
+    "retrieval_explicit_conflict_query_returns_statement_and_both_provenance_handles",
+    "retrieval_conflict_mode_respects_kind_and_minimum_trust_filters",
+    "retrieval_conflict_provenance_handles_are_hard_bounded",
+    "retrieval_large_conflict_still_fail_closes_on_late_hidden_member",
+    "retrieval_conflict_scan_window_fails_closed_instead_of_validating_a_prefix",
+    "retrieval_merged_conflict_is_found_through_active_member_and_hides_noncurrent_members",
+    "retrieval_graph_expansion_requires_anchor_and_is_hard_bounded",
+    "retrieval_stale_memory_is_excluded_normally_and_visible_in_history",
+    "retrieval_ordinary_excludes_all_noncurrent_and_conflicted_fact_states",
+    "retrieval_v4_memory_is_searchable_after_one_time_v5_projection_migration",
+    "memory_history_exact_episode_enters_context_as_derived_c3_evidence_only",
+    "memory_history_router_runs_exact_key_before_lexical_fallback",
+    "memory_history_preserves_role_visibility_fail_closed"
+  ],
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-memory --offline",
+      "result": "passed",
+      "detail": "lifecycle 25/25; retrieval 18/18; doc tests pass"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-context --offline -- memory_history",
+      "result": "passed",
+      "detail": "3/3"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-state --offline",
+      "result": "passed",
+      "detail": "6 unit + 1 process-kill + 6 security + doc tests"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-memory -p sovereign-state -p sovereign-context --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test --workspace --offline",
+      "result": "passed",
+      "detail": "all workspace tests passed; only intentional local-model qualification/smoke tests ignored"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "independent_audit": {
+    "worker": "worker-26",
+    "initial_result": {
+      "M4-T01 repaired invariants": "CLOSABLE",
+      "M4-T02 frozen task": "NOT CLOSABLE"
+    },
+    "initial_blockers": [
+      "conflict mode bypassed public kind/minimum_trust filtering",
+      "conflict provenance handles lacked a hard member bound"
+    ],
+    "repair_followup": "first hard-cap repair exposed and then fixed a late-hidden-member scope-validation gap",
+    "final_result": {
+      "M4-T01 repaired invariants": "CLOSABLE",
+      "M4-T02 frozen task": "CLOSABLE"
+    },
+    "final_blockers": [],
+    "notes": "Final exact-tree read-only audit confirmed <=128 conflict members are all scope-validated, >128 fails closed, at most 16 matching handles are emitted with explicit truncation, filters/token caps remain intact, and no second DB/pool was introduced."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429"
+  },
+  "source_hashes": {
+    "Cargo.lock": "sha256:b2300f38a9352c7cf9ff6e5af46a49460dab48b34b4b228300ed2123f6f6cbf8",
+    "crates/sovereign-context/Cargo.toml": "sha256:0e4def8b51678014886db43485b6e5d76e8e0610a2b91e1421b33e4140dbae76",
+    "crates/sovereign-context/src/lib.rs": "sha256:a4cc739a0fbd12810a9f4c3a0ed023610897b6660369dd7023eefda471486c61",
+    "crates/sovereign-context/src/memory.rs": "sha256:be7a25728637d9c1741b3a579954b2e0d909f1be14a089c704958466a6ac4be7",
+    "crates/sovereign-context/tests/memory_history.rs": "sha256:85b1132746b7695f055f79bdd12debe12cdc6e9122bf046f27656f7512d3b710",
+    "crates/sovereign-memory/Cargo.toml": "sha256:abe292c5a60524faf22cd49e4fc40a6d275f5ee410775f2dcc660c85e717b9a7",
+    "crates/sovereign-memory/src/lib.rs": "sha256:01b45a23e06b72a10e1f57f4283e0cc3816e8fc92ff0f82fbacf536fb3ab689d",
+    "crates/sovereign-memory/src/retrieval.rs": "sha256:0653491d8b5077d589b15e1aae3c8017a38eccfefd2dba39c85ad996554c1d21",
+    "crates/sovereign-memory/tests/lifecycle.rs": "sha256:4e14cce548e5d6d3dd0177f909de52c851ba08497be5a1d555eed610be9895d3",
+    "crates/sovereign-memory/tests/retrieval.rs": "sha256:147004ea5f49ffc2ab07d2e9c07e107f9ff66323c678a9186159eb3afe4f1d8a",
+    "crates/sovereign-state/migrations/0004_memory.sql": "sha256:fd92717db8ccd0075cd5c78913ebda1fa91a712cc07b92d872d7c113bd45d1a1",
+    "crates/sovereign-state/migrations/0005_memory_retrieval.sql": "sha256:518d34acb6ca32a05f092b03f0ee8c535e7c7bd69e5107b90681c4ec835e3c91",
+    "crates/sovereign-state/migrations/manifest.json": "sha256:f8b6cceb056e5a06bccef2ae6065ff6634499610e1b12ee85f359693048f1b0d",
+    "crates/sovereign-state/src/lib.rs": "sha256:f807f6c1498e64db4eea8d42c7267eacd1bb1b6977b72f7c45eb71d83c5b7230",
+    "schemas/memory-record-v1.json": "sha256:c609a3d9e9ecbe7723ca33a83a55acb921037e7fc3ba598027076eeadf7a79aa"
+  },
+  "network_runtime_dependency": false
+}

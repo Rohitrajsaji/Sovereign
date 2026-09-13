@@ -1,6 +1,6 @@
 {
   "schema": "sovereign-state-migrations-v1",
-  "current_version": 4,
+  "current_version": 5,
   "migrations": [
     {
       "version": 1,
@@ -59,6 +59,28 @@
         "memory_conflict_members_memory_idx",
         "memory_records_no_delete",
         "memory_conflict_sets_no_delete"
+      ]
+    },
+    {
+      "version": 5,
+      "name": "memory_retrieval",
+      "path": "0005_memory_retrieval.sql",
+      "transactional": true,
+      "creates": [
+        "memory_records.conflict_key",
+        "memory_records.confidence",
+        "memory_records.lineage_id",
+        "memory_records.content_digest",
+        "memory_conflict_sets.conflict_key",
+        "memory_records_conflict_key_idx",
+        "memory_records_conflict_key_required_insert",
+        "memory_records_conflict_key_required_update",
+        "memory_records_lineage_required_insert",
+        "memory_records_content_digest_required_insert",
+        "memory_records_confidence_consistent_insert",
+        "memory_records_confidence_consistent_update",
+        "memory_conflict_sets_conflict_key_required_insert",
+        "memory_fts_projection"
       ]
     }
   ]
