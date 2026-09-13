@@ -1,0 +1,103 @@
+{
+  "task_id": "M4-T01",
+  "title": "Implement canonical memory schema and lifecycle",
+  "roadmap_version": "1.4-frozen",
+  "status": "completed",
+  "completed_at": "2026-09-13T14:37:04Z",
+  "dependencies": {
+    "M0-T02": "completed",
+    "M2-T03": "completed",
+    "milestones": [
+      "M2",
+      "M3"
+    ]
+  },
+  "interfaces": [
+    "MemoryRecord v1",
+    "MemoryScope v1",
+    "MemoryLifecycle v1",
+    "MemoryManager"
+  ],
+  "implementation": {
+    "durable_authority": "sovereign-state StateStore / SQLite WAL remains the only canonical store; sovereign-memory owns lifecycle semantics and never opens a second database authority",
+    "state_schema_version": 4,
+    "migration": "crates/sovereign-state/migrations/0004_memory.sql",
+    "schema_manifest": "schemas/memory-record-v1.json",
+    "memory_classes": [
+      "governed_knowledge",
+      "validated_project_fact",
+      "episodic",
+      "procedural_candidate",
+      "preference_context"
+    ],
+    "scope": "uniform project/agent/shared-within-project envelope plus explicit role visibility",
+    "provenance": "source evidence IDs, producing task/attempt, repository/revision, exact source fingerprints, confidence, trust, version, expiry and invalidation predicates",
+    "conflict_semantics": "same-scope equal-trust incompatible assertions create durable conflict sets; governed contradictions require explicit supersession; lower-trust contradictions remain auditable but are excluded from normal injection",
+    "freshness_semantics": "repository fingerprint/revision delta is applied before lifecycle injection eligibility; affected active records become stale without deleting provenance",
+    "retention_semantics": "stale/superseded/deprecated/expired/archived and unresolved conflicted records are excluded from ordinary injection; records and conflict sets are delete-protected durable provenance"
+  },
+  "acceptance": {
+    "every_durable_memory_type_uses_same_scope_provenance_envelope": "passed",
+    "project_isolation": "passed",
+    "role_and_agent_isolation": "passed",
+    "supersession": "passed",
+    "conflict_retention": "passed",
+    "expiry": "passed",
+    "source_fingerprint_invalidation": "passed",
+    "repository_delta_stales_before_injection": "passed",
+    "fresh_validated_conflict_set_not_last_write_wins": "passed",
+    "governed_replacement_is_versioned_supersession": "passed",
+    "lower_trust_contradiction_demoted": "passed",
+    "migration_backup_and_transactional_rollback": "passed",
+    "no_ambiguous_legacy_trust_or_provenance_synthesis": "passed; migration creates new canonical tables and imports no legacy rows"
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-memory --offline -- lifecycle",
+      "status": "passed",
+      "detail": "12 passed; 0 failed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-memory --offline",
+      "status": "passed",
+      "detail": "12 integration tests plus doc tests passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-state --offline",
+      "status": "passed",
+      "detail": "existing state/crash/security fixtures plus schema-v4 migration rollback fixture passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-memory -p sovereign-state --all-targets --offline -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "status": "passed"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    },
+    {
+      "command": "jq -e . schemas/memory-record-v1.json >/dev/null && jq -e . crates/sovereign-state/migrations/manifest.json >/dev/null",
+      "status": "passed"
+    }
+  ],
+  "source_hashes": {
+    "Cargo.toml": "sha256:b2a4de6b3832810b458e541b38f244e95082108e85e37ead9187decf1cba66f2",
+    "Cargo.lock": "sha256:d817d0c48a8a8f6b59e911fe9717efbcd62e9f6ed70a9c98b4bbca8285651d81",
+    "crates/sovereign-memory/Cargo.toml": "sha256:4c8c725aa883d8928ae60ad74617a9dd7258511dcdfb38a9dc54037e0b588f4d",
+    "crates/sovereign-memory/src/lib.rs": "sha256:1375e02eb19251a2c42615d930f82857ed6488200ccd5a1b0f3eb20628753855",
+    "crates/sovereign-memory/tests/lifecycle.rs": "sha256:c02a56093b5a2219f6c2a30cbe7231186f58f201dc159b00a94eea04ecf2befc",
+    "crates/sovereign-state/migrations/0004_memory.sql": "sha256:fd92717db8ccd0075cd5c78913ebda1fa91a712cc07b92d872d7c113bd45d1a1",
+    "crates/sovereign-state/migrations/manifest.json": "sha256:4a4f06170a37f3106dfdb4d292193228e738ba9e292fbd75d8fa5820967d27e6",
+    "crates/sovereign-state/src/lib.rs": "sha256:227b31c5195e18179718bf00066f5278d324354fdf343cf597becdcec47f760c",
+    "schemas/memory-record-v1.json": "sha256:700feec80546d68883ff7e0cf212ee72642a64be3befcc4bf375fa3c37993323"
+  },
+  "network_runtime_dependency": false
+}

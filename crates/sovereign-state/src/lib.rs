@@ -16,9 +16,10 @@ use std::time::Duration;
 const FOUNDATION_SQL: &str = include_str!("../migrations/0001_foundation.sql");
 const ARTIFACTS_SQL: &str = include_str!("../migrations/0002_artifacts.sql");
 const SECURITY_KERNEL_SQL: &str = include_str!("../migrations/0003_security_kernel.sql");
+const MEMORY_SQL: &str = include_str!("../migrations/0004_memory.sql");
 
 /// Current durable schema version implemented by this crate.
-pub const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 /// One numbered, transactional durable-state migration.
 #[derive(Debug, Clone, Copy)]
@@ -53,6 +54,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 3,
         name: "security_kernel",
         sql: SECURITY_KERNEL_SQL,
+    },
+    Migration {
+        version: 4,
+        name: "memory_lifecycle",
+        sql: MEMORY_SQL,
     },
 ];
 
@@ -1642,6 +1648,86 @@ mod tests {
         assert_eq!(
             copied.get_state("fixture", "key").unwrap_or_default(),
             Some("{\"ok\":true}".to_owned())
+        );
+    }
+
+    #[test]
+    fn memory_migration_has_exact_v3_backup_and_transactional_rollback_fixture() {
+        const BROKEN_AFTER_MEMORY: Migration = Migration {
+            version: 5,
+            name: "broken_after_memory_fixture",
+            sql: "CREATE TABLE memory_partial(value TEXT); INSERT INTO definitely_missing_memory_table VALUES (1);",
+        };
+
+        let temp = TestDir::new("memory-migration-rollback");
+        let db = temp.db();
+        let backup = temp.0.join("pre-memory-v3.sqlite3");
+        let mut connection =
+            Connection::open(&db).unwrap_or_else(|error| panic!("open v3 fixture: {error}"));
+        configure_connection(&connection).unwrap_or_else(|error| panic!("configure: {error}"));
+        MigrationRunner::apply(&mut connection, &MIGRATIONS[..3])
+            .unwrap_or_else(|error| panic!("apply v3: {error}"));
+        connection
+            .execute(
+                "INSERT INTO state_records(namespace, record_key, value_json, version, updated_at_ms) VALUES ('fixture', 'before-memory', '{\"preserved\":true}', 1, 1)",
+                [],
+            )
+            .unwrap_or_else(|error| panic!("seed v3: {error}"));
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap_or_else(|error| panic!("checkpoint: {error}"));
+        drop(connection);
+        fs::copy(&db, &backup).unwrap_or_else(|error| panic!("backup: {error}"));
+
+        let backup_connection =
+            Connection::open(&backup).unwrap_or_else(|error| panic!("open backup: {error}"));
+        let backup_version: i64 = backup_connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(-1);
+        assert_eq!(backup_version, 3);
+        drop(backup_connection);
+
+        let mut upgraded =
+            Connection::open(&db).unwrap_or_else(|error| panic!("open upgrade: {error}"));
+        configure_connection(&upgraded)
+            .unwrap_or_else(|error| panic!("configure upgrade: {error}"));
+        MigrationRunner::apply(&mut upgraded, MIGRATIONS)
+            .unwrap_or_else(|error| panic!("apply memory: {error}"));
+        let memory_table: i64 = upgraded
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_records'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        assert_eq!(memory_table, 1);
+
+        let mut with_broken = MIGRATIONS.to_vec();
+        with_broken.push(BROKEN_AFTER_MEMORY);
+        assert!(MigrationRunner::apply(&mut upgraded, &with_broken).is_err());
+        let partial: i64 = upgraded
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='memory_partial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(-1);
+        assert_eq!(partial, 0);
+        drop(upgraded);
+
+        let migrated_backup =
+            StateStore::open(&backup).unwrap_or_else(|error| panic!("migrate backup: {error}"));
+        assert_eq!(
+            migrated_backup
+                .get_state("fixture", "before-memory")
+                .unwrap_or_default(),
+            Some("{\"preserved\":true}".to_owned())
+        );
+        assert_eq!(
+            migrated_backup.schema_version().unwrap_or(-1),
+            CURRENT_SCHEMA_VERSION
         );
     }
 

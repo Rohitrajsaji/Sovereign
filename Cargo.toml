@@ -7,6 +7,7 @@ members = [
     "crates/sovereign-eval",
     "crates/sovereign-evidence",
     "crates/sovereign-model",
+    "crates/sovereign-memory",
     "crates/sovereign-plan",
     "crates/sovereign-policy",
     "crates/sovereign-repo",

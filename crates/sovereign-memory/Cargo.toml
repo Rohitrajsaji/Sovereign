@@ -1,0 +1,18 @@
+[package]
+name = "sovereign-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+sha2.workspace = true
+sovereign-state = { path = "../sovereign-state" }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

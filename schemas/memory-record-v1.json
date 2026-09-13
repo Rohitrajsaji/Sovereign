@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sovereign://schemas/memory-record-v1.json",
+  "title": "Sovereign MemoryRecord v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "kind",
+    "scope",
+    "subject",
+    "predicate",
+    "assertion",
+    "trust",
+    "confidence",
+    "status",
+    "provenance",
+    "created_at_ms",
+    "updated_at_ms",
+    "version",
+    "invalidation_predicates",
+    "access_count",
+    "normal_injection"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "kind": {
+      "enum": [
+        "governed_knowledge",
+        "validated_project_fact",
+        "episodic",
+        "procedural_candidate",
+        "preference_context"
+      ]
+    },
+    "scope": { "$ref": "#/$defs/memory_scope" },
+    "subject": { "type": "string", "minLength": 1 },
+    "predicate": { "type": "string", "minLength": 1 },
+    "assertion": { "type": "string", "minLength": 1 },
+    "trust": { "enum": ["governed", "validated", "observed", "unreviewed"] },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "status": {
+      "enum": ["active", "stale", "superseded", "deprecated", "expired", "archived"]
+    },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "created_at_ms": { "type": "integer", "minimum": 0 },
+    "updated_at_ms": { "type": "integer", "minimum": 0 },
+    "validated_at_ms": { "type": ["integer", "null"], "minimum": 0 },
+    "version": { "type": "integer", "minimum": 1 },
+    "supersedes": { "type": ["string", "null"] },
+    "superseded_by": { "type": ["string", "null"] },
+    "expires_at_ms": { "type": ["integer", "null"], "minimum": 0 },
+    "invalidation_predicates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/invalidation_predicate" }
+    },
+    "access_count": { "type": "integer", "minimum": 0 },
+    "last_accessed_at_ms": { "type": ["integer", "null"], "minimum": 0 },
+    "conflict_set_id": { "type": ["string", "null"] },
+    "normal_injection": { "type": "boolean" },
+    "exclusion_reason": { "type": ["string", "null"] }
+  },
+  "$defs": {
+    "memory_scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["project_id", "kind", "agent_id", "role_visibility"],
+      "properties": {
+        "project_id": { "type": "string", "minLength": 1 },
+        "kind": { "enum": ["project", "agent", "shared"] },
+        "agent_id": { "type": ["string", "null"] },
+        "role_visibility": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "source_fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "key", "digest"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "file_blob",
+            "symbol",
+            "dependency_manifest",
+            "command_tool_version",
+            "repository_commit_range"
+          ]
+        },
+        "key": { "type": "string", "minLength": 1 },
+        "digest": { "type": "string", "minLength": 1 }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_evidence_ids",
+        "producing_task_id",
+        "producing_attempt_id",
+        "repository_id",
+        "repository_revision",
+        "source_fingerprints"
+      ],
+      "properties": {
+        "source_evidence_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "producing_task_id": { "type": ["string", "null"] },
+        "producing_attempt_id": { "type": ["string", "null"] },
+        "repository_id": { "type": ["string", "null"] },
+        "repository_revision": { "type": ["string", "null"] },
+        "source_fingerprints": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/source_fingerprint" }
+        }
+      }
+    },
+    "invalidation_predicate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "key", "expected_value"],
+      "properties": {
+        "kind": {
+          "enum": ["fingerprint_changed", "repository_revision_changed", "expires_at"]
+        },
+        "key": { "type": "string", "minLength": 1 },
+        "expected_value": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

@@ -1,6 +1,6 @@
 {
   "schema": "sovereign-state-migrations-v1",
-  "current_version": 3,
+  "current_version": 4,
   "migrations": [
     {
       "version": 1,
@@ -38,6 +38,27 @@
         "action_records_no_delete",
         "checkpoint_integrity_no_update",
         "checkpoint_integrity_no_delete"
+      ]
+    },
+    {
+      "version": 4,
+      "name": "memory_lifecycle",
+      "path": "0004_memory.sql",
+      "transactional": true,
+      "creates": [
+        "memory_conflict_sets",
+        "memory_records",
+        "memory_role_visibility",
+        "memory_source_evidence",
+        "memory_source_fingerprints",
+        "memory_invalidation_predicates",
+        "memory_conflict_members",
+        "memory_records_scope_subject_idx",
+        "memory_records_injection_idx",
+        "memory_source_fingerprints_lookup_idx",
+        "memory_conflict_members_memory_idx",
+        "memory_records_no_delete",
+        "memory_conflict_sets_no_delete"
       ]
     }
   ]

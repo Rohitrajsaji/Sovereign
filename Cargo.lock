@@ -774,6 +774,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovereign-memory"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sovereign-state",
+]
+
+[[package]]
 name = "sovereign-model"
 version = "0.1.0"
 dependencies = [
