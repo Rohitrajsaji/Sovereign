@@ -6,8 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde_json.workspace = true
+sovereign-controller = { path = "../../crates/sovereign-controller" }
+sovereign-state = { path = "../../crates/sovereign-state" }
 sovereign-types = { path = "../../crates/sovereign-types" }
 
 [lints]
 workspace = true
-

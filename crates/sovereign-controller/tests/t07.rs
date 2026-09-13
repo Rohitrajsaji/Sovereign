@@ -6,7 +6,7 @@ use sovereign_context::{
 };
 use sovereign_controller::{
     Controller, ControllerError, ExecutionRuntime, ModelProposalV1, PermissionContext,
-    PlanValidity, ReadinessInputs, SchedulerView, TaskState,
+    PlanValidity, ReadinessInputs, RecoveryManager, SchedulerView, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_model::{
@@ -614,6 +614,84 @@ fn readiness_requires_all_guard_classes_and_never_persists_ready_bit() {
 }
 
 #[test]
+fn pause_is_durable_across_recovery_and_gates_readiness_until_resume() {
+    let mut fixture = compiled_fixture("pause-recovery", true);
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    controller
+        .pause(Some("operator requested"))
+        .unwrap_or_else(|error| panic!("pause: {error}"));
+    assert!(
+        controller
+            .execution_control()
+            .unwrap_or_else(|error| panic!("control: {error}"))
+            .paused
+    );
+    let Err(error) = controller.derive_ready_lease(&fixture.registry, &task_id, readiness()) else {
+        panic!("paused controller unexpectedly derived readiness")
+    };
+    assert!(error.to_string().contains("paused"));
+    drop(controller);
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen state: {error}"));
+    let (mut recovered, _) = RecoveryManager::recover(state, &fixture.registry)
+        .unwrap_or_else(|error| panic!("recover paused controller: {error}"));
+    assert!(
+        recovered
+            .execution_control()
+            .unwrap_or_else(|error| panic!("recovered control: {error}"))
+            .paused
+    );
+    let Err(error) = recovered.derive_ready_lease(&fixture.registry, &task_id, readiness()) else {
+        panic!("recovered paused controller unexpectedly derived readiness")
+    };
+    assert!(error.to_string().contains("paused"));
+
+    recovered
+        .resume()
+        .unwrap_or_else(|error| panic!("resume: {error}"));
+    assert!(
+        !recovered
+            .execution_control()
+            .unwrap_or_else(|error| panic!("resumed control: {error}"))
+            .paused
+    );
+}
+
+#[test]
+fn durable_status_exposes_controller_state_and_evidence_without_mutation_authority() {
+    let mut fixture = compiled_fixture("status-view", true);
+    let requirement_id = first_evidence_requirement_id(&fixture);
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    controller
+        .record_exact_evidence_satisfaction(
+            &fixture.registry,
+            &task_id,
+            &requirement_id,
+            &fixture.packet,
+            &["file:repo.app:src/settings/SettingsForm.tsx".to_owned()],
+        )
+        .unwrap_or_else(|error| panic!("record evidence: {error}"));
+    let before_sequence = controller
+        .state()
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("journal before status: {error}"));
+    let view = controller
+        .durable_status()
+        .unwrap_or_else(|error| panic!("durable status: {error}"));
+    let after_sequence = controller
+        .state()
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("journal after status: {error}"));
+    assert_eq!(before_sequence, after_sequence, "status read mutated state");
+    assert!(view.active_plan.is_some());
+    assert!(!view.tasks.is_empty());
+    assert!(view.actions.is_empty());
+    assert!(!view.evidence.is_empty());
+    assert!(view.approval_requests.is_empty());
+}
+
+#[test]
 fn exact_evidence_satisfaction_rejects_unrelated_retained_evidence() {
     let mut fixture = compiled_fixture("evidence-provenance", true);
     let requirement_id = first_evidence_requirement_id(&fixture);
@@ -902,6 +980,47 @@ fn baseline_drift_invalidates_ready_lease_and_advances_epoch() {
             .unwrap_or_else(|error| panic!("epoch: {error}"))
             > old_epoch
     );
+}
+
+#[test]
+fn pause_after_ready_lease_blocks_mutation_before_model_or_tool_dispatch() {
+    let mut fixture = compiled_fixture("pause-after-ready", false);
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .unwrap_or_else(|error| panic!("ready: {error}"));
+    controller
+        .pause(Some("operator requested"))
+        .unwrap_or_else(|error| panic!("pause: {error}"));
+
+    let execution = backend(vec![model_response(
+        valid_execution_proposal(&fixture.form_digest),
+        fixture.packet.metrics.final_serialized_input_tokens,
+    )]);
+    let parts = runtime_parts(&fixture);
+    let isolation =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("seatbelt: {error}"));
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut budget = ModelCallBudget::new(1, 30_000);
+    let Err(error) = controller.execute_replace(ready, &runtime, &fixture.packet, &mut budget)
+    else {
+        panic!("paused controller unexpectedly executed a repository mutation")
+    };
+    assert!(matches!(error, ControllerError::NotReady(_)));
+    assert_eq!(budget.remaining_calls(), 1);
+    assert_eq!(controller.task_model_calls_used(&task_id), Some(0));
+    let source = fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+        .unwrap_or_else(|error| panic!("read source: {error}"));
+    assert!(source.contains("Save"));
 }
 
 #[test]

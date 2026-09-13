@@ -1,0 +1,92 @@
+{
+  "schema": "sovereign-product-task-evidence-v1",
+  "task": "PD-T01",
+  "status": "completed",
+  "completed_at": "2026-09-13T05:28:27Z",
+  "acceptance_base": "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md",
+  "scheduling_overlay": "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md",
+  "dependencies": [
+    "M1-T09",
+    "milestone:M1"
+  ],
+  "acceptance": {
+    "natural_language_goal_submission": "Controller-owned durable GoalIntentV1 queued_for_plan_compilation; no execution bypass",
+    "plan_task_attempt_action_status": true,
+    "evidence_inspection": true,
+    "controller_owned_pause_resume": true,
+    "pause_survives_recovery": true,
+    "pause_gates_readiness_and_mutation": true,
+    "approval_requests_render_only_durable_facts": true,
+    "approval_authority_not_added": true,
+    "duplicate_execution_state_outside_controller_state": false
+  },
+  "cli_surface": [
+    "goal <natural-language goal>",
+    "status",
+    "evidence",
+    "pause [reason]",
+    "resume",
+    "approvals",
+    "doctor",
+    "--version",
+    "help"
+  ],
+  "authority_notes": [
+    "The CLI opens the authoritative StateStore but delegates all mutations to Controller APIs.",
+    "Goal submission does not claim full arbitrary-goal execution before later product dependencies exist; it truthfully records durable intent for canonical PlanCompiler processing.",
+    "Status reads active plan, tasks, attempts, authoritative action records, verification/evidence records, goal intents, execution control, and approval-request records from Controller/StateStore.",
+    "Approval rendering is read-only and does not create, approve, authorize, or dispatch an action."
+  ],
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign --offline",
+      "status": "passed",
+      "tests": "3/3"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-controller --test t07 --offline",
+      "status": "passed",
+      "tests": "21/21"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-eval --test crash_resume --offline",
+      "status": "passed",
+      "tests": "20/20",
+      "source": "current-tree workspace regression and implementer verification"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo clippy -p sovereign-controller -p sovereign --all-targets --offline -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "independent_audit": {
+    "status": "closable",
+    "blockers": []
+  },
+  "artifacts": {
+    "cli_manifest": {
+      "path": "apps/sovereign/Cargo.toml",
+      "sha256": "b485d34b0ada159546ac043e35c60b5a3064293899ca9d0e8be518525a779b90"
+    },
+    "cli": {
+      "path": "apps/sovereign/src/main.rs",
+      "sha256": "2e16fbef9792be1fe7100bed0327ce1ddc1f0f7672d2d516cd33fa1f93cd7082"
+    },
+    "controller": {
+      "path": "crates/sovereign-controller/src/lib.rs",
+      "sha256": "bafcb1d285e186719ba8411dcf8b544720d5d665c69b95ffdaca2b96c249abc8"
+    },
+    "controller_tests": {
+      "path": "crates/sovereign-controller/tests/t07.rs",
+      "sha256": "377d339537cdf0d856821fa4fb24647cf3fad5aa7bab554c6a2b2d0089a0736f"
+    }
+  }
+}

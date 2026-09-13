@@ -50,6 +50,8 @@ const EVIDENCE_SATISFACTION_SCHEMA_VERSION: u32 = 1;
 const VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION: u32 = 1;
 pub const CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const RECOVERY_PROCESS_LEASE_SCHEMA_VERSION: u32 = 1;
+pub const EXECUTION_CONTROL_SCHEMA_VERSION: u32 = 1;
+pub const GOAL_INTENT_SCHEMA_VERSION: u32 = 1;
 const ACTION_INTENT_SCHEMA_VERSION: u32 = 2;
 const MAX_PROPOSAL_EVIDENCE_IDS: usize = 16;
 const MAX_PROPOSAL_EVIDENCE_ID_BYTES: usize = 512;
@@ -175,6 +177,58 @@ pub enum SchedulerView {
     Blocked,
     Running,
     Terminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionControlV1 {
+    pub schema_version: u32,
+    pub paused: bool,
+    pub reason: Option<String>,
+    pub changed_at_ms: i64,
+}
+
+impl Default for ExecutionControlV1 {
+    fn default() -> Self {
+        Self {
+            schema_version: EXECUTION_CONTROL_SCHEMA_VERSION,
+            paused: false,
+            reason: None,
+            changed_at_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalIntentV1 {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub natural_language_goal: String,
+    pub status: String,
+    pub submitted_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ControllerStatusView {
+    pub execution_control: ExecutionControlV1,
+    pub active_plan: Option<Value>,
+    pub tasks: Vec<Value>,
+    pub attempts: Vec<Value>,
+    pub actions: Vec<ControllerActionStatusView>,
+    pub evidence: Vec<Value>,
+    pub goal_intents: Vec<GoalIntentV1>,
+    pub approval_requests: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerActionStatusView {
+    pub action_id: String,
+    pub state: String,
+    pub payload_digest: String,
+    pub policy_digest: String,
+    pub execution_epoch: i64,
+    pub result_digest: Option<String>,
+    pub last_event_sequence: i64,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,6 +500,8 @@ pub struct CheckpointManifest {
     pub evidence_binding_digests: BTreeMap<String, String>,
     pub action_records: Vec<CheckpointActionRecord>,
     pub process_leases: Vec<RecoveryProcessLease>,
+    #[serde(default)]
+    pub execution_control: ExecutionControlV1,
     pub action_journal_sequence: i64,
     pub execution_epoch: i64,
 }
@@ -675,6 +731,126 @@ impl Controller {
             .tasks
             .get(task_id)
             .map(|task| task.task_contract_digest.as_str())
+    }
+
+    /// Returns the durable Controller-owned execution-control state.
+    ///
+    /// # Errors
+    /// Fails closed on malformed durable state.
+    pub fn execution_control(&self) -> Result<ExecutionControlV1, ControllerError> {
+        load_execution_control(&self.state)
+    }
+
+    /// Durably records a natural-language goal intent without bypassing the `PlanCompiler`.
+    /// The intent remains queued until a later execution path compiles and activates it.
+    ///
+    /// # Errors
+    /// Returns an error for an empty goal or durable-state failure.
+    pub fn submit_goal_intent(&mut self, goal: &str) -> Result<GoalIntentV1, ControllerError> {
+        let goal = goal.trim();
+        if goal.is_empty() {
+            return Err(ControllerError::InvalidPlan(
+                "natural-language goal must not be empty".to_owned(),
+            ));
+        }
+        let submitted_at_ms = unix_millis()?;
+        let digest = sha256_prefixed(
+            format!(
+                "{}\0{}\0{}",
+                goal,
+                submitted_at_ms,
+                self.state.latest_journal_sequence()?
+            )
+            .as_bytes(),
+        );
+        let goal_id = format!("goal-{}", &digest[7..23]);
+        let intent = GoalIntentV1 {
+            schema_version: GOAL_INTENT_SCHEMA_VERSION,
+            goal_id: goal_id.clone(),
+            natural_language_goal: goal.to_owned(),
+            status: "queued_for_plan_compilation".to_owned(),
+            submitted_at_ms,
+        };
+        let intent_json = serde_json::to_string(&intent)?;
+        self.persist_control_record_with_event(
+            "controller.goal_intent",
+            &goal_id,
+            &intent_json,
+            "goal_intent_submitted",
+            &json!({"status": intent.status}),
+        )?;
+        if self.active.is_some() {
+            self.checkpoint_now()?;
+        }
+        Ok(intent)
+    }
+
+    /// Pauses Controller readiness/mutation globally without changing frozen task-state semantics.
+    ///
+    /// # Errors
+    /// Returns a durable-state/checkpoint error when the transition cannot be recorded safely.
+    pub fn pause(&mut self, reason: Option<&str>) -> Result<ExecutionControlV1, ControllerError> {
+        self.set_execution_paused(true, reason)
+    }
+
+    /// Resumes Controller readiness/mutation globally without changing frozen task-state semantics.
+    ///
+    /// # Errors
+    /// Returns a durable-state/checkpoint error when the transition cannot be recorded safely.
+    pub fn resume(&mut self) -> Result<ExecutionControlV1, ControllerError> {
+        self.set_execution_paused(false, None)
+    }
+
+    /// Renders a read-only durable status projection for CLI clients.
+    ///
+    /// # Errors
+    /// Fails closed on malformed Controller-owned durable records.
+    pub fn durable_status(&self) -> Result<ControllerStatusView, ControllerError> {
+        let decode_values = |namespace: &str| -> Result<Vec<Value>, ControllerError> {
+            self.state
+                .state_records(namespace)?
+                .into_iter()
+                .map(|record| Ok(serde_json::from_str(&record.value_json)?))
+                .collect()
+        };
+        let mut evidence = decode_values("controller.verification")?;
+        evidence.extend(decode_values("controller.evidence_satisfaction")?);
+        evidence.extend(decode_values("controller.evidence_item")?);
+        let goal_intents = self
+            .state
+            .state_records("controller.goal_intent")?
+            .into_iter()
+            .map(|record| Ok(serde_json::from_str(&record.value_json)?))
+            .collect::<Result<Vec<GoalIntentV1>, ControllerError>>()?;
+        let active_plan = self
+            .state
+            .get_state("controller.plan", "active")?
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()?;
+        Ok(ControllerStatusView {
+            execution_control: self.execution_control()?,
+            active_plan,
+            tasks: decode_values("controller.task")?,
+            attempts: decode_values("controller.attempt")?,
+            actions: self
+                .state
+                .action_records()?
+                .into_iter()
+                .map(|record| ControllerActionStatusView {
+                    action_id: record.action_id,
+                    state: record.state,
+                    payload_digest: record.payload_digest,
+                    policy_digest: record.policy_digest,
+                    execution_epoch: record.execution_epoch,
+                    result_digest: record.result_digest,
+                    last_event_sequence: record.last_event_sequence,
+                    updated_at_ms: record.updated_at_ms,
+                })
+                .collect(),
+            evidence,
+            goal_intents,
+            approval_requests: decode_values("controller.approval_request")?,
+        })
     }
 
     /// Returns the latest Controller-owned durable `FailureRecord v1` for a task.
@@ -1014,6 +1190,7 @@ impl Controller {
         task_id: &str,
         inputs: ReadinessInputs<'_>,
     ) -> Result<ReadyLease, ControllerError> {
+        self.require_execution_not_paused()?;
         self.require_current_baseline(registry)?;
         if self.task_state(task_id) == Some(TaskState::DeferredResource) {
             self.restore_resource_deferred_task(task_id, TaskState::Planned)?;
@@ -1102,6 +1279,7 @@ impl Controller {
         task_id: &str,
         inputs: ReadinessInputs<'_>,
     ) -> Result<ReadyLease, ControllerError> {
+        self.require_execution_not_paused()?;
         self.require_current_baseline(registry)?;
         let (state, retry_exhausted, resource_retry_exhausted) = self
             .active_ref()?
@@ -2325,6 +2503,7 @@ impl Controller {
         lease: &ReadyLease,
         registry: &ProjectRegistry,
     ) -> Result<(), ControllerError> {
+        self.require_execution_not_paused()?;
         self.require_current_baseline(registry)?;
         let active = self.active_ref()?;
         if active.validity != PlanValidity::Current
@@ -3785,6 +3964,7 @@ impl Controller {
             evidence_binding_digests,
             action_records,
             process_leases,
+            execution_control: self.execution_control()?,
             action_journal_sequence: self.state.latest_journal_sequence()?,
             execution_epoch: self.state.current_execution_epoch()?,
         })
@@ -3876,6 +4056,89 @@ impl Controller {
             event_kind,
             payload_json: &serde_json::to_string(&payload)?,
         })?;
+        Ok(())
+    }
+
+    fn persist_control_record_with_event(
+        &mut self,
+        namespace: &str,
+        key: &str,
+        value_json: &str,
+        event_kind: &str,
+        payload: &Value,
+    ) -> Result<(), ControllerError> {
+        let event_payload = serde_json::to_string(payload)?;
+        let seed = sha256_prefixed(
+            format!(
+                "{}\0{}\0{}\0{}",
+                event_kind,
+                key,
+                self.state.latest_journal_sequence()?,
+                event_payload
+            )
+            .as_bytes(),
+        );
+        let event_id = format!("controller.{}", &seed[7..27]);
+        self.state.put_state_records_with_events(
+            &[StateRecordUpdate {
+                namespace,
+                key,
+                value_json,
+            }],
+            &[NewJournalEvent {
+                event_id: &event_id,
+                entity_type: "controller",
+                entity_id: key,
+                event_kind,
+                payload_json: &event_payload,
+            }],
+        )?;
+        Ok(())
+    }
+
+    fn set_execution_paused(
+        &mut self,
+        paused: bool,
+        reason: Option<&str>,
+    ) -> Result<ExecutionControlV1, ControllerError> {
+        // Invalidate every previously derived readiness lease before making a resume visible.
+        // If the later durable control transition fails, the extra epoch advance is safe and
+        // fail-closed; the inverse ordering could briefly make a stale pre-pause lease usable.
+        self.state.advance_execution_epoch()?;
+        let control = ExecutionControlV1 {
+            schema_version: EXECUTION_CONTROL_SCHEMA_VERSION,
+            paused,
+            reason: reason
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            changed_at_ms: unix_millis()?,
+        };
+        let value_json = serde_json::to_string(&control)?;
+        self.persist_control_record_with_event(
+            "controller.execution_control",
+            "global",
+            &value_json,
+            if paused {
+                "execution_paused"
+            } else {
+                "execution_resumed"
+            },
+            &json!({"paused": paused, "reason": control.reason}),
+        )?;
+        if self.active.is_some() {
+            self.checkpoint_now()?;
+        }
+        Ok(control)
+    }
+
+    fn require_execution_not_paused(&self) -> Result<(), ControllerError> {
+        let control = self.execution_control()?;
+        if control.paused {
+            return Err(ControllerError::NotReady(
+                "Controller execution is paused".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -4120,6 +4383,11 @@ impl RecoveryManager {
         validate_checkpoint_immutable_bindings(&state, &manifest)?;
         let fallback_checkpoint_used = trusted_checkpoint.generation != physical_latest.generation;
         let replayed_events = validate_post_checkpoint_runtime_correlation(
+            &state,
+            &manifest,
+            trusted_checkpoint.action_sequence,
+        )?;
+        validate_post_checkpoint_execution_control(
             &state,
             &manifest,
             trusted_checkpoint.action_sequence,
@@ -4407,6 +4675,49 @@ fn validate_post_checkpoint_runtime_correlation(
     }
     validate_post_checkpoint_baseline_correlation(state, manifest, &events)?;
     Ok(events.len())
+}
+
+fn validate_post_checkpoint_execution_control(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+) -> Result<(), ControllerError> {
+    let mut replayed = manifest.execution_control.clone();
+    for event in state.journal_after(checkpoint_sequence)? {
+        if event.entity_type != "controller"
+            || (event.event_kind != "execution_paused" && event.event_kind != "execution_resumed")
+        {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        let paused = payload
+            .get("paused")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "execution-control journal event is missing paused flag".to_owned(),
+                )
+            })?;
+        replayed = ExecutionControlV1 {
+            schema_version: EXECUTION_CONTROL_SCHEMA_VERSION,
+            paused,
+            reason: payload
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            // The authoritative current record supplies the transition timestamp; journal
+            // correlation proves the semantic paused/resumed state and reason.
+            changed_at_ms: replayed.changed_at_ms,
+        };
+    }
+    let current = load_execution_control(state)?;
+    if replayed.paused != current.paused || replayed.reason != current.reason {
+        return Err(ControllerError::InvalidPlan(
+            "current execution-control state does not equal ordered post-checkpoint journal replay"
+                .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_post_checkpoint_baseline_correlation(
@@ -6133,6 +6444,20 @@ fn validate_required_evidence_types(
 
 fn snapshot_digest(snapshot: &RepositorySnapshot) -> Result<String, ControllerError> {
     Ok(sha256_prefixed(snapshot.manifest_json()?.as_bytes()))
+}
+
+fn load_execution_control(state: &StateStore) -> Result<ExecutionControlV1, ControllerError> {
+    let Some(raw) = state.get_state("controller.execution_control", "global")? else {
+        return Ok(ExecutionControlV1::default());
+    };
+    let control: ExecutionControlV1 = serde_json::from_str(&raw)?;
+    if control.schema_version != EXECUTION_CONTROL_SCHEMA_VERSION {
+        return Err(ControllerError::InvalidPlan(format!(
+            "unsupported execution-control schema version {}",
+            control.schema_version
+        )));
+    }
+    Ok(control)
 }
 
 fn checkpoint_artifact_store(state_path: &Path) -> Result<ArtifactStore, ControllerError> {

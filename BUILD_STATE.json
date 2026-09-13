@@ -4,7 +4,7 @@
   "architecture_revision": "2026-09-12.7",
   "plan_ir_version": "1.2",
   "implementation_started": true,
-  "updated_at": "2026-09-13T05:09:10Z",
+  "updated_at": "2026-09-13T05:28:27Z",
   "current_task": "M2-T01",
   "current_gate": null,
   "active_steering": {
@@ -78,6 +78,10 @@
     "M1-T09": {
       "status": "completed",
       "evidence": "implementation/evidence/M1-T09.json"
+    },
+    "PD-T01": {
+      "status": "completed",
+      "evidence": "implementation/evidence/PD-T01.json"
     }
   },
   "completed_milestones": {
