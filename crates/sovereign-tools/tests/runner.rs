@@ -5,8 +5,9 @@ use sovereign_policy::{
 };
 use sovereign_state::StateStore;
 use sovereign_tools::{
-    ActionJournal, ActionState, AuthorizedAction, PermissionClass, ProcessRunner, Reconciliation,
-    ReconciliationMode, ResourceLimitKind, ToolManifest,
+    ActionJournal, ActionState, AuthorizedAction, CapabilityLayers, CapabilitySet, PermissionClass,
+    PermissionDecision, ProcessRunner, Reconciliation, ReconciliationMode, ResourceLimitKind,
+    ToolManifest, ToolSchemaV1, filter_authorized_tool_schemas,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -59,11 +60,15 @@ fn shell_policy() -> CommandPolicy {
     policy
 }
 
+fn test_digest(byte: char) -> String {
+    format!("sha256:{}", byte.to_string().repeat(64))
+}
+
 fn manifest() -> ToolManifest {
     ToolManifest {
         tool_id: "tool_shell".to_owned(),
         version: "1".to_owned(),
-        content_digest: "sha256:manifest".to_owned(),
+        content_digest: test_digest('1'),
         permission_ceiling: BTreeSet::from([
             PermissionClass::ProcessExec,
             PermissionClass::RepositoryWrite,
@@ -89,7 +94,7 @@ fn shell_action(
 ) -> AuthorizedAction {
     let executable = PinnedExecutable::from_path("/bin/sh", "macos-system")
         .unwrap_or_else(|error| panic!("pin shell action: {error}"));
-    AuthorizedAction {
+    let mut action = AuthorizedAction {
         action_id: id.to_owned(),
         plan_id: "plan_m1".to_owned(),
         plan_revision: 1,
@@ -97,13 +102,14 @@ fn shell_action(
         attempt_id: format!("attempt-{id}"),
         tool_id: "tool_shell".to_owned(),
         tool_version: "1".to_owned(),
-        tool_digest: "sha256:manifest".to_owned(),
+        tool_digest: test_digest('1'),
         executable_digest: executable.sha256,
         repository_id: "repo_fixture".to_owned(),
         destination_digest: None,
         permission_class: PermissionClass::ProcessExec,
         execution_epoch: 0,
-        policy_digest: "sha256:policy".to_owned(),
+        policy_digest: test_digest('2'),
+        permission_decision_digest: "sha256:pending-decision".to_owned(),
         isolation_policy_digest: "sha256:pending-isolation".to_owned(),
         nonce: format!("nonce-{id}"),
         expires_at_ms: now_ms() + 60_000,
@@ -121,7 +127,39 @@ fn shell_action(
         },
         individually_authorized_environment: BTreeSet::new(),
         reconciliation_mode: mode,
-    }
+    };
+    action.permission_decision_digest = permission_decision(&action).digest();
+    action
+}
+
+fn permission_decision(action: &AuthorizedAction) -> PermissionDecision {
+    PermissionDecision::new(
+        action.plan_id.clone(),
+        action.plan_revision,
+        action.task_id.clone(),
+        test_digest('3'),
+        action.policy_digest.clone(),
+        action.tool_id.clone(),
+        action.tool_version.clone(),
+        action.tool_digest.clone(),
+        CapabilityLayers {
+            global: CapabilitySet::all(),
+            project: CapabilitySet::all(),
+            task: CapabilitySet::all(),
+            role: CapabilitySet::all(),
+            tool: CapabilitySet::all(),
+            user: CapabilitySet::all(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("permission decision: {error}"))
+}
+
+fn authorize(
+    journal: &mut ActionJournal<'_>,
+    action: &AuthorizedAction,
+    tool_manifest: &ToolManifest,
+) -> Result<i64, sovereign_tools::ToolError> {
+    journal.authorize(action, tool_manifest, &permission_decision(action))
 }
 
 fn fixture(label: &str) -> (TestDir, PathBuf, PathBuf, StateStore) {
@@ -153,6 +191,96 @@ fn bind_isolation(action: &mut AuthorizedAction, request: &IsolationRequest) {
     action.isolation_policy_digest = request
         .digest()
         .unwrap_or_else(|error| panic!("isolation digest: {error}"));
+}
+
+#[test]
+fn tool_schema_required_capabilities_must_be_within_manifest_and_decision() {
+    let tool_manifest = manifest();
+    let schema = ToolSchemaV1 {
+        tool_id: tool_manifest.tool_id.clone(),
+        version: tool_manifest.version.clone(),
+        content_digest: tool_manifest.content_digest.clone(),
+        name: "shell".to_owned(),
+        description: "Run one structured shell command".to_owned(),
+        input_schema: serde_json::json!({"type": "object"}),
+        required_capabilities: CapabilitySet::new([PermissionClass::ProcessExec]),
+    };
+    assert!(schema.validate_against_manifest(&tool_manifest).is_ok());
+
+    let (_temp, repo, _home, _store) = fixture("schema-filter");
+    let action = shell_action(
+        "action_schema_filter",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 1_024,
+            disk_bytes: 1_024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::IdempotentRead,
+    );
+    let decision = permission_decision(&action);
+    let schemas = [schema.clone()];
+    let manifests = [tool_manifest.clone()];
+    let decisions = [decision];
+    let visible = filter_authorized_tool_schemas(&schemas, &manifests, &decisions)
+        .unwrap_or_else(|error| panic!("filter schemas: {error}"));
+    assert_eq!(visible, vec![&schema]);
+
+    let too_broad = ToolSchemaV1 {
+        required_capabilities: CapabilitySet::new([PermissionClass::NetworkRead]),
+        ..schema
+    };
+    assert!(too_broad.validate_against_manifest(&tool_manifest).is_err());
+}
+
+#[test]
+fn mismatched_permission_decision_cannot_authorize_action() {
+    let (_temp, repo, _home, mut store) = fixture("decision-binding");
+    let action = shell_action(
+        "action_decision_binding",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 1_024,
+            disk_bytes: 1_024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::IdempotentRead,
+    );
+    let mismatched = PermissionDecision::new(
+        action.plan_id.clone(),
+        action.plan_revision,
+        "sibling-task",
+        test_digest('3'),
+        action.policy_digest.clone(),
+        action.tool_id.clone(),
+        action.tool_version.clone(),
+        action.tool_digest.clone(),
+        CapabilityLayers {
+            global: CapabilitySet::all(),
+            project: CapabilitySet::all(),
+            task: CapabilitySet::all(),
+            role: CapabilitySet::all(),
+            tool: CapabilitySet::all(),
+            user: CapabilitySet::all(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("mismatched decision: {error}"));
+    let original_payload_digest = action.payload_digest();
+    let mut changed_binding = action.clone();
+    changed_binding.permission_decision_digest = mismatched.digest();
+    assert_ne!(original_payload_digest, changed_binding.payload_digest());
+
+    let mut journal = ActionJournal::new(&mut store);
+    assert!(
+        journal
+            .authorize(&action, &manifest(), &mismatched)
+            .is_err()
+    );
+    assert!(journal.record(&action.action_id).unwrap_or(None).is_none());
 }
 
 #[cfg(target_os = "macos")]
@@ -189,8 +317,7 @@ fn process_runner_refuses_execution_until_exact_action_is_durably_authorized() {
         assert!(!repo.join("marker.txt").exists());
         assert!(journal.record(&action.action_id).unwrap_or(None).is_none());
 
-        journal
-            .authorize(&action, &manifest())
+        authorize(&mut journal, &action, &manifest())
             .unwrap_or_else(|error| panic!("authorize: {error}"));
         let result = runner
             .run(&mut journal, &action, &request, &artifact_store)
@@ -243,8 +370,7 @@ fn process_exec_does_not_imply_repository_write_and_isolation_binding_is_exact()
         MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("sandbox: {error}"));
     let runner = ProcessRunner::new(&command_policy, &backend);
     let mut journal = ActionJournal::new(&mut store);
-    journal
-        .authorize(&action, &manifest())
+    authorize(&mut journal, &action, &manifest())
         .unwrap_or_else(|error| panic!("authorize: {error}"));
     assert!(
         runner
@@ -274,8 +400,7 @@ fn process_exec_does_not_imply_repository_write_and_isolation_binding_is_exact()
     );
     let offline = isolation(&repo, &home, false);
     bind_isolation(&mut read_action, &offline);
-    journal
-        .authorize(&read_action, &manifest())
+    authorize(&mut journal, &read_action, &manifest())
         .unwrap_or_else(|error| panic!("authorize read: {error}"));
     let mut changed = offline;
     changed.allow_repository_write = true;
@@ -312,8 +437,7 @@ fn published_receipt_before_state_observation_never_creates_false_commit() {
     );
     {
         let mut journal = ActionJournal::new(&mut store);
-        journal
-            .authorize(&action, &manifest())
+        authorize(&mut journal, &action, &manifest())
             .unwrap_or_else(|error| panic!("authorize: {error}"));
         journal
             .transition(&action, ActionState::Authorized, ActionState::Dispatched)
@@ -368,8 +492,7 @@ fn observed_receipt_survives_restart_and_can_then_commit() {
     );
     let digest = {
         let mut journal = ActionJournal::new(&mut store);
-        journal
-            .authorize(&action, &manifest())
+        authorize(&mut journal, &action, &manifest())
             .unwrap_or_else(|error| panic!("authorize: {error}"));
         journal
             .transition(&action, ActionState::Authorized, ActionState::Dispatched)
@@ -416,12 +539,12 @@ fn manifest_cannot_enlarge_action_permission_or_lower_risk_floor() {
     );
     action.permission_class = PermissionClass::NetworkWrite;
     let mut journal = ActionJournal::new(&mut store);
-    assert!(journal.authorize(&action, &manifest()).is_err());
+    assert!(authorize(&mut journal, &action, &manifest()).is_err());
     assert!(journal.record(&action.action_id).unwrap_or(None).is_none());
 
     action.permission_class = PermissionClass::ProcessExec;
     action.command.declared_risk = CommandRisk::ReadOnly;
-    assert!(journal.authorize(&action, &manifest()).is_err());
+    assert!(authorize(&mut journal, &action, &manifest()).is_err());
 }
 
 #[test]
@@ -455,8 +578,7 @@ fn crash_after_dispatch_becomes_unknown_safe_read_reconciles_and_unsafe_unknown_
     let mut journal = ActionJournal::new(&mut store);
 
     for action in [&safe, &unsafe_action] {
-        journal
-            .authorize(action, &tool_manifest)
+        authorize(&mut journal, action, &tool_manifest)
             .unwrap_or_else(|error| panic!("authorize: {error}"));
         journal
             .transition(action, ActionState::Authorized, ActionState::Dispatched)
@@ -515,8 +637,7 @@ fn timeout_kills_and_reaps_the_entire_process_group() {
     let request = isolation(&repo, &home, false);
     bind_isolation(&mut action, &request);
     let mut journal = ActionJournal::new(&mut store);
-    journal
-        .authorize(&action, &manifest())
+    authorize(&mut journal, &action, &manifest())
         .unwrap_or_else(|error| panic!("authorize: {error}"));
     let result = runner
         .run(&mut journal, &action, &request, &artifact_store)
@@ -576,8 +697,7 @@ fn output_disk_and_subprocess_ceilings_terminate_bounded_commands() {
         let request = isolation(&repo, &home, allow_write);
         bind_isolation(&mut action, &request);
         let mut journal = ActionJournal::new(&mut store);
-        journal
-            .authorize(&action, &manifest())
+        authorize(&mut journal, &action, &manifest())
             .unwrap_or_else(|error| panic!("authorize {label}: {error}"));
         let result = runner
             .run(&mut journal, &action, &request, &artifact_store)
@@ -607,8 +727,7 @@ fn output_disk_and_subprocess_ceilings_terminate_bounded_commands() {
     let request = isolation(&repo, &home, false);
     bind_isolation(&mut action, &request);
     let mut journal = ActionJournal::new(&mut store);
-    journal
-        .authorize(&action, &manifest())
+    authorize(&mut journal, &action, &manifest())
         .unwrap_or_else(|error| panic!("authorize children: {error}"));
     assert!(
         runner
@@ -647,8 +766,7 @@ fn escaped_descendant_holding_output_pipe_is_bounded_and_recovery_blocked() {
     let request = isolation(&repo, &home, true);
     bind_isolation(&mut action, &request);
     let mut journal = ActionJournal::new(&mut store);
-    journal
-        .authorize(&action, &manifest())
+    authorize(&mut journal, &action, &manifest())
         .unwrap_or_else(|error| panic!("authorize: {error}"));
     let started = std::time::Instant::now();
     assert!(

@@ -1,15 +1,16 @@
 use super::{ControllerError, PermissionContext, sha256_prefixed};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use sovereign_context::{ContextPacket, EvidenceKind};
 use sovereign_model::{
     MODEL_SCHEMA_VERSION, ModelBackend, ModelFinishReason, ModelMessage, ModelMessageRole,
     ModelOutputContract, ModelRequest,
 };
-use sovereign_tools::PermissionClass;
+use sovereign_policy::{Capability, CapabilitySet};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ROLE_PROFILE_SCHEMA_VERSION: u32 = 1;
+pub const ROLE_PROFILE_VERSION: &str = "1.0.0";
 pub const ROLE_OUTPUT_SCHEMA_VERSION: u32 = 1;
 const ROLE_OUTPUT_TOKEN_CEILING: u32 = 512;
 const MAX_ROLE_FINDINGS: usize = 32;
@@ -29,32 +30,104 @@ pub enum RoleId {
     Verifier,
 }
 
-/// Serializable tool-class ceiling used by [`RoleProfile`]. The Controller
-/// intersects this ceiling with its existing permission context before use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RoleToolClass {
-    ProcessExec,
-    RepositoryWrite,
-    PackageInstall,
-    NetworkRead,
-    NetworkWrite,
-    Destructive,
-    ExternalSideEffect,
-}
-
-impl From<RoleToolClass> for PermissionClass {
-    fn from(value: RoleToolClass) -> Self {
-        match value {
-            RoleToolClass::ProcessExec => Self::ProcessExec,
-            RoleToolClass::RepositoryWrite => Self::RepositoryWrite,
-            RoleToolClass::PackageInstall => Self::PackageInstall,
-            RoleToolClass::NetworkRead => Self::NetworkRead,
-            RoleToolClass::NetworkWrite => Self::NetworkWrite,
-            RoleToolClass::Destructive => Self::Destructive,
-            RoleToolClass::ExternalSideEffect => Self::ExternalSideEffect,
+impl RoleId {
+    #[must_use]
+    pub const fn plan_ir_id(self) -> &'static str {
+        match self {
+            Self::Explorer => "role.explorer",
+            Self::Planner => "role.planner",
+            Self::Implementer => "role.implementer",
+            Self::Debugger => "role.debugger",
+            Self::Reviewer => "role.reviewer",
+            Self::SecurityReviewer => "role.security_reviewer",
+            Self::Verifier => "role.verifier",
         }
     }
+
+    #[must_use]
+    pub fn from_plan_ir_id(value: &str) -> Option<Self> {
+        match value {
+            "role.explorer" => Some(Self::Explorer),
+            "role.planner" => Some(Self::Planner),
+            "role.implementer" => Some(Self::Implementer),
+            "role.debugger" => Some(Self::Debugger),
+            "role.reviewer" => Some(Self::Reviewer),
+            "role.security_reviewer" => Some(Self::SecurityReviewer),
+            "role.verifier" => Some(Self::Verifier),
+            _ => None,
+        }
+    }
+}
+
+/// Exact Plan IR role pin resolved against the canonical in-process role registry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RolePin {
+    pub id: String,
+    pub version: String,
+    pub digest: String,
+}
+
+/// Backwards-compatible public name for the canonical Plan IR capability domain.
+///
+/// Role authority no longer owns a divergent seven-value enum. Every role ceiling is expressed
+/// directly in [`sovereign_policy::Capability`], so newly defined Plan IR capabilities cannot be
+/// accidentally omitted from the role authority type.
+pub type RoleToolClass = Capability;
+
+fn serialize_role_capability_ceiling<S>(
+    capabilities: &BTreeSet<Capability>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    // Keep the v1 RoleProfile wire form stable for the seven values that existed before the
+    // authority type was unified. This preserves existing canonical role digests/pins while the
+    // in-memory authority domain is the canonical twelve-value Capability enum.
+    let mut values = capabilities.iter().copied().collect::<Vec<_>>();
+    values.sort_by_key(|capability| match capability {
+        Capability::ProcessExec => 0,
+        Capability::RepositoryWrite => 1,
+        Capability::PackageInstall => 2,
+        Capability::NetworkRead => 3,
+        Capability::NetworkWrite => 4,
+        Capability::Destructive => 5,
+        Capability::ExternalSideEffect => 6,
+        Capability::Read => 7,
+        Capability::SandboxWrite => 8,
+        Capability::BrowserInteractive => 9,
+        Capability::SecretUse => 10,
+        Capability::ExternalIntelligence => 11,
+    });
+    values
+        .into_iter()
+        .map(|capability| match capability {
+            Capability::RepositoryWrite => "repository_write",
+            other => other.as_plan_ir_str(),
+        })
+        .collect::<Vec<_>>()
+        .serialize(serializer)
+}
+
+fn deserialize_role_capability_ceiling<'de, D>(
+    deserializer: D,
+) -> Result<BTreeSet<Capability>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    values
+        .into_iter()
+        .map(|value| {
+            if value == "repository_write" {
+                return Ok(Capability::RepositoryWrite);
+            }
+            Capability::from_plan_ir_str(&value).ok_or_else(|| {
+                serde::de::Error::custom(format!("unknown canonical role capability {value}"))
+            })
+        })
+        .collect()
 }
 
 /// Typed advisory result produced by a logical role. No disposition in this
@@ -79,7 +152,11 @@ pub struct RoleProfile {
     pub role: RoleId,
     pub reasoning_objective: String,
     pub default_evidence_types: BTreeSet<EvidenceKind>,
-    pub allowed_tool_classes_ceiling: BTreeSet<RoleToolClass>,
+    #[serde(
+        serialize_with = "serialize_role_capability_ceiling",
+        deserialize_with = "deserialize_role_capability_ceiling"
+    )]
+    pub allowed_tool_classes_ceiling: BTreeSet<Capability>,
     pub output_schema: String,
     pub allowed_dispositions: BTreeSet<RoleDisposition>,
     pub completion_contract: String,
@@ -92,6 +169,12 @@ impl RoleProfile {
     /// Returns a JSON error if serialization of the typed profile fails.
     pub fn digest(&self) -> Result<String, serde_json::Error> {
         serde_json::to_vec(self).map(|bytes| sha256_prefixed(&bytes))
+    }
+
+    /// Returns this role ceiling in the canonical deterministic capability-set representation.
+    #[must_use]
+    pub fn capability_ceiling(&self) -> CapabilitySet {
+        CapabilitySet::new(self.allowed_tool_classes_ceiling.iter().copied())
     }
 
     fn validate(&self) -> Result<(), ControllerError> {
@@ -159,6 +242,47 @@ impl RoleRegistry {
         self.profiles
             .get(&role)
             .unwrap_or_else(|| unreachable!("canonical role registry is complete"))
+    }
+
+    /// Returns the exact canonical Plan IR pin for one logical role profile.
+    ///
+    /// # Errors
+    /// Returns a JSON error if the canonical profile cannot be serialized for digesting.
+    pub fn canonical_pin(&self, role: RoleId) -> Result<RolePin, serde_json::Error> {
+        Ok(RolePin {
+            id: role.plan_ir_id().to_owned(),
+            version: ROLE_PROFILE_VERSION.to_owned(),
+            digest: self.profile(role).digest()?,
+        })
+    }
+
+    /// Resolves only an exact canonical `{id, version, digest}` Plan IR role pin.
+    /// Role text alone is never enough to select an authority-relevant ceiling.
+    ///
+    /// # Errors
+    /// Returns an invalid-plan error for unknown IDs, unsupported versions, or digest mismatch.
+    pub fn resolve_pin(
+        &self,
+        id: &str,
+        version: &str,
+        digest: &str,
+    ) -> Result<&RoleProfile, ControllerError> {
+        let role = RoleId::from_plan_ir_id(id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!("unknown canonical role pin id {id}"))
+        })?;
+        if version != ROLE_PROFILE_VERSION {
+            return Err(ControllerError::InvalidPlan(format!(
+                "unsupported canonical role pin version {version}"
+            )));
+        }
+        let profile = self.profile(role);
+        let expected = profile.digest()?;
+        if digest != expected {
+            return Err(ControllerError::InvalidPlan(format!(
+                "role pin digest does not match canonical profile for {id}"
+            )));
+        }
+        Ok(profile)
     }
 
     /// Produces a deterministic role -> profile digest manifest suitable for
@@ -239,22 +363,16 @@ impl PermissionContext {
     /// manufacture a permission that was absent from the current role ceiling.
     #[must_use]
     pub fn narrow_for_role(&self, profile: &RoleProfile) -> Self {
-        let profile_ceiling = profile
-            .allowed_tool_classes_ceiling
-            .iter()
-            .copied()
-            .map(PermissionClass::from)
-            .collect::<BTreeSet<_>>();
-        let role_ceiling = self
-            .role_ceiling
-            .intersection(&profile_ceiling)
-            .copied()
-            .collect();
+        let role_ceiling: BTreeSet<_> = self
+            .role_capabilities()
+            .intersection(&profile.capability_ceiling())
+            .into();
         Self {
             controller_ceiling: self.controller_ceiling.clone(),
             project_ceiling: self.project_ceiling.clone(),
             role_ceiling,
             persisted_grants: self.persisted_grants.clone(),
+            persisted_grant_issuer: self.persisted_grant_issuer.clone(),
         }
     }
 }
@@ -273,7 +391,7 @@ fn explorer_profile() -> RoleProfile {
             EvidenceKind::Instruction,
             EvidenceKind::ToolSchema,
         ]),
-        allowed_tool_classes_ceiling: BTreeSet::from([RoleToolClass::ProcessExec]),
+        allowed_tool_classes_ceiling: BTreeSet::from([Capability::ProcessExec]),
         output_schema: "RoleOutputV1".to_owned(),
         allowed_dispositions: BTreeSet::from([
             RoleDisposition::Proposed,
@@ -324,8 +442,8 @@ fn implementer_profile() -> RoleProfile {
             EvidenceKind::ToolSchema,
         ]),
         allowed_tool_classes_ceiling: BTreeSet::from([
-            RoleToolClass::ProcessExec,
-            RoleToolClass::RepositoryWrite,
+            Capability::ProcessExec,
+            Capability::RepositoryWrite,
         ]),
         output_schema: "RoleOutputV1".to_owned(),
         allowed_dispositions: BTreeSet::from([
@@ -356,8 +474,8 @@ fn debugger_profile() -> RoleProfile {
             EvidenceKind::ToolSchema,
         ]),
         allowed_tool_classes_ceiling: BTreeSet::from([
-            RoleToolClass::ProcessExec,
-            RoleToolClass::RepositoryWrite,
+            Capability::ProcessExec,
+            Capability::RepositoryWrite,
         ]),
         output_schema: "RoleOutputV1".to_owned(),
         allowed_dispositions: BTreeSet::from([
@@ -385,7 +503,7 @@ fn reviewer_profile() -> RoleProfile {
             EvidenceKind::Verification,
             EvidenceKind::ToolSchema,
         ]),
-        allowed_tool_classes_ceiling: BTreeSet::from([RoleToolClass::ProcessExec]),
+        allowed_tool_classes_ceiling: BTreeSet::from([Capability::ProcessExec]),
         output_schema: "RoleOutputV1".to_owned(),
         allowed_dispositions: BTreeSet::from([
             RoleDisposition::Approve,
@@ -413,7 +531,7 @@ fn security_reviewer_profile() -> RoleProfile {
             EvidenceKind::Verification,
             EvidenceKind::ToolSchema,
         ]),
-        allowed_tool_classes_ceiling: BTreeSet::from([RoleToolClass::ProcessExec]),
+        allowed_tool_classes_ceiling: BTreeSet::from([Capability::ProcessExec]),
         output_schema: "RoleOutputV1".to_owned(),
         allowed_dispositions: BTreeSet::from([
             RoleDisposition::Approve,
@@ -440,7 +558,7 @@ fn verifier_profile() -> RoleProfile {
             EvidenceKind::Verification,
             EvidenceKind::ToolSchema,
         ]),
-        allowed_tool_classes_ceiling: BTreeSet::from([RoleToolClass::ProcessExec]),
+        allowed_tool_classes_ceiling: BTreeSet::from([Capability::ProcessExec]),
         output_schema: "RoleOutputV1".to_owned(),
         allowed_dispositions: BTreeSet::from([
             RoleDisposition::Pass,
@@ -590,6 +708,7 @@ mod tests {
             controller_prefix: "Controller remains the only authority.".to_owned(),
             task_contract: "review the exact task contract".to_owned(),
             current_state: "attempt verified; no unknown actions".to_owned(),
+            authorized_tool_schemas: Vec::new(),
             candidates,
             output_schema: "RoleOutputV1".to_owned(),
         }
@@ -727,18 +846,52 @@ mod tests {
     fn roles_cannot_elevate_existing_permission_context() {
         let registry = RoleRegistry::canonical();
         let base = PermissionContext::read_only();
-        assert!(base.permits(PermissionClass::ProcessExec));
-        assert!(!base.permits(PermissionClass::RepositoryWrite));
+        assert!(base.permits(Capability::ProcessExec));
+        assert!(!base.permits(Capability::RepositoryWrite));
 
         let implementer = base.narrow_for_role(registry.profile(RoleId::Implementer));
-        assert!(implementer.permits(PermissionClass::ProcessExec));
-        assert!(!implementer.permits(PermissionClass::RepositoryWrite));
-        assert!(!implementer.permits(PermissionClass::NetworkRead));
+        assert!(implementer.permits(Capability::ProcessExec));
+        assert!(!implementer.permits(Capability::RepositoryWrite));
+        assert!(!implementer.permits(Capability::NetworkRead));
 
         let reviewer = PermissionContext::m1_local_autonomous()
             .narrow_for_role(registry.profile(RoleId::Reviewer));
-        assert!(reviewer.permits(PermissionClass::ProcessExec));
-        assert!(!reviewer.permits(PermissionClass::RepositoryWrite));
+        assert!(reviewer.permits(Capability::ProcessExec));
+        assert!(!reviewer.permits(Capability::RepositoryWrite));
+
+        let broad = BTreeSet::from([
+            Capability::ProcessExec,
+            Capability::RepositoryWrite,
+            Capability::Destructive,
+        ]);
+        let broad_context = PermissionContext {
+            controller_ceiling: broad.clone(),
+            project_ceiling: broad.clone(),
+            role_ceiling: broad.clone(),
+            persisted_grants: broad,
+            persisted_grant_issuer: "user:test".to_owned(),
+        };
+        let implementer = broad_context.narrow_for_role(registry.profile(RoleId::Implementer));
+        assert!(implementer.permits(Capability::RepositoryWrite));
+        assert!(!implementer.permits(Capability::Destructive));
+    }
+
+    #[test]
+    fn role_ceiling_accepts_the_full_canonical_twelve_capability_domain() {
+        let mut profile = RoleRegistry::canonical()
+            .profile(RoleId::Implementer)
+            .clone();
+        profile.allowed_tool_classes_ceiling = Capability::ALL.into_iter().collect();
+
+        assert_eq!(profile.capability_ceiling(), CapabilitySet::all());
+        assert_eq!(profile.capability_ceiling().iter().count(), 12);
+
+        let encoded = serde_json::to_vec(&profile)
+            .unwrap_or_else(|error| panic!("serialize canonical capability role profile: {error}"));
+        let decoded: RoleProfile = serde_json::from_slice(&encoded).unwrap_or_else(|error| {
+            panic!("deserialize canonical capability role profile: {error}")
+        });
+        assert_eq!(decoded.capability_ceiling(), CapabilitySet::all());
     }
 
     #[test]
@@ -772,5 +925,27 @@ mod tests {
             assert!(!object.contains_key("grants"));
             assert!(!object.contains_key("permissions"));
         }
+    }
+
+    #[test]
+    fn exact_plan_ir_role_pin_resolves_only_canonical_profile() {
+        let registry = RoleRegistry::canonical();
+        let pin = registry
+            .canonical_pin(RoleId::Implementer)
+            .unwrap_or_else(|error| panic!("canonical pin: {error}"));
+        let profile = registry
+            .resolve_pin(&pin.id, &pin.version, &pin.digest)
+            .unwrap_or_else(|error| panic!("resolve canonical pin: {error}"));
+        assert_eq!(profile.role, RoleId::Implementer);
+        assert!(
+            registry
+                .resolve_pin(
+                    &pin.id,
+                    &pin.version,
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .is_err()
+        );
+        assert!(registry.resolve_pin(&pin.id, "0.9.0", &pin.digest).is_err());
     }
 }

@@ -1,9 +1,10 @@
 use sovereign_policy::{
-    CheckpointIntegrityFloor, CommandMode, CommandPolicy, CommandRisk, CommandSpec,
-    ExecutionIsolationBackend, HeavyLeaseClass, HostPressureSnapshot, IsolationRequest,
-    M1ResourceGovernor, MacSandboxExecBackend, MinimalNetworkPolicy, MinimalResourceLeaseAuthority,
-    ModelCallBudget, NetworkDestination, PathPolicy, PinnedExecutable, PressureBand,
-    ResourceGovernor, sanitized_environment,
+    Capability, CapabilityLayers, CapabilitySet, CheckpointIntegrityFloor, CommandMode,
+    CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, HeavyLeaseClass,
+    HostPressureSnapshot, IsolationRequest, M1ResourceGovernor, MacSandboxExecBackend,
+    MinimalNetworkPolicy, MinimalResourceLeaseAuthority, ModelCallBudget, NetworkDestination,
+    PathPolicy, PermissionDecision, PinnedExecutable, PressureBand, ResourceGovernor,
+    TaskCapabilityGrant, sanitized_environment,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -46,6 +47,156 @@ fn direct_spec(executable: impl Into<PathBuf>, args: &[&str]) -> CommandSpec {
         disk_write_limit_bytes: 16 * 1024,
         subprocess_limit: 2,
     }
+}
+
+fn test_digest(byte: char) -> String {
+    format!("sha256:{}", byte.to_string().repeat(64))
+}
+
+#[test]
+fn canonical_plan_ir_capability_mapping_covers_all_twelve_values() {
+    let expected = [
+        (Capability::Read, "read"),
+        (Capability::SandboxWrite, "sandbox_write"),
+        (Capability::RepositoryWrite, "repo_write"),
+        (Capability::ProcessExec, "process_exec"),
+        (Capability::PackageInstall, "package_install"),
+        (Capability::NetworkRead, "network_read"),
+        (Capability::NetworkWrite, "network_write"),
+        (Capability::BrowserInteractive, "browser_interactive"),
+        (Capability::SecretUse, "secret_use"),
+        (Capability::ExternalSideEffect, "external_side_effect"),
+        (Capability::ExternalIntelligence, "external_intelligence"),
+        (Capability::Destructive, "destructive"),
+    ];
+    assert_eq!(Capability::ALL.len(), expected.len());
+    for (capability, wire_name) in expected {
+        assert_eq!(capability.as_plan_ir_str(), wire_name);
+        assert_eq!(Capability::from_plan_ir_str(wire_name), Some(capability));
+    }
+    assert_eq!(Capability::from_plan_ir_str("repository_write"), None);
+}
+
+#[test]
+fn capability_set_and_permission_decision_digests_are_deterministic() {
+    let first = CapabilitySet::new([
+        Capability::ProcessExec,
+        Capability::Read,
+        Capability::RepositoryWrite,
+    ]);
+    let reordered = CapabilitySet::new([
+        Capability::RepositoryWrite,
+        Capability::ProcessExec,
+        Capability::Read,
+        Capability::Read,
+    ]);
+    assert_eq!(first, reordered);
+    assert_eq!(first.digest(), reordered.digest());
+
+    let layers = CapabilityLayers {
+        global: CapabilitySet::all(),
+        project: first.clone(),
+        task: CapabilitySet::new([Capability::Read, Capability::RepositoryWrite]),
+        role: CapabilitySet::all(),
+        tool: CapabilitySet::new([
+            Capability::Read,
+            Capability::RepositoryWrite,
+            Capability::ProcessExec,
+        ]),
+        user: CapabilitySet::all(),
+    };
+    let decision = PermissionDecision::new(
+        "plan-a",
+        7,
+        "task-a",
+        test_digest('a'),
+        test_digest('b'),
+        "tool-a",
+        "1",
+        test_digest('c'),
+        layers.clone(),
+    )
+    .unwrap_or_else(|error| panic!("decision: {error}"));
+    let same = PermissionDecision::new(
+        "plan-a",
+        7,
+        "task-a",
+        test_digest('a'),
+        test_digest('b'),
+        "tool-a",
+        "1",
+        test_digest('c'),
+        layers,
+    )
+    .unwrap_or_else(|error| panic!("same decision: {error}"));
+    assert_eq!(decision.digest(), same.digest());
+    assert_eq!(
+        decision.effective,
+        CapabilitySet::new([Capability::Read, Capability::RepositoryWrite])
+    );
+}
+
+#[test]
+fn task_capability_grant_rejects_sibling_and_stale_task_scope() {
+    let task_contract_digest = test_digest('d');
+    let grant = TaskCapabilityGrant {
+        plan_id: "plan-a".to_owned(),
+        plan_revision: 3,
+        task_id: "task-a".to_owned(),
+        task_contract_digest: task_contract_digest.clone(),
+        policy_digest: test_digest('f'),
+        issued_by: "user:test".to_owned(),
+        capabilities: CapabilitySet::new([Capability::NetworkRead]),
+    };
+    assert!(
+        grant
+            .capabilities_for_scope(
+                "plan-a",
+                3,
+                "task-a",
+                &task_contract_digest,
+                &test_digest('f')
+            )
+            .is_ok()
+    );
+    assert!(
+        grant
+            .capabilities_for_scope(
+                "plan-a",
+                3,
+                "task-b",
+                &task_contract_digest,
+                &test_digest('f')
+            )
+            .is_err()
+    );
+    assert!(
+        grant
+            .capabilities_for_scope(
+                "plan-a",
+                4,
+                "task-a",
+                &task_contract_digest,
+                &test_digest('f')
+            )
+            .is_err()
+    );
+    assert!(
+        grant
+            .capabilities_for_scope("plan-a", 3, "task-a", &test_digest('e'), &test_digest('f'))
+            .is_err()
+    );
+    assert!(
+        grant
+            .capabilities_for_scope(
+                "plan-a",
+                3,
+                "task-a",
+                &task_contract_digest,
+                &test_digest('e')
+            )
+            .is_err()
+    );
 }
 
 #[test]

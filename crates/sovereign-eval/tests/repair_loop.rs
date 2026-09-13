@@ -6,7 +6,7 @@ use sovereign_context::{
     EvidenceItem, EvidenceKind, PacketSection, TrustClass,
 };
 use sovereign_controller::{
-    Controller, ExecutionRuntime, ReadinessInputs, RecoveryManager, TaskState,
+    Controller, ExecutionRuntime, ReadinessInputs, RecoveryManager, RoleId, RoleRegistry, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_model::{
@@ -19,12 +19,12 @@ use sovereign_plan::{
     PlanValidator, ValidationEnvironment,
 };
 use sovereign_policy::{
-    CommandPolicy, CommandRisk, HostPressureSnapshot, IsolationRequest, MacSandboxExecBackend,
-    ModelCallBudget, PinnedExecutable,
+    CapabilitySet, CommandPolicy, CommandRisk, HostPressureSnapshot, IsolationRequest,
+    MacSandboxExecBackend, ModelCallBudget, PinnedExecutable,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot};
 use sovereign_state::StateStore;
-use sovereign_tools::{PermissionClass, ToolManifest};
+use sovereign_tools::{PermissionClass, ToolManifest, ToolSchemaV1};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -195,7 +195,10 @@ impl RuntimeHarness {
             tool_id: "tool.patch".to_owned(),
             version: "1.0.0".to_owned(),
             content_digest: WRITE_TOOL_DIGEST.to_owned(),
-            permission_ceiling: BTreeSet::from([PermissionClass::RepositoryWrite]),
+            permission_ceiling: BTreeSet::from([
+                PermissionClass::ProcessExec,
+                PermissionClass::RepositoryWrite,
+            ]),
             declared_risk_floor: CommandRisk::RepositoryMutation,
         };
         Self {
@@ -247,6 +250,13 @@ fn capability(id: &str, digest: &str) -> Value {
     json!({"id": id, "version": "1.0.0", "digest": digest})
 }
 
+fn canonical_implementer_role() -> Value {
+    let pin = RoleRegistry::canonical()
+        .canonical_pin(RoleId::Implementer)
+        .unwrap_or_else(|error| panic!("canonical implementer pin: {error}"));
+    json!({"id": pin.id, "version": pin.version, "digest": pin.digest})
+}
+
 fn prepare(fixture: &Fixture) -> Prepared {
     let mut registry = ProjectRegistry::new();
     registry
@@ -281,6 +291,7 @@ fn prepare(fixture: &Fixture) -> Prepared {
                     "repository=repo.app; head={:?}; dirty_digest={}; active_attempt=none",
                     snapshot.head, snapshot.dirty_digest
                 ),
+                authorized_tool_schemas: Vec::new(),
                 candidates: vec![
                     EvidenceItem::from_exact_file(&form, "exact current Settings form"),
                     EvidenceItem::from_exact_file(&focused_test, "focused current Settings test"),
@@ -325,6 +336,18 @@ fn repair_base_context(base: &ContextPacket) -> ContextPacket {
         TrustClass::Untrusted,
         "must be excluded from repair",
         "RAW_TOOL_LOG_MUST_NOT_APPEAR",
+    ));
+    packet.items.push(EvidenceItem::new(
+        "adversarial.tool-schema",
+        PacketSection::ToolEvidence,
+        ContextLevel::C1,
+        EvidenceKind::ToolSchema,
+        "tool://tool.patch@1.0.0/schema",
+        WRITE_TOOL_DIGEST,
+        "caller_supplied_generic_tool_schema",
+        TrustClass::Untrusted,
+        "must not self-authorize into repair",
+        "FORGED_TOOL_SCHEMA_MUST_NOT_APPEAR",
     ));
     packet
 }
@@ -418,10 +441,7 @@ fn compile_and_activate(
     prepared: &Prepared,
     backend: &dyn ModelBackend,
 ) -> (Controller, String, String) {
-    let role = capability(
-        "role.implementer",
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    );
+    let role = canonical_implementer_role();
     let skills = vec![capability(
         "skill.focused-edit",
         "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -554,10 +574,23 @@ fn failed_attempt_recovers_resource_defers_then_targeted_repair_succeeds() {
             &prepared.registry,
             &task_id,
             ReadinessInputs::permissive_m1("sha256:repair-initial-admission"),
+            &runtime_harness.tool_manifest,
         )
         .unwrap_or_else(|error| panic!("derive initial ready lease: {error}"));
     let runtime = runtime_harness.runtime(&prepared, &backend);
     let repair_context = repair_base_context(&prepared.packet);
+    let repair_schema = ToolSchemaV1 {
+        tool_id: runtime_harness.tool_manifest.tool_id.clone(),
+        version: runtime_harness.tool_manifest.version.clone(),
+        content_digest: runtime_harness.tool_manifest.content_digest.clone(),
+        name: "patch".to_owned(),
+        description: "Apply one exact Controller-authorized replacement".to_owned(),
+        input_schema: json!({"type": "object", "required": ["path"]}),
+        required_capabilities: CapabilitySet::new([
+            PermissionClass::ProcessExec,
+            PermissionClass::RepositoryWrite,
+        ]),
+    };
     let mut execution_budget = ModelCallBudget::new(2, 30_000);
     let first =
         controller.execute_replace(ready, &runtime, &prepared.packet, &mut execution_budget);
@@ -618,6 +651,7 @@ fn failed_attempt_recovers_resource_defers_then_targeted_repair_succeeds() {
         &task_id,
         &runtime,
         &repair_context,
+        std::slice::from_ref(&repair_schema),
         constrained_readiness("sha256:repair-resource-constrained"),
         &mut execution_budget,
     );
@@ -643,6 +677,7 @@ fn failed_attempt_recovers_resource_defers_then_targeted_repair_succeeds() {
             &task_id,
             &runtime,
             &repair_context,
+            std::slice::from_ref(&repair_schema),
             ReadinessInputs::permissive_m1("sha256:repair-resource-recovered"),
             &mut execution_budget,
         )
@@ -706,6 +741,28 @@ fn failed_attempt_recovers_resource_defers_then_targeted_repair_succeeds() {
             .serialized_input
             .contains("RAW_TOOL_LOG_MUST_NOT_APPEAR")
     );
+    let repair_tool_schema = repair_packet
+        .context
+        .items
+        .iter()
+        .find(|item| item.kind == EvidenceKind::ToolSchema)
+        .unwrap_or_else(|| panic!("repair must preserve exact Controller-authorized tool schema"));
+    assert_eq!(
+        repair_tool_schema.provenance,
+        "controller_authorized_tool_schema_v1"
+    );
+    assert_eq!(repair_tool_schema.trust_class, TrustClass::Tool);
+    assert!(
+        repair_tool_schema
+            .text
+            .contains("\"tool_id\":\"tool.patch\"")
+    );
+    assert!(
+        !repair_packet
+            .context
+            .serialized_input
+            .contains("FORGED_TOOL_SCHEMA_MUST_NOT_APPEAR")
+    );
 
     let (task_contract_after, acceptance_after) =
         task_contract_and_acceptance(&controller, &task_id);
@@ -752,6 +809,7 @@ fn identical_second_failure_blocks_third_repair() {
             &prepared.registry,
             &task_id,
             ReadinessInputs::permissive_m1("sha256:identical-initial"),
+            &runtime_harness.tool_manifest,
         )
         .unwrap_or_else(|error| panic!("derive identical-failure initial lease: {error}"));
     assert!(
@@ -770,6 +828,7 @@ fn identical_second_failure_blocks_third_repair() {
         &task_id,
         &runtime,
         &prepared.packet,
+        &[],
         ReadinessInputs::permissive_m1("sha256:identical-second"),
         &mut execution_budget,
     );
@@ -795,6 +854,7 @@ fn identical_second_failure_blocks_third_repair() {
         &task_id,
         &runtime,
         &prepared.packet,
+        &[],
         ReadinessInputs::permissive_m1("sha256:identical-third"),
         &mut execution_budget,
     );

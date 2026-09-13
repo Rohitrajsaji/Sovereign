@@ -951,6 +951,7 @@ fn routing_context_policy_and_packet_keep_c0_c3_bounded_without_semantic_or_hist
                 controller_prefix: "controller".to_owned(),
                 task_contract: "task".to_owned(),
                 current_state: "state".to_owned(),
+                authorized_tool_schemas: Vec::new(),
                 candidates: vec![c1, c2, c3],
                 output_schema: "schema".to_owned(),
             },

@@ -74,7 +74,8 @@ fn packet_with_evidence() -> ContextPacket {
                 controller_prefix: "controller".to_owned(),
                 task_contract: "task contract".to_owned(),
                 current_state: "current state".to_owned(),
-                candidates: vec![exact, lexical, duplicate, tool, schema],
+                authorized_tool_schemas: vec![schema],
+                candidates: vec![exact, lexical, duplicate, tool],
                 output_schema: "output schema".to_owned(),
             },
         )
@@ -396,6 +397,7 @@ fn context_metrics_failed_attempt_keeps_hit_quality_not_applicable_and_zero_deno
                 controller_prefix: "controller".to_owned(),
                 task_contract: "task".to_owned(),
                 current_state: "state".to_owned(),
+                authorized_tool_schemas: Vec::new(),
                 candidates: Vec::new(),
                 output_schema: "schema".to_owned(),
             },

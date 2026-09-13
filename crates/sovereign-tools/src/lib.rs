@@ -5,6 +5,9 @@
 
 use sha2::{Digest, Sha256};
 use sovereign_evidence::{ArtifactStore, EvidenceError};
+pub use sovereign_policy::{
+    Capability, CapabilityLayers, CapabilitySet, PermissionDecision, TaskCapabilityGrant,
+};
 use sovereign_policy::{
     CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, IsolatedCommand,
     IsolationRequest, PolicyError, sanitized_environment,
@@ -87,16 +90,7 @@ impl From<std::time::SystemTimeError> for ToolError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum PermissionClass {
-    ProcessExec,
-    RepositoryWrite,
-    PackageInstall,
-    NetworkRead,
-    NetworkWrite,
-    Destructive,
-    ExternalSideEffect,
-}
+pub type PermissionClass = Capability;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolManifest {
@@ -125,6 +119,115 @@ impl ToolManifest {
     }
 }
 
+/// Model-visible v1 schema for one exact tool identity and its minimum required capabilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolSchemaV1 {
+    pub tool_id: String,
+    pub version: String,
+    pub content_digest: String,
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+    pub required_capabilities: CapabilitySet,
+}
+
+impl ToolSchemaV1 {
+    /// Validates this schema against the exact executable manifest identity and ceiling.
+    ///
+    /// # Errors
+    /// Returns an authority error when identity differs or schema requirements exceed the
+    /// manifest ceiling.
+    pub fn validate_against_manifest(&self, manifest: &ToolManifest) -> Result<(), ToolError> {
+        manifest.validate()?;
+        if self.tool_id.trim().is_empty()
+            || self.version.trim().is_empty()
+            || !self.content_digest.starts_with("sha256:")
+            || self.name.trim().is_empty()
+            || !self.input_schema.is_object()
+        {
+            return Err(ToolError::Authority(
+                "tool schema requires exact identity, name, and object input schema".to_owned(),
+            ));
+        }
+        if self.tool_id != manifest.tool_id
+            || self.version != manifest.version
+            || self.content_digest != manifest.content_digest
+        {
+            return Err(ToolError::Authority(
+                "tool schema identity does not match exact manifest identity".to_owned(),
+            ));
+        }
+        if !self
+            .required_capabilities
+            .iter()
+            .all(|capability| manifest.permission_ceiling.contains(&capability))
+        {
+            return Err(ToolError::Authority(
+                "tool schema required capabilities exceed manifest ceiling".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns whether this exact schema is relevant under one validated permission decision.
+    ///
+    /// # Errors
+    /// Returns an authority error when the schema/manifest or decision is malformed.
+    pub fn visible_under(
+        &self,
+        manifest: &ToolManifest,
+        decision: &PermissionDecision,
+    ) -> Result<bool, ToolError> {
+        self.validate_against_manifest(manifest)?;
+        decision
+            .validate()
+            .map_err(|error| ToolError::Authority(error.to_string()))?;
+        Ok(
+            decision.matches_tool(&self.tool_id, &self.version, &self.content_digest)
+                && self
+                    .required_capabilities
+                    .iter()
+                    .all(|capability| decision.effective.contains(capability)),
+        )
+    }
+}
+
+/// Filters model-visible schemas through exact manifests and already-scoped permission decisions.
+///
+/// # Errors
+/// Returns an authority error if a schema has no exact manifest or either frozen object is
+/// malformed. A valid but unauthorized schema is omitted.
+pub fn filter_authorized_tool_schemas<'a>(
+    schemas: &'a [ToolSchemaV1],
+    manifests: &[ToolManifest],
+    decisions: &[PermissionDecision],
+) -> Result<Vec<&'a ToolSchemaV1>, ToolError> {
+    let mut visible = Vec::new();
+    for schema in schemas {
+        let manifest = manifests
+            .iter()
+            .find(|manifest| {
+                manifest.tool_id == schema.tool_id
+                    && manifest.version == schema.version
+                    && manifest.content_digest == schema.content_digest
+            })
+            .ok_or_else(|| {
+                ToolError::Authority(format!(
+                    "tool schema {} has no exact manifest identity",
+                    schema.tool_id
+                ))
+            })?;
+        schema.validate_against_manifest(manifest)?;
+        for decision in decisions {
+            if schema.visible_under(manifest, decision)? {
+                visible.push(schema);
+                break;
+            }
+        }
+    }
+    Ok(visible)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconciliationMode {
     IdempotentRead,
@@ -147,6 +250,7 @@ pub struct AuthorizedAction {
     pub permission_class: PermissionClass,
     pub execution_epoch: i64,
     pub policy_digest: String,
+    pub permission_decision_digest: String,
     pub isolation_policy_digest: String,
     pub nonce: String,
     pub expires_at_ms: i64,
@@ -178,6 +282,7 @@ impl AuthorizedAction {
         digest_field(&mut hasher, permission_name(self.permission_class));
         hasher.update(self.execution_epoch.to_be_bytes());
         digest_field(&mut hasher, &self.policy_digest);
+        digest_field(&mut hasher, &self.permission_decision_digest);
         digest_field(&mut hasher, &self.isolation_policy_digest);
         digest_field(&mut hasher, &self.nonce);
         hasher.update(self.expires_at_ms.to_be_bytes());
@@ -234,6 +339,7 @@ impl AuthorizedAction {
             || !self.tool_digest.starts_with("sha256:")
             || !self.executable_digest.starts_with("sha256:")
             || !self.policy_digest.starts_with("sha256:")
+            || !self.permission_decision_digest.starts_with("sha256:")
             || !self.isolation_policy_digest.starts_with("sha256:")
             || self
                 .destination_digest
@@ -247,6 +353,34 @@ impl AuthorizedAction {
         }
         if self.expires_at_ms < now_ms {
             return Err(ToolError::Authority("authorized action expired".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Verifies this exact action against the frozen permission decision whose digest it carries.
+    ///
+    /// # Errors
+    /// Returns an authority error for a mismatched decision, scope, policy, tool, or capability.
+    pub fn verify_permission_decision(
+        &self,
+        decision: &PermissionDecision,
+    ) -> Result<(), ToolError> {
+        decision
+            .validate()
+            .map_err(|error| ToolError::Authority(error.to_string()))?;
+        if self.permission_decision_digest != decision.digest()
+            || self.plan_id != decision.plan_id
+            || self.plan_revision != decision.plan_revision
+            || self.task_id != decision.task_id
+            || self.policy_digest != decision.policy_digest
+            || self.tool_id != decision.tool_id
+            || self.tool_version != decision.tool_version
+            || self.tool_digest != decision.tool_digest
+            || !decision.effective.contains(self.permission_class)
+        {
+            return Err(ToolError::Authority(
+                "authorized action does not match exact permission decision".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -289,9 +423,11 @@ impl<'a> ActionJournal<'a> {
         &mut self,
         action: &AuthorizedAction,
         manifest: &ToolManifest,
+        permission_decision: &PermissionDecision,
     ) -> Result<i64, ToolError> {
         let now = unix_millis()?;
         action.validate(now)?;
+        action.verify_permission_decision(permission_decision)?;
         manifest.validate()?;
         if manifest.tool_id != action.tool_id {
             return Err(ToolError::Authority(format!(
@@ -916,15 +1052,7 @@ fn digest_field(hasher: &mut Sha256, value: &str) {
 }
 
 const fn permission_name(permission: PermissionClass) -> &'static str {
-    match permission {
-        PermissionClass::ProcessExec => "process_exec",
-        PermissionClass::RepositoryWrite => "repository_write",
-        PermissionClass::PackageInstall => "package_install",
-        PermissionClass::NetworkRead => "network_read",
-        PermissionClass::NetworkWrite => "network_write",
-        PermissionClass::Destructive => "destructive",
-        PermissionClass::ExternalSideEffect => "external_side_effect",
-    }
+    permission.as_plan_ir_str()
 }
 
 const fn command_risk_name(risk: CommandRisk) -> &'static str {

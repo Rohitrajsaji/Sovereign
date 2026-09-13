@@ -91,6 +91,7 @@ fn context_packet(goal: &str, multi_repo: bool) -> ContextPacket {
                         .to_owned(),
                 task_contract: goal.to_owned(),
                 current_state: "bounded frozen-scenario evidence is current".to_owned(),
+                authorized_tool_schemas: Vec::new(),
                 candidates,
                 output_schema: "m3-plan-proposal-v1".to_owned(),
             },

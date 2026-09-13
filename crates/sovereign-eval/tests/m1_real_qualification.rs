@@ -6,7 +6,8 @@ use sovereign_context::{
     EvidenceKind,
 };
 use sovereign_controller::{
-    Controller, ExecutionRuntime, ModelProposalV1, ReadinessInputs, RecoveryManager, TaskState,
+    Controller, ExecutionRuntime, ModelProposalV1, ReadinessInputs, RecoveryManager, RoleId,
+    RoleRegistry, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_model::{
@@ -137,6 +138,7 @@ impl Prepared {
                     current_state:
                         "repository=repo.app; exact_source_evidence_complete=true; active_plan=none"
                             .to_owned(),
+                    authorized_tool_schemas: Vec::new(),
                     candidates: vec![
                         EvidenceItem::from_exact_file(&form, "exact current Settings form"),
                         EvidenceItem::from_exact_file(
@@ -194,7 +196,10 @@ impl RuntimeHarness {
             tool_id: "tool.patch".to_owned(),
             version: "1.0.0".to_owned(),
             content_digest: WRITE_TOOL_DIGEST.to_owned(),
-            permission_ceiling: BTreeSet::from([PermissionClass::RepositoryWrite]),
+            permission_ceiling: BTreeSet::from([
+                PermissionClass::ProcessExec,
+                PermissionClass::RepositoryWrite,
+            ]),
             declared_risk_floor: CommandRisk::RepositoryMutation,
         };
         Self {
@@ -436,6 +441,13 @@ fn capability(id: &str, digest: &str) -> Value {
     json!({"id": id, "version": "1.0.0", "digest": digest})
 }
 
+fn canonical_implementer_role() -> Value {
+    let pin = RoleRegistry::canonical()
+        .canonical_pin(RoleId::Implementer)
+        .unwrap_or_else(|error| panic!("canonical implementer pin: {error}"));
+    json!({"id": pin.id, "version": pin.version, "digest": pin.digest})
+}
+
 fn global_policy() -> Value {
     serde_json::from_str(include_str!("fixtures/scenario1/policy.json"))
         .unwrap_or_else(|error| panic!("parse qualification policy: {error}"))
@@ -463,10 +475,7 @@ fn compilation_input(prepared: &Prepared) -> PlanCompilationInput {
             languages: vec!["typescript".to_owned()],
         },
         policy: global_policy(),
-        role: capability(
-            "role.implementer",
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ),
+        role: canonical_implementer_role(),
         skills: vec![capability(
             "skill.focused-edit",
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -820,6 +829,7 @@ fn m1_real_qwen_implementation_repair_restart_qualification() {
             &prepared.registry,
             &task_id,
             ReadinessInputs::permissive_m1("sha256:m1-real-initial-readiness"),
+            &runtime_harness.tool_manifest,
         )
         .unwrap_or_else(|error| panic!("derive real-Qwen initial readiness: {error}"));
     let mut execution_budget = ModelCallBudget::new(2, 30_000);
@@ -901,6 +911,7 @@ fn m1_real_qwen_implementation_repair_restart_qualification() {
                 &task_id,
                 &execution_runtime,
                 &prepared.packet,
+                &[],
                 ReadinessInputs::permissive_m1("sha256:m1-real-repair-readiness"),
                 &mut execution_budget,
             )

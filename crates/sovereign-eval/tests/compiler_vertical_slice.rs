@@ -144,6 +144,7 @@ fn prepare_context(fixture: &FixtureRepo) -> PreparedContext {
                     "repository=repo.app; head={:?}; dirty_digest={}; plan_activation=none; authorized_actions=0",
                     snapshot.head, snapshot.dirty_digest
                 ),
+                authorized_tool_schemas: Vec::new(),
                 candidates,
                 output_schema: "bounded minimal planning proposal v1".to_owned(),
             },

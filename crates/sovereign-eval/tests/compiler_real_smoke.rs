@@ -186,6 +186,7 @@ fn build_input(root: &Path) -> (PlanCompilationInput, u32) {
                     "repository=repo.app; head={:?}; dirty_digest={}; active_plan=none",
                     snapshot.head, snapshot.dirty_digest
                 ),
+                authorized_tool_schemas: Vec::new(),
                 candidates: vec![
                     EvidenceItem::from_exact_file(&form, "exact current Settings form"),
                     EvidenceItem::from_exact_file(&focused_test, "focused current Settings test"),

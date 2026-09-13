@@ -1839,7 +1839,7 @@ fn build_m3_task(
     let write_capable = !known_files.is_empty() && global_capabilities.contains("repo_write");
     let discovery_only = known_files.is_empty() && !unknown_files.is_empty();
     let permissions = if write_capable {
-        json!(["read", "repo_write"])
+        json!(["read", "repo_write", "process_exec"])
     } else {
         json!(["read"])
     };
@@ -2682,7 +2682,7 @@ fn build_task(
     let write_capable = !known_files.is_empty() && global_capabilities.contains("repo_write");
     let discovery_only = !unknown_files.is_empty() && known_files.is_empty();
     let permissions = if write_capable {
-        json!(["read", "repo_write"])
+        json!(["read", "repo_write", "process_exec"])
     } else {
         json!(["read"])
     };

@@ -5,7 +5,9 @@ use sovereign_context::{
     RepositoryRetrievalBackend, RetrievalIntent, RetrievalRouteKind, RetrievalRouter,
     RetrievalTrace,
 };
-use sovereign_controller::{Controller, ExecutionRuntime, ReadinessInputs, TaskState};
+use sovereign_controller::{
+    Controller, ExecutionRuntime, ReadinessInputs, RoleId, RoleRegistry, TaskState,
+};
 use sovereign_eval::{EvaluationAttemptRecord, aggregate_context_metrics};
 use sovereign_evidence::ArtifactStore;
 use sovereign_model::{
@@ -39,6 +41,19 @@ const SETTINGS_FORM_TEST: &[u8] =
 const WRITE_TOOL_DIGEST: &str =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn write_tool_manifest() -> ToolManifest {
+    ToolManifest {
+        tool_id: "tool.patch".to_owned(),
+        version: "1.0.0".to_owned(),
+        content_digest: WRITE_TOOL_DIGEST.to_owned(),
+        permission_ceiling: BTreeSet::from([
+            PermissionClass::ProcessExec,
+            PermissionClass::RepositoryWrite,
+        ]),
+        declared_risk_floor: CommandRisk::RepositoryMutation,
+    }
+}
 
 struct FixtureRepo {
     base: PathBuf,
@@ -114,6 +129,13 @@ fn capability(id: &str, version: &str, digest: &str) -> Value {
     json!({"id": id, "version": version, "digest": digest})
 }
 
+fn canonical_implementer_role() -> Value {
+    let pin = RoleRegistry::canonical()
+        .canonical_pin(RoleId::Implementer)
+        .unwrap_or_else(|error| panic!("canonical implementer pin: {error}"));
+    json!({"id": pin.id, "version": pin.version, "digest": pin.digest})
+}
+
 fn prepare_context(fixture: &FixtureRepo) -> PreparedContext {
     let mut registry = ProjectRegistry::new();
     registry
@@ -158,6 +180,7 @@ fn prepare_context(fixture: &FixtureRepo) -> PreparedContext {
                     "repository=repo.app; head={:?}; dirty_digest={}; active_attempt=none",
                     snapshot.head, snapshot.dirty_digest
                 ),
+                authorized_tool_schemas: Vec::new(),
                 candidates,
                 output_schema: "phase-specific typed proposal".to_owned(),
             },
@@ -319,6 +342,7 @@ fn routed_attempt_context(
                     "repository=repo.app; head={:?}; dirty_digest={}; active_attempt=none",
                     snapshot.head, snapshot.dirty_digest
                 ),
+                authorized_tool_schemas: Vec::new(),
                 candidates: outcome.evidence,
                 output_schema: "phase-specific typed proposal".to_owned(),
             },
@@ -453,11 +477,7 @@ fn natural_language_goal_compiles_then_controller_edits_and_deterministically_ve
         })
         .unwrap_or_else(|error| panic!("load fake backend: {error}"));
 
-    let role = capability(
-        "role.implementer",
-        "1.0.0",
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    );
+    let role = canonical_implementer_role();
     let skills = vec![capability(
         "skill.focused-edit",
         "1.0.0",
@@ -530,6 +550,7 @@ fn natural_language_goal_compiles_then_controller_edits_and_deterministically_ve
             &prepared.registry,
             &task_id,
             ReadinessInputs::permissive_m1("sha256:resource-admission-current"),
+            &write_tool_manifest(),
         )
         .unwrap_or_else(|error| panic!("derive ready lease: {error}"));
 
@@ -553,13 +574,7 @@ fn natural_language_goal_compiles_then_controller_edits_and_deterministically_ve
         allow_repository_write: true,
         require_full_filesystem_read_jail: false,
     };
-    let tool_manifest = ToolManifest {
-        tool_id: "tool.patch".to_owned(),
-        version: "1.0.0".to_owned(),
-        content_digest: WRITE_TOOL_DIGEST.to_owned(),
-        permission_ceiling: BTreeSet::from([PermissionClass::RepositoryWrite]),
-        declared_risk_floor: CommandRisk::RepositoryMutation,
-    };
+    let tool_manifest = write_tool_manifest();
     let runtime = ExecutionRuntime {
         registry: &prepared.registry,
         backend: &backend,
@@ -656,11 +671,7 @@ fn m2_medium_d2_goal_succeeds_with_real_routing_and_context_token_metrics_withou
         })
         .unwrap_or_else(|error| panic!("load medium planner backend: {error}"));
 
-    let role = capability(
-        "role.implementer",
-        "1.0.0",
-        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    );
+    let role = canonical_implementer_role();
     let skills = vec![capability(
         "skill.focused-edit",
         "1.0.0",
@@ -776,6 +787,7 @@ fn m2_medium_d2_goal_succeeds_with_real_routing_and_context_token_metrics_withou
             &prepared.registry,
             &upstream,
             ReadinessInputs::permissive_m1("sha256:m2-medium-resource-admission"),
+            &write_tool_manifest(),
         )
         .unwrap_or_else(|error| panic!("derive medium upstream readiness: {error}"));
 
@@ -799,13 +811,7 @@ fn m2_medium_d2_goal_succeeds_with_real_routing_and_context_token_metrics_withou
         allow_repository_write: true,
         require_full_filesystem_read_jail: false,
     };
-    let tool_manifest = ToolManifest {
-        tool_id: "tool.patch".to_owned(),
-        version: "1.0.0".to_owned(),
-        content_digest: WRITE_TOOL_DIGEST.to_owned(),
-        permission_ceiling: BTreeSet::from([PermissionClass::RepositoryWrite]),
-        declared_risk_floor: CommandRisk::RepositoryMutation,
-    };
+    let tool_manifest = write_tool_manifest();
 
     let upstream_proposal = replace_proposal(
         &source_context.evidence_id,
@@ -863,6 +869,7 @@ fn m2_medium_d2_goal_succeeds_with_real_routing_and_context_token_metrics_withou
             &prepared.registry,
             &downstream,
             ReadinessInputs::permissive_m1("sha256:m2-medium-resource-admission"),
+            &tool_manifest,
         )
         .unwrap_or_else(|error| panic!("derive medium downstream readiness: {error}"));
     let downstream_proposal = replace_proposal(

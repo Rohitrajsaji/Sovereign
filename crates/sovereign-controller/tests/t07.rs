@@ -4,11 +4,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sovereign_context::{
     ContextBudget, ContextMode, ContextPacket, ContextPacketInput, ContextPlanner, EvidenceItem,
+    EvidenceKind,
 };
 use sovereign_controller::{
     CheckpointActionRecord, CheckpointManifest, Controller, ControllerError, ExecutionRuntime,
     ExecutionSuccess, ModelProposalV1, PermissionContext, PlanValidity, ReadinessInputs,
-    RecoveryManager, SchedulerView, TaskState,
+    RecoveryManager, RoleId, RoleRegistry, SchedulerView, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_memory::{MemoryKind, MemoryTrust, ProcedurePattern};
@@ -22,15 +23,15 @@ use sovereign_plan::{
     PlanCompilationResult, PlanCompiler, PlanValidator, ValidationEnvironment,
 };
 use sovereign_policy::{
-    CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, HostPressureSnapshot,
-    IsolatedCommand, IsolationCapabilities, IsolationRequest, MacSandboxExecBackend,
-    ModelCallBudget, PinnedExecutable, PolicyError,
+    CapabilitySet, CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend,
+    HostPressureSnapshot, IsolatedCommand, IsolationCapabilities, IsolationRequest,
+    MacSandboxExecBackend, ModelCallBudget, PinnedExecutable, PolicyError,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence};
 use sovereign_state::{
     ActionTransition, NewActionRecord, NewCheckpointIntegrityRecord, NewJournalEvent, StateStore,
 };
-use sovereign_tools::{PermissionClass, ToolManifest};
+use sovereign_tools::{PermissionClass, ToolManifest, ToolSchemaV1};
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
@@ -360,6 +361,13 @@ fn capability(id: &str, digest: &str) -> Value {
     json!({"id": id, "version": "1.0.0", "digest": digest})
 }
 
+fn canonical_implementer_role() -> Value {
+    let pin = RoleRegistry::canonical()
+        .canonical_pin(RoleId::Implementer)
+        .unwrap_or_else(|error| panic!("canonical implementer pin: {error}"));
+    json!({"id": pin.id, "version": pin.version, "digest": pin.digest})
+}
+
 fn model_response(content: String, input_tokens: u32) -> ModelResponse {
     ModelResponse {
         schema_version: MODEL_SCHEMA_VERSION,
@@ -587,6 +595,7 @@ fn compiled_fixture_inner(
                 controller_prefix: "Controller owns all state and authority.".to_owned(),
                 task_contract: "Rename Save to Apply only.".to_owned(),
                 current_state: format!("dirty_digest={}", snapshot.dirty_digest),
+                authorized_tool_schemas: Vec::new(),
                 candidates: vec![
                     EvidenceItem::from_exact_file(&form, "exact source"),
                     EvidenceItem::from_exact_file(&other, "unrelated exact source"),
@@ -711,10 +720,7 @@ fn compiled_fixture_inner(
             languages: vec!["typescript".to_owned()],
         },
         policy,
-        role: capability(
-            "role.implementer",
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ),
+        role: canonical_implementer_role(),
         skills: vec![capability(
             "skill.focused-edit",
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -823,6 +829,19 @@ struct RuntimeParts {
     manifest: ToolManifest,
 }
 
+fn write_tool_manifest() -> ToolManifest {
+    ToolManifest {
+        tool_id: "tool.patch".to_owned(),
+        version: "1.0.0".to_owned(),
+        content_digest: WRITE_TOOL_DIGEST.to_owned(),
+        permission_ceiling: BTreeSet::from([
+            PermissionClass::ProcessExec,
+            PermissionClass::RepositoryWrite,
+        ]),
+        declared_risk_floor: CommandRisk::RepositoryMutation,
+    }
+}
+
 fn runtime_parts(fixture: &CompiledFixture) -> RuntimeParts {
     let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python")
         .unwrap_or_else(|error| panic!("pin python: {error}"));
@@ -846,13 +865,7 @@ fn runtime_parts(fixture: &CompiledFixture) -> RuntimeParts {
         },
         artifacts: ArtifactStore::open(fixture.repo.base.join("cas"))
             .unwrap_or_else(|error| panic!("artifacts: {error}")),
-        manifest: ToolManifest {
-            tool_id: "tool.patch".to_owned(),
-            version: "1.0.0".to_owned(),
-            content_digest: WRITE_TOOL_DIGEST.to_owned(),
-            permission_ceiling: BTreeSet::from([PermissionClass::RepositoryWrite]),
-            declared_risk_floor: CommandRisk::RepositoryMutation,
-        },
+        manifest: write_tool_manifest(),
     }
 }
 
@@ -866,7 +879,12 @@ fn execute_verified_replace(
     new_literal: &str,
 ) -> ExecutionSuccess {
     let ready = controller
-        .derive_ready_lease(&fixture.registry, task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("derive {task_id} ready lease: {error}"));
     let execution = backend(vec![model_response(
         execution_proposal(path, source_digest, old_literal, new_literal),
@@ -972,7 +990,12 @@ fn execute_worktree_replace(
     new_literal: &str,
 ) {
     let ready = controller
-        .derive_ready_lease(&fixture.registry, task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("derive {task_id} ready lease: {error}"));
     let lease = controller
         .task_worktree_lease(task_id)
@@ -1063,7 +1086,12 @@ fn readiness_requires_all_guard_classes_and_never_persists_ready_bit() {
     let mut fixture = compiled_fixture("readiness", true);
     let requirement_id = first_evidence_requirement_id(&fixture);
     let (mut controller, task_id) = controller_for(&mut fixture);
-    let Err(error) = controller.derive_ready_lease(&fixture.registry, &task_id, readiness()) else {
+    let Err(error) = controller.derive_ready_lease(
+        &fixture.registry,
+        &task_id,
+        readiness(),
+        &write_tool_manifest(),
+    ) else {
         panic!("execution-gating evidence unexpectedly produced readiness")
     };
     assert!(error.to_string().contains("unsatisfied"));
@@ -1078,7 +1106,12 @@ fn readiness_requires_all_guard_classes_and_never_persists_ready_bit() {
         )
         .unwrap_or_else(|error| panic!("record evidence satisfaction: {error}"));
     let lease = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready after evidence satisfaction: {error}"));
     controller
         .cancel_ready_lease(lease)
@@ -1110,7 +1143,12 @@ fn pause_is_durable_across_recovery_and_gates_readiness_until_resume() {
             .unwrap_or_else(|error| panic!("control: {error}"))
             .paused
     );
-    let Err(error) = controller.derive_ready_lease(&fixture.registry, &task_id, readiness()) else {
+    let Err(error) = controller.derive_ready_lease(
+        &fixture.registry,
+        &task_id,
+        readiness(),
+        &write_tool_manifest(),
+    ) else {
         panic!("paused controller unexpectedly derived readiness")
     };
     assert!(error.to_string().contains("paused"));
@@ -1126,7 +1164,12 @@ fn pause_is_durable_across_recovery_and_gates_readiness_until_resume() {
             .unwrap_or_else(|error| panic!("recovered control: {error}"))
             .paused
     );
-    let Err(error) = recovered.derive_ready_lease(&fixture.registry, &task_id, readiness()) else {
+    let Err(error) = recovered.derive_ready_lease(
+        &fixture.registry,
+        &task_id,
+        readiness(),
+        &write_tool_manifest(),
+    ) else {
         panic!("recovered paused controller unexpectedly derived readiness")
     };
     assert!(error.to_string().contains("paused"));
@@ -1347,7 +1390,12 @@ fn stale_evidence_record_invalidates_ready_lease_before_model_dispatch() {
         )
         .unwrap_or_else(|error| panic!("record evidence satisfaction: {error}"));
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("derive ready lease: {error}"));
 
     let mut second = StateStore::open(&fixture.repo.state_path)
@@ -1395,6 +1443,7 @@ fn stale_evidence_record_invalidates_ready_lease_before_model_dispatch() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn verified_upstream_bindings_make_dependent_task_ready_and_misbound_record_blocks_it() {
     let mut fixture = compiled_two_task_fixture("dependency-bindings");
     let contract = two_task_contract(&fixture);
@@ -1415,7 +1464,12 @@ fn verified_upstream_bindings_make_dependent_task_ready_and_misbound_record_bloc
     );
     assert!(
         controller
-            .derive_ready_lease(&fixture.registry, &contract.downstream, readiness())
+            .derive_ready_lease(
+                &fixture.registry,
+                &contract.downstream,
+                readiness(),
+                &write_tool_manifest()
+            )
             .is_err(),
         "dependent task must stay blocked before upstream verified success"
     );
@@ -1430,7 +1484,12 @@ fn verified_upstream_bindings_make_dependent_task_ready_and_misbound_record_bloc
         )
         .unwrap_or_else(|error| panic!("satisfy upstream exact evidence: {error}"));
     let upstream_ready = controller
-        .derive_ready_lease(&fixture.registry, &contract.upstream, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &contract.upstream,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("upstream ready: {error}"));
     let execution = backend(vec![model_response(
         valid_execution_proposal(&fixture.form_digest),
@@ -1458,7 +1517,12 @@ fn verified_upstream_bindings_make_dependent_task_ready_and_misbound_record_bloc
         Some(TaskState::Succeeded)
     );
     let downstream_ready = controller
-        .derive_ready_lease(&fixture.registry, &contract.downstream, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &contract.downstream,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("fresh verified dependency should be ready: {error}"));
     controller
         .cancel_ready_lease(downstream_ready)
@@ -1483,7 +1547,12 @@ fn verified_upstream_bindings_make_dependent_task_ready_and_misbound_record_bloc
         .unwrap_or_else(|error| panic!("tamper artifact binding: {error}"));
     assert!(
         controller
-            .derive_ready_lease(&fixture.registry, &contract.downstream, readiness())
+            .derive_ready_lease(
+                &fixture.registry,
+                &contract.downstream,
+                readiness(),
+                &write_tool_manifest()
+            )
             .is_err(),
         "misbound dependency artifact must block readiness"
     );
@@ -1646,12 +1715,140 @@ fn permission_context_is_controller_owned_and_can_deny_repo_write() {
     let activation = controller
         .activate(compilation, &fixture.registry)
         .unwrap_or_else(|error| panic!("activate: {error}"));
-    let Err(error) =
-        controller.derive_ready_lease(&fixture.registry, &activation.task_ids[0], readiness())
-    else {
+    let Err(error) = controller.derive_ready_lease(
+        &fixture.registry,
+        &activation.task_ids[0],
+        readiness(),
+        &write_tool_manifest(),
+    ) else {
         panic!("read-only permission context unexpectedly produced readiness")
     };
     assert!(error.to_string().contains("permission intersection"));
+}
+
+#[test]
+fn m5_t03_task_grant_change_is_exact_and_invalidates_stale_ready_authority() {
+    let mut fixture = compiled_fixture("m5-grant-scope", false);
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let manifest = write_tool_manifest();
+    let stale = controller
+        .derive_ready_lease(&fixture.registry, &task_id, readiness(), &manifest)
+        .unwrap_or_else(|error| panic!("initial exact grant readiness: {error}"));
+    let epoch_before = controller
+        .state()
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("epoch before grant change: {error}"));
+    let epoch_after = controller
+        .set_task_capability_grant(
+            &task_id,
+            CapabilitySet::new([PermissionClass::RepositoryWrite]),
+        )
+        .unwrap_or_else(|error| panic!("narrow exact task grant: {error}"));
+    assert!(epoch_after > epoch_before);
+
+    let Err(error) =
+        controller.derive_ready_lease(&fixture.registry, &task_id, readiness(), &manifest)
+    else {
+        panic!("grant without process_exec unexpectedly produced readiness")
+    };
+    assert!(error.to_string().contains("permission intersection"));
+
+    controller
+        .cancel_ready_lease(stale)
+        .unwrap_or_else(|error| panic!("release stale resource lease: {error}"));
+    controller
+        .set_task_capability_grant(
+            &task_id,
+            CapabilitySet::new([
+                PermissionClass::ProcessExec,
+                PermissionClass::RepositoryWrite,
+            ]),
+        )
+        .unwrap_or_else(|error| panic!("restore exact task grant: {error}"));
+    let current = controller
+        .derive_ready_lease(&fixture.registry, &task_id, readiness(), &manifest)
+        .unwrap_or_else(|error| panic!("restored exact grant readiness: {error}"));
+    controller
+        .cancel_ready_lease(current)
+        .unwrap_or_else(|error| panic!("release restored lease: {error}"));
+}
+
+#[test]
+fn m5_t03_only_exact_pinned_authorized_tool_schema_enters_context_packet() {
+    let mut fixture = compiled_fixture("m5-schema-filter", false);
+    let (controller, task_id) = controller_for(&mut fixture);
+    let patch_manifest = write_tool_manifest();
+    let irrelevant_digest =
+        "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let irrelevant_manifest = ToolManifest {
+        tool_id: "tool.unpinned".to_owned(),
+        version: "1.0.0".to_owned(),
+        content_digest: irrelevant_digest.to_owned(),
+        permission_ceiling: BTreeSet::from([
+            PermissionClass::ProcessExec,
+            PermissionClass::RepositoryWrite,
+        ]),
+        declared_risk_floor: CommandRisk::RepositoryMutation,
+    };
+    let patch_schema = ToolSchemaV1 {
+        tool_id: patch_manifest.tool_id.clone(),
+        version: patch_manifest.version.clone(),
+        content_digest: patch_manifest.content_digest.clone(),
+        name: "patch".to_owned(),
+        description: "Apply one exact Controller-authorized replacement".to_owned(),
+        input_schema: json!({"type": "object", "required": ["path"]}),
+        required_capabilities: CapabilitySet::new([
+            PermissionClass::ProcessExec,
+            PermissionClass::RepositoryWrite,
+        ]),
+    };
+    let irrelevant_schema = ToolSchemaV1 {
+        tool_id: irrelevant_manifest.tool_id.clone(),
+        version: irrelevant_manifest.version.clone(),
+        content_digest: irrelevant_manifest.content_digest.clone(),
+        name: "unpinned".to_owned(),
+        description: "must never enter this task packet".to_owned(),
+        input_schema: json!({"type": "object"}),
+        required_capabilities: CapabilitySet::new([PermissionClass::ProcessExec]),
+    };
+    let authorized = controller
+        .authorized_tool_schema_evidence(
+            &task_id,
+            &[patch_schema, irrelevant_schema],
+            &[patch_manifest, irrelevant_manifest],
+        )
+        .unwrap_or_else(|error| panic!("derive authorized tool schemas: {error}"));
+    assert_eq!(authorized.len(), 1);
+    assert_eq!(authorized[0].kind, EvidenceKind::ToolSchema);
+    assert!(authorized[0].text.contains("tool.patch"));
+    assert!(!authorized[0].text.contains("tool.unpinned"));
+
+    let packet = ContextPlanner::default()
+        .build(
+            ContextMode::Implementation,
+            ContextBudget::m1_8k(),
+            ContextPacketInput {
+                controller_prefix: "Controller owns authority.".to_owned(),
+                task_contract: "Use only the exact pinned patch tool.".to_owned(),
+                current_state: "ready for bounded schema projection".to_owned(),
+                authorized_tool_schemas: authorized,
+                candidates: Vec::new(),
+                output_schema: "typed proposal".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("build authorized schema packet: {error}"));
+    assert_eq!(
+        packet
+            .items
+            .iter()
+            .filter(|item| item.kind == EvidenceKind::ToolSchema)
+            .count(),
+        1
+    );
+    assert!(packet.serialized_input.contains("tool.patch"));
+    assert!(!packet.serialized_input.contains("tool.unpinned"));
+    assert!(packet.metrics.tool_schema_tokens > 0);
+    assert!(packet.metrics.tool_schema_tokens <= packet.budget.tool_schema_tokens);
 }
 
 #[test]
@@ -1670,7 +1867,7 @@ fn constrained_pressure_defers_before_ready_lease_is_issued() {
     };
     assert!(
         controller
-            .derive_ready_lease(&fixture.registry, &task_id, inputs)
+            .derive_ready_lease(&fixture.registry, &task_id, inputs, &write_tool_manifest())
             .is_err()
     );
     assert_eq!(
@@ -1696,7 +1893,12 @@ fn checkpoint_sequence_gap_blocks_readiness() {
         .unwrap_or_else(|error| panic!("append gap: {error}"));
     assert!(
         controller
-            .derive_ready_lease(&fixture.registry, &task_id, readiness())
+            .derive_ready_lease(
+                &fixture.registry,
+                &task_id,
+                readiness(),
+                &write_tool_manifest()
+            )
             .is_err()
     );
 }
@@ -1706,7 +1908,12 @@ fn baseline_drift_invalidates_ready_lease_and_advances_epoch() {
     let mut fixture = compiled_fixture("baseline-drift", false);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     let old_epoch = ready.execution_epoch();
     fs::write(
@@ -1754,7 +1961,12 @@ fn pause_after_ready_lease_blocks_mutation_before_model_or_tool_dispatch() {
     let mut fixture = compiled_fixture("pause-after-ready", false);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     controller
         .pause(Some("operator requested"))
@@ -1795,7 +2007,12 @@ fn malformed_model_output_cannot_set_success_or_authority() {
     let mut fixture = compiled_fixture("malformed", false);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     let malformed = json!({
         "schema_version": 1,
@@ -1861,7 +2078,12 @@ fn wrong_literal_relation_cannot_satisfy_compiled_acceptance_contract() {
     let mut fixture = compiled_fixture("wrong-literal-relation", false);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     let wrong = json!({
         "schema_version": 1,
@@ -1923,7 +2145,12 @@ fn verifier_failure_cannot_transition_task_to_succeeded() {
     let mut fixture = compiled_fixture("verify-fail", false);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     let execution = backend(vec![model_response(
         valid_execution_proposal(&fixture.form_digest),
@@ -1967,7 +2194,12 @@ fn preexisting_dirty_target_hunk_is_preserved_by_verified_controller_edit() {
     let unstaged_before = git_text(&fixture.repo.root, &["diff", "--", "src/other.txt"]);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     let execution = backend(vec![model_response(
         valid_execution_proposal(&fixture.form_digest),
@@ -2034,7 +2266,12 @@ fn verified_atomic_replace_preserves_target_file_mode() {
     assert_eq!(before_mode, 0o755);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     let execution = backend(vec![model_response(
         valid_execution_proposal(&fixture.form_digest),
@@ -2073,7 +2310,12 @@ fn committed_nonzero_process_result_is_execution_failure_not_unknown() {
     let mut fixture = compiled_fixture("nonzero", false);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     let execution = backend(vec![model_response(
         valid_execution_proposal(&fixture.form_digest),
@@ -2124,7 +2366,12 @@ fn controller_learning_records_real_failure_and_accepts_exact_repair_origin() {
     let mut fixture = compiled_fixture_with_task_model_call_cap("controller-learning-repair", 2);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("initial repair fixture readiness: {error}"));
     let execution = backend(vec![
         model_response(
@@ -2189,6 +2436,7 @@ fn controller_learning_records_real_failure_and_accepts_exact_repair_origin() {
             &task_id,
             &repair_runtime,
             &fixture.packet,
+            &[],
             readiness(),
             &mut budget,
         )
@@ -2216,7 +2464,12 @@ fn epoch_change_after_authorization_blocks_dispatch_before_mutation() {
     let mut fixture = compiled_fixture("epoch", false);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     let execution = backend(vec![model_response(
         valid_execution_proposal(&fixture.form_digest),
@@ -2271,7 +2524,12 @@ fn exhausted_model_budget_defers_cleanly_before_backend_dispatch() {
     let mut fixture = compiled_fixture("budget", false);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     let execution = backend(vec![model_response(
         valid_execution_proposal(&fixture.form_digest),
@@ -2309,7 +2567,12 @@ fn compiled_task_model_call_ceiling_cannot_be_refilled_by_caller_budget() {
     let mut fixture = compiled_fixture_with_task_model_call_cap("task-budget", 0);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     let execution = backend(vec![model_response(
         valid_execution_proposal(&fixture.form_digest),
@@ -2362,7 +2625,12 @@ fn worktree_d3_execution_persists_change_set_and_never_mutates_primary() {
             .unwrap_or_else(|error| panic!("primary source before: {error}"));
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("D3 ready: {error}"));
     let lease = controller
         .task_worktree_lease(&task_id)
@@ -2433,7 +2701,12 @@ fn worktree_recovery_revalidates_exact_head_and_common_git_directory() {
     let mut fixture = compiled_worktree_fixture("worktree-recovery");
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
         .unwrap_or_else(|error| panic!("D3 ready: {error}"));
     let lease = controller
         .task_worktree_lease(&task_id)
@@ -2476,7 +2749,12 @@ fn recovery_manager_rejects_persisted_worktree_root_and_path_tamper() {
         let mut fixture = compiled_worktree_fixture(label);
         let (mut controller, task_id) = controller_for(&mut fixture);
         let ready = controller
-            .derive_ready_lease(&fixture.registry, &task_id, readiness())
+            .derive_ready_lease(
+                &fixture.registry,
+                &task_id,
+                readiness(),
+                &write_tool_manifest(),
+            )
             .unwrap_or_else(|error| panic!("D3 ready before {field} tamper: {error}"));
         let lease = controller
             .task_worktree_lease(&task_id)
@@ -2799,7 +3077,7 @@ fn worktree_mutating_t1_to_t2_composes_verified_upstream_and_readiness_uses_comp
     assert!(t1_change_set.diff_content.contains("Apply"));
 
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &t2, readiness())
+        .derive_ready_lease(&fixture.registry, &t2, readiness(), &write_tool_manifest())
         .unwrap_or_else(|error| {
             panic!("T2 must become ready from composed T1 output, not primary: {error}")
         });
@@ -2903,7 +3181,7 @@ fn worktree_join_composes_shared_ancestor_once_and_branch_local_deltas_determini
     );
 
     let ready = controller
-        .derive_ready_lease(&fixture.registry, &t4, readiness())
+        .derive_ready_lease(&fixture.registry, &t4, readiness(), &write_tool_manifest())
         .unwrap_or_else(|error| panic!("join T4 ready: {error}"));
     let t4_lease = controller
         .task_worktree_lease(&t4)
@@ -3008,7 +3286,7 @@ fn worktree_join_conflict_is_durable_and_blocks_before_mutation() {
     );
 
     let error = controller
-        .derive_ready_lease(&fixture.registry, &t4, readiness())
+        .derive_ready_lease(&fixture.registry, &t4, readiness(), &write_tool_manifest())
         .err()
         .unwrap_or_else(|| panic!("conflicting join must not become ready"));
     assert!(error.to_string().contains("composition conflict"));

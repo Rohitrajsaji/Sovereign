@@ -7,7 +7,7 @@ use sovereign_context::{
     ContextBudget, ContextMode, ContextPacket, ContextPacketInput, ContextPlanner, EvidenceItem,
 };
 use sovereign_controller::{
-    Controller, ExecutionRuntime, ReadinessInputs, RecoveryManager, TaskState,
+    Controller, ExecutionRuntime, ReadinessInputs, RecoveryManager, RoleId, RoleRegistry, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_model::{
@@ -46,6 +46,19 @@ const CHILD_BASE: &str = "SOVEREIGN_CRASH_CHILD_BASE";
 const CHILD_ROOT: &str = "SOVEREIGN_CRASH_CHILD_ROOT";
 const CHILD_MARKER: &str = "SOVEREIGN_CRASH_CHILD_MARKER";
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn write_tool_manifest() -> ToolManifest {
+    ToolManifest {
+        tool_id: "tool.patch".to_owned(),
+        version: "1.0.0".to_owned(),
+        content_digest: WRITE_TOOL_DIGEST.to_owned(),
+        permission_ceiling: BTreeSet::from([
+            PermissionClass::ProcessExec,
+            PermissionClass::RepositoryWrite,
+        ]),
+        declared_risk_floor: CommandRisk::RepositoryMutation,
+    }
+}
 
 struct Fixture {
     base: PathBuf,
@@ -129,6 +142,13 @@ fn capability(id: &str, digest: &str) -> Value {
     json!({"id": id, "version": "1.0.0", "digest": digest})
 }
 
+fn canonical_implementer_role() -> Value {
+    let pin = RoleRegistry::canonical()
+        .canonical_pin(RoleId::Implementer)
+        .unwrap_or_else(|error| panic!("canonical implementer pin: {error}"));
+    json!({"id": pin.id, "version": pin.version, "digest": pin.digest})
+}
+
 fn registry_for(root: &Path) -> ProjectRegistry {
     let mut registry = ProjectRegistry::new();
     registry
@@ -161,6 +181,7 @@ fn prepare(root: &Path) -> Prepared {
                 controller_prefix: "Controller owns durable recovery authority.".to_owned(),
                 task_contract: "Rename Save to Apply only.".to_owned(),
                 current_state: format!("dirty_digest={}", snapshot.dirty_digest),
+                authorized_tool_schemas: Vec::new(),
                 candidates: vec![
                     EvidenceItem::from_exact_file(&form, "exact form"),
                     EvidenceItem::from_exact_file(&focused_test, "focused test"),
@@ -280,10 +301,7 @@ fn compile_and_activate(
             languages: vec!["typescript".to_owned()],
         },
         policy: global_policy(),
-        role: capability(
-            "role.implementer",
-            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ),
+        role: canonical_implementer_role(),
         skills: vec![capability(
             "skill.focused-edit",
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
@@ -406,6 +424,19 @@ fn install_uncheckpointed_supersession(
         )
     };
     let attempt_runtime_map_digest = canonical_value_digest(&json!({}));
+    let prior_grant_raw = state
+        .get_state("controller.task_capability_grant", task_id)
+        .unwrap_or_else(|error| panic!("read revision N task capability grant: {error}"))
+        .unwrap_or_else(|| panic!("revision N task capability grant missing"));
+    let mut next_grant: Value = serde_json::from_str(&prior_grant_raw)
+        .unwrap_or_else(|error| panic!("revision N task capability grant json: {error}"));
+    next_grant["plan_revision"] = json!(2);
+    next_grant["task_contract_digest"] = Value::String(task_contract_digest.clone());
+    let task_capability_grant_values = BTreeMap::from([(task_id.to_owned(), next_grant.clone())]);
+    let task_capability_grant_map_digest = canonical_value_digest(
+        &serde_json::to_value(&task_capability_grant_values)
+            .unwrap_or_else(|error| panic!("task capability grant map: {error}")),
+    );
     let carry_record_digests = BTreeMap::<String, String>::new();
     let carry_proof_digest = canonical_value_digest(
         &serde_json::to_value(&carry_record_digests)
@@ -477,8 +508,10 @@ fn install_uncheckpointed_supersession(
     })
     .to_string();
     let task_key = format!("{plan_id}@r2:{task_id}");
+    let task_grant_key = format!("{plan_id}@r2:{task_id}");
     let prior_revision_key = format!("{plan_id}@r1");
     let task_runtime_json = task_runtime.to_string();
+    let task_grant_json = next_grant.to_string();
     let next_document_json = next_document.to_string();
     let compilation_json = compilation_evidence.to_string();
     let activation_payload = json!({
@@ -490,6 +523,7 @@ fn install_uncheckpointed_supersession(
         "carry_proof_digest": carry_proof_digest,
         "task_runtime_map_digest": task_runtime_map_digest,
         "attempt_runtime_map_digest": attempt_runtime_map_digest,
+        "task_capability_grant_map_digest": task_capability_grant_map_digest,
         "execution_epoch": epoch,
         "repository_snapshot_digest": repository_snapshot_digest,
         "baseline_diff_digest": baseline_diff_digest,
@@ -536,6 +570,11 @@ fn install_uncheckpointed_supersession(
             "controller.task",
             task_key.as_str(),
             task_runtime_json.as_str(),
+        ),
+        (
+            "controller.task_capability_grant",
+            task_grant_key.as_str(),
+            task_grant_json.as_str(),
         ),
     ];
     let owned_records = records
@@ -600,13 +639,7 @@ fn runtime_parts(base: &Path, root: &Path) -> RuntimeParts {
         },
         artifacts: ArtifactStore::open(base.join("cas"))
             .unwrap_or_else(|error| panic!("artifact store: {error}")),
-        manifest: ToolManifest {
-            tool_id: "tool.patch".to_owned(),
-            version: "1.0.0".to_owned(),
-            content_digest: WRITE_TOOL_DIGEST.to_owned(),
-            permission_ceiling: BTreeSet::from([PermissionClass::RepositoryWrite]),
-            declared_risk_floor: CommandRisk::RepositoryMutation,
-        },
+        manifest: write_tool_manifest(),
     }
 }
 
@@ -679,6 +712,7 @@ fn run_child(case: &str, base: &Path, root: &Path, marker: &Path) {
             &prepared.registry,
             &task_id,
             ReadinessInputs::permissive_m1("sha256:t08-resource"),
+            &write_tool_manifest(),
         )
         .unwrap_or_else(|error| panic!("child ready: {error}"));
     let parts = runtime_parts(base, root);
@@ -1132,6 +1166,7 @@ fn run_to_success(fixture: &Fixture) -> String {
             &prepared.registry,
             &task_id,
             ReadinessInputs::permissive_m1("sha256:t08-resource"),
+            &write_tool_manifest(),
         )
         .unwrap_or_else(|error| panic!("ready: {error}"));
     let parts = runtime_parts(&fixture.base, &fixture.root);
@@ -1739,6 +1774,7 @@ fn historical_unknown_that_is_now_failed_does_not_block_recovered_readiness() {
             &registry,
             &task_id,
             ReadinessInputs::permissive_m1("sha256:t08-history-resource"),
+            &write_tool_manifest(),
         )
         .unwrap_or_else(|error| panic!("historical unknown should not block: {error}"));
     controller

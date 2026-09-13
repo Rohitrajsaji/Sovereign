@@ -1,0 +1,72 @@
+{
+  "milestone_id": "M5",
+  "title": "Progressive roles, skills, and capability filtering",
+  "roadmap_version": "1.4-frozen",
+  "completed_at": "2026-09-13T21:02:43Z",
+  "required_tasks": [
+    "M5-T01",
+    "M5-T02",
+    "M5-T03"
+  ],
+  "all_required_tasks_completed": true,
+  "task_evidence": {
+    "implementation/evidence/M5-T01.json": "sha256:4139f254355ce3d9bac33e19f62cdf91f937dffa145c29f0a51b8260de1f5dfe",
+    "implementation/evidence/M5-T02.json": "sha256:cd2c584c5fd5ca10985d051a55205dfa3c2207e9c94975bbc82145aa58ce0c02",
+    "implementation/evidence/M5-T03.json": "sha256:ef843843ebb1403ca72f565f867f39a6ae60caae3e00c9a3049858652f970209"
+  },
+  "milestone_gates": {
+    "task_can_automatically_select_role_and_relevant_skill_while_model_tool_context_remains_bounded": {
+      "status": "passed",
+      "proofs": [
+        "implementation/evidence/M5-T01.json",
+        "implementation/evidence/M5-T02.json",
+        "implementation/evidence/M5-T03.json"
+      ],
+      "detail": "Canonical logical roles operate serially over the same loaded model with fresh bounded reviewer/verifier contexts; deterministic metadata-only skill selection loads only exact frozen pins under byte/token ceilings; exact task/role/grant/tool capability intersection filters model-visible tool schemas through the ContextPlanner budget without adding a second tool-authority path."
+    },
+    "role_skill_and_tool_text_cannot_expand_controller_authority": {
+      "status": "passed",
+      "proofs": [
+        "implementation/evidence/M5-T01.json",
+        "implementation/evidence/M5-T02.json",
+        "implementation/evidence/M5-T03.json"
+      ],
+      "detail": "Roles only narrow canonical CapabilitySet authority, skills remain untrusted instruction evidence, tool manifests are ceilings only, and repair/normal tool schemas are Controller-rederived from exact task pins and PermissionDecision."
+    }
+  },
+  "closure_verification": {
+    "policy": "14/14 passed",
+    "tools": "11/11 passed",
+    "roles": "7/7 passed",
+    "skills": "7/7 passed in independent audit",
+    "controller_t07": "35/35 passed",
+    "context": "9+11+3+18 passed",
+    "repair_loop": "2/2 passed",
+    "crash_resume": "22/22 passed",
+    "cargo_test_workspace": "passed; only two intentional local-Qwen target qualification tests ignored",
+    "cargo_check_workspace_all_targets": "passed",
+    "clippy_workspace_all_targets_D_warnings": "passed",
+    "cargo_fmt_check": "passed",
+    "git_diff_check": "passed",
+    "source_hash_reconciliation": "worker-38 final exact-tree hashes and prime live recheck match the repaired 22-file M5-T03 freeze exactly"
+  },
+  "independent_read_only_audit": {
+    "worker": "worker-38",
+    "result": "CLOSABLE",
+    "verdict": "M5-T03 frozen task: CLOSABLE",
+    "blockers": [],
+    "scope": "exact repaired frozen M5-T03 tree feeding final M5 closure"
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "network_runtime_dependency": false
+}

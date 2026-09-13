@@ -1,0 +1,269 @@
+{
+  "schema_version": 1,
+  "task_id": "M5-T03",
+  "title": "Implement capability intersection and tool-schema filtering",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "f4dd6313bf1b17214ade53734bc1be12e1598622",
+  "status": "completed",
+  "completed_at": "2026-09-13T21:02:43Z",
+  "verified_at": "2026-09-13T21:02:43Z",
+  "dependencies": [
+    "M1-T04",
+    "M5-T02"
+  ],
+  "interfaces": [
+    "CapabilitySet",
+    "PermissionDecision"
+  ],
+  "schemas": [
+    {
+      "name": "CapabilitySet",
+      "version": 1
+    },
+    {
+      "name": "PermissionDecision",
+      "version": 1
+    }
+  ],
+  "canonical_capabilities": [
+    "read",
+    "sandbox_write",
+    "repo_write",
+    "process_exec",
+    "package_install",
+    "network_read",
+    "network_write",
+    "browser_interactive",
+    "secret_use",
+    "external_side_effect",
+    "external_intelligence",
+    "destructive"
+  ],
+  "permission_authority": {
+    "controller_owned": true,
+    "decision_layers": [
+      "controller ceiling",
+      "Plan IR global policy ceiling",
+      "project policy ceiling",
+      "active task permissions",
+      "exact canonical role-profile ceiling",
+      "exact persisted task-scoped user grant layer",
+      "exact tool-manifest ceiling"
+    ],
+    "effective_semantics": "deterministic intersection only; no layer can expand another ceiling",
+    "execution_isolation_remains_independent_required_runtime_enforcement": true,
+    "skill_text_or_hints_are_authority": false,
+    "role_can_expand_authority": false,
+    "tool_manifest_can_grant_authority": false,
+    "unknown_or_malformed_capability_fails_closed": true,
+    "mutating_compiler_permissions": [
+      "read",
+      "repo_write",
+      "process_exec"
+    ],
+    "implicit_process_execution_via_repo_write": false
+  },
+  "task_capability_grants": {
+    "namespace": "controller.task_capability_grant",
+    "schema_version": 1,
+    "exact_scope_fields": [
+      "plan_id",
+      "plan_revision",
+      "task_id",
+      "task_contract_digest",
+      "policy_digest",
+      "issued_by",
+      "capabilities"
+    ],
+    "sibling_or_stale_scope_denied": true,
+    "cannot_expand_controller_base_grant_ceiling": true,
+    "mutation_advances_execution_epoch": true,
+    "journaled_and_checkpoint_bound": true,
+    "n_plus_one_activation_binds": "task_capability_grant_map_digest"
+  },
+  "role_authority": {
+    "canonical_role_pin_shape": "{id,version,digest}",
+    "canonical_profile_version": "1.0.0",
+    "unknown_id_version_or_digest_fails_closed": true,
+    "ceiling_domain": "sovereign_policy::Capability / CapabilitySet (all 12 canonical values)",
+    "compatibility_role_tool_class_is_type_alias_only": true,
+    "separate_divergent_role_permission_enum": false
+  },
+  "tool_schema_filtering": {
+    "schema_type": "ToolSchemaV1",
+    "exact_identity_fields": [
+      "tool_id",
+      "version",
+      "content_digest"
+    ],
+    "required_capabilities_must_fit_manifest_and_current_decision": true,
+    "only_exact_task_pinned_authorized_schemas_visible": true,
+    "generic_evidence_kind_tool_schema_self_authorizes": false,
+    "model_request_tools": [],
+    "serialized_context_is_only_model_visible_schema_path_for_m5_t03": true,
+    "context_planner_tool_schema_token_budget_preserved": true,
+    "deterministic_order_and_dedupe_preserved": true
+  },
+  "repair_schema_authority": {
+    "base_context_tool_schema_is_trusted": false,
+    "typed_schema_input_required": true,
+    "authorization_is_rederived_against_exact_runtime_manifest_and_current_permission_decision": true,
+    "forged_generic_schema_regression": "FORGED_TOOL_SCHEMA_MUST_NOT_APPEAR is absent while controller_authorized_tool_schema_v1 exact typed schema survives repair"
+  },
+  "ready_and_action_binding": {
+    "ready_lease_binds_whole_permission_decision": true,
+    "ready_lease_validation_recomputes_exact_current_decision": true,
+    "grant_or_epoch_drift_invalidates_stale_ready_authority": true,
+    "lowering_tool_identity_source": "lease.permission_decision exact tool_id/version/digest",
+    "lowering_uses_tools_zero": false,
+    "authorized_action_binds_permission_decision_digest": true,
+    "action_payload_digest_commits_permission_decision_digest": true,
+    "action_journal_checks_exact_action_tool_manifest_risk_lifecycle_epoch_payload_and_permission_decision": true
+  },
+  "recovery_integrity": {
+    "task_grant_rows_are_checkpoint_evidence_bindings": true,
+    "post_checkpoint_grant_changes_require_journal_correlation": true,
+    "n_plus_one_task_grant_map_digest_bound": true,
+    "stale_ready_authority_fails_closed": true
+  },
+  "frozen_acceptance_regressions": [
+    "canonical_plan_ir_capability_mapping_covers_all_twelve_values",
+    "task_capability_grant_rejects_sibling_and_stale_task_scope",
+    "skills_malicious_permission_request_is_untrusted_and_cannot_elevate",
+    "roles_cannot_elevate_existing_permission_context",
+    "m5_t03_task_grant_change_is_exact_and_invalidates_stale_ready_authority",
+    "m5_t03_only_exact_pinned_authorized_tool_schema_enters_context_packet",
+    "tool_schema_required_capabilities_must_be_within_manifest_and_decision",
+    "mismatched_permission_decision_cannot_authorize_action",
+    "repair_loop forged generic ToolSchema cannot enter trusted repair schema lane"
+  ],
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-policy -p sovereign-tools --offline",
+      "result": "passed",
+      "detail": "sovereign-policy 14/14; sovereign-tools 11/11; doc tests passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --offline -- roles",
+      "result": "passed",
+      "detail": "7/7 role regressions"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --offline --test t07",
+      "result": "passed",
+      "detail": "35/35"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-context --offline",
+      "result": "passed",
+      "detail": "context_metrics 9/9; context_packet 11/11; memory_history 3/3; routing 18/18"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --offline --test repair_loop",
+      "result": "passed",
+      "detail": "2/2 including adversarial repair-schema authority regression"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --offline --test crash_resume",
+      "result": "passed",
+      "detail": "22/22"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --offline --test vertical_slice",
+      "result": "passed",
+      "detail": "2/2"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test --workspace --offline",
+      "result": "passed",
+      "detail": "all non-ignored workspace tests passed; only two intentional local-Qwen qualification tests ignored"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "independent_audit": {
+    "worker": "worker-38",
+    "initial_result": "NOT CLOSABLE",
+    "initial_blockers": [
+      "lower_replace_action selected /tools[0] instead of exact lease PermissionDecision tool identity",
+      "role authority used a divergent seven-value RoleToolClass domain instead of canonical CapabilitySet",
+      "repair copied caller-supplied base ContextPacket ToolSchema evidence into the trusted authorized lane without typed exact revalidation"
+    ],
+    "repairs": [
+      "lowering now derives exact tool id/version/digest from lease.permission_decision and validates the runtime manifest against it",
+      "RoleToolClass is compatibility alias only to sovereign_policy::Capability; RoleProfile ceiling is canonical CapabilitySet across all 12 values",
+      "repair accepts typed ToolSchemaV1 input and re-derives authorized evidence through exact runtime manifest/current PermissionDecision; base-context ToolSchema is excluded"
+    ],
+    "final_result": "CLOSABLE",
+    "final_verdict": "M5-T03 frozen task: CLOSABLE",
+    "final_blockers": [],
+    "notes": "Fresh read-only exact-tree re-audit matched all 22 source/test hashes before/after, reconfirmed frozen contract hashes and all authority/recovery invariants, and independently reran focused plus full workspace/quality gates."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "source_hashes": {
+    "crates/sovereign-context/src/lib.rs": "sha256:5ebf6a22d2274992b632429f5f819fdd79f494ddde3630a1ac2f6c9caa9e4643",
+    "crates/sovereign-context/tests/context_metrics.rs": "sha256:005e1dfd64300a7a4412f6791ec74e2491e6b8fcf913d070709494089b37754c",
+    "crates/sovereign-context/tests/context_packet.rs": "sha256:e142b6af76a7a0d841e48ec33067f5302ecf4e862e4225d816e592a6a68344ef",
+    "crates/sovereign-context/tests/routing.rs": "sha256:35143fb460cd75dd69d2426f22d181b975961163d064056e69aa800bf7a54a9b",
+    "crates/sovereign-controller/src/lib.rs": "sha256:ad5c1807ffb64de69793b009274def1db035a118bac394ef25b6631bab0609db",
+    "crates/sovereign-controller/src/roles.rs": "sha256:720f19d47c5bc7b5f02acec05a069150deeddbf92526d572407486c0f610b7e8",
+    "crates/sovereign-controller/src/skills.rs": "sha256:aa7f21a982c85ee1e3235e59413c18e0fbb00acfda44858e352730d19aa25000",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:e87e4b477f7344f744979f940c8485fb3ce94057b3c1923d21b5896278db7c37",
+    "crates/sovereign-eval/tests/compiler_real_smoke.rs": "sha256:8a0d1bb4d0beaa7646c538b535796e0f09505ad2105fb1cf7f5edad554081393",
+    "crates/sovereign-eval/tests/compiler_vertical_slice.rs": "sha256:4834506285e662faf8ef1a87831c95a78271c0fff3980e97bce7a98dd96c26a8",
+    "crates/sovereign-eval/tests/crash_resume.rs": "sha256:cf8584d524160b4341e783dbbe57828065ce1be5977a0f0e837eab217f02f57a",
+    "crates/sovereign-eval/tests/m1_real_qualification.rs": "sha256:ad9fc15832897251e50e1ac71261feb7099055275732dce02b52b2cbbd511de7",
+    "crates/sovereign-eval/tests/m3_scenario_gate.rs": "sha256:e081f6cf83ecc413c4241d91db3fc42e3a9f5fabf48dedc65e880a0284f81a04",
+    "crates/sovereign-eval/tests/repair_loop.rs": "sha256:3f4b6830ea15432a71b93b4ee947c1bd13528efa186651e0bbfb8fdc65d37bc7",
+    "crates/sovereign-eval/tests/vertical_slice.rs": "sha256:872594a5fe544253b2bb848343e7aa003f7edf057ed15742b0f12f92b5d63420",
+    "crates/sovereign-plan/src/compiler.rs": "sha256:19a405b926b956228e9003b772b5c5002c3d071f8619bec80957c6e17a464b23",
+    "crates/sovereign-plan/tests/compiler_m3.rs": "sha256:ca4a79b3a348911a1a7a1bbea22f7e2c82e8144aa37ab281d704f5effa230b98",
+    "crates/sovereign-plan/tests/minimal_compiler.rs": "sha256:2826196f9b4335415f11bbad6d5c08a3eca3746293913237ed361fa33ad00670",
+    "crates/sovereign-policy/src/lib.rs": "sha256:088b1bacaee5407f7a41fc10f8f02c2ec36d65b470109414b4c1e19cde80733e",
+    "crates/sovereign-policy/tests/kernel.rs": "sha256:0269e331a28ecffc0c92f7d763aa830655a550d27fa7914c8f116cc8317eb18f",
+    "crates/sovereign-tools/src/lib.rs": "sha256:125d7ba7223d40937caca5ae6abddaab0fae70907fb62c23934bd0313429477d",
+    "crates/sovereign-tools/tests/runner.rs": "sha256:3fefcbc20e680a33f2cf47932213d1663d4a48a365956dcf16cacc796b2608e6"
+  },
+  "frozen_tree": {
+    "head": "f4dd6313bf1b17214ade53734bc1be12e1598622",
+    "modified_files": 22,
+    "untracked_files": 0,
+    "insertions": 2324,
+    "deletions": 304
+  },
+  "state_authority": {
+    "new_database": false,
+    "new_state_store": false,
+    "new_lifecycle_writer": false,
+    "controller_remains_sole_execution_authority": true
+  },
+  "network_runtime_dependency": false
+}

@@ -1,6 +1,6 @@
 use sovereign_context::{
     ContextBudget, ContextError, ContextLevel, ContextMode, ContextPacketInput, ContextPlanner,
-    EvidenceItem, EvidenceKind, PacketSection, TrustClass,
+    EvidenceItem, EvidenceKind, PacketSection, RepairPacketInput, TrustClass,
 };
 use sovereign_evidence::{
     EvidenceKind as ToolEvidenceKind, FailureSignature, RetainedRange, ToolEvidence,
@@ -13,6 +13,7 @@ fn required_input(candidates: Vec<EvidenceItem>) -> ContextPacketInput {
         controller_prefix: "safe-controller-prefix".to_owned(),
         task_contract: "objective=edit settings; acceptance=focused test passes".to_owned(),
         current_state: "attempt=1; unknown_actions=0; diff=current".to_owned(),
+        authorized_tool_schemas: Vec::new(),
         candidates,
         output_schema: "ModelProposal{action,evidence_ids}".to_owned(),
     }
@@ -170,12 +171,10 @@ fn packet_uses_frozen_weak_model_section_order() {
         EvidenceKind::ToolSchema,
         "patch{path,diff}",
     );
+    let mut input = required_input(vec![tool, routed, direct]);
+    input.authorized_tool_schemas.push(schema);
     let packet = planner
-        .build(
-            ContextMode::Implementation,
-            ContextBudget::m1_8k(),
-            required_input(vec![tool, routed, direct, schema]),
-        )
+        .build(ContextMode::Implementation, ContextBudget::m1_8k(), input)
         .unwrap_or_else(|error| panic!("build: {error}"));
 
     let kinds = packet
@@ -231,18 +230,22 @@ fn forbidden_bulk_context_is_absent_by_default() {
         )
         .with_relevance(false),
         candidate(
-            "relevant-tool",
+            "generic-relevant-tool",
             PacketSection::ControllerPrefix,
             EvidenceKind::ToolSchema,
-            "only relevant patch tool",
+            "generic candidate cannot authorize patch tool",
         ),
     ];
+    let authorized = candidate(
+        "authorized-relevant-tool",
+        PacketSection::ControllerPrefix,
+        EvidenceKind::ToolSchema,
+        "only authorized relevant patch tool",
+    );
+    let mut input = required_input(candidates);
+    input.authorized_tool_schemas.push(authorized);
     let packet = planner
-        .build(
-            ContextMode::Implementation,
-            roomy_budget(),
-            required_input(candidates),
-        )
+        .build(ContextMode::Implementation, roomy_budget(), input)
         .unwrap_or_else(|error| panic!("build: {error}"));
 
     let ids = packet
@@ -255,7 +258,135 @@ fn forbidden_bulk_context_is_absent_by_default() {
     assert!(!ids.contains(&"raw-log"));
     assert!(!ids.contains(&"hidden"));
     assert!(!ids.contains(&"all-tool-schemas"));
-    assert!(ids.contains(&"relevant-tool"));
+    assert!(!ids.contains(&"generic-relevant-tool"));
+    assert!(ids.contains(&"authorized-relevant-tool"));
+}
+
+#[test]
+fn authorized_tool_schema_lane_preserves_dedupe_order_and_budget() {
+    let planner = ContextPlanner::default();
+    let generic = candidate(
+        "generic-schema",
+        PacketSection::ControllerPrefix,
+        EvidenceKind::ToolSchema,
+        "generic schema must stay hidden",
+    );
+    let schema_text = "authorized-schema-body-is-longer-than-the-small-ceiling";
+    let authorized_a = candidate(
+        "authorized-a",
+        PacketSection::ControllerPrefix,
+        EvidenceKind::ToolSchema,
+        schema_text,
+    );
+    let authorized_b = candidate(
+        "authorized-b",
+        PacketSection::ControllerPrefix,
+        EvidenceKind::ToolSchema,
+        schema_text,
+    );
+    let budget = ContextBudget {
+        max_input_tokens: 1_000,
+        c0_tokens: 400,
+        tool_schema_tokens: 4,
+        c1_tokens: 100,
+        routed_expansion_tokens: 0,
+        tool_failure_tokens: 0,
+        serialization_reserve_tokens: 496,
+    };
+    let mut input = required_input(vec![generic]);
+    input.authorized_tool_schemas = vec![authorized_b, authorized_a];
+
+    let packet = planner
+        .build(ContextMode::Implementation, budget, input)
+        .unwrap_or_else(|error| panic!("build: {error}"));
+    let schemas = packet
+        .items
+        .iter()
+        .filter(|item| item.kind == EvidenceKind::ToolSchema)
+        .collect::<Vec<_>>();
+
+    assert_eq!(schemas.len(), 1);
+    assert_eq!(schemas[0].evidence_id, "authorized-a");
+    assert_eq!(packet.items[1].evidence_id, "authorized-a");
+    assert!(schemas[0].text.len() < schema_text.len());
+    assert!(schemas[0].expansion_handle.is_some());
+    assert!(packet.metrics.tool_schema_tokens <= budget.tool_schema_tokens);
+    assert_eq!(packet.metrics.tool_schema_tokens, schemas[0].token_cost);
+    assert!(packet.metrics.duplicate_tokens_removed > 0);
+    assert!(
+        packet
+            .items
+            .iter()
+            .all(|item| item.evidence_id != "generic-schema")
+    );
+}
+
+#[test]
+fn repair_reviewer_and_verifier_builders_only_admit_authorized_tool_schemas() {
+    let planner = ContextPlanner::default();
+    let generic = candidate(
+        "generic-schema",
+        PacketSection::ControllerPrefix,
+        EvidenceKind::ToolSchema,
+        "generic schema",
+    );
+    let authorized = candidate(
+        "authorized-schema",
+        PacketSection::ControllerPrefix,
+        EvidenceKind::ToolSchema,
+        "authorized schema",
+    );
+
+    let mut reviewer_input = required_input(vec![generic.clone()]);
+    reviewer_input.authorized_tool_schemas = vec![authorized.clone()];
+    let reviewer = planner
+        .build_reviewer(roomy_budget(), reviewer_input)
+        .unwrap_or_else(|error| panic!("reviewer: {error}"));
+
+    let mut verifier_input = required_input(vec![generic.clone()]);
+    verifier_input.authorized_tool_schemas = vec![authorized.clone()];
+    let verifier = planner
+        .build_verifier(roomy_budget(), verifier_input)
+        .unwrap_or_else(|error| panic!("verifier: {error}"));
+
+    let repair = planner
+        .build_repair(
+            roomy_budget(),
+            RepairPacketInput {
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 1,
+                plan_digest: "sha256:plan".to_owned(),
+                task_id: "task.fixture".to_owned(),
+                task_contract_digest: "sha256:task".to_owned(),
+                acceptance_contract_digest: "sha256:acceptance".to_owned(),
+                prior_attempt_id: "attempt.fixture".to_owned(),
+                failure_signature: "test:fixture:deadbeef".to_owned(),
+                failure_record_digest: "sha256:failure".to_owned(),
+                failure_evidence_refs: Vec::new(),
+                controller_prefix: "safe-controller-prefix".to_owned(),
+                task_contract: "objective=repair settings".to_owned(),
+                current_state: "attempt=2; diff=current".to_owned(),
+                authorized_tool_schemas: vec![authorized],
+                candidates: vec![generic],
+                output_schema: "ModelProposal{action,evidence_ids}".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("repair: {error}"));
+
+    for packet in [&reviewer, &verifier, &repair.context] {
+        assert!(
+            packet
+                .items
+                .iter()
+                .any(|item| item.evidence_id == "authorized-schema")
+        );
+        assert!(
+            packet
+                .items
+                .iter()
+                .all(|item| item.evidence_id != "generic-schema")
+        );
+    }
 }
 
 #[test]

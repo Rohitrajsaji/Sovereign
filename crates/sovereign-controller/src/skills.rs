@@ -1181,6 +1181,7 @@ mod tests {
                         controller_prefix: "controller".to_owned(),
                         task_contract: "task".to_owned(),
                         current_state: "ready".to_owned(),
+                        authorized_tool_schemas: Vec::new(),
                         candidates: vec![metadata_evidence(text)],
                         output_schema: "RoleOutputV1".to_owned(),
                     },

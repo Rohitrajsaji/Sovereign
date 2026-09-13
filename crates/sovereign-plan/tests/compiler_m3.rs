@@ -108,6 +108,7 @@ fn planning_packet() -> ContextPacket {
                     .to_owned(),
                 task_contract: "Update the shared API and its app consumer.".to_owned(),
                 current_state: "repository baselines current".to_owned(),
+                authorized_tool_schemas: Vec::new(),
                 candidates: vec![app, shared, supplied],
                 output_schema: "m3-plan-proposal-v1".to_owned(),
             },

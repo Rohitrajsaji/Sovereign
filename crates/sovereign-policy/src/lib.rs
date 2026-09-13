@@ -11,6 +11,355 @@ use std::fs;
 use std::net::TcpListener;
 use std::path::{Component, Path, PathBuf};
 
+pub const CAPABILITY_SET_SCHEMA_VERSION: u32 = 1;
+pub const PERMISSION_DECISION_SCHEMA_VERSION: u32 = 1;
+
+/// Canonical Plan IR v1 capability vocabulary.
+///
+/// Existing `sovereign-tools::PermissionClass` callers keep their Rust variant names through a
+/// type alias; the wire names here are the twelve frozen Plan IR permission strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Capability {
+    Read,
+    SandboxWrite,
+    RepositoryWrite,
+    ProcessExec,
+    PackageInstall,
+    NetworkRead,
+    NetworkWrite,
+    BrowserInteractive,
+    SecretUse,
+    ExternalSideEffect,
+    ExternalIntelligence,
+    Destructive,
+}
+
+impl Capability {
+    pub const ALL: [Self; 12] = [
+        Self::Read,
+        Self::SandboxWrite,
+        Self::RepositoryWrite,
+        Self::ProcessExec,
+        Self::PackageInstall,
+        Self::NetworkRead,
+        Self::NetworkWrite,
+        Self::BrowserInteractive,
+        Self::SecretUse,
+        Self::ExternalSideEffect,
+        Self::ExternalIntelligence,
+        Self::Destructive,
+    ];
+
+    #[must_use]
+    pub const fn as_plan_ir_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::SandboxWrite => "sandbox_write",
+            Self::RepositoryWrite => "repo_write",
+            Self::ProcessExec => "process_exec",
+            Self::PackageInstall => "package_install",
+            Self::NetworkRead => "network_read",
+            Self::NetworkWrite => "network_write",
+            Self::BrowserInteractive => "browser_interactive",
+            Self::SecretUse => "secret_use",
+            Self::ExternalSideEffect => "external_side_effect",
+            Self::ExternalIntelligence => "external_intelligence",
+            Self::Destructive => "destructive",
+        }
+    }
+
+    #[must_use]
+    pub fn from_plan_ir_str(value: &str) -> Option<Self> {
+        match value {
+            "read" => Some(Self::Read),
+            "sandbox_write" => Some(Self::SandboxWrite),
+            "repo_write" => Some(Self::RepositoryWrite),
+            "process_exec" => Some(Self::ProcessExec),
+            "package_install" => Some(Self::PackageInstall),
+            "network_read" => Some(Self::NetworkRead),
+            "network_write" => Some(Self::NetworkWrite),
+            "browser_interactive" => Some(Self::BrowserInteractive),
+            "secret_use" => Some(Self::SecretUse),
+            "external_side_effect" => Some(Self::ExternalSideEffect),
+            "external_intelligence" => Some(Self::ExternalIntelligence),
+            "destructive" => Some(Self::Destructive),
+            _ => None,
+        }
+    }
+}
+
+/// Deterministic capability set used at every permission-intersection layer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CapabilitySet {
+    capabilities: BTreeSet<Capability>,
+}
+
+impl CapabilitySet {
+    #[must_use]
+    pub fn new(capabilities: impl IntoIterator<Item = Capability>) -> Self {
+        Self {
+            capabilities: capabilities.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn all() -> Self {
+        Self::new(Capability::ALL)
+    }
+
+    #[must_use]
+    pub fn contains(&self, capability: Capability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+
+    #[must_use]
+    pub fn is_subset_of(&self, ceiling: &Self) -> bool {
+        self.capabilities.is_subset(&ceiling.capabilities)
+    }
+
+    #[must_use]
+    pub fn intersection(&self, other: &Self) -> Self {
+        Self::new(self.capabilities.intersection(&other.capabilities).copied())
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
+        self.capabilities.iter().copied()
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(CAPABILITY_SET_SCHEMA_VERSION.to_be_bytes());
+        for capability in &self.capabilities {
+            digest_policy_field(&mut hasher, capability.as_plan_ir_str());
+        }
+        format!("sha256:{:x}", hasher.finalize())
+    }
+}
+
+impl From<BTreeSet<Capability>> for CapabilitySet {
+    fn from(value: BTreeSet<Capability>) -> Self {
+        Self {
+            capabilities: value,
+        }
+    }
+}
+
+impl From<CapabilitySet> for BTreeSet<Capability> {
+    fn from(value: CapabilitySet) -> Self {
+        value.capabilities
+    }
+}
+
+/// Explicit capability grant bound to one exact Plan revision and task contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCapabilityGrant {
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub task_id: String,
+    pub task_contract_digest: String,
+    pub policy_digest: String,
+    pub issued_by: String,
+    pub capabilities: CapabilitySet,
+}
+
+impl TaskCapabilityGrant {
+    /// Returns the grant only for its exact task scope. Sibling tasks and stale contracts fail
+    /// closed instead of receiving an empty or partially matching grant.
+    ///
+    /// # Errors
+    /// Returns a policy denial when any scope component differs or the grant is malformed.
+    pub fn capabilities_for_scope(
+        &self,
+        plan_id: &str,
+        plan_revision: u32,
+        task_id: &str,
+        task_contract_digest: &str,
+        policy_digest: &str,
+    ) -> Result<&CapabilitySet, PolicyError> {
+        self.validate()?;
+        if self.plan_id != plan_id
+            || self.plan_revision != plan_revision
+            || self.task_id != task_id
+            || self.task_contract_digest != task_contract_digest
+            || self.policy_digest != policy_digest
+        {
+            return Err(PolicyError::Denied(
+                "task capability grant scope does not match exact task contract/policy".to_owned(),
+            ));
+        }
+        Ok(&self.capabilities)
+    }
+
+    /// # Errors
+    /// Returns a policy denial for incomplete exact scope fields.
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        if self.plan_id.trim().is_empty()
+            || self.task_id.trim().is_empty()
+            || !is_sha256_binding(&self.task_contract_digest)
+            || !is_sha256_binding(&self.policy_digest)
+            || self.issued_by.trim().is_empty()
+        {
+            return Err(PolicyError::Denied(
+                "task capability grant requires exact plan/task/contract/policy scope and issuer"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The six deterministic capability ceilings whose intersection is effective authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityLayers {
+    pub global: CapabilitySet,
+    pub project: CapabilitySet,
+    pub task: CapabilitySet,
+    pub role: CapabilitySet,
+    pub tool: CapabilitySet,
+    pub user: CapabilitySet,
+}
+
+impl CapabilityLayers {
+    #[must_use]
+    pub fn effective(&self) -> CapabilitySet {
+        self.global
+            .intersection(&self.project)
+            .intersection(&self.task)
+            .intersection(&self.role)
+            .intersection(&self.tool)
+            .intersection(&self.user)
+    }
+}
+
+/// Frozen permission decision bound to an exact task contract, policy, and tool identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDecision {
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub task_id: String,
+    pub task_contract_digest: String,
+    pub policy_digest: String,
+    pub tool_id: String,
+    pub tool_version: String,
+    pub tool_digest: String,
+    pub layers: CapabilityLayers,
+    pub effective: CapabilitySet,
+}
+
+impl PermissionDecision {
+    /// Constructs a deterministic v1 decision from the six frozen authority layers.
+    ///
+    /// # Errors
+    /// Returns a policy denial when any exact identity binding is incomplete.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        plan_id: impl Into<String>,
+        plan_revision: u32,
+        task_id: impl Into<String>,
+        task_contract_digest: impl Into<String>,
+        policy_digest: impl Into<String>,
+        tool_id: impl Into<String>,
+        tool_version: impl Into<String>,
+        tool_digest: impl Into<String>,
+        layers: CapabilityLayers,
+    ) -> Result<Self, PolicyError> {
+        let decision = Self {
+            plan_id: plan_id.into(),
+            plan_revision,
+            task_id: task_id.into(),
+            task_contract_digest: task_contract_digest.into(),
+            policy_digest: policy_digest.into(),
+            tool_id: tool_id.into(),
+            tool_version: tool_version.into(),
+            tool_digest: tool_digest.into(),
+            effective: layers.effective(),
+            layers,
+        };
+        decision.validate()?;
+        Ok(decision)
+    }
+
+    /// Revalidates exact bindings and proves the stored effective set is the layer intersection.
+    ///
+    /// # Errors
+    /// Returns a policy denial for malformed bindings or a mutated/inconsistent effective set.
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        if self.plan_id.trim().is_empty()
+            || self.task_id.trim().is_empty()
+            || self.tool_id.trim().is_empty()
+            || self.tool_version.trim().is_empty()
+            || !is_sha256_binding(&self.task_contract_digest)
+            || !is_sha256_binding(&self.policy_digest)
+            || !is_sha256_binding(&self.tool_digest)
+        {
+            return Err(PolicyError::Denied(
+                "permission decision has incomplete exact-binding fields".to_owned(),
+            ));
+        }
+        if self.effective != self.layers.effective() {
+            return Err(PolicyError::Denied(
+                "permission decision effective capabilities do not match layer intersection"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(PERMISSION_DECISION_SCHEMA_VERSION.to_be_bytes());
+        digest_policy_field(&mut hasher, &self.plan_id);
+        hasher.update(self.plan_revision.to_be_bytes());
+        digest_policy_field(&mut hasher, &self.task_id);
+        digest_policy_field(&mut hasher, &self.task_contract_digest);
+        digest_policy_field(&mut hasher, &self.policy_digest);
+        digest_policy_field(&mut hasher, &self.tool_id);
+        digest_policy_field(&mut hasher, &self.tool_version);
+        digest_policy_field(&mut hasher, &self.tool_digest);
+        for layer in [
+            &self.layers.global,
+            &self.layers.project,
+            &self.layers.task,
+            &self.layers.role,
+            &self.layers.tool,
+            &self.layers.user,
+            &self.effective,
+        ] {
+            digest_policy_field(&mut hasher, &layer.digest());
+        }
+        format!("sha256:{:x}", hasher.finalize())
+    }
+
+    #[must_use]
+    pub fn matches_task_scope(
+        &self,
+        plan_id: &str,
+        plan_revision: u32,
+        task_id: &str,
+        task_contract_digest: &str,
+    ) -> bool {
+        self.plan_id == plan_id
+            && self.plan_revision == plan_revision
+            && self.task_id == task_id
+            && self.task_contract_digest == task_contract_digest
+    }
+
+    #[must_use]
+    pub fn matches_tool(&self, tool_id: &str, tool_version: &str, tool_digest: &str) -> bool {
+        self.tool_id == tool_id
+            && self.tool_version == tool_version
+            && self.tool_digest == tool_digest
+    }
+}
+
+fn is_sha256_binding(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
 #[derive(Debug)]
 pub enum PolicyError {
     Io(std::io::Error),

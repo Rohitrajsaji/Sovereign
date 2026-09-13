@@ -397,6 +397,9 @@ pub struct ContextPacketInput {
     pub controller_prefix: String,
     pub task_contract: String,
     pub current_state: String,
+    /// Tool schemas already validated and authorized for this invocation.
+    /// Generic candidate evidence cannot grant itself tool-schema visibility.
+    pub authorized_tool_schemas: Vec<EvidenceItem>,
     pub candidates: Vec<EvidenceItem>,
     pub output_schema: String,
 }
@@ -464,6 +467,8 @@ pub struct RepairPacketInput {
     pub controller_prefix: String,
     pub task_contract: String,
     pub current_state: String,
+    /// Tool schemas already validated and authorized for this repair invocation.
+    pub authorized_tool_schemas: Vec<EvidenceItem>,
     pub candidates: Vec<EvidenceItem>,
     pub output_schema: String,
 }
@@ -600,7 +605,16 @@ impl<C: TokenCounter> ContextPlanner<C> {
         let mut candidates = input
             .candidates
             .into_iter()
-            .filter(|item| item.relevant && allowed_in_mode(mode, item))
+            .filter(|item| {
+                item.kind != EvidenceKind::ToolSchema
+                    && item.relevant
+                    && allowed_in_mode(mode, item)
+            })
+            .chain(input.authorized_tool_schemas.into_iter().filter(|item| {
+                item.kind == EvidenceKind::ToolSchema
+                    && item.relevant
+                    && allowed_in_mode(mode, item)
+            }))
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
             (left.section, left.kind, &left.evidence_id).cmp(&(
@@ -772,6 +786,7 @@ impl<C: TokenCounter> ContextPlanner<C> {
                 controller_prefix: input.controller_prefix,
                 task_contract: input.task_contract,
                 current_state: input.current_state,
+                authorized_tool_schemas: input.authorized_tool_schemas,
                 candidates: input.candidates,
                 output_schema: input.output_schema,
             },

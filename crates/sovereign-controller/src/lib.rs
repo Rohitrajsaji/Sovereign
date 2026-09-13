@@ -25,9 +25,9 @@ use sovereign_plan::{
     smallest_replan_scope_tasks,
 };
 use sovereign_policy::{
-    CommandMode, CommandPolicy, CommandRisk, HeavyLeaseClass, HostPressureSnapshot,
-    IsolationRequest, M1ResourceGovernor, ModelCallBudget, PolicyError, ResourceGovernor,
-    ResourceLease,
+    Capability, CapabilityLayers, CapabilitySet, CommandMode, CommandPolicy, CommandRisk,
+    HeavyLeaseClass, HostPressureSnapshot, IsolationRequest, M1ResourceGovernor, ModelCallBudget,
+    PermissionDecision, PolicyError, ResourceGovernor, ResourceLease, TaskCapabilityGrant,
 };
 use sovereign_repo::{
     ChangeSet, ChangeSetCompositionInput, ComposeChangeSetsOutcome, CompositionConflictEvidence,
@@ -40,7 +40,8 @@ use sovereign_state::{
 };
 use sovereign_tools::{
     ActionJournal, AuthorizedAction, PermissionClass, ProcessRunner, RawToolResult,
-    ReconciliationMode, ToolError, ToolManifest, reap_owned_process_group,
+    ReconciliationMode, ToolError, ToolManifest, ToolSchemaV1, filter_authorized_tool_schemas,
+    reap_owned_process_group,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -54,8 +55,8 @@ mod roles;
 mod skills;
 
 pub use roles::{
-    ROLE_OUTPUT_SCHEMA_VERSION, ROLE_PROFILE_SCHEMA_VERSION, RoleDisposition, RoleId, RoleOutputV1,
-    RoleProfile, RoleRegistry, RoleToolClass,
+    ROLE_OUTPUT_SCHEMA_VERSION, ROLE_PROFILE_SCHEMA_VERSION, ROLE_PROFILE_VERSION, RoleDisposition,
+    RoleId, RoleOutputV1, RolePin, RoleProfile, RoleRegistry, RoleToolClass,
 };
 pub use skills::{
     DEFAULT_MAX_DISCOVERED_MANIFESTS, DEFAULT_MAX_SELECTED_BODY_BYTES,
@@ -313,7 +314,7 @@ pub struct ReadyLease {
     checkpoint_generation: i64,
     checkpoint_action_sequence: i64,
     checkpoint_hash: String,
-    permission_digest: String,
+    permission_decision: PermissionDecision,
     resource_digest: String,
     execution_epoch: i64,
     resource_lease: ResourceLease,
@@ -358,6 +359,7 @@ pub struct PermissionContext {
     project_ceiling: BTreeSet<PermissionClass>,
     role_ceiling: BTreeSet<PermissionClass>,
     persisted_grants: BTreeSet<PermissionClass>,
+    persisted_grant_issuer: String,
 }
 
 impl PermissionContext {
@@ -372,6 +374,7 @@ impl PermissionContext {
             project_ceiling: granted.clone(),
             role_ceiling: granted.clone(),
             persisted_grants: granted,
+            persisted_grant_issuer: "user:local-autonomous-profile".to_owned(),
         }
     }
 
@@ -383,9 +386,11 @@ impl PermissionContext {
             project_ceiling: granted.clone(),
             role_ceiling: granted.clone(),
             persisted_grants: granted,
+            persisted_grant_issuer: "user:read-only-profile".to_owned(),
         }
     }
 
+    #[cfg(test)]
     fn permits(&self, permission: PermissionClass) -> bool {
         self.controller_ceiling.contains(&permission)
             && self.project_ceiling.contains(&permission)
@@ -393,23 +398,97 @@ impl PermissionContext {
             && self.persisted_grants.contains(&permission)
     }
 
+    #[cfg(test)]
     fn digest(&self) -> String {
         let encode = |set: &BTreeSet<PermissionClass>| {
             set.iter()
-                .map(|permission| format!("{permission:?}"))
+                .map(|permission| permission.as_plan_ir_str())
                 .collect::<Vec<_>>()
                 .join(",")
         };
         sha256_prefixed(
             format!(
-                "{}\0{}\0{}\0{}",
+                "{}\0{}\0{}\0{}\0{}",
                 encode(&self.controller_ceiling),
                 encode(&self.project_ceiling),
                 encode(&self.role_ceiling),
-                encode(&self.persisted_grants)
+                encode(&self.persisted_grants),
+                self.persisted_grant_issuer
             )
             .as_bytes(),
         )
+    }
+
+    fn controller_capabilities(&self) -> CapabilitySet {
+        CapabilitySet::new(self.controller_ceiling.iter().copied())
+    }
+
+    fn project_capabilities(&self) -> CapabilitySet {
+        CapabilitySet::new(self.project_ceiling.iter().copied())
+    }
+
+    fn role_capabilities(&self) -> CapabilitySet {
+        CapabilitySet::new(self.role_ceiling.iter().copied())
+    }
+
+    fn persisted_grant_capabilities(&self) -> CapabilitySet {
+        CapabilitySet::new(self.persisted_grants.iter().copied())
+    }
+}
+
+const TASK_CAPABILITY_GRANT_SCHEMA_VERSION: u32 = 1;
+const TASK_CAPABILITY_GRANT_NAMESPACE: &str = "controller.task_capability_grant";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedTaskCapabilityGrantV1 {
+    schema_version: u32,
+    plan_id: String,
+    plan_revision: u32,
+    task_id: String,
+    task_contract_digest: String,
+    policy_digest: String,
+    issued_by: String,
+    capabilities: Vec<String>,
+}
+
+impl PersistedTaskCapabilityGrantV1 {
+    fn from_grant(grant: &TaskCapabilityGrant) -> Self {
+        Self {
+            schema_version: TASK_CAPABILITY_GRANT_SCHEMA_VERSION,
+            plan_id: grant.plan_id.clone(),
+            plan_revision: grant.plan_revision,
+            task_id: grant.task_id.clone(),
+            task_contract_digest: grant.task_contract_digest.clone(),
+            policy_digest: grant.policy_digest.clone(),
+            issued_by: grant.issued_by.clone(),
+            capabilities: grant
+                .capabilities
+                .iter()
+                .map(|capability| capability.as_plan_ir_str().to_owned())
+                .collect(),
+        }
+    }
+
+    fn into_grant(self) -> Result<TaskCapabilityGrant, ControllerError> {
+        if self.schema_version != TASK_CAPABILITY_GRANT_SCHEMA_VERSION {
+            return Err(ControllerError::NotReady(
+                "unsupported persisted task capability grant schema".to_owned(),
+            ));
+        }
+        let capabilities =
+            capability_set_from_strings(self.capabilities.iter().map(String::as_str))?;
+        let grant = TaskCapabilityGrant {
+            plan_id: self.plan_id,
+            plan_revision: self.plan_revision,
+            task_id: self.task_id,
+            task_contract_digest: self.task_contract_digest,
+            policy_digest: self.policy_digest,
+            issued_by: self.issued_by,
+            capabilities,
+        };
+        grant.validate()?;
+        Ok(grant)
     }
 }
 
@@ -895,6 +974,145 @@ impl Controller {
     #[must_use]
     pub const fn state(&self) -> &StateStore {
         &self.state
+    }
+
+    /// Replaces the exact persisted user-grant layer for one active task.
+    /// The requested set can only narrow the Controller-configured user ceiling;
+    /// every successful change advances the execution epoch so stale leases/actions fail closed.
+    ///
+    /// # Errors
+    /// Returns a policy/readiness error for an unknown task, stale plan, or attempted grant
+    /// outside the configured user-authority ceiling.
+    pub fn set_task_capability_grant(
+        &mut self,
+        task_id: &str,
+        capabilities: CapabilitySet,
+    ) -> Result<i64, ControllerError> {
+        self.require_execution_not_paused()?;
+        if !capabilities.is_subset_of(&self.permission_context.persisted_grant_capabilities()) {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "task capability grant cannot exceed configured user authority".to_owned(),
+            )));
+        }
+        let (plan_id, plan_revision, task_contract_digest, policy_digest) = {
+            let active = self.active_ref()?;
+            if active.validity != PlanValidity::Current {
+                return Err(ControllerError::NotReady(
+                    "cannot change grants for a non-current plan".to_owned(),
+                ));
+            }
+            let task = active
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+            (
+                active.plan_id.clone(),
+                active.revision,
+                task.task_contract_digest.clone(),
+                active.policy_digest.clone(),
+            )
+        };
+        let grant = TaskCapabilityGrant {
+            plan_id: plan_id.clone(),
+            plan_revision,
+            task_id: task_id.to_owned(),
+            task_contract_digest,
+            policy_digest: policy_digest.clone(),
+            issued_by: self.permission_context.persisted_grant_issuer.clone(),
+            capabilities,
+        };
+        grant.validate()?;
+        let persisted = PersistedTaskCapabilityGrantV1::from_grant(&grant);
+        let value_json = serde_json::to_string(&persisted)?;
+        // Epoch first is deliberately fail-closed: persistence failure only invalidates more
+        // previously derived authority; the inverse ordering could leave a stale lease usable.
+        let epoch = self.state.advance_execution_epoch()?;
+        let key = revision_scoped_key(&plan_id, plan_revision, task_id);
+        self.persist_control_record_with_event(
+            TASK_CAPABILITY_GRANT_NAMESPACE,
+            &key,
+            &value_json,
+            "task_capability_grant_changed",
+            &json!({
+                "plan_id": plan_id,
+                "plan_revision": plan_revision,
+                "task_id": task_id,
+                "policy_digest": policy_digest,
+                "grant_digest": sha256_prefixed(value_json.as_bytes()),
+                "execution_epoch": epoch,
+            }),
+        )?;
+        self.checkpoint_now()?;
+        Ok(epoch)
+    }
+
+    /// Converts only exact task-pinned schemas visible under the current permission decision into
+    /// model-context evidence. This is the sole Controller bridge into
+    /// `ContextPacketInput::authorized_tool_schemas`; provider-native tool calls remain disabled.
+    ///
+    /// # Errors
+    /// Fails closed for malformed schema/manifest identities or invalid active authority.
+    pub fn authorized_tool_schema_evidence(
+        &self,
+        task_id: &str,
+        schemas: &[ToolSchemaV1],
+        manifests: &[ToolManifest],
+    ) -> Result<Vec<EvidenceItem>, ControllerError> {
+        let task = self
+            .active_ref()?
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        let task_tools = required_array(&task.task, "/tools")?;
+        let mut decisions = Vec::new();
+        for manifest in manifests {
+            let pinned = task_tools.iter().any(|tool| {
+                required_str(tool, "/id").ok() == Some(manifest.tool_id.as_str())
+                    && required_str(tool, "/version").ok() == Some(manifest.version.as_str())
+                    && required_str(tool, "/digest").ok() == Some(manifest.content_digest.as_str())
+            });
+            if pinned {
+                decisions.push(self.permission_decision_for_task(task_id, manifest)?);
+            }
+        }
+        let visible = filter_authorized_tool_schemas(schemas, manifests, &decisions)?;
+        visible
+            .into_iter()
+            .map(|schema| {
+                let required_capabilities = schema
+                    .required_capabilities
+                    .iter()
+                    .map(Capability::as_plan_ir_str)
+                    .collect::<Vec<_>>();
+                let text = serde_json::to_string(&json!({
+                    "schema": "ToolSchemaV1",
+                    "tool_id": schema.tool_id,
+                    "version": schema.version,
+                    "content_digest": schema.content_digest,
+                    "name": schema.name,
+                    "description": schema.description,
+                    "input_schema": schema.input_schema,
+                    "required_capabilities": required_capabilities,
+                }))?;
+                Ok(EvidenceItem::new(
+                    format!(
+                        "tool-schema:{}:{}:{}",
+                        schema.tool_id,
+                        schema.version,
+                        digest_fragment(&schema.content_digest, 24)
+                    ),
+                    PacketSection::ToolEvidence,
+                    ContextLevel::C1,
+                    EvidenceKind::ToolSchema,
+                    format!("tool://{}@{}/schema", schema.tool_id, schema.version),
+                    schema.content_digest.clone(),
+                    "controller_authorized_tool_schema_v1",
+                    TrustClass::Tool,
+                    "exact task-pinned tool schema allowed by the effective permission decision",
+                    text,
+                ))
+            })
+            .collect()
     }
 
     #[must_use]
@@ -2493,6 +2711,7 @@ impl Controller {
             attempts: BTreeMap::new(),
         });
         self.persist_all_runtime()?;
+        self.persist_default_task_capability_grants()?;
         let revision_key = revision_record_key(&plan_id, revision);
         self.state.put_state(
             "controller.compilation_evidence",
@@ -2832,13 +3051,34 @@ impl Controller {
                 scope_counter_json,
             ),
         ];
+        let mut task_capability_grant_values = BTreeMap::new();
         for (task_id, runtime) in &next_active.tasks {
             records.push((
                 "controller.task".to_owned(),
                 revision_scoped_key(&previous_plan_id, next_revision, task_id),
                 serde_json::to_string(runtime)?,
             ));
+            let grant = TaskCapabilityGrant {
+                plan_id: previous_plan_id.clone(),
+                plan_revision: next_revision,
+                task_id: task_id.clone(),
+                task_contract_digest: runtime.task_contract_digest.clone(),
+                policy_digest: next_active.policy_digest.clone(),
+                issued_by: self.permission_context.persisted_grant_issuer.clone(),
+                capabilities: self.permission_context.persisted_grant_capabilities(),
+            };
+            grant.validate()?;
+            let persisted_grant = PersistedTaskCapabilityGrantV1::from_grant(&grant);
+            task_capability_grant_values
+                .insert(task_id.clone(), serde_json::to_value(&persisted_grant)?);
+            records.push((
+                TASK_CAPABILITY_GRANT_NAMESPACE.to_owned(),
+                revision_scoped_key(&previous_plan_id, next_revision, task_id),
+                serde_json::to_string(&persisted_grant)?,
+            ));
         }
+        let task_capability_grant_map_digest =
+            digest_json(&serde_json::to_value(&task_capability_grant_values)?)?;
         records.extend(lineage_records_for_supersession(
             &self.state,
             &previous_active,
@@ -2855,6 +3095,7 @@ impl Controller {
             "carry_proof_digest": carry_proof_digest,
             "task_runtime_map_digest": task_runtime_map_digest,
             "attempt_runtime_map_digest": attempt_runtime_map_digest,
+            "task_capability_grant_map_digest": task_capability_grant_map_digest,
             "execution_epoch": epoch,
             "repository_snapshot_digest": current_snapshot_digest,
             "baseline_diff_digest": next_active.baseline_diff_digest,
@@ -2913,6 +3154,7 @@ impl Controller {
         registry: &ProjectRegistry,
         task_id: &str,
         inputs: ReadinessInputs<'_>,
+        tool_manifest: &ToolManifest,
     ) -> Result<ReadyLease, ControllerError> {
         self.require_execution_not_paused()?;
         self.require_current_baseline(registry)?;
@@ -2920,7 +3162,13 @@ impl Controller {
         if self.task_state(task_id) == Some(TaskState::DeferredResource) {
             self.restore_resource_deferred_task(task_id, TaskState::Planned)?;
         }
-        self.derive_ready_lease_for_state(registry, task_id, inputs, TaskState::Planned)
+        self.derive_ready_lease_for_state(
+            registry,
+            task_id,
+            inputs,
+            TaskState::Planned,
+            tool_manifest,
+        )
     }
 
     fn derive_ready_lease_for_state(
@@ -2929,6 +3177,7 @@ impl Controller {
         task_id: &str,
         inputs: ReadinessInputs<'_>,
         eligible_state: TaskState,
+        tool_manifest: &ToolManifest,
     ) -> Result<ReadyLease, ControllerError> {
         let epoch = self.state.current_execution_epoch()?;
         let (plan_id, revision, plan_digest, task_digest, task_value, validity) = {
@@ -2957,7 +3206,19 @@ impl Controller {
         let baseline_digest = snapshot_digest(&self.task_execution_snapshot(registry, task_id)?)?;
         let evidence_binding_digest =
             self.resolve_readiness_evidence_digest(registry, task_id, &task_value)?;
-        let permission_digest = self.effective_permission_digest(&task_value)?;
+        let permission_decision = self.permission_decision_for_task(task_id, tool_manifest)?;
+        if !permission_decision
+            .effective
+            .contains(PermissionClass::RepositoryWrite)
+            || !permission_decision
+                .effective
+                .contains(PermissionClass::ProcessExec)
+        {
+            return Err(ControllerError::NotReady(
+                "effective permission intersection denies repository mutation/process execution"
+                    .to_owned(),
+            ));
+        }
         let resource_lease = match self.resource_governor.acquire(
             format!("ready:{plan_id}:{task_id}:{epoch}"),
             HeavyLeaseClass::Model,
@@ -2988,7 +3249,7 @@ impl Controller {
             checkpoint_generation,
             checkpoint_action_sequence,
             checkpoint_hash,
-            permission_digest,
+            permission_decision,
             resource_digest,
             execution_epoch: epoch,
             resource_lease,
@@ -3003,6 +3264,7 @@ impl Controller {
         registry: &ProjectRegistry,
         task_id: &str,
         inputs: ReadinessInputs<'_>,
+        tool_manifest: &ToolManifest,
     ) -> Result<ReadyLease, ControllerError> {
         self.require_execution_not_paused()?;
         self.require_current_baseline(registry)?;
@@ -3035,7 +3297,13 @@ impl Controller {
                 )));
             }
         }
-        self.derive_ready_lease_for_state(registry, task_id, inputs, TaskState::RepairPending)
+        self.derive_ready_lease_for_state(
+            registry,
+            task_id,
+            inputs,
+            TaskState::RepairPending,
+            tool_manifest,
+        )
     }
 
     fn restore_resource_deferred_task(
@@ -3178,6 +3446,7 @@ impl Controller {
         task_id: &str,
         runtime: &ExecutionRuntime<'_, I>,
         base_context: &ContextPacket,
+        tool_schemas: &[ToolSchemaV1],
         readiness: ReadinessInputs<'_>,
         model_budget: &mut ModelCallBudget,
     ) -> Result<(ExecutionSuccess, RepairPacket), ControllerError> {
@@ -3266,16 +3535,26 @@ impl Controller {
         };
 
         let current_diff = self.task_execution_diff(runtime.registry, task_id)?;
+        // Never trust ToolSchema evidence carried by a caller-supplied ContextPacket. Repair
+        // re-derives the lane from typed schemas against the exact runtime manifest and current
+        // Controller permission decision, so generic EvidenceItem text cannot launder itself
+        // into model-visible tool authority.
+        let authorized_tool_schemas = self.authorized_tool_schema_evidence(
+            task_id,
+            tool_schemas,
+            std::slice::from_ref(runtime.tool_manifest),
+        )?;
         let mut candidates = base_context
             .items
             .iter()
             .filter(|item| {
-                matches!(
-                    item.section,
-                    PacketSection::DirectEvidence
-                        | PacketSection::RoutedExpansion
-                        | PacketSection::ToolEvidence
-                ) || item.kind == EvidenceKind::ToolSchema
+                item.kind != EvidenceKind::ToolSchema
+                    && matches!(
+                        item.section,
+                        PacketSection::DirectEvidence
+                            | PacketSection::RoutedExpansion
+                            | PacketSection::ToolEvidence
+                    )
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -3291,8 +3570,7 @@ impl Controller {
             .and_then(|raw| serde_json::from_str::<PersistedActionIntent>(&raw).ok())
             .map(|intent| format!("path:{}", intent.path));
         for item in &mut candidates {
-            if item.kind == EvidenceKind::ToolSchema
-                || failure.evidence_refs.contains(&item.evidence_id)
+            if failure.evidence_refs.contains(&item.evidence_id)
                 || implicated_path
                     .as_deref()
                     .is_some_and(|path| item.locator.as_deref() == Some(path))
@@ -3366,6 +3644,7 @@ impl Controller {
                     current_state: format!(
                         "plan={plan_id}; task={task_id}; attempts_started={attempts_started}; same_failure_count={same_failure_count}; repair_pending=true"
                     ),
+                    authorized_tool_schemas,
                     candidates,
                     output_schema: "Strict ModelProposalV1 JSON: schema_version=1, evidence_ids, and exactly one replace_literal action with repository_id, path, expected_source_digest, old_literal, new_literal, expected_occurrences=1. The Controller enforces the full JSON Schema out-of-band."
                         .to_owned(),
@@ -3417,7 +3696,8 @@ impl Controller {
         )?;
         self.checkpoint_now()?;
 
-        let mut lease = self.derive_repair_lease(runtime.registry, task_id, readiness)?;
+        let mut lease =
+            self.derive_repair_lease(runtime.registry, task_id, readiness, runtime.tool_manifest)?;
         let repair_origin = RepairAttemptOriginV1 {
             schema_version: 1,
             prior_attempt_id: failure.attempt_id.clone(),
@@ -3465,6 +3745,7 @@ impl Controller {
     /// # Errors
     /// Returns a fail-closed recovery/readiness error when the intent, baseline, retry budget,
     /// authority, or current repository content no longer matches.
+    #[allow(clippy::too_many_lines)]
     pub fn resume_recovered_replace<I: sovereign_policy::ExecutionIsolationBackend>(
         &mut self,
         prior_action_id: &str,
@@ -3556,9 +3837,14 @@ impl Controller {
                 "recovery attempt budget is exhausted".to_owned(),
             ));
         }
-        let mut lease = self.derive_ready_lease(runtime.registry, &intent.task_id, readiness)?;
+        let mut lease = self.derive_ready_lease(
+            runtime.registry,
+            &intent.task_id,
+            readiness,
+            runtime.tool_manifest,
+        )?;
         let result = (|| {
-            self.validate_ready_lease(&lease, runtime.registry)?;
+            self.validate_ready_lease(&lease, runtime.registry, runtime.tool_manifest)?;
             let attempt_id = self.start_attempt(&lease, runtime.registry)?;
             self.execute_validated_replace(&mut lease, runtime, &attempt_id, &validated)
         })();
@@ -3579,7 +3865,7 @@ impl Controller {
         model_budget: &mut ModelCallBudget,
         repair_origin: Option<&RepairAttemptOriginV1>,
     ) -> Result<ExecutionSuccess, ControllerError> {
-        self.validate_ready_lease(lease, runtime.registry)?;
+        self.validate_ready_lease(lease, runtime.registry, runtime.tool_manifest)?;
         let model_deadline_ms = self.task_model_deadline_ms(&lease.task_id)?;
         match self.consume_task_model_call(&lease.task_id, model_budget, model_deadline_ms) {
             Ok(()) => {}
@@ -3660,6 +3946,14 @@ impl Controller {
         validated: &ValidatedReplace,
     ) -> Result<ExecutionSuccess, ControllerError> {
         let execution_root = self.task_execution_root(&lease.task_id)?;
+        let permission_decision =
+            self.permission_decision_for_task(&lease.task_id, runtime.tool_manifest)?;
+        if permission_decision != lease.permission_decision {
+            return Err(ControllerError::NotReady(
+                "ready lease permission decision no longer matches exact runtime authority"
+                    .to_owned(),
+            ));
+        }
         let mut isolation_request = runtime.isolation_request.clone();
         isolation_request
             .repository_root
@@ -3675,11 +3969,11 @@ impl Controller {
         self.persist_action_intent(&action, validated, runtime.artifacts.root())?;
         {
             let mut journal = ActionJournal::new(&mut self.state);
-            journal.authorize(&action, runtime.tool_manifest)?;
+            journal.authorize(&action, runtime.tool_manifest, &permission_decision)?;
         }
         self.checkpoint_now()?;
         self.rebind_ready_checkpoint(lease)?;
-        self.validate_ready_lease(lease, runtime.registry)?;
+        self.validate_ready_lease(lease, runtime.registry, runtime.tool_manifest)?;
         let runner = ProcessRunner::new(runtime.command_policy, runtime.isolation_backend);
         let raw = {
             let mut journal = ActionJournal::new(&mut self.state);
@@ -3852,7 +4146,6 @@ impl Controller {
                 "hard dependencies are not succeeded in Controller-owned state".to_owned(),
             ));
         }
-        let _ = self.effective_permission_digest(task)?;
         let current_sequence = self.state.latest_journal_sequence()?;
         self.state
             .validate_checkpoint_integrity_floor(current_sequence)?;
@@ -3871,43 +4164,119 @@ impl Controller {
         Ok(())
     }
 
-    fn effective_permission_digest(&self, task: &Value) -> Result<String, ControllerError> {
-        if !self
-            .permission_context
-            .permits(PermissionClass::RepositoryWrite)
-            || !self
-                .permission_context
-                .permits(PermissionClass::ProcessExec)
-        {
-            return Err(ControllerError::NotReady(
-                "Controller/project/role/grant permission intersection denies repository mutation"
-                    .to_owned(),
-            ));
-        }
+    fn permission_decision_for_task(
+        &self,
+        task_id: &str,
+        manifest: &ToolManifest,
+    ) -> Result<PermissionDecision, ControllerError> {
+        manifest.validate()?;
         let active = self.active_ref()?;
-        let plan = &active.plan_document;
-        let global_permissions = required_array(plan, "/policy/capability_ceiling")?;
-        let task_permissions = required_array(task, "/permissions")?;
-        let global_repo_write = global_permissions
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+
+        let pinned_tool = required_array(&task.task, "/tools")?
             .iter()
-            .any(|permission| permission.as_str() == Some("repo_write"));
-        let task_repo_write = task_permissions
-            .iter()
-            .any(|permission| permission.as_str() == Some("repo_write"));
-        if !global_repo_write || !task_repo_write {
-            return Err(ControllerError::NotReady(
-                "Plan/task capability ceiling does not authorize repository mutation".to_owned(),
-            ));
-        }
-        let tool = required_array(task, "/tools")?
-            .first()
-            .ok_or_else(|| ControllerError::InvalidPlan("task has no pinned tool".to_owned()))?;
-        Ok(digest_json(&json!({
-            "controller_context": self.permission_context.digest(),
-            "global_capability_ceiling": global_permissions,
-            "task_permissions": task_permissions,
-            "pinned_tool": tool,
-        }))?)
+            .find(|tool| {
+                required_str(tool, "/id").ok() == Some(manifest.tool_id.as_str())
+                    && required_str(tool, "/version").ok() == Some(manifest.version.as_str())
+                    && required_str(tool, "/digest").ok() == Some(manifest.content_digest.as_str())
+            })
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "runtime tool manifest is not an exact active-task tool pin".to_owned(),
+                )
+            })?;
+        let tool_id = required_str(pinned_tool, "/id")?;
+        let tool_version = required_str(pinned_tool, "/version")?;
+        let tool_digest = required_str(pinned_tool, "/digest")?;
+
+        let role_pin = task
+            .task
+            .pointer("/role")
+            .ok_or_else(|| ControllerError::InvalidPlan("task role pin missing".to_owned()))?;
+        let role_registry = RoleRegistry::canonical();
+        let role_profile = role_registry.resolve_pin(
+            required_str(role_pin, "/id")?,
+            required_str(role_pin, "/version")?,
+            required_str(role_pin, "/digest")?,
+        )?;
+        let canonical_role_ceiling = role_profile.capability_ceiling();
+        let role = self
+            .permission_context
+            .role_capabilities()
+            .intersection(&canonical_role_ceiling);
+
+        let global_requested = capability_set_from_json_array(required_array(
+            &active.plan_document,
+            "/policy/capability_ceiling",
+        )?)?;
+        let global = self
+            .permission_context
+            .controller_capabilities()
+            .intersection(&global_requested);
+        let task_requested =
+            capability_set_from_json_array(required_array(&task.task, "/permissions")?)?;
+        let tool = CapabilitySet::new(manifest.permission_ceiling.iter().copied());
+        let grant = self.load_task_capability_grant(active, task_id, task)?;
+        let persisted_user = grant.capabilities_for_scope(
+            &active.plan_id,
+            active.revision,
+            task_id,
+            &task.task_contract_digest,
+            &active.policy_digest,
+        )?;
+        let user = self
+            .permission_context
+            .persisted_grant_capabilities()
+            .intersection(persisted_user);
+
+        Ok(PermissionDecision::new(
+            active.plan_id.clone(),
+            active.revision,
+            task_id.to_owned(),
+            task.task_contract_digest.clone(),
+            active.policy_digest.clone(),
+            tool_id.to_owned(),
+            tool_version.to_owned(),
+            tool_digest.to_owned(),
+            CapabilityLayers {
+                global,
+                project: self.permission_context.project_capabilities(),
+                task: task_requested,
+                role,
+                tool,
+                user,
+            },
+        )?)
+    }
+
+    fn load_task_capability_grant(
+        &self,
+        active: &ActivePlan,
+        task_id: &str,
+        task: &TaskRuntime,
+    ) -> Result<TaskCapabilityGrant, ControllerError> {
+        let key = revision_scoped_key(&active.plan_id, active.revision, task_id);
+        let raw = self
+            .state
+            .get_state(TASK_CAPABILITY_GRANT_NAMESPACE, &key)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "task {task_id} lacks an exact persisted capability grant"
+                ))
+            })?;
+        let persisted: PersistedTaskCapabilityGrantV1 = serde_json::from_str(&raw)?;
+        let grant = persisted.into_grant()?;
+        grant.capabilities_for_scope(
+            &active.plan_id,
+            active.revision,
+            task_id,
+            &task.task_contract_digest,
+            &active.policy_digest,
+        )?;
+        Ok(grant)
     }
 
     fn validate_exact_context_evidence(
@@ -4538,11 +4907,14 @@ impl Controller {
         &mut self,
         lease: &ReadyLease,
         registry: &ProjectRegistry,
+        tool_manifest: &ToolManifest,
     ) -> Result<(), ControllerError> {
         self.require_execution_not_paused()?;
         self.require_current_baseline(registry)?;
         let execution_baseline_digest =
             snapshot_digest(&self.task_execution_snapshot(registry, &lease.task_id)?)?;
+        let current_permission_decision =
+            self.permission_decision_for_task(&lease.task_id, tool_manifest)?;
         let active = self.active_ref()?;
         if active.validity != PlanValidity::Current
             || active.plan_id != lease.plan_id
@@ -4572,7 +4944,7 @@ impl Controller {
         if generation != lease.checkpoint_generation
             || action_sequence != lease.checkpoint_action_sequence
             || checkpoint_hash != lease.checkpoint_hash
-            || self.effective_permission_digest(&task.task)? != lease.permission_digest
+            || current_permission_decision != lease.permission_decision
             || current_evidence_binding != lease.evidence_binding_digest
         {
             return Err(ControllerError::NotReady(
@@ -4804,15 +5176,13 @@ impl Controller {
             .tasks
             .get(&lease.task_id)
             .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?;
-        let tool = required_array(&task.task, "/tools")?
-            .first()
-            .ok_or_else(|| ControllerError::InvalidPlan("task has no pinned tool".to_owned()))?;
-        let tool_id = required_str(tool, "/id")?;
-        let tool_version = required_str(tool, "/version")?;
-        let tool_digest = required_str(tool, "/digest")?;
-        if manifest.tool_id != tool_id
-            || manifest.version != tool_version
-            || manifest.content_digest != tool_digest
+        let decision = &lease.permission_decision;
+        decision.validate()?;
+        if decision.task_id != lease.task_id
+            || decision.task_contract_digest != task.task_contract_digest
+            || manifest.tool_id != decision.tool_id
+            || manifest.version != decision.tool_version
+            || manifest.content_digest != decision.tool_digest
             || !manifest
                 .permission_ceiling
                 .contains(&PermissionClass::RepositoryWrite)
@@ -4863,15 +5233,16 @@ impl Controller {
             plan_revision: active.revision,
             task_id: lease.task_id.clone(),
             attempt_id: attempt_id.to_owned(),
-            tool_id: tool_id.to_owned(),
-            tool_version: tool_version.to_owned(),
-            tool_digest: tool_digest.to_owned(),
+            tool_id: decision.tool_id.clone(),
+            tool_version: decision.tool_version.clone(),
+            tool_digest: decision.tool_digest.clone(),
             executable_digest: python.sha256.clone(),
             repository_id: active.repository_id.clone(),
             destination_digest: Some(validated.proposal.expected_source_digest.clone()),
             permission_class: PermissionClass::RepositoryWrite,
             execution_epoch: lease.execution_epoch,
             policy_digest: active.policy_digest.clone(),
+            permission_decision_digest: lease.permission_decision.digest(),
             isolation_policy_digest: isolation_request.digest()?,
             nonce: format!("nonce.{}", &action_seed[27..47]),
             expires_at_ms: unix_millis()?.saturating_add(60_000),
@@ -6369,6 +6740,7 @@ impl Controller {
             "controller.repair_packet",
             "controller.change_set",
             "controller.worktree_conflict",
+            TASK_CAPABILITY_GRANT_NAMESPACE,
         ] {
             for record in self.state.state_records(namespace)? {
                 if namespace != "controller.action_intent"
@@ -6506,6 +6878,80 @@ impl Controller {
             let key = active_scoped_key(self.active_ref()?, &attempt_id);
             self.state.put_state("controller.attempt", &key, &value)?;
         }
+        Ok(())
+    }
+
+    fn persist_default_task_capability_grants(&mut self) -> Result<(), ControllerError> {
+        let configured = self.permission_context.persisted_grant_capabilities();
+        let issuer = self.permission_context.persisted_grant_issuer.clone();
+        let (plan_id, plan_revision, policy_digest, task_scopes) = {
+            let active = self.active_ref()?;
+            (
+                active.plan_id.clone(),
+                active.revision,
+                active.policy_digest.clone(),
+                active
+                    .tasks
+                    .iter()
+                    .map(|(task_id, task)| (task_id.clone(), task.task_contract_digest.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mut records = Vec::with_capacity(task_scopes.len());
+        for (task_id, task_contract_digest) in &task_scopes {
+            let grant = TaskCapabilityGrant {
+                plan_id: plan_id.clone(),
+                plan_revision,
+                task_id: task_id.clone(),
+                task_contract_digest: task_contract_digest.clone(),
+                policy_digest: policy_digest.clone(),
+                issued_by: issuer.clone(),
+                capabilities: configured.clone(),
+            };
+            grant.validate()?;
+            let key = revision_scoped_key(&plan_id, plan_revision, task_id);
+            records.push((
+                key,
+                serde_json::to_string(&PersistedTaskCapabilityGrantV1::from_grant(&grant))?,
+            ));
+        }
+        let payload = json!({
+            "plan_id": plan_id,
+            "plan_revision": plan_revision,
+            "policy_digest": policy_digest,
+            "issuer": issuer,
+            "task_ids": task_scopes.iter().map(|(task_id, _)| task_id).collect::<Vec<_>>(),
+            "configured_user_ceiling_digest": configured.digest(),
+        });
+        let payload_json = serde_json::to_string(&payload)?;
+        let seed = sha256_prefixed(
+            format!(
+                "task_capability_grants_materialized\0{}\0{}\0{}",
+                plan_id,
+                self.state.latest_journal_sequence()?,
+                payload_json
+            )
+            .as_bytes(),
+        );
+        let event_id = format!("controller.{}", &seed[7..27]);
+        let updates = records
+            .iter()
+            .map(|(key, value_json)| StateRecordUpdate {
+                namespace: TASK_CAPABILITY_GRANT_NAMESPACE,
+                key,
+                value_json,
+            })
+            .collect::<Vec<_>>();
+        self.state.put_state_records_with_events(
+            &updates,
+            &[NewJournalEvent {
+                event_id: &event_id,
+                entity_type: "controller",
+                entity_id: &plan_id,
+                event_kind: "task_capability_grants_materialized",
+                payload_json: &payload_json,
+            }],
+        )?;
         Ok(())
     }
 
@@ -6936,11 +7382,17 @@ impl RecoveryManager {
                 .journal_after(trusted_checkpoint.action_sequence)?
                 .len()
         } else {
-            validate_post_checkpoint_runtime_correlation(
+            let replayed = validate_post_checkpoint_runtime_correlation(
                 &state,
                 &manifest,
                 trusted_checkpoint.action_sequence,
-            )?
+            )?;
+            validate_post_checkpoint_task_grant_correlation(
+                &state,
+                &manifest,
+                trusted_checkpoint.action_sequence,
+            )?;
+            replayed
         };
         validate_post_checkpoint_execution_control(
             &state,
@@ -7342,6 +7794,22 @@ fn validate_post_checkpoint_supersession(
             "N+1 task runtime map differs from activation event binding".to_owned(),
         ));
     }
+    let task_capability_grant_values = state
+        .state_records(TASK_CAPABILITY_GRANT_NAMESPACE)?
+        .into_iter()
+        .filter_map(|record| {
+            logical_key_for_revision(&record.key, active_plan_id, active_revision)
+                .map(|task_id| (task_id, record.value_json))
+        })
+        .map(|(task_id, raw)| Ok((task_id, serde_json::from_str::<Value>(&raw)?)))
+        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+    if digest_json(&serde_json::to_value(&task_capability_grant_values)?)?
+        != required_str(&payload, "/task_capability_grant_map_digest")?
+    {
+        return Err(ControllerError::InvalidPlan(
+            "N+1 task capability grants differ from activation event binding".to_owned(),
+        ));
+    }
     let attempt_values = state
         .state_records("controller.attempt")?
         .into_iter()
@@ -7497,6 +7965,59 @@ fn validate_post_checkpoint_runtime_correlation(
     }
     validate_post_checkpoint_baseline_correlation(state, manifest, &events)?;
     Ok(events.len())
+}
+
+fn validate_post_checkpoint_task_grant_correlation(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+) -> Result<(), ControllerError> {
+    let binding_prefix = format!("{TASK_CAPABILITY_GRANT_NAMESPACE}:");
+    let mut replayed = manifest
+        .evidence_binding_digests
+        .iter()
+        .filter_map(|(binding_key, digest)| {
+            binding_key
+                .strip_prefix(&binding_prefix)
+                .map(|key| (key.to_owned(), digest.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    for event in state.journal_after(checkpoint_sequence)? {
+        if event.entity_type != "controller" || event.event_kind != "task_capability_grant_changed"
+        {
+            continue;
+        }
+        if !key_belongs_to_revision(&event.entity_id, &manifest.plan_id, manifest.plan_revision) {
+            return Err(ControllerError::InvalidPlan(
+                "post-checkpoint capability grant event targets a different plan revision"
+                    .to_owned(),
+            ));
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        if required_str(&payload, "/plan_id")? != manifest.plan_id
+            || required_u32(&payload, "/plan_revision")? != manifest.plan_revision
+        {
+            return Err(ControllerError::InvalidPlan(
+                "post-checkpoint capability grant event scope is stale".to_owned(),
+            ));
+        }
+        let grant_digest = required_str(&payload, "/grant_digest")?;
+        replayed.insert(event.entity_id.clone(), grant_digest.to_owned());
+    }
+    let current = state
+        .state_records(TASK_CAPABILITY_GRANT_NAMESPACE)?
+        .into_iter()
+        .filter(|record| {
+            key_belongs_to_revision(&record.key, &manifest.plan_id, manifest.plan_revision)
+        })
+        .map(|record| (record.key, sha256_prefixed(record.value_json.as_bytes())))
+        .collect::<BTreeMap<_, _>>();
+    if replayed != current {
+        return Err(ControllerError::InvalidPlan(
+            "current task capability grants do not equal checkpoint plus journal replay".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_post_checkpoint_execution_control(
@@ -9129,12 +9650,40 @@ fn ready_lease_digest(lease: &ReadyLease) -> String {
             lease.checkpoint_generation,
             lease.checkpoint_action_sequence,
             lease.checkpoint_hash,
-            lease.permission_digest,
+            lease.permission_decision.digest(),
             lease.resource_digest,
             lease.execution_epoch,
         )
         .as_bytes(),
     )
+}
+
+fn capability_set_from_json_array(values: &[Value]) -> Result<CapabilitySet, ControllerError> {
+    let mut capabilities = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value.as_str().ok_or_else(|| {
+            ControllerError::InvalidPlan("capability must be a string".to_owned())
+        })?;
+        let capability = Capability::from_plan_ir_str(value).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!("unknown Plan IR capability {value}"))
+        })?;
+        capabilities.push(capability);
+    }
+    Ok(CapabilitySet::new(capabilities))
+}
+
+fn capability_set_from_strings<'a, I>(values: I) -> Result<CapabilitySet, ControllerError>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut capabilities = Vec::new();
+    for value in values {
+        let capability = Capability::from_plan_ir_str(value).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!("unknown Plan IR capability {value}"))
+        })?;
+        capabilities.push(capability);
+    }
+    Ok(CapabilitySet::new(capabilities))
 }
 
 fn digest_fragment(digest: &str, length: usize) -> &str {

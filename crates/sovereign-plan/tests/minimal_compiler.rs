@@ -69,6 +69,7 @@ fn focused_packet() -> ContextPacket {
                 task_contract: "Rename SettingsForm button Save to Apply without behavior changes."
                     .to_owned(),
                 current_state: "attempt=0; repository baseline is current".to_owned(),
+                authorized_tool_schemas: Vec::new(),
                 candidates: vec![source, test],
                 output_schema: "minimal-plan-proposal-v1".to_owned(),
             },
@@ -476,7 +477,10 @@ fn minimal_compiler_model_cannot_widen_permissions_or_replace_pins() {
     assert_eq!(task["role"], expected_role);
     assert_eq!(task["skills"][0], expected_skill);
     assert_eq!(task["tools"][0], expected_tool);
-    assert_eq!(task["permissions"], json!(["read", "repo_write"]));
+    assert_eq!(
+        task["permissions"],
+        json!(["read", "repo_write", "process_exec"])
+    );
 }
 
 #[test]
