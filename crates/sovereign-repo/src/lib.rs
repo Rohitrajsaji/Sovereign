@@ -6,6 +6,7 @@
 
 mod lexical;
 mod structural;
+mod worktree;
 
 pub use lexical::{
     IndexCalibration, IndexConfig, IndexResourceHealth, IndexSnapshot, LexicalHit, LexicalQuery,
@@ -15,6 +16,11 @@ pub use structural::{
     DependencyEdge, DependencyGraph, StructuralConfig, StructuralIndex, StructuralLookup,
     StructuralPathQueryResult, StructuralQueryResult, StructuralRefreshReport, StructuralRetriever,
     StructuralSnapshot, StructuralTelemetry, SymbolIndex, SymbolRecord,
+};
+pub use worktree::{
+    ChangeSet, ChangeSetCompositionInput, ChangeSetCompositionProvenance, ComposeChangeSetsOutcome,
+    CompositionConflictEvidence, UntrackedFileDelta, WorktreeBaseline, WorktreeFileContent,
+    WorktreeLease,
 };
 
 use serde::{Deserialize, Serialize};
@@ -56,6 +62,8 @@ pub enum RepoError {
         status: Option<i32>,
         stderr: String,
     },
+    UnsafeGitConfiguration(String),
+    InvalidWorktreeLease(String),
     Serialization(serde_json::Error),
 }
 
@@ -113,6 +121,15 @@ impl Display for RepoError {
                 "Git {operation} failed with status {status:?}: {}",
                 stderr.trim()
             ),
+            Self::UnsafeGitConfiguration(message) => {
+                write!(
+                    f,
+                    "unsafe Git configuration for controller worktree: {message}"
+                )
+            }
+            Self::InvalidWorktreeLease(message) => {
+                write!(f, "invalid controller worktree lease: {message}")
+            }
             Self::Serialization(error) => {
                 write!(f, "repository manifest serialization error: {error}")
             }
@@ -961,6 +978,7 @@ fn git_output(root: &Path, args: &[&str]) -> Result<Output, RepoError> {
         .env("PATH", path)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .args([
@@ -968,6 +986,10 @@ fn git_output(root: &Path, args: &[&str]) -> Result<Output, RepoError> {
             "core.hooksPath=/dev/null",
             "-c",
             "core.fsmonitor=false",
+            "-c",
+            "core.attributesFile=/dev/null",
+            "-c",
+            "submodule.recurse=false",
             "-c",
             "color.ui=false",
             "-c",

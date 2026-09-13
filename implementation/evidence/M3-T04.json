@@ -1,0 +1,197 @@
+{
+  "schema_version": 1,
+  "task_id": "M3-T04",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "78c2764bbafd9bab9f45b44a32e7e66c45069827",
+  "status": "completed",
+  "completed_at": "2026-09-13T13:58:14Z",
+  "verified_at": "2026-09-13T13:58:14Z",
+  "objective": "Create Controller-owned D3/D4 task worktrees without disturbing user changes and preserve reconstructible merge/conflict evidence.",
+  "interfaces": [
+    "WorktreeLease",
+    "ChangeSet"
+  ],
+  "dependency_closed_composition": {
+    "execution_view": "primary exact HEAD plus only verified transitive hard-dependency task-local ChangeSets",
+    "hard_dependency_authority": "task.dependencies[]",
+    "primary_mutation": false,
+    "unrelated_successful_tasks_composed": false,
+    "shared_ancestor_deduplication": "transitive dependency closure is deterministically ordered and deduplicated by task id",
+    "task_local_delta": "each ChangeSet is captured relative to the exact composed pre-task WorktreeBaseline rather than primary HEAD",
+    "t1_to_t2_proof": "worktree_mutating_t1_to_t2_composes_verified_upstream_and_readiness_uses_composed_view",
+    "join_proof": "worktree_join_composes_shared_ancestor_once_and_branch_local_deltas_deterministically",
+    "join_contract": "T4 sees base + T1 once + delta(T2 over T1) + delta(T3 over T1)",
+    "readiness": "D3/D4 readiness resolves against the exact composed execution view"
+  },
+  "change_set_reconstruction": {
+    "tracked_patch": "git diff --binary --full-index against composed index baseline",
+    "binary_tracked": "reconstructible",
+    "untracked": "preimage digest plus postimage bytes and mode are retained",
+    "binary_untracked": "reconstructible",
+    "proof": "worktree_composition_preserves_binary_untracked_and_join_deduplicates_shared_ancestor"
+  },
+  "conflict_contract": {
+    "behavior": "composition conflicts persist durable CompositionConflictEvidence/unmerged paths and block before task mutation",
+    "auto_resolve": false,
+    "discard_conflict_state": false,
+    "proofs": [
+      "worktree_join_conflict_is_evidence_and_never_auto_resolved",
+      "worktree_join_conflict_is_durable_and_blocks_before_mutation",
+      "worktree_change_set_preserves_unmerged_conflict_evidence"
+    ]
+  },
+  "lease_authority": {
+    "canonical_controller_root": "canonical(state.path().parent())/worktrees",
+    "exact_path_rule": "worktree_path == controller_root.join(lease_id)",
+    "lease_identity_binds": [
+      "repository_id",
+      "plan_id",
+      "plan_revision",
+      "task_id",
+      "task_contract_digest",
+      "primary_root",
+      "controller_root",
+      "worktree_path",
+      "primary HEAD",
+      "worktree HEAD",
+      "detached state",
+      "common Git directory"
+    ],
+    "controller_rederivation": "Controller independently rederives the worktree root from StateStore on normal use and recovery",
+    "old_revision_lease_authority": false,
+    "tamper_proofs": [
+      "controller_rederives_state_parent_worktree_root_and_rejects_path_root_tamper",
+      "recovery_manager_rejects_persisted_worktree_root_and_path_tamper",
+      "worktree_recovery_revalidates_exact_head_and_common_git_directory"
+    ]
+  },
+  "cross_revision_carry": {
+    "worktree_mode_freshness": "immutable TaskCarryExecutionProvenanceV1 derived from the task ChangeSet plus exact composed dependency ChangeSet set",
+    "non_worktree_freshness": "primary source fingerprints remain authoritative for non-D3/D4 carry",
+    "nonempty_changed_source_regression": true,
+    "historical_change_set": "may be replayed only through explicit CarriedChangeSetProvenanceV1",
+    "fresh_n_plus_one_lease_required": true,
+    "old_lease_cleared": true,
+    "fabricated_n_plus_one_verification": false,
+    "historical_verification_retained": true,
+    "durable_change_set_binding": "runtime ChangeSet serialization must equal exact revision-scoped controller.change_set bytes; runtime artifact digest must equal SHA-256 of those durable bytes and artifact metadata must exist",
+    "proofs": [
+      "d3_carried_n_changeset_composes_into_fresh_n_plus_one_lease_and_authorizes_downstream",
+      "dependent_carry_requires_upstream_to_actually_carry_into_n_plus_one",
+      "n_plus_one_dependency_consumes_carried_output_through_explicit_old_revision_provenance",
+      "dependency_binding_same_plan_revision_is_never_cross_revision_carry_authority"
+    ]
+  },
+  "action_intent_compatibility": {
+    "current_schema_version": 3,
+    "legacy_schema_version": 2,
+    "v3_d3_d4_semantics": "Controller-owned worktree execution and verification only",
+    "legacy_v2_semantics": "historical primary-root execution only",
+    "legacy_v2_normalization_grants_worktree_authority": false,
+    "true_interrupted_fixture": "checkpoint-bound committed v2 action with task and attempt Verifying and effect already materialized on primary",
+    "recovery_path": "RecoveryManager queues/runs deterministic committed-action verification against primary for genuine v2",
+    "legacy_success_synthesizes_worktree_lease": false,
+    "legacy_success_synthesizes_change_set": false,
+    "legacy_success_synthesizes_carry_provenance": false,
+    "forged_v2_worktree_fields": "rejected",
+    "proofs": [
+      "recovery_migrates_genuine_v2_action_intent_without_granting_worktree_authority",
+      "committed_v2_action_intent_recovers_as_primary_only_and_cannot_gain_worktree_authority"
+    ]
+  },
+  "git_and_primary_security": {
+    "primary_reset_or_clean": false,
+    "primary_auto_merge_or_advance": false,
+    "forbidden_runtime_git_subcommands_found": [],
+    "forbidden_runtime_git_subcommands_reviewed": [
+      "fetch",
+      "pull",
+      "push",
+      "reset",
+      "clean",
+      "prune"
+    ],
+    "force_worktree_remove": "only exact lease-derived Controller worktree path after binding validation",
+    "checkout_hardening": [
+      "system/global Git config disabled",
+      "hooks disabled",
+      "fsmonitor disabled",
+      "terminal prompts disabled",
+      "filters clean/smudge/process/required rejected",
+      "include/includeIf rejected",
+      "LFS/filter attributes rejected",
+      "promisor/partialClone rejected",
+      "common Git directory validated",
+      "exact detached HEAD validated"
+    ],
+    "dirty_primary_proof": "worktree_dirty_primary_is_byte_for_byte_protected_and_cleanup_is_owned"
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-repo --offline",
+      "result": "passed",
+      "detail": "37 tests passed including worktree 8/8"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-controller --offline",
+      "result": "passed",
+      "detail": "15 lib + 30 t07 passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-eval --test crash_resume --offline",
+      "result": "passed",
+      "detail": "22/22"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-eval --test m3_scenario_gate --offline",
+      "result": "passed",
+      "detail": "7/7"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test --workspace --offline",
+      "result": "passed",
+      "detail": "durably recorded exact pre-evidence T04 dirty-tree run exited 0; closure-boundary rerun follows evidence/BUILD_STATE mutation"
+    }
+  ],
+  "independent_audit": {
+    "worker": "worker-24",
+    "result": "CLOSABLE",
+    "blockers": [],
+    "notes": "Fresh whole-tree exact-live-tree read-only audit independently traced the frozen T04 contract plus later composition/carry/root/recovery corrections and reran focused/full/static gates; no blocker remained."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429"
+  },
+  "source_hashes": {
+    "crates/sovereign-controller/src/lib.rs": "sha256:86a5859dc24293a1b172d88e766211e8c7a5ea94f2f7fce3d2c0c0293373d764",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:1ebf8d16b46d245a1d6f49e5e9f1dc259f903b74e5c4d174d807ddf39c5b98d2",
+    "crates/sovereign-repo/src/lib.rs": "sha256:333c3be6b588cfe4413d9be74a5e4e29fc8a389db3685c6efe20a5c399218b19",
+    "crates/sovereign-repo/src/worktree.rs": "sha256:e50fe68f0bddd463a8868640677b2aa86393340ad19d6d47f3eb8e05da470161",
+    "crates/sovereign-repo/tests/worktree.rs": "sha256:5f8f945049966bc3ae0f978f283bf01d3eb95d19f0e30fa328894d704fbc24a5",
+    "crates/sovereign-eval/tests/m3_scenario_gate.rs": "sha256:9ad0a83e437a846a996298667d182c666015cc240c5e42f890decd05fb97afaf"
+  },
+  "network_runtime_dependency": false
+}

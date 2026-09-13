@@ -26,7 +26,9 @@ use sovereign_policy::{
     ResourceLease,
 };
 use sovereign_repo::{
-    ExactRetriever, ProjectRegistry, RepoError, RepositoryIntelligence, RepositorySnapshot,
+    ChangeSet, ChangeSetCompositionInput, ComposeChangeSetsOutcome, CompositionConflictEvidence,
+    ExactDiffEvidence, ExactFileEvidence, ExactRetriever, ProjectRegistry, RepoError,
+    RepositoryIntelligence, RepositorySnapshot, WorktreeBaseline, WorktreeLease,
 };
 use sovereign_state::{
     CheckpointIntegrityRecord, JournalEvent, NewCheckpointIntegrityRecord, NewJournalEvent,
@@ -56,7 +58,8 @@ pub const CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const RECOVERY_PROCESS_LEASE_SCHEMA_VERSION: u32 = 1;
 pub const EXECUTION_CONTROL_SCHEMA_VERSION: u32 = 1;
 pub const GOAL_INTENT_SCHEMA_VERSION: u32 = 1;
-const ACTION_INTENT_SCHEMA_VERSION: u32 = 2;
+const LEGACY_ACTION_INTENT_SCHEMA_VERSION: u32 = 2;
+const ACTION_INTENT_SCHEMA_VERSION: u32 = 3;
 const MAX_PROPOSAL_EVIDENCE_IDS: usize = 16;
 const MAX_PROPOSAL_EVIDENCE_ID_BYTES: usize = 512;
 const ATOMIC_REPLACE_HELPER: &str = r"import hashlib, os, pathlib, sys
@@ -695,6 +698,8 @@ struct VerifiedOutputBindingV1 {
     verification_artifact_digest: String,
     repository_snapshot_digest: String,
     #[serde(default)]
+    change_set_digest: Option<String>,
+    #[serde(default)]
     carried_from_plan_revision: Option<u32>,
     #[serde(default)]
     carried_from_plan_digest: Option<String>,
@@ -712,9 +717,17 @@ struct TaskCarryFingerprintV1 {
     dependency_contract_digest: String,
     instruction_fingerprint_digest: String,
     source_fingerprints: BTreeMap<String, String>,
+    #[serde(default)]
+    execution_provenance: Option<TaskCarryExecutionProvenanceV1>,
     acceptance_contract_digest: String,
     verification_id: String,
     verification_artifact_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TaskCarryExecutionProvenanceV1 {
+    change_set_digest: String,
+    composed_change_sets: Vec<ComposedChangeSetBindingV1>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -730,8 +743,46 @@ struct TaskRuntime {
     resource_retry_exhausted: bool,
     #[serde(default)]
     resource_deferred_from: Option<TaskState>,
+    #[serde(default)]
+    worktree_lease: Option<WorktreeLease>,
+    #[serde(default)]
+    worktree_state: Option<WorktreeLifecycle>,
+    #[serde(default)]
+    change_set: Option<ChangeSet>,
+    #[serde(default)]
+    change_set_artifact_digest: Option<String>,
+    #[serde(default)]
+    change_set_carry: Option<CarriedChangeSetProvenanceV1>,
+    #[serde(default)]
+    worktree_baseline: Option<WorktreeBaseline>,
+    #[serde(default)]
+    worktree_composition: Vec<ComposedChangeSetBindingV1>,
+    #[serde(default)]
+    worktree_conflict: Option<CompositionConflictEvidence>,
     task_contract_digest: String,
     task: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ComposedChangeSetBindingV1 {
+    task_id: String,
+    change_set_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CarriedChangeSetProvenanceV1 {
+    from_revision: u32,
+    to_revision: u32,
+    source_change_set_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorktreeLifecycle {
+    Prepared,
+    Materialized,
+    Conflict,
+    Released,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -861,6 +912,439 @@ impl Controller {
             .tasks
             .get(task_id)
             .map(|task| task.task_contract_digest.as_str())
+    }
+
+    #[must_use]
+    pub fn task_worktree_lease(&self, task_id: &str) -> Option<&WorktreeLease> {
+        self.active
+            .as_ref()?
+            .tasks
+            .get(task_id)?
+            .worktree_lease
+            .as_ref()
+    }
+
+    #[must_use]
+    pub fn task_change_set(&self, task_id: &str) -> Option<&ChangeSet> {
+        self.active
+            .as_ref()?
+            .tasks
+            .get(task_id)?
+            .change_set
+            .as_ref()
+    }
+
+    #[must_use]
+    pub fn task_worktree_conflict(&self, task_id: &str) -> Option<&CompositionConflictEvidence> {
+        self.active
+            .as_ref()?
+            .tasks
+            .get(task_id)?
+            .worktree_conflict
+            .as_ref()
+    }
+
+    fn controller_worktree_root(&self) -> Result<PathBuf, ControllerError> {
+        let parent = self.state.path().parent().ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "state database has no parent for controller worktrees".to_owned(),
+            )
+        })?;
+        let parent = parent.canonicalize()?;
+        let root = parent.join("worktrees");
+        if root.exists() {
+            Ok(root.canonicalize()?)
+        } else {
+            Ok(root)
+        }
+    }
+
+    fn validate_controller_worktree_lease_binding(
+        &self,
+        task_id: &str,
+        lease: &WorktreeLease,
+    ) -> Result<(), ControllerError> {
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        let expected_root = self.controller_worktree_root()?;
+        let expected_path = expected_root.join(&lease.lease_id);
+        if lease.plan_id != active.plan_id
+            || lease.plan_revision != active.revision
+            || lease.task_id != task_id
+            || lease.task_contract_digest != task.task_contract_digest
+            || lease.repository_id != active.repository_id
+            || lease.primary_root != active.repository_root
+            || lease.controller_root != expected_root
+            || lease.worktree_path != expected_path
+        {
+            return Err(ControllerError::NotReady(
+                "worktree lease is stale, path/root-tampered, or bound to another revision/task"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn ordered_upstream_change_sets(
+        &self,
+        task_id: &str,
+    ) -> Result<
+        (
+            Vec<ComposedChangeSetBindingV1>,
+            Vec<ChangeSetCompositionInput>,
+        ),
+        ControllerError,
+    > {
+        let active = self.active_ref()?;
+        let order = dependency_closure_order(&active.tasks, task_id)?;
+        let mut bindings = Vec::with_capacity(order.len());
+        let mut change_sets = Vec::with_capacity(order.len());
+        for upstream_task_id in order {
+            let upstream = active.tasks.get(&upstream_task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "composed dependency task {upstream_task_id} disappeared"
+                ))
+            })?;
+            if upstream.state != TaskState::Succeeded {
+                return Err(ControllerError::NotReady(format!(
+                    "composed dependency task {upstream_task_id} is not succeeded"
+                )));
+            }
+            let record_key = active_scoped_key(active, &upstream_task_id);
+            let change_set = validate_durable_change_set_binding(
+                &self.state,
+                &record_key,
+                &upstream_task_id,
+                upstream,
+            )?;
+            let change_set_digest = change_set.digest()?;
+            bindings.push(ComposedChangeSetBindingV1 {
+                task_id: upstream_task_id,
+                change_set_digest: change_set_digest.clone(),
+            });
+            let input = if let Some(carry) = upstream.change_set_carry.as_ref() {
+                if carry.from_revision != change_set.plan_revision
+                    || carry.to_revision != active.revision
+                    || carry.source_change_set_digest != change_set_digest
+                {
+                    return Err(ControllerError::NotReady(
+                        "carried ChangeSet provenance is stale or misbound".to_owned(),
+                    ));
+                }
+                ChangeSetCompositionInput::carried(
+                    change_set,
+                    carry.from_revision,
+                    carry.to_revision,
+                )?
+            } else {
+                if change_set.plan_revision != active.revision {
+                    return Err(ControllerError::NotReady(
+                        "historical ChangeSet lacks explicit carry provenance".to_owned(),
+                    ));
+                }
+                ChangeSetCompositionInput::current(change_set)
+            };
+            change_sets.push(input);
+        }
+        Ok((bindings, change_sets))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ensure_task_worktree(
+        &mut self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+    ) -> Result<(), ControllerError> {
+        if !self.active_uses_controller_worktrees()? {
+            return Ok(());
+        }
+        let (plan_id, plan_revision, task_contract_digest, repository_id, primary_root) = {
+            let active = self.active_ref()?;
+            let task = active
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+            (
+                active.plan_id.clone(),
+                active.revision,
+                task.task_contract_digest.clone(),
+                active.repository_id.clone(),
+                active.repository_root.clone(),
+            )
+        };
+        if self
+            .active_ref()?
+            .tasks
+            .get(task_id)
+            .and_then(|task| task.worktree_lease.as_ref())
+            .is_none()
+        {
+            let controller_root = self.controller_worktree_root()?;
+            let lease = registry.prepare_worktree_lease(
+                &repository_id,
+                &controller_root,
+                &plan_id,
+                plan_revision,
+                task_id,
+                &task_contract_digest,
+            )?;
+            if lease.primary_root != primary_root
+                || lease.controller_root != controller_root
+                || lease.worktree_path != controller_root.join(&lease.lease_id)
+            {
+                return Err(ControllerError::NotReady(
+                    "prepared worktree lease is not bound to the active repository/controller root"
+                        .to_owned(),
+                ));
+            }
+            {
+                let task = self
+                    .active_mut()?
+                    .tasks
+                    .get_mut(task_id)
+                    .ok_or_else(|| ControllerError::NotReady("task disappeared".to_owned()))?;
+                task.worktree_lease = Some(lease.clone());
+                task.worktree_state = Some(WorktreeLifecycle::Prepared);
+            }
+            self.persist_worktree_task_state(
+                task_id,
+                "worktree_lease_prepared",
+                &json!({"lease_id": lease.lease_id, "base_head": lease.base_head}),
+            )?;
+        }
+
+        let (lease, lifecycle) = {
+            let active = self.active_ref()?;
+            let task = active
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::NotReady("task disappeared".to_owned()))?;
+            let lease = task.worktree_lease.clone().ok_or_else(|| {
+                ControllerError::NotReady("D3/D4 task lost its worktree lease".to_owned())
+            })?;
+            (lease, task.worktree_state)
+        };
+        self.validate_controller_worktree_lease_binding(task_id, &lease)?;
+        let (expected_composition, upstream_change_sets) =
+            self.ordered_upstream_change_sets(task_id)?;
+        match lifecycle {
+            Some(WorktreeLifecycle::Prepared) => {
+                if lease.worktree_path.exists() {
+                    registry.validate_worktree_lease(&lease)?;
+                } else {
+                    registry.materialize_worktree(&lease)?;
+                }
+                match registry.compose_change_sets(&lease, &upstream_change_sets)? {
+                    ComposeChangeSetsOutcome::Ready(baseline) => {
+                        let task = self.active_mut()?.tasks.get_mut(task_id).ok_or_else(|| {
+                            ControllerError::NotReady("task disappeared".to_owned())
+                        })?;
+                        task.worktree_state = Some(WorktreeLifecycle::Materialized);
+                        task.worktree_baseline = Some(baseline.clone());
+                        task.worktree_composition.clone_from(&expected_composition);
+                        task.worktree_conflict = None;
+                        self.persist_worktree_task_state(
+                            task_id,
+                            "worktree_materialized",
+                            &json!({
+                                "lease_id": lease.lease_id,
+                                "path": lease.worktree_path,
+                                "baseline_digest": baseline.digest,
+                                "composition": expected_composition,
+                            }),
+                        )?;
+                    }
+                    ComposeChangeSetsOutcome::Conflict(conflict) => {
+                        let task = self.active_mut()?.tasks.get_mut(task_id).ok_or_else(|| {
+                            ControllerError::NotReady("task disappeared".to_owned())
+                        })?;
+                        task.worktree_state = Some(WorktreeLifecycle::Conflict);
+                        task.worktree_composition = expected_composition;
+                        task.worktree_conflict = Some(conflict.clone());
+                        self.persist_worktree_conflict(task_id, &conflict)?;
+                        return Err(ControllerError::NotReady(format!(
+                            "dependency ChangeSet composition conflict for task {task_id}"
+                        )));
+                    }
+                }
+            }
+            Some(WorktreeLifecycle::Materialized) => {
+                registry.validate_worktree_lease(&lease)?;
+                let task = self
+                    .active_ref()?
+                    .tasks
+                    .get(task_id)
+                    .ok_or_else(|| ControllerError::NotReady("task disappeared".to_owned()))?;
+                if task.worktree_baseline.is_none()
+                    || task.worktree_composition != expected_composition
+                    || task.worktree_conflict.is_some()
+                {
+                    return Err(ControllerError::NotReady(
+                        "materialized worktree composition/baseline binding is stale".to_owned(),
+                    ));
+                }
+            }
+            Some(WorktreeLifecycle::Conflict) => {
+                registry.validate_worktree_lease(&lease)?;
+                if self
+                    .active_ref()?
+                    .tasks
+                    .get(task_id)
+                    .and_then(|task| task.worktree_conflict.as_ref())
+                    .is_none()
+                {
+                    return Err(ControllerError::InvalidPlan(
+                        "conflicted worktree lost durable conflict evidence".to_owned(),
+                    ));
+                }
+                return Err(ControllerError::NotReady(
+                    "dependency ChangeSet composition remains conflicted".to_owned(),
+                ));
+            }
+            Some(WorktreeLifecycle::Released) => {
+                return Err(ControllerError::NotReady(
+                    "completed controller worktree lease cannot authorize another mutation"
+                        .to_owned(),
+                ));
+            }
+            None => {
+                return Err(ControllerError::NotReady(
+                    "D3/D4 worktree lifecycle is missing".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_worktree_conflict(
+        &mut self,
+        task_id: &str,
+        conflict: &CompositionConflictEvidence,
+    ) -> Result<(), ControllerError> {
+        let task_json =
+            serde_json::to_string(self.active_ref()?.tasks.get(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("worktree conflict task disappeared".to_owned())
+            })?)?;
+        let key = active_scoped_key(self.active_ref()?, task_id);
+        self.persist_runtime_records_with_events(
+            &[
+                ("controller.task".to_owned(), task_id.to_owned(), task_json),
+                (
+                    "controller.worktree_conflict".to_owned(),
+                    key,
+                    serde_json::to_string(conflict)?,
+                ),
+            ],
+            &[(
+                "worktree_composition_conflict".to_owned(),
+                task_id.to_owned(),
+                serde_json::to_value(conflict)?,
+            )],
+        )?;
+        self.checkpoint_now()?;
+        Ok(())
+    }
+
+    fn persist_worktree_task_state(
+        &mut self,
+        task_id: &str,
+        event_kind: &str,
+        payload: &Value,
+    ) -> Result<(), ControllerError> {
+        let task_json =
+            serde_json::to_string(self.active_ref()?.tasks.get(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("worktree task disappeared".to_owned())
+            })?)?;
+        self.persist_runtime_records_with_events(
+            &[("controller.task".to_owned(), task_id.to_owned(), task_json)],
+            &[(event_kind.to_owned(), task_id.to_owned(), payload.clone())],
+        )?;
+        self.checkpoint_now()?;
+        Ok(())
+    }
+
+    fn active_uses_controller_worktrees(&self) -> Result<bool, ControllerError> {
+        let mode = required_str(&self.active_ref()?.plan_document, "/depth/mode")?;
+        Ok(matches!(mode, "D3" | "D4"))
+    }
+
+    fn task_execution_lease(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<&WorktreeLease>, ControllerError> {
+        if !self.active_uses_controller_worktrees()? {
+            return Ok(None);
+        }
+        let task = self
+            .active_ref()?
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        if task.worktree_state != Some(WorktreeLifecycle::Materialized) {
+            return Err(ControllerError::NotReady(
+                "D3/D4 task worktree is not materialized".to_owned(),
+            ));
+        }
+        let lease = task
+            .worktree_lease
+            .as_ref()
+            .ok_or_else(|| ControllerError::NotReady("D3/D4 task lease is missing".to_owned()))?;
+        self.validate_controller_worktree_lease_binding(task_id, lease)?;
+        Ok(Some(lease))
+    }
+
+    fn task_execution_root(&self, task_id: &str) -> Result<PathBuf, ControllerError> {
+        self.task_execution_lease(task_id)?.map_or_else(
+            || {
+                self.active_ref()
+                    .map(|active| active.repository_root.clone())
+            },
+            |lease| Ok(lease.worktree_path.clone()),
+        )
+    }
+
+    fn task_execution_snapshot(
+        &self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+    ) -> Result<RepositorySnapshot, ControllerError> {
+        match self.task_execution_lease(task_id)? {
+            Some(lease) => Ok(registry.worktree_snapshot(lease)?),
+            None => Ok(registry.snapshot(&self.active_ref()?.repository_id)?),
+        }
+    }
+
+    fn task_execution_diff(
+        &self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+    ) -> Result<ExactDiffEvidence, ControllerError> {
+        match self.task_execution_lease(task_id)? {
+            Some(lease) => Ok(registry.worktree_diff(lease)?),
+            None => Ok(
+                ExactRetriever::new(registry).current_diff(&self.active_ref()?.repository_id)?
+            ),
+        }
+    }
+
+    fn task_execution_read(
+        &self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+        path: &Path,
+        expected_digest: Option<&str>,
+    ) -> Result<ExactFileEvidence, ControllerError> {
+        match self.task_execution_lease(task_id)? {
+            Some(lease) => Ok(registry.read_worktree_path(lease, path, expected_digest)?),
+            None => Ok(ExactRetriever::new(registry).read_path(
+                &self.active_ref()?.repository_id,
+                path,
+                expected_digest,
+            )?),
+        }
     }
 
     /// Returns the durable Controller-owned execution-control state.
@@ -1560,6 +2044,7 @@ impl Controller {
         selected_evidence_ids: &[String],
     ) -> Result<String, ControllerError> {
         self.require_current_baseline(registry)?;
+        self.ensure_task_worktree(registry, task_id)?;
         let (plan_id, plan_revision, plan_digest, task_contract_digest, requirement) = {
             let active = self.active_ref()?;
             let task = active
@@ -1600,11 +2085,20 @@ impl Controller {
             .collect::<Result<Vec<_>, _>>()?;
         let repository_id = self.active_ref()?.repository_id.clone();
         for item in &selected {
-            Self::validate_exact_context_evidence(registry, &repository_id, item)?;
-            validate_requirement_bound_evidence(registry, &repository_id, item, &probe)?;
+            self.validate_task_exact_context_evidence(registry, task_id, &repository_id, item)?;
+            self.validate_task_requirement_bound_evidence(
+                registry,
+                task_id,
+                &repository_id,
+                item,
+                &probe,
+            )?;
         }
-        validate_requirement_probe_cardinality(registry, &repository_id, &probe, &satisfaction)?;
-        let snapshot = registry.snapshot(&repository_id)?;
+        if satisfaction == "exactly_one" {
+            let ExactRequirementProbe::Path { path, .. } = &probe;
+            self.task_execution_read(registry, task_id, Path::new(path), None)?;
+        }
+        let snapshot = self.task_execution_snapshot(registry, task_id)?;
         let repository_snapshot_digest = snapshot_digest(&snapshot)?;
         let evidence_digests = selected
             .iter()
@@ -1747,6 +2241,14 @@ impl Controller {
                         resource_deferrals_used: 0,
                         resource_retry_exhausted: false,
                         resource_deferred_from: None,
+                        worktree_lease: None,
+                        worktree_state: None,
+                        change_set: None,
+                        change_set_artifact_digest: None,
+                        change_set_carry: None,
+                        worktree_baseline: None,
+                        worktree_composition: Vec::new(),
+                        worktree_conflict: None,
                         task_contract_digest,
                         task: task.clone(),
                     },
@@ -1865,7 +2367,6 @@ impl Controller {
             goal_id,
             repository_id,
             repository_root,
-            previous_tasks,
         ) = {
             let active = self.active_ref()?;
             if active.validity != PlanValidity::Invalidated {
@@ -1881,7 +2382,6 @@ impl Controller {
                 active.goal_id.clone(),
                 active.repository_id.clone(),
                 active.repository_root.clone(),
-                active.tasks.clone(),
             )
         };
         if required_str(&next_plan, "/plan_id")? != previous_plan_id
@@ -1954,6 +2454,8 @@ impl Controller {
             )));
         }
 
+        self.close_active_worktrees_for_supersession(registry)?;
+
         let previous_active = ActivePlan {
             plan_document: previous_plan.clone(),
             compiler_plan_digest: previous_plan_digest.clone(),
@@ -1969,7 +2471,7 @@ impl Controller {
             baseline_diff_digest: self.active_ref()?.baseline_diff_digest.clone(),
             baseline_diff_content: self.active_ref()?.baseline_diff_content.clone(),
             validity: PlanValidity::Invalidated,
-            tasks: previous_tasks,
+            tasks: self.active_ref()?.tasks.clone(),
             attempts: self.active_ref()?.attempts.clone(),
         };
         let runtime_build = build_superseding_runtime(
@@ -2215,6 +2717,7 @@ impl Controller {
     ) -> Result<ReadyLease, ControllerError> {
         self.require_execution_not_paused()?;
         self.require_current_baseline(registry)?;
+        self.ensure_task_worktree(registry, task_id)?;
         if self.task_state(task_id) == Some(TaskState::DeferredResource) {
             self.restore_resource_deferred_task(task_id, TaskState::Planned)?;
         }
@@ -2252,7 +2755,7 @@ impl Controller {
         self.check_task_readiness(task_id, &task_value, inputs, eligible_state)?;
         let (checkpoint_generation, checkpoint_action_sequence, checkpoint_hash) =
             self.current_checkpoint_binding()?;
-        let baseline_digest = snapshot_digest(&self.active_ref()?.baseline)?;
+        let baseline_digest = snapshot_digest(&self.task_execution_snapshot(registry, task_id)?)?;
         let evidence_binding_digest =
             self.resolve_readiness_evidence_digest(registry, task_id, &task_value)?;
         let permission_digest = self.effective_permission_digest(&task_value)?;
@@ -2304,6 +2807,7 @@ impl Controller {
     ) -> Result<ReadyLease, ControllerError> {
         self.require_execution_not_paused()?;
         self.require_current_baseline(registry)?;
+        self.ensure_task_worktree(registry, task_id)?;
         let (state, retry_exhausted, resource_retry_exhausted) = self
             .active_ref()?
             .tasks
@@ -2562,8 +3066,7 @@ impl Controller {
             )
         };
 
-        let current_diff = ExactRetriever::new(runtime.registry)
-            .current_diff(&self.active_ref()?.repository_id)?;
+        let current_diff = self.task_execution_diff(runtime.registry, task_id)?;
         let mut candidates = base_context
             .items
             .iter()
@@ -2788,12 +3291,16 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        let intent: PersistedActionIntent = serde_json::from_str(&raw)?;
-        if intent.schema_version != ACTION_INTENT_SCHEMA_VERSION {
-            return Err(ControllerError::NotReady(
-                "recovery action intent schema is unsupported".to_owned(),
-            ));
-        }
+        let raw_intent: PersistedActionIntent = serde_json::from_str(&raw)?;
+        let primary_root = runtime
+            .registry
+            .repository(&raw_intent.repository_id)
+            .ok_or_else(|| {
+                ControllerError::NotReady("recovery action repository is missing".to_owned())
+            })?
+            .root
+            .clone();
+        let intent = normalize_persisted_action_intent(raw_intent, &primary_root)?;
         let prior = self.state.action_record(prior_action_id)?.ok_or_else(|| {
             ControllerError::NotReady("recovery action record missing".to_owned())
         })?;
@@ -2950,7 +3457,19 @@ impl Controller {
         attempt_id: &str,
         validated: &ValidatedReplace,
     ) -> Result<ExecutionSuccess, ControllerError> {
-        let action = self.lower_replace_action(lease, attempt_id, validated, runtime)?;
+        let execution_root = self.task_execution_root(&lease.task_id)?;
+        let mut isolation_request = runtime.isolation_request.clone();
+        isolation_request
+            .repository_root
+            .clone_from(&execution_root);
+        let action = self.lower_replace_action(
+            lease,
+            attempt_id,
+            validated,
+            runtime,
+            &isolation_request,
+            &execution_root,
+        )?;
         self.persist_action_intent(&action, validated, runtime.artifacts.root())?;
         {
             let mut journal = ActionJournal::new(&mut self.state);
@@ -2962,12 +3481,7 @@ impl Controller {
         let runner = ProcessRunner::new(runtime.command_policy, runtime.isolation_backend);
         let raw = {
             let mut journal = ActionJournal::new(&mut self.state);
-            runner.run(
-                &mut journal,
-                &action,
-                runtime.isolation_request,
-                runtime.artifacts,
-            )
+            runner.run(&mut journal, &action, &isolation_request, runtime.artifacts)
         };
         let result = match raw {
             Ok(result) => result,
@@ -3068,9 +3582,14 @@ impl Controller {
             let _ = self.route_failure_record(failure)?;
             return Err(ControllerError::VerificationFailed(Box::new(verification)));
         }
+        self.persist_worktree_change_set_if_required(
+            runtime.registry,
+            &lease.task_id,
+            runtime.artifacts,
+        )?;
         self.record_verified_output_bindings(&verification, &artifact.digest)?;
         self.apply_verified_success(&verification)?;
-        self.refresh_baseline_after_verified_success(runtime.registry)?;
+        self.finalize_verified_repository_success(runtime.registry, &lease.task_id)?;
         let action_record = self
             .state
             .action_record(&action.action_id)?
@@ -3230,14 +3749,106 @@ impl Controller {
         Ok(())
     }
 
+    fn validate_task_exact_context_evidence(
+        &self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+        repository_id: &str,
+        item: &EvidenceItem,
+    ) -> Result<(), ControllerError> {
+        if item.repository_id.as_deref() != Some(repository_id) {
+            return Err(ControllerError::NotReady(
+                "evidence item repository does not match active repository".to_owned(),
+            ));
+        }
+        match item.kind {
+            EvidenceKind::SourceSlice | EvidenceKind::SearchHit | EvidenceKind::Instruction => {
+                let prefix = format!("repo://{repository_id}/");
+                let relative = item.source_uri.strip_prefix(&prefix).ok_or_else(|| {
+                    ControllerError::NotReady(
+                        "repository evidence lacks an exact repo:// source URI".to_owned(),
+                    )
+                })?;
+                let current = self.task_execution_read(
+                    registry,
+                    task_id,
+                    Path::new(relative),
+                    Some(&item.source_digest),
+                )?;
+                if sha256_prefixed(item.text.as_bytes()) != item.content_digest
+                    || current.digest != item.source_digest
+                {
+                    return Err(ControllerError::NotReady(
+                        "retained exact evidence digest is not current in composed execution view"
+                            .to_owned(),
+                    ));
+                }
+            }
+            EvidenceKind::Diff => {
+                let current = self.task_execution_diff(registry, task_id)?;
+                if current.digest != item.source_digest
+                    || sha256_prefixed(item.text.as_bytes()) != item.content_digest
+                {
+                    return Err(ControllerError::NotReady(
+                        "retained diff evidence is not current in composed execution view"
+                            .to_owned(),
+                    ));
+                }
+            }
+            _ => {
+                return Err(ControllerError::NotReady(
+                    "execution evidence must be exact current repository evidence".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_task_requirement_bound_evidence(
+        &self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+        repository_id: &str,
+        item: &EvidenceItem,
+        probe: &ExactRequirementProbe,
+    ) -> Result<(), ControllerError> {
+        let path = evidence_repo_relative_path(repository_id, item).ok_or_else(|| {
+            ControllerError::NotReady(
+                "requirement-bound exact evidence lacks a repository-relative source".to_owned(),
+            )
+        })?;
+        let ExactRequirementProbe::Path {
+            path: expected_path,
+            contains,
+        } = probe;
+        if path != expected_path {
+            return Err(ControllerError::NotReady(format!(
+                "selected evidence path {path} does not satisfy required exact path {expected_path}"
+            )));
+        }
+        let current = self.task_execution_read(
+            registry,
+            task_id,
+            Path::new(expected_path),
+            Some(&item.source_digest),
+        )?;
+        for literal in contains {
+            if !current.content.contains(literal) {
+                return Err(ControllerError::NotReady(format!(
+                    "selected exact evidence lacks required literal {literal:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn resolve_readiness_evidence_digest(
         &self,
         registry: &ProjectRegistry,
         task_id: &str,
         task: &Value,
     ) -> Result<String, ControllerError> {
-        let active = self.active_ref()?;
-        let current_snapshot = registry.snapshot(&active.repository_id)?;
+        let current_snapshot = self.task_execution_snapshot(registry, task_id)?;
         let current_snapshot_digest = snapshot_digest(&current_snapshot)?;
         let mut evidence_records = self.resolve_evidence_satisfaction_digests(
             registry,
@@ -3246,7 +3857,7 @@ impl Controller {
             &current_snapshot_digest,
         )?;
         let mut dependency_records =
-            self.resolve_dependency_binding_digests(task, &current_snapshot_digest)?;
+            self.resolve_dependency_binding_digests(task_id, task, &current_snapshot_digest)?;
         evidence_records.sort();
         dependency_records.sort();
         Ok(digest_json(&json!({
@@ -3336,9 +3947,15 @@ impl Controller {
                         "retained evidence {evidence_id} no longer matches its durable digest"
                     )));
                 }
-                Self::validate_exact_context_evidence(registry, &active.repository_id, &item)?;
-                validate_requirement_bound_evidence(
+                self.validate_task_exact_context_evidence(
                     registry,
+                    task_id,
+                    &active.repository_id,
+                    &item,
+                )?;
+                self.validate_task_requirement_bound_evidence(
+                    registry,
+                    task_id,
                     &active.repository_id,
                     &item,
                     &probe,
@@ -3351,6 +3968,7 @@ impl Controller {
 
     fn resolve_dependency_binding_digests(
         &self,
+        downstream_task_id: &str,
         task: &Value,
         current_snapshot_digest: &str,
     ) -> Result<Vec<String>, ControllerError> {
@@ -3377,6 +3995,7 @@ impl Controller {
                     upstream_task_id,
                     &upstream.task_contract_digest,
                     artifact_id,
+                    downstream_task_id,
                     current_snapshot_digest,
                 )?);
             }
@@ -3391,6 +4010,7 @@ impl Controller {
                     upstream_task_id,
                     &upstream.task_contract_digest,
                     criterion_id,
+                    downstream_task_id,
                     current_snapshot_digest,
                 )?);
             }
@@ -3458,6 +4078,7 @@ impl Controller {
         upstream_task_id: &str,
         upstream_task_contract_digest: &str,
         binding_id: &str,
+        downstream_task_id: &str,
         current_snapshot_digest: &str,
     ) -> Result<String, ControllerError> {
         let active = self.active_ref()?;
@@ -3490,7 +4111,6 @@ impl Controller {
             || record.task_contract_digest != upstream_task_contract_digest
             || record.binding_kind != expected_kind
             || record.binding_id != binding_id
-            || record.repository_snapshot_digest != current_snapshot_digest
         {
             return Err(ControllerError::NotReady(format!(
                 "verified dependency output binding {binding_id} is stale or misbound"
@@ -3563,7 +4183,80 @@ impl Controller {
                     "carried dependency output binding {binding_id} has invalid carry provenance"
                 )));
             }
-        } else if verification.post_snapshot_digest != current_snapshot_digest {
+            if self.active_uses_controller_worktrees()? {
+                let upstream = active.tasks.get(upstream_task_id).ok_or_else(|| {
+                    ControllerError::NotReady(format!(
+                        "carried dependency task {upstream_task_id} disappeared"
+                    ))
+                })?;
+                let change_set = upstream.change_set.as_ref().ok_or_else(|| {
+                    ControllerError::NotReady(format!(
+                        "carried dependency task {upstream_task_id} lost immutable ChangeSet"
+                    ))
+                })?;
+                let change_set_digest = change_set.digest()?;
+                let carried = upstream.change_set_carry.as_ref().ok_or_else(|| {
+                    ControllerError::NotReady(format!(
+                        "carried dependency task {upstream_task_id} lost explicit ChangeSet carry provenance"
+                    ))
+                })?;
+                let downstream = active.tasks.get(downstream_task_id).ok_or_else(|| {
+                    ControllerError::NotReady(format!(
+                        "downstream task {downstream_task_id} disappeared"
+                    ))
+                })?;
+                let composed = downstream.worktree_composition.iter().any(|binding| {
+                    binding.task_id == upstream_task_id
+                        && binding.change_set_digest == change_set_digest
+                });
+                if carried.from_revision != verification_revision
+                    || carried.to_revision != active.revision
+                    || carried.source_change_set_digest != change_set_digest
+                    || record.change_set_digest.as_deref() != Some(change_set_digest.as_str())
+                    || !composed
+                {
+                    return Err(ControllerError::NotReady(format!(
+                        "carried dependency output binding {binding_id} is not present in the exact composed ChangeSet view"
+                    )));
+                }
+            } else if record.repository_snapshot_digest != current_snapshot_digest {
+                return Err(ControllerError::NotReady(format!(
+                    "carried dependency output binding {binding_id} is stale for the current snapshot"
+                )));
+            }
+        } else if self.active_uses_controller_worktrees()? {
+            let upstream = active.tasks.get(upstream_task_id).ok_or_else(|| {
+                ControllerError::NotReady(format!("dependency task {upstream_task_id} disappeared"))
+            })?;
+            let upstream_change_set_digest = upstream
+                .change_set
+                .as_ref()
+                .ok_or_else(|| {
+                    ControllerError::NotReady(format!(
+                        "dependency task {upstream_task_id} lacks immutable ChangeSet"
+                    ))
+                })?
+                .digest()?;
+            let downstream = active.tasks.get(downstream_task_id).ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "downstream task {downstream_task_id} disappeared"
+                ))
+            })?;
+            let composed = downstream.worktree_composition.iter().any(|binding| {
+                binding.task_id == upstream_task_id
+                    && binding.change_set_digest == upstream_change_set_digest
+            });
+            if record.change_set_digest.as_deref() != Some(upstream_change_set_digest.as_str())
+                || verification.post_snapshot_digest != record.repository_snapshot_digest
+                || !composed
+            {
+                return Err(ControllerError::NotReady(format!(
+                    "verified dependency output binding {binding_id} is not present in the current composed execution view"
+                )));
+            }
+        } else if verification.post_snapshot_digest != current_snapshot_digest
+            || record.repository_snapshot_digest != current_snapshot_digest
+        {
             return Err(ControllerError::NotReady(format!(
                 "verified dependency output binding {binding_id} is stale for the current snapshot"
             )));
@@ -3637,6 +4330,8 @@ impl Controller {
     ) -> Result<(), ControllerError> {
         self.require_execution_not_paused()?;
         self.require_current_baseline(registry)?;
+        let execution_baseline_digest =
+            snapshot_digest(&self.task_execution_snapshot(registry, &lease.task_id)?)?;
         let active = self.active_ref()?;
         if active.validity != PlanValidity::Current
             || active.plan_id != lease.plan_id
@@ -3652,7 +4347,7 @@ impl Controller {
             .get(&lease.task_id)
             .ok_or_else(|| ControllerError::NotReady("ready task disappeared".to_owned()))?;
         if task.task_contract_digest != lease.task_contract_digest
-            || snapshot_digest(&active.baseline)? != lease.baseline_digest
+            || execution_baseline_digest != lease.baseline_digest
             || self.state.current_execution_epoch()? != lease.execution_epoch
             || ready_lease_digest(lease) != lease.lease_digest
         {
@@ -3852,9 +4547,9 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        let retriever = ExactRetriever::new(registry);
-        let source = retriever.read_path(
-            &action.repository_id,
+        let source = self.task_execution_read(
+            registry,
+            &lease.task_id,
             Path::new(&action.path),
             Some(&action.expected_source_digest),
         )?;
@@ -3867,7 +4562,8 @@ impl Controller {
             .content
             .replacen(&action.old_literal, &action.new_literal, 1);
         let expected_post_digest = sha256_prefixed(expected_post.as_bytes());
-        let target_metadata = fs::symlink_metadata(active.repository_root.join(&action.path))?;
+        let execution_root = self.task_execution_root(&lease.task_id)?;
+        let target_metadata = fs::symlink_metadata(execution_root.join(&action.path))?;
         if !target_metadata.is_file() || target_metadata.file_type().is_symlink() {
             return Err(ControllerError::ProposalRejected(
                 "replace_literal target must remain a regular non-symlink file".to_owned(),
@@ -3886,9 +4582,10 @@ impl Controller {
         attempt_id: &str,
         validated: &ValidatedReplace,
         runtime: &ExecutionRuntime<'_, I>,
+        isolation_request: &IsolationRequest,
+        execution_root: &Path,
     ) -> Result<AuthorizedAction, ControllerError> {
         let command_policy = runtime.command_policy;
-        let isolation_request = runtime.isolation_request;
         let manifest = runtime.tool_manifest;
         let python_executable = runtime.python_executable;
         let active = self.active_ref()?;
@@ -3915,14 +4612,14 @@ impl Controller {
         }
         if !isolation_request.allow_repository_write
             || !isolation_request.network_offline
-            || isolation_request.repository_root.canonicalize()? != active.repository_root
+            || isolation_request.repository_root.canonicalize()? != execution_root.canonicalize()?
         {
             return Err(ControllerError::Policy(PolicyError::Denied(
                 "replace_literal requires exact offline repository-write isolation".to_owned(),
             )));
         }
         let python = command_policy.pinned_executable(python_executable)?;
-        let destination = active.repository_root.join(&validated.proposal.path);
+        let destination = execution_root.join(&validated.proposal.path);
         let command = sovereign_policy::CommandSpec {
             executable: python.path.clone(),
             args: vec![
@@ -3934,7 +4631,7 @@ impl Controller {
                 validated.proposal.old_literal.clone(),
                 validated.proposal.new_literal.clone(),
             ],
-            working_directory: active.repository_root.clone(),
+            working_directory: execution_root.to_path_buf(),
             environment: BTreeMap::new(),
             mode: CommandMode::Direct,
             declared_risk: CommandRisk::RepositoryMutation,
@@ -3979,7 +4676,7 @@ impl Controller {
         validated: &ValidatedReplace,
         artifact_store_root: &Path,
     ) -> Result<(), ControllerError> {
-        let (plan_digest, task_contract_digest) = {
+        let (plan_digest, task_contract_digest, worktree_lease_id, execution_root) = {
             let active = self.active_ref()?;
             let task = active.tasks.get(&action.task_id).ok_or_else(|| {
                 ControllerError::InvalidPlan("action intent task disappeared".to_owned())
@@ -3987,6 +4684,13 @@ impl Controller {
             (
                 active.plan_digest.clone(),
                 task.task_contract_digest.clone(),
+                task.worktree_lease
+                    .as_ref()
+                    .map(|lease| lease.lease_id.clone()),
+                task.worktree_lease.as_ref().map_or_else(
+                    || active.repository_root.clone(),
+                    |lease| lease.worktree_path.clone(),
+                ),
             )
         };
         let intent = PersistedActionIntent {
@@ -4003,6 +4707,8 @@ impl Controller {
             action_nonce: action.nonce.clone(),
             policy_digest: action.policy_digest.clone(),
             repository_id: action.repository_id.clone(),
+            worktree_lease_id,
+            execution_root,
             path: validated.proposal.path.clone(),
             expected_source_digest: validated.proposal.expected_source_digest.clone(),
             old_literal: validated.proposal.old_literal.clone(),
@@ -4028,6 +4734,19 @@ impl Controller {
         let task = active.tasks.get(&intent.task_id).ok_or_else(|| {
             ControllerError::NotReady("recovery action task disappeared".to_owned())
         })?;
+        if let Some(lease) = task.worktree_lease.as_ref() {
+            self.validate_controller_worktree_lease_binding(&intent.task_id, lease)?;
+        }
+        let expected_worktree_lease_id = task
+            .worktree_lease
+            .as_ref()
+            .map(|lease| lease.lease_id.as_str());
+        let expected_execution_root = task
+            .worktree_lease
+            .as_ref()
+            .map_or(active.repository_root.as_path(), |lease| {
+                lease.worktree_path.as_path()
+            });
         if intent.schema_version != ACTION_INTENT_SCHEMA_VERSION
             || intent.plan_id != active.plan_id
             || intent.plan_revision != active.revision
@@ -4035,6 +4754,8 @@ impl Controller {
             || intent.repository_id != active.repository_id
             || intent.policy_digest != active.policy_digest
             || intent.task_contract_digest != task.task_contract_digest
+            || intent.worktree_lease_id.as_deref() != expected_worktree_lease_id
+            || intent.execution_root != expected_execution_root
         {
             return Err(ControllerError::NotReady(
                 "recovery action intent is stale or misbound".to_owned(),
@@ -4064,8 +4785,9 @@ impl Controller {
                 "recovery action target is outside active task scope".to_owned(),
             ));
         }
-        let source = ExactRetriever::new(registry).read_path(
-            &intent.repository_id,
+        let source = self.task_execution_read(
+            registry,
+            &intent.task_id,
             Path::new(&intent.path),
             Some(&intent.expected_source_digest),
         )?;
@@ -4079,7 +4801,7 @@ impl Controller {
             .replacen(&intent.old_literal, &intent.new_literal, 1);
         let expected_post_digest = sha256_prefixed(expected_post.as_bytes());
         let current_mode = permission_mode(&fs::symlink_metadata(
-            active.repository_root.join(&intent.path),
+            expected_execution_root.join(&intent.path),
         )?);
         if expected_post_digest != intent.expected_post_digest
             || current_mode != intent.expected_target_mode
@@ -4110,7 +4832,17 @@ impl Controller {
                     "recovery verification intent {action_id} is missing"
                 ))
             })?;
-        let intent: PersistedActionIntent = serde_json::from_str(&raw)?;
+        let raw_intent: PersistedActionIntent = serde_json::from_str(&raw)?;
+        let legacy_primary_recovery =
+            raw_intent.schema_version == LEGACY_ACTION_INTENT_SCHEMA_VERSION;
+        let primary_root = registry
+            .repository(&raw_intent.repository_id)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan("recovery verification repository missing".to_owned())
+            })?
+            .root
+            .clone();
+        let intent = normalize_persisted_action_intent(raw_intent, &primary_root)?;
         let record = self
             .state
             .action_record(action_id)?
@@ -4134,6 +4866,21 @@ impl Controller {
             if task.state != TaskState::Verifying || attempt.state != AttemptState::Verifying {
                 return Err(ControllerError::NotReady(
                     "recovery verification state is not Verifying".to_owned(),
+                ));
+            }
+            if legacy_primary_recovery
+                && (task.worktree_lease.is_some()
+                    || task.worktree_state.is_some()
+                    || task.worktree_baseline.is_some()
+                    || task.change_set.is_some()
+                    || task.change_set_artifact_digest.is_some()
+                    || task.change_set_carry.is_some()
+                    || !task.worktree_composition.is_empty()
+                    || task.worktree_conflict.is_some())
+            {
+                return Err(ControllerError::NotReady(
+                    "legacy v2 committed recovery cannot inherit controller worktree authority"
+                        .to_owned(),
                 ));
             }
             (
@@ -4164,6 +4911,7 @@ impl Controller {
             task_contract_digest,
             baseline_digest,
             execution_epoch: self.state.current_execution_epoch()?,
+            legacy_primary_recovery,
         };
         let verification = DeterministicVerifier::verify(
             &self.state,
@@ -4222,9 +4970,28 @@ impl Controller {
             let _ = self.route_failure_record(failure)?;
             return Err(ControllerError::VerificationFailed(Box::new(verification)));
         }
-        self.record_verified_output_bindings(&verification, &artifact.digest)?;
-        self.apply_verified_success(&verification)?;
-        self.refresh_baseline_after_verified_success(registry)?;
+        if legacy_primary_recovery {
+            self.apply_verified_success(&verification)?;
+            self.refresh_baseline_after_verified_success(registry)?;
+            self.append_controller_event(
+                "legacy_v2_primary_recovery_verified",
+                &intent.task_id,
+                &json!({
+                    "action_id": action_id,
+                    "verification_id": verification.verification_id,
+                    "execution_semantics": "historical_primary",
+                    "worktree_authority": false,
+                    "change_set_authority": false,
+                    "carry_authority": false,
+                }),
+            )?;
+            self.checkpoint_now()?;
+        } else {
+            self.persist_worktree_change_set_if_required(registry, &intent.task_id, &artifacts)?;
+            self.record_verified_output_bindings(&verification, &artifact.digest)?;
+            self.apply_verified_success(&verification)?;
+            self.finalize_verified_repository_success(registry, &intent.task_id)?;
+        }
         Ok(())
     }
 
@@ -4339,23 +5106,18 @@ impl Controller {
         registry: &ProjectRegistry,
         repair_origin: Option<&RepairAttemptOriginV1>,
     ) -> Result<String, ControllerError> {
-        let (repository_id, repository_root, baseline_diff_digest) = {
-            let active = self.active_ref()?;
-            (
-                active.repository_id.clone(),
-                active.repository_root.clone(),
-                active.baseline_diff_digest.clone(),
-            )
-        };
-        let pre_snapshot = registry.snapshot(&repository_id)?;
+        let repository_root = self.task_execution_root(&lease.task_id)?;
+        let pre_snapshot = self.task_execution_snapshot(registry, &lease.task_id)?;
         let pre_snapshot_digest = snapshot_digest(&pre_snapshot)?;
         if pre_snapshot_digest != lease.baseline_digest {
             return Err(ControllerError::NotReady(
                 "repository changed before attempt start".to_owned(),
             ));
         }
-        let pre_diff = ExactRetriever::new(registry).current_diff(&repository_id)?;
-        if pre_diff.digest != baseline_diff_digest {
+        let pre_diff = self.task_execution_diff(registry, &lease.task_id)?;
+        if !self.active_uses_controller_worktrees()?
+            && pre_diff.digest != self.active_ref()?.baseline_diff_digest
+        {
             return Err(ControllerError::NotReady(
                 "repository diff changed before attempt start".to_owned(),
             ));
@@ -4802,6 +5564,7 @@ impl Controller {
         verification_artifact_digest: &str,
         task_contract_digest: &str,
     ) -> Result<(), ControllerError> {
+        let execution_root = self.task_execution_root(&verification.task_id)?;
         let active = self.active_ref()?;
         let task = active.tasks.get(&verification.task_id).ok_or_else(|| {
             ControllerError::InvalidPlan("carry fingerprint task disappeared".to_owned())
@@ -4813,7 +5576,7 @@ impl Controller {
             })?;
             source_fingerprints.insert(
                 path.to_owned(),
-                path_fingerprint(&active.repository_root, Path::new(path))?,
+                path_fingerprint(&execution_root, Path::new(path))?,
             );
         }
         let implementation_inputs_digest = digest_json(
@@ -4834,6 +5597,25 @@ impl Controller {
                 })?,
         )?;
         let (_, acceptance_contract_digest) = compiled_acceptance_contract(&task.task)?;
+        let execution_provenance = if matches!(
+            active
+                .plan_document
+                .pointer("/depth/mode")
+                .and_then(Value::as_str),
+            Some("D3" | "D4")
+        ) {
+            Some(
+                task_carry_execution_provenance(active, &verification.task_id)?.ok_or_else(
+                    || {
+                        ControllerError::InvalidPlan(
+                            "verified D3/D4 task lacks immutable execution provenance".to_owned(),
+                        )
+                    },
+                )?,
+            )
+        } else {
+            None
+        };
         let record = TaskCarryFingerprintV1 {
             schema_version: TASK_CARRY_FINGERPRINT_SCHEMA_VERSION,
             plan_id: active.plan_id.clone(),
@@ -4845,6 +5627,7 @@ impl Controller {
             dependency_contract_digest,
             instruction_fingerprint_digest,
             source_fingerprints,
+            execution_provenance,
             acceptance_contract_digest,
             verification_id: verification.verification_id.clone(),
             verification_artifact_digest: verification_artifact_digest.to_owned(),
@@ -4869,6 +5652,12 @@ impl Controller {
         verification_artifact_digest: &str,
     ) -> Result<(), ControllerError> {
         let active = self.active_ref()?;
+        let change_set_digest = active
+            .tasks
+            .get(&verification.task_id)
+            .and_then(|task| task.change_set.as_ref())
+            .map(ChangeSet::digest)
+            .transpose()?;
         let record = VerifiedOutputBindingV1 {
             schema_version: VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION,
             plan_id: active.plan_id.clone(),
@@ -4882,6 +5671,7 @@ impl Controller {
             verification_id: verification.verification_id.clone(),
             verification_artifact_digest: verification_artifact_digest.to_owned(),
             repository_snapshot_digest: verification.post_snapshot_digest.clone(),
+            change_set_digest,
             carried_from_plan_revision: None,
             carried_from_plan_digest: None,
         };
@@ -5010,6 +5800,238 @@ impl Controller {
         Ok(())
     }
 
+    fn persist_worktree_change_set_if_required(
+        &mut self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), ControllerError> {
+        if !self.active_uses_controller_worktrees()? {
+            return Ok(());
+        }
+        let (lease, baseline, existing, existing_digest, record_key, reference_id) = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("ChangeSet task disappeared".to_owned())
+            })?;
+            if task.worktree_state != Some(WorktreeLifecycle::Materialized) {
+                return Err(ControllerError::NotReady(
+                    "ChangeSet capture requires a materialized controller worktree".to_owned(),
+                ));
+            }
+            let lease = task.worktree_lease.clone().ok_or_else(|| {
+                ControllerError::InvalidPlan("ChangeSet task lacks worktree lease".to_owned())
+            })?;
+            let baseline = task.worktree_baseline.clone().ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "ChangeSet task lacks composed pre-task baseline".to_owned(),
+                )
+            })?;
+            (
+                lease,
+                baseline,
+                task.change_set.clone(),
+                task.change_set_artifact_digest.clone(),
+                active_scoped_key(active, task_id),
+                format!(
+                    "changeset.{}@r{}.{}",
+                    active.plan_id, active.revision, task_id
+                ),
+            )
+        };
+        let current = registry.capture_change_set_from_baseline(&lease, &baseline)?;
+        if !current.unmerged_paths.is_empty() {
+            return Err(ControllerError::NotReady(
+                "task ChangeSet contains unresolved conflict/unmerged evidence".to_owned(),
+            ));
+        }
+        if let Some(existing) = existing {
+            if existing != current || existing_digest.is_none() {
+                return Err(ControllerError::NotReady(
+                    "current worktree differs from its durable immutable ChangeSet".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        let change_set_json = serde_json::to_string(&current)?;
+        let artifact = artifacts.put(&mut self.state, change_set_json.as_bytes())?;
+        self.state
+            .add_artifact_reference(&reference_id, &artifact.digest)?;
+        {
+            let task = self.active_mut()?.tasks.get_mut(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("ChangeSet task disappeared".to_owned())
+            })?;
+            task.change_set = Some(current.clone());
+            task.change_set_artifact_digest = Some(artifact.digest.clone());
+        }
+        let task_json =
+            serde_json::to_string(self.active_ref()?.tasks.get(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("ChangeSet task disappeared".to_owned())
+            })?)?;
+        self.persist_runtime_records_with_events(
+            &[
+                ("controller.task".to_owned(), task_id.to_owned(), task_json),
+                (
+                    "controller.change_set".to_owned(),
+                    record_key,
+                    change_set_json,
+                ),
+            ],
+            &[(
+                "worktree_change_set_published".to_owned(),
+                task_id.to_owned(),
+                json!({
+                    "lease_id": lease.lease_id,
+                    "artifact_digest": artifact.digest,
+                    "diff_digest": current.diff_digest,
+                    "unmerged_digest": current.unmerged_digest,
+                }),
+            )],
+        )?;
+        self.checkpoint_now()?;
+        Ok(())
+    }
+
+    fn finalize_verified_repository_success(
+        &mut self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+    ) -> Result<(), ControllerError> {
+        if !self.active_uses_controller_worktrees()? {
+            return self.refresh_baseline_after_verified_success(registry);
+        }
+        let (lease, change_set) = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("worktree success task disappeared".to_owned())
+            })?;
+            if task.worktree_state != Some(WorktreeLifecycle::Materialized) {
+                return Err(ControllerError::NotReady(
+                    "successful D3/D4 task no longer has a materialized worktree".to_owned(),
+                ));
+            }
+            (
+                task.worktree_lease.clone().ok_or_else(|| {
+                    ControllerError::InvalidPlan("successful D3/D4 task lacks lease".to_owned())
+                })?,
+                task.change_set.clone().ok_or_else(|| {
+                    ControllerError::InvalidPlan("successful D3/D4 task lacks ChangeSet".to_owned())
+                })?,
+            )
+        };
+        registry.release_worktree(&lease, &change_set)?;
+        self.active_mut()?
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan("worktree success task disappeared".to_owned())
+            })?
+            .worktree_state = Some(WorktreeLifecycle::Released);
+        self.persist_worktree_task_state(
+            task_id,
+            "worktree_released",
+            &json!({"lease_id": lease.lease_id, "change_set_diff_digest": change_set.diff_digest}),
+        )?;
+        Ok(())
+    }
+
+    fn close_active_worktrees_for_supersession(
+        &mut self,
+        registry: &ProjectRegistry,
+    ) -> Result<(), ControllerError> {
+        if !self.active_uses_controller_worktrees()? {
+            return Ok(());
+        }
+        let task_ids = self.active_ref()?.tasks.keys().cloned().collect::<Vec<_>>();
+        for task_id in task_ids {
+            let (lease, lifecycle, baseline, existing_change_set) = {
+                let task = self.active_ref()?.tasks.get(&task_id).ok_or_else(|| {
+                    ControllerError::InvalidPlan("worktree task disappeared".to_owned())
+                })?;
+                (
+                    task.worktree_lease.clone(),
+                    task.worktree_state,
+                    task.worktree_baseline.clone(),
+                    task.change_set.clone(),
+                )
+            };
+            let Some(lease) = lease else {
+                continue;
+            };
+            if lifecycle == Some(WorktreeLifecycle::Released) {
+                continue;
+            }
+            if lifecycle == Some(WorktreeLifecycle::Conflict) {
+                return Err(ControllerError::NotReady(format!(
+                    "conflicted worktree {} must remain durable for explicit recovery/replan",
+                    lease.lease_id
+                )));
+            }
+            if lifecycle == Some(WorktreeLifecycle::Prepared) && !lease.worktree_path.exists() {
+                continue;
+            }
+            registry.validate_worktree_lease(&lease)?;
+            let current = match baseline.as_ref() {
+                Some(baseline) => registry.capture_change_set_from_baseline(&lease, baseline)?,
+                None => registry.capture_change_set(&lease)?,
+            };
+            if let Some(existing) = existing_change_set
+                && existing != current
+            {
+                return Err(ControllerError::NotReady(format!(
+                    "superseded worktree {} differs from its durable ChangeSet",
+                    lease.lease_id
+                )));
+            }
+            let change_set_json = serde_json::to_string(&current)?;
+            let record_key = active_scoped_key(self.active_ref()?, &task_id);
+            {
+                let task = self.active_mut()?.tasks.get_mut(&task_id).ok_or_else(|| {
+                    ControllerError::InvalidPlan("worktree task disappeared".to_owned())
+                })?;
+                task.change_set = Some(current.clone());
+            }
+            let task_json =
+                serde_json::to_string(self.active_ref()?.tasks.get(&task_id).ok_or_else(
+                    || ControllerError::InvalidPlan("worktree task disappeared".to_owned()),
+                )?)?;
+            self.persist_runtime_records_with_events(
+                &[
+                    ("controller.task".to_owned(), task_id.clone(), task_json),
+                    (
+                        "controller.change_set".to_owned(),
+                        record_key,
+                        change_set_json,
+                    ),
+                ],
+                &[(
+                    "worktree_change_set_published_for_supersession".to_owned(),
+                    task_id.clone(),
+                    json!({
+                        "lease_id": lease.lease_id,
+                        "diff_digest": current.diff_digest,
+                        "unmerged_digest": current.unmerged_digest,
+                    }),
+                )],
+            )?;
+            self.checkpoint_now()?;
+            registry.release_worktree(&lease, &current)?;
+            self.active_mut()?
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan("worktree task disappeared".to_owned())
+                })?
+                .worktree_state = Some(WorktreeLifecycle::Released);
+            self.persist_worktree_task_state(
+                &task_id,
+                "worktree_released_for_supersession",
+                &json!({"lease_id": lease.lease_id}),
+            )?;
+        }
+        Ok(())
+    }
+
     fn refresh_baseline_after_verified_success(
         &mut self,
         registry: &ProjectRegistry,
@@ -5125,6 +6147,8 @@ impl Controller {
             "controller.action_intent",
             "controller.failure_record",
             "controller.repair_packet",
+            "controller.change_set",
+            "controller.worktree_conflict",
         ] {
             for record in self.state.state_records(namespace)? {
                 if namespace != "controller.action_intent"
@@ -5610,6 +6634,38 @@ impl Controller {
     }
 }
 
+fn task_carry_execution_provenance(
+    active: &ActivePlan,
+    task_id: &str,
+) -> Result<Option<TaskCarryExecutionProvenanceV1>, ControllerError> {
+    let task = active.tasks.get(task_id).ok_or_else(|| {
+        ControllerError::InvalidPlan(format!(
+            "carry execution provenance task {task_id} disappeared"
+        ))
+    })?;
+    let Some(change_set) = task.change_set.as_ref() else {
+        return Ok(None);
+    };
+    let mut composed_change_sets = Vec::new();
+    for upstream_task_id in dependency_closure_order(&active.tasks, task_id)? {
+        let Some(upstream_change_set) = active
+            .tasks
+            .get(&upstream_task_id)
+            .and_then(|runtime| runtime.change_set.as_ref())
+        else {
+            return Ok(None);
+        };
+        composed_change_sets.push(ComposedChangeSetBindingV1 {
+            task_id: upstream_task_id,
+            change_set_digest: upstream_change_set.digest()?,
+        });
+    }
+    Ok(Some(TaskCarryExecutionProvenanceV1 {
+        change_set_digest: change_set.digest()?,
+        composed_change_sets,
+    }))
+}
+
 impl RecoveryManager {
     /// Reconstructs the active Controller exclusively from durable SQLite/CAS/Git state.
     /// No chat transcript, model call, or raw `PlanIr` activation surface participates.
@@ -5696,6 +6752,7 @@ impl RecoveryManager {
             trusted_recovery_intent_digests,
         };
 
+        let recovery_worktrees = reconcile_recovered_worktrees(&mut controller, registry)?;
         let (unresolved_process_lease_ids, unresolved_process_actions) =
             reap_recovery_process_leases(&mut controller.state)?;
         let mut unknown_action_ids = reconcile_recovery_actions(
@@ -5703,6 +6760,7 @@ impl RecoveryManager {
             registry,
             &unresolved_process_actions,
             &manifest,
+            &recovery_worktrees,
         )?;
         let (interrupted_attempt_ids, pending_recovery_action_ids, verification_actions) =
             normalize_recovered_runtime(&mut controller, &unknown_action_ids)?;
@@ -5763,11 +6821,10 @@ impl RecoveryManager {
         let execution_epoch_after = controller.state.current_execution_epoch()?;
         let mutation_blocked = !unknown_action_ids.is_empty()
             || !unresolved_process_lease_ids.is_empty()
-            || controller
-                .active_ref()?
-                .tasks
-                .values()
-                .any(|task| task.state == TaskState::ReconcilingUnknown);
+            || controller.active_ref()?.tasks.values().any(|task| {
+                task.state == TaskState::ReconcilingUnknown
+                    || task.worktree_state == Some(WorktreeLifecycle::Conflict)
+            });
         let (recovered_plan_id, recovered_plan_digest) = {
             let active = controller.active_ref()?;
             (active.plan_id.clone(), active.plan_digest.clone())
@@ -5872,7 +6929,11 @@ fn validate_checkpoint_immutable_bindings(
         };
         if !matches!(
             namespace,
-            "controller.action_intent" | "controller.failure_record" | "controller.repair_packet"
+            "controller.action_intent"
+                | "controller.failure_record"
+                | "controller.repair_packet"
+                | "controller.change_set"
+                | "controller.worktree_conflict"
         ) {
             continue;
         }
@@ -6571,11 +7632,199 @@ fn reap_recovery_process_leases(
 }
 
 #[allow(clippy::too_many_lines)]
+fn reconcile_recovered_worktrees(
+    controller: &mut Controller,
+    registry: &ProjectRegistry,
+) -> Result<BTreeMap<String, WorktreeLease>, ControllerError> {
+    if !controller.active_uses_controller_worktrees()? {
+        return Ok(BTreeMap::new());
+    }
+    let mut leases = BTreeMap::new();
+    let task_ids = controller
+        .active_ref()?
+        .tasks
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for task_id in task_ids {
+        let (lease, lifecycle, change_set, task_state, task_contract_digest) = {
+            let task = controller
+                .active_ref()?
+                .tasks
+                .get(&task_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan("recovery task disappeared".to_owned())
+                })?;
+            (
+                task.worktree_lease.clone(),
+                task.worktree_state,
+                task.change_set.clone(),
+                task.state,
+                task.task_contract_digest.clone(),
+            )
+        };
+        let Some(lease) = lease else {
+            if lifecycle.is_some() || change_set.is_some() {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "recovery task {task_id} has worktree state/evidence without a lease"
+                )));
+            }
+            continue;
+        };
+        if lease.task_contract_digest != task_contract_digest {
+            return Err(ControllerError::InvalidPlan(format!(
+                "recovery task {task_id} has a stale task-contract worktree lease"
+            )));
+        }
+        controller.validate_controller_worktree_lease_binding(&task_id, &lease)?;
+        match lifecycle {
+            Some(WorktreeLifecycle::Prepared) => {
+                if lease.worktree_path.exists() {
+                    let result = controller.ensure_task_worktree(registry, &task_id);
+                    if let Err(error) = result {
+                        if controller
+                            .active_ref()?
+                            .tasks
+                            .get(&task_id)
+                            .is_some_and(|task| {
+                                task.worktree_state == Some(WorktreeLifecycle::Conflict)
+                                    && task.worktree_conflict.is_some()
+                            })
+                        {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    leases.insert(task_id.clone(), lease.clone());
+                }
+            }
+            Some(WorktreeLifecycle::Materialized) => {
+                if !lease.worktree_path.exists() {
+                    if task_state == TaskState::Succeeded && change_set.is_some() {
+                        controller
+                            .active_mut()?
+                            .tasks
+                            .get_mut(&task_id)
+                            .ok_or_else(|| {
+                                ControllerError::InvalidPlan("recovery task disappeared".to_owned())
+                            })?
+                            .worktree_state = Some(WorktreeLifecycle::Released);
+                        controller.persist_worktree_task_state(
+                            &task_id,
+                            "worktree_release_reconciled",
+                            &json!({"lease_id": lease.lease_id}),
+                        )?;
+                        continue;
+                    }
+                    return Err(ControllerError::NotReady(format!(
+                        "materialized recovery worktree {} is missing before verified release",
+                        lease.lease_id
+                    )));
+                }
+                registry.validate_worktree_lease(&lease)?;
+                let (expected_composition, _) =
+                    controller.ordered_upstream_change_sets(&task_id)?;
+                let task = controller
+                    .active_ref()?
+                    .tasks
+                    .get(&task_id)
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan("recovery task disappeared".to_owned())
+                    })?;
+                let baseline = task.worktree_baseline.as_ref().ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!(
+                        "materialized recovery worktree {} lacks composed baseline",
+                        lease.lease_id
+                    ))
+                })?;
+                if task.worktree_composition != expected_composition
+                    || task.worktree_conflict.is_some()
+                {
+                    return Err(ControllerError::NotReady(format!(
+                        "recovery worktree {} composition binding is stale",
+                        lease.lease_id
+                    )));
+                }
+                if let Some(expected) = change_set.as_ref()
+                    && registry.capture_change_set_from_baseline(&lease, baseline)? != *expected
+                {
+                    return Err(ControllerError::NotReady(format!(
+                        "recovery worktree {} differs from its immutable ChangeSet",
+                        lease.lease_id
+                    )));
+                }
+                leases.insert(task_id.clone(), lease.clone());
+            }
+            Some(WorktreeLifecycle::Conflict) => {
+                if !lease.worktree_path.exists() {
+                    return Err(ControllerError::NotReady(format!(
+                        "conflicted recovery worktree {} is missing",
+                        lease.lease_id
+                    )));
+                }
+                registry.validate_worktree_lease(&lease)?;
+                let task = controller
+                    .active_ref()?
+                    .tasks
+                    .get(&task_id)
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan("recovery task disappeared".to_owned())
+                    })?;
+                let conflict = task.worktree_conflict.as_ref().ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!(
+                        "conflicted recovery worktree {} lacks durable conflict evidence",
+                        lease.lease_id
+                    ))
+                })?;
+                let key = active_scoped_key(controller.active_ref()?, &task_id);
+                let durable = controller
+                    .state
+                    .get_state("controller.worktree_conflict", &key)?
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan(format!(
+                            "conflicted recovery worktree {} lost conflict record",
+                            lease.lease_id
+                        ))
+                    })?;
+                if serde_json::from_str::<CompositionConflictEvidence>(&durable)? != *conflict {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "conflicted recovery worktree {} conflict evidence changed",
+                        lease.lease_id
+                    )));
+                }
+            }
+            Some(WorktreeLifecycle::Released) => {
+                if lease.worktree_path.exists() {
+                    return Err(ControllerError::NotReady(format!(
+                        "released recovery worktree {} unexpectedly still exists",
+                        lease.lease_id
+                    )));
+                }
+                if change_set.is_none() {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "released recovery worktree {} lacks immutable ChangeSet evidence",
+                        lease.lease_id
+                    )));
+                }
+            }
+            None => {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "recovery worktree {} has no lifecycle state",
+                    lease.lease_id
+                )));
+            }
+        }
+    }
+    Ok(leases)
+}
+
+#[allow(clippy::too_many_lines)]
 fn reconcile_recovery_actions(
     state: &mut StateStore,
     registry: &ProjectRegistry,
     unresolved_process_actions: &BTreeSet<String>,
     manifest: &CheckpointManifest,
+    worktrees: &BTreeMap<String, WorktreeLease>,
 ) -> Result<Vec<String>, ControllerError> {
     for record in state.action_records()? {
         if record.state == "dispatched" {
@@ -6614,31 +7863,58 @@ fn reconcile_recovery_actions(
             unknown.push(record.action_id);
             continue;
         }
-        let intent: PersistedActionIntent = serde_json::from_str(&raw_intent)?;
-        if intent.schema_version != ACTION_INTENT_SCHEMA_VERSION
-            || intent.action_id != record.action_id
+        let raw_intent: PersistedActionIntent = serde_json::from_str(&raw_intent)?;
+        let Some(repository) = registry.repository(&raw_intent.repository_id) else {
+            unknown.push(record.action_id);
+            continue;
+        };
+        let Ok(intent) = normalize_persisted_action_intent(raw_intent, &repository.root) else {
+            unknown.push(record.action_id);
+            continue;
+        };
+        if intent.action_id != record.action_id
             || intent.payload_digest != record.payload_digest
             || intent.policy_digest != record.policy_digest
         {
             unknown.push(record.action_id);
             continue;
         }
-        let Ok(current) = ExactRetriever::new(registry).read_path(
-            &intent.repository_id,
-            Path::new(&intent.path),
-            None,
-        ) else {
+        let current = if let Some(lease_id) = intent.worktree_lease_id.as_deref() {
+            let Some(lease) = worktrees.get(&intent.task_id) else {
+                unknown.push(record.action_id);
+                continue;
+            };
+            if lease.lease_id != lease_id || lease.worktree_path != intent.execution_root {
+                unknown.push(record.action_id);
+                continue;
+            }
+            registry.read_worktree_path(lease, Path::new(&intent.path), None)
+        } else {
+            if intent.execution_root
+                != registry
+                    .repository(&intent.repository_id)
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan(
+                            "recovery intent repository missing".to_owned(),
+                        )
+                    })?
+                    .root
+            {
+                unknown.push(record.action_id);
+                continue;
+            }
+            ExactRetriever::new(registry).read_path(
+                &intent.repository_id,
+                Path::new(&intent.path),
+                None,
+            )
+        };
+        let Ok(current) = current else {
             unknown.push(record.action_id);
             continue;
         };
         let current_mode = permission_mode(&fs::symlink_metadata(
-            registry
-                .repository(&intent.repository_id)
-                .ok_or_else(|| {
-                    ControllerError::InvalidPlan("recovery intent repository missing".to_owned())
-                })?
-                .root
-                .join(&intent.path),
+            intent.execution_root.join(&intent.path),
         )?);
         if current.digest == intent.expected_post_digest
             && current_mode == intent.expected_target_mode
@@ -6715,12 +7991,14 @@ fn normalize_recovered_runtime(
     unknown_action_ids: &[String],
 ) -> Result<RecoveryRuntimeNormalization, ControllerError> {
     let unknown = unknown_action_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let primary_root = controller.active_ref()?.repository_root.clone();
     let intents = controller
         .state
         .state_records("controller.action_intent")?
         .into_iter()
         .map(|record| {
-            let intent: PersistedActionIntent = serde_json::from_str(&record.value_json)?;
+            let raw: PersistedActionIntent = serde_json::from_str(&record.value_json)?;
+            let intent = normalize_persisted_action_intent(raw, &primary_root)?;
             Ok((record.key, intent))
         })
         .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
@@ -6876,6 +8154,10 @@ struct PersistedActionIntent {
     action_nonce: String,
     policy_digest: String,
     repository_id: String,
+    #[serde(default)]
+    worktree_lease_id: Option<String>,
+    #[serde(default)]
+    execution_root: PathBuf,
     path: String,
     expected_source_digest: String,
     old_literal: String,
@@ -6883,6 +8165,39 @@ struct PersistedActionIntent {
     expected_post_digest: String,
     expected_target_mode: u32,
     artifact_store_root: PathBuf,
+}
+
+fn normalize_persisted_action_intent(
+    mut intent: PersistedActionIntent,
+    primary_root: &Path,
+) -> Result<PersistedActionIntent, ControllerError> {
+    match intent.schema_version {
+        ACTION_INTENT_SCHEMA_VERSION => {
+            if intent.execution_root.as_os_str().is_empty() {
+                return Err(ControllerError::NotReady(
+                    "v3 recovery action intent lacks an execution root".to_owned(),
+                ));
+            }
+        }
+        LEGACY_ACTION_INTENT_SCHEMA_VERSION => {
+            // Committed v2 predates WorktreeLease/execution_root. It can only be interpreted as
+            // the historical primary-repository execution view; it never gains worktree authority.
+            if intent.worktree_lease_id.is_some() || !intent.execution_root.as_os_str().is_empty() {
+                return Err(ControllerError::NotReady(
+                    "legacy v2 action intent contains fields that did not exist in v2".to_owned(),
+                ));
+            }
+            intent.worktree_lease_id = None;
+            intent.execution_root = primary_root.to_path_buf();
+            intent.schema_version = ACTION_INTENT_SCHEMA_VERSION;
+        }
+        _ => {
+            return Err(ControllerError::NotReady(
+                "recovery action intent schema is unsupported".to_owned(),
+            ));
+        }
+    }
+    Ok(intent)
 }
 
 fn persisted_intent_action_seed(intent: &PersistedActionIntent) -> Result<String, ControllerError> {
@@ -6912,6 +8227,7 @@ struct VerificationLeaseBinding {
     task_contract_digest: String,
     baseline_digest: String,
     execution_epoch: i64,
+    legacy_primary_recovery: bool,
 }
 
 impl From<&ReadyLease> for VerificationLeaseBinding {
@@ -6924,6 +8240,7 @@ impl From<&ReadyLease> for VerificationLeaseBinding {
             task_contract_digest: lease.task_contract_digest.clone(),
             baseline_digest: lease.baseline_digest.clone(),
             execution_epoch: lease.execution_epoch,
+            legacy_primary_recovery: false,
         }
     }
 }
@@ -6956,25 +8273,50 @@ impl DeterministicVerifier {
         })?;
         let (evaluator, acceptance_contract_digest) = compiled_acceptance_contract(&task.task)?;
         let current_epoch = state.current_execution_epoch()?;
-        let post_snapshot = registry.snapshot(&active.repository_id)?;
+        let execution_lease = if lease.legacy_primary_recovery {
+            None
+        } else {
+            active_task_execution_lease(active, &lease.task_id)?
+        };
+        let execution_root = execution_lease.map_or(active.repository_root.as_path(), |worktree| {
+            worktree.worktree_path.as_path()
+        });
+        let post_snapshot = match execution_lease {
+            Some(worktree) => registry.worktree_snapshot(worktree)?,
+            None => registry.snapshot(&active.repository_id)?,
+        };
         let post_snapshot_digest = snapshot_digest(&post_snapshot)?;
-        let retriever = ExactRetriever::new(registry);
-        let file = retriever.read_path(
-            &active.repository_id,
-            Path::new(&validated.proposal.path),
-            None,
-        )?;
+        let file = match execution_lease {
+            Some(worktree) => {
+                registry.read_worktree_path(worktree, Path::new(&validated.proposal.path), None)?
+            }
+            None => ExactRetriever::new(registry).read_path(
+                &active.repository_id,
+                Path::new(&validated.proposal.path),
+                None,
+            )?,
+        };
         let observed_target_mode = permission_mode(&fs::symlink_metadata(
-            active.repository_root.join(&validated.proposal.path),
+            execution_root.join(&validated.proposal.path),
         )?);
-        let diff = retriever.current_diff(&active.repository_id)?;
+        let diff = match execution_lease {
+            Some(worktree) => registry.worktree_diff(worktree)?,
+            None => ExactRetriever::new(registry).current_diff(&active.repository_id)?,
+        };
         let action_record = state.action_record(action_id)?;
         let action_committed = action_record
             .as_ref()
             .is_some_and(|record| record.state == "committed" && record.result_digest.is_some());
         let expected_path = PathBuf::from(&validated.proposal.path);
-        let repository_failure =
-            repository_verification_failure(active, attempt, lease, &post_snapshot, &expected_path);
+        let repository_failure = repository_verification_failure(
+            active,
+            attempt,
+            lease,
+            &post_snapshot,
+            &expected_path,
+            execution_root,
+            execution_lease.is_some(),
+        );
         let freshness_ok = required_array(&task.task, "/acceptance_criteria")?
             .iter()
             .all(|criterion| {
@@ -7076,6 +8418,8 @@ fn repository_verification_failure(
     lease: &VerificationLeaseBinding,
     post_snapshot: &RepositorySnapshot,
     expected_path: &Path,
+    execution_root: &Path,
+    controller_worktree: bool,
 ) -> Option<String> {
     let mut allowed_changed_paths = attempt
         .pre_changed_fingerprints
@@ -7088,15 +8432,40 @@ fn repository_verification_failure(
     }
     if attempt.pre_snapshot_digest != lease.baseline_digest
         || attempt.baseline_digest != lease.baseline_digest
-        || attempt.pre_diff_digest != active.baseline_diff_digest
-        || sha256_prefixed(active.baseline_diff_content.as_bytes()) != active.baseline_diff_digest
+        || (!controller_worktree
+            && (attempt.pre_diff_digest != active.baseline_diff_digest
+                || sha256_prefixed(active.baseline_diff_content.as_bytes())
+                    != active.baseline_diff_digest))
     {
         return Some("pre_attempt_baseline_binding_invalid".to_owned());
     }
-    if !protected_preexisting_changes_unchanged(&active.repository_root, attempt, expected_path) {
+    if !protected_preexisting_changes_unchanged(execution_root, attempt, expected_path) {
         return Some("protected_preexisting_change_modified".to_owned());
     }
     None
+}
+
+fn active_task_execution_lease<'a>(
+    active: &'a ActivePlan,
+    task_id: &str,
+) -> Result<Option<&'a WorktreeLease>, ControllerError> {
+    let mode = required_str(&active.plan_document, "/depth/mode")?;
+    if !matches!(mode, "D3" | "D4") {
+        return Ok(None);
+    }
+    let task = active
+        .tasks
+        .get(task_id)
+        .ok_or_else(|| ControllerError::InvalidPlan(format!("unknown task {task_id}")))?;
+    if task.worktree_state != Some(WorktreeLifecycle::Materialized) {
+        return Err(ControllerError::NotReady(
+            "D3/D4 verification requires a materialized controller worktree".to_owned(),
+        ));
+    }
+    task.worktree_lease
+        .as_ref()
+        .map(Some)
+        .ok_or_else(|| ControllerError::NotReady("D3/D4 worktree lease is missing".to_owned()))
 }
 
 fn verification_failure_code(checks: &[(bool, &str)]) -> Option<String> {
@@ -7657,8 +9026,112 @@ fn active_scoped_key(active: &ActivePlan, logical_key: &str) -> String {
     revision_scoped_key(&active.plan_id, active.revision, logical_key)
 }
 
+fn validate_durable_change_set_binding(
+    state: &StateStore,
+    record_key: &str,
+    task_id: &str,
+    runtime: &TaskRuntime,
+) -> Result<ChangeSet, ControllerError> {
+    let change_set = runtime.change_set.clone().ok_or_else(|| {
+        ControllerError::NotReady(format!(
+            "task {task_id} lacks immutable ChangeSet authority"
+        ))
+    })?;
+    let serialized = serde_json::to_string(&change_set)?;
+    let durable_raw = state
+        .get_state("controller.change_set", record_key)?
+        .ok_or_else(|| {
+            ControllerError::NotReady(format!("task {task_id} lost durable ChangeSet evidence"))
+        })?;
+    if durable_raw != serialized {
+        return Err(ControllerError::NotReady(format!(
+            "task {task_id} ChangeSet differs from durable immutable evidence"
+        )));
+    }
+    let expected_artifact_digest = format!("{:x}", Sha256::digest(serialized.as_bytes()));
+    if runtime.change_set_artifact_digest.as_deref() != Some(expected_artifact_digest.as_str()) {
+        return Err(ControllerError::NotReady(format!(
+            "task {task_id} ChangeSet artifact binding does not match exact durable bytes"
+        )));
+    }
+    if state
+        .artifact_metadata(&expected_artifact_digest)?
+        .is_none()
+    {
+        return Err(ControllerError::NotReady(format!(
+            "task {task_id} lost exact ChangeSet artifact"
+        )));
+    }
+    Ok(change_set)
+}
+
 fn revision_record_key(plan_id: &str, revision: u32) -> String {
     format!("{plan_id}@r{revision}")
+}
+
+fn dependency_closure_order(
+    tasks: &BTreeMap<String, TaskRuntime>,
+    task_id: &str,
+) -> Result<Vec<String>, ControllerError> {
+    let target = tasks
+        .get(task_id)
+        .ok_or_else(|| ControllerError::InvalidPlan(format!("unknown task {task_id}")))?;
+    let mut closure = BTreeSet::new();
+    let mut stack = required_array(&target.task, "/dependencies")?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                ControllerError::InvalidPlan("dependency task id must be a string".to_owned())
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    while let Some(current) = stack.pop() {
+        if !closure.insert(current.clone()) {
+            continue;
+        }
+        let runtime = tasks.get(&current).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!("unknown dependency task {current}"))
+        })?;
+        for dependency in required_array(&runtime.task, "/dependencies")? {
+            stack.push(
+                dependency
+                    .as_str()
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan(
+                            "dependency task id must be a string".to_owned(),
+                        )
+                    })?
+                    .to_owned(),
+            );
+        }
+    }
+
+    let mut remaining = closure;
+    let mut emitted = BTreeSet::new();
+    let mut ordered = Vec::new();
+    while !remaining.is_empty() {
+        let next = remaining.iter().find(|candidate| {
+            tasks.get(*candidate).is_some_and(|runtime| {
+                required_array(&runtime.task, "/dependencies").is_ok_and(|dependencies| {
+                    dependencies.iter().all(|dependency| {
+                        dependency.as_str().is_some_and(|dependency_id| {
+                            !remaining.contains(dependency_id) || emitted.contains(dependency_id)
+                        })
+                    })
+                })
+            })
+        });
+        let Some(next) = next.cloned() else {
+            return Err(ControllerError::InvalidPlan(
+                "task dependency graph is cyclic or malformed during ChangeSet composition"
+                    .to_owned(),
+            ));
+        };
+        remaining.remove(&next);
+        emitted.insert(next.clone());
+        ordered.push(next);
+    }
+    Ok(ordered)
 }
 
 fn fresh_task_runtime(task: &Value) -> Result<TaskRuntime, ControllerError> {
@@ -7671,6 +9144,14 @@ fn fresh_task_runtime(task: &Value) -> Result<TaskRuntime, ControllerError> {
         resource_deferrals_used: 0,
         resource_retry_exhausted: false,
         resource_deferred_from: None,
+        worktree_lease: None,
+        worktree_state: None,
+        change_set: None,
+        change_set_artifact_digest: None,
+        change_set_carry: None,
+        worktree_baseline: None,
+        worktree_composition: Vec::new(),
+        worktree_conflict: None,
         task_contract_digest: digest_json(task)?,
         task: task.clone(),
     })
@@ -7850,6 +9331,11 @@ fn build_superseding_runtime(
     let mut carry_records = Vec::new();
     let instruction_digest = plan_instruction_fingerprint_digest(next_plan)?;
     let mut local_carry_candidates = BTreeMap::new();
+    let previous_uses_worktrees = previous
+        .plan_document
+        .pointer("/depth/mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| matches!(mode, "D3" | "D4"));
 
     for (task_id, task) in &next_task_map {
         let mut runtime = fresh_task_runtime(task)?;
@@ -7895,6 +9381,17 @@ fn build_superseding_runtime(
                 let old_key = revision_scoped_key(&previous.plan_id, previous.revision, task_id);
                 if let Some(raw) = state.get_state("controller.task_carry_fingerprint", &old_key)? {
                     let proof: TaskCarryFingerprintV1 = serde_json::from_str(&raw)?;
+                    let source_fresh = if previous_uses_worktrees {
+                        proof.execution_provenance.is_some()
+                            && task_carry_execution_provenance(previous, task_id)?
+                                == proof.execution_provenance
+                    } else {
+                        proof.execution_provenance.is_none()
+                            && proof.source_fingerprints.iter().all(|(path, fingerprint)| {
+                                path_fingerprint(&previous.repository_root, Path::new(path))
+                                    .is_ok_and(|current| current == *fingerprint)
+                            })
+                    };
                     let proof_matches = proof.schema_version
                         == TASK_CARRY_FINGERPRINT_SCHEMA_VERSION
                         && proof.plan_id == previous.plan_id
@@ -7906,10 +9403,7 @@ fn build_superseding_runtime(
                         && proof.dependency_contract_digest
                             == task_dependency_contract_digest(task)?
                         && proof.instruction_fingerprint_digest == instruction_digest
-                        && proof.source_fingerprints.iter().all(|(path, fingerprint)| {
-                            path_fingerprint(&previous.repository_root, Path::new(path))
-                                .is_ok_and(|current| current == *fingerprint)
-                        });
+                        && source_fresh;
                     let verification_ok = if proof_matches
                         && state
                             .artifact_metadata(&proof.verification_artifact_digest)?
@@ -7936,7 +9430,18 @@ fn build_superseding_runtime(
                     } else {
                         false
                     };
-                    if verification_ok {
+                    let worktree_carry_ok = if previous_uses_worktrees {
+                        validate_durable_change_set_binding(
+                            state,
+                            &old_key,
+                            task_id,
+                            previous_runtime,
+                        )
+                        .is_ok()
+                    } else {
+                        true
+                    };
+                    if verification_ok && worktree_carry_ok {
                         local_carry_candidates.insert(task_id.clone(), proof);
                     }
                 }
@@ -7975,6 +9480,46 @@ fn build_superseding_runtime(
                 ))
             })?;
             runtime.state = TaskState::Succeeded;
+            let previous_runtime = previous.tasks.get(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "carry candidate {task_id} disappeared from previous runtime"
+                ))
+            })?;
+            if previous_uses_worktrees {
+                let change_set = previous_runtime.change_set.clone().ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!(
+                        "D3/D4 carry candidate {task_id} lost immutable ChangeSet provenance"
+                    ))
+                })?;
+                let artifact_digest = previous_runtime
+                    .change_set_artifact_digest
+                    .clone()
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan(format!(
+                            "D3/D4 carry candidate {task_id} lost ChangeSet artifact provenance"
+                        ))
+                    })?;
+                let source_change_set_digest = change_set.digest()?;
+                runtime.change_set = Some(change_set.clone());
+                runtime.change_set_artifact_digest = Some(artifact_digest);
+                runtime.change_set_carry = Some(CarriedChangeSetProvenanceV1 {
+                    from_revision: previous.revision,
+                    to_revision: next_revision,
+                    source_change_set_digest,
+                });
+                // Old worktree leases are never carried. Only immutable verified ChangeSet evidence
+                // is rebound as N+1 composition input; a fresh N+1 lease is required for mutation.
+                runtime.worktree_lease = None;
+                runtime.worktree_state = None;
+                runtime.worktree_baseline = None;
+                runtime.worktree_composition.clear();
+                runtime.worktree_conflict = None;
+                carry_records.push((
+                    "controller.change_set".to_owned(),
+                    revision_scoped_key(&previous.plan_id, next_revision, task_id),
+                    serde_json::to_string(&change_set)?,
+                ));
+            }
             let mut next_proof = proof.clone();
             next_proof.plan_revision = next_revision;
             next_plan_digest.clone_into(&mut next_proof.plan_digest);
@@ -8363,55 +9908,6 @@ fn valid_repo_relative_path(path: &str) -> bool {
 fn evidence_repo_relative_path<'a>(repository_id: &str, item: &'a EvidenceItem) -> Option<&'a str> {
     item.source_uri
         .strip_prefix(&format!("repo://{repository_id}/"))
-}
-
-fn validate_requirement_bound_evidence(
-    registry: &ProjectRegistry,
-    repository_id: &str,
-    item: &EvidenceItem,
-    probe: &ExactRequirementProbe,
-) -> Result<(), ControllerError> {
-    let path = evidence_repo_relative_path(repository_id, item).ok_or_else(|| {
-        ControllerError::NotReady(
-            "requirement-bound exact evidence lacks a repository-relative source".to_owned(),
-        )
-    })?;
-    let ExactRequirementProbe::Path {
-        path: expected_path,
-        contains,
-    } = probe;
-    if path != expected_path {
-        return Err(ControllerError::NotReady(format!(
-            "selected evidence path {path} does not satisfy required exact path {expected_path}"
-        )));
-    }
-    let current = ExactRetriever::new(registry).read_path(
-        repository_id,
-        Path::new(expected_path),
-        Some(&item.source_digest),
-    )?;
-    for literal in contains {
-        if !current.content.contains(literal) {
-            return Err(ControllerError::NotReady(format!(
-                "selected exact evidence lacks required literal {literal:?}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_requirement_probe_cardinality(
-    registry: &ProjectRegistry,
-    repository_id: &str,
-    probe: &ExactRequirementProbe,
-    satisfaction: &str,
-) -> Result<(), ControllerError> {
-    if satisfaction != "exactly_one" {
-        return Ok(());
-    }
-    let ExactRequirementProbe::Path { path, .. } = probe;
-    ExactRetriever::new(registry).read_path(repository_id, Path::new(path), None)?;
-    Ok(())
 }
 
 fn baseline_target_added_line_contains_literal(diff: &str, path: &str, literal: &str) -> bool {
@@ -8820,13 +10316,15 @@ fn unix_millis() -> Result<i64, ControllerError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActivePlan, Controller, ExactRequirementProbe, FailureClassification,
-        FailureClassificationKind, PlanValidity, RecoveryProcessLease, TaskCarryFingerprintV1,
-        TaskRuntime, TaskState, VerificationResultV1, VerifiedOutputBindingV1,
+        ACTION_INTENT_SCHEMA_VERSION, ActivePlan, Controller, ExactRequirementProbe,
+        FailureClassification, FailureClassificationKind, LEGACY_ACTION_INTENT_SCHEMA_VERSION,
+        PlanValidity, RecoveryProcessLease, TaskCarryExecutionProvenanceV1, TaskCarryFingerprintV1,
+        TaskRuntime, TaskState, VerificationResultV1, VerifiedOutputBindingV1, WorktreeLifecycle,
         acceptance_permits_cross_revision_carry, build_superseding_runtime,
         compilation_inputs_are_fresh_for_carry, compiled_acceptance_contract,
         dependency_bindings_permit_cross_revision_carry, digest_json, exact_requirement_probe,
-        explicit_replace_relation, has_unresolved_process_lease, lineage_records_for_supersession,
+        explicit_replace_relation, fresh_task_runtime, has_unresolved_process_lease,
+        lineage_records_for_supersession, normalize_persisted_action_intent,
         normalized_failure_signature, output_binding_key, plan_instruction_fingerprint_digest,
         process_lease_is_terminal, repair_allowed, revision_record_key, revision_scoped_key,
         scope_lineage_id,
@@ -8834,10 +10332,13 @@ mod tests {
     use serde_json::{Value, json};
     use sovereign_evidence::ArtifactStore;
     use sovereign_plan::{PlanRevisionDiff, ReplanScope};
-    use sovereign_repo::{ProjectRegistry, RepositorySnapshot};
+    use sovereign_repo::{
+        ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot, WorktreeLease,
+    };
     use sovereign_state::StateStore;
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -8846,6 +10347,137 @@ mod tests {
         assert!(!repair_allowed(2, 2, 1, 2));
         assert!(!repair_allowed(1, 3, 2, 2));
         assert!(!repair_allowed(2, 2, 2, 2));
+    }
+
+    #[test]
+    fn worktree_depth_gate_covers_d3_and_d4_only() {
+        for (index, (mode, expected)) in [("D2", false), ("D3", true), ("D4", true)]
+            .into_iter()
+            .enumerate()
+        {
+            let (base, state) = temp_state(&format!("worktree-depth-{index}"));
+            let plan_digest = format!("sha256:{}", "a".repeat(64));
+            let mut active = active_fixture(&base, 1, &plan_digest);
+            active.plan_document["depth"] = json!({"mode": mode});
+            let mut controller = Controller::new(state);
+            controller.active = Some(active);
+            assert_eq!(
+                controller
+                    .active_uses_controller_worktrees()
+                    .unwrap_or_else(|error| panic!("depth gate {mode}: {error}")),
+                expected
+            );
+            drop(controller);
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    #[test]
+    fn controller_rederives_state_parent_worktree_root_and_rejects_path_root_tamper() {
+        let (base, state) = temp_state("worktree-root-binding");
+        let repository_root = base.join("repo");
+        std::fs::create_dir_all(&repository_root)
+            .unwrap_or_else(|error| panic!("create repository root: {error}"));
+        let repository_root = repository_root
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonical repository root: {error}"));
+        let plan_digest = format!("sha256:{}", "a".repeat(64));
+        let mut active = active_fixture(&repository_root, 3, &plan_digest);
+        active.plan_document["depth"] = json!({"mode": "D3"});
+        let task = json!({"task_id": "task.A"});
+        let runtime =
+            fresh_task_runtime(&task).unwrap_or_else(|error| panic!("fresh task runtime: {error}"));
+        let task_contract_digest = runtime.task_contract_digest.clone();
+        active.tasks.insert("task.A".to_owned(), runtime);
+        let mut controller = Controller::new(state);
+        controller.active = Some(active);
+        let expected_root = base
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonical state parent: {error}"))
+            .join("worktrees");
+        let lease_id = "worktree.bound".to_owned();
+        let lease = WorktreeLease {
+            schema_version: 1,
+            lease_id: lease_id.clone(),
+            repository_id: "repo.app".to_owned(),
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 3,
+            task_id: "task.A".to_owned(),
+            task_contract_digest,
+            primary_root: repository_root,
+            controller_root: expected_root.clone(),
+            worktree_path: expected_root.join(&lease_id),
+            base_head: "deadbeef".to_owned(),
+        };
+        controller
+            .validate_controller_worktree_lease_binding("task.A", &lease)
+            .unwrap_or_else(|error| panic!("valid controller binding: {error}"));
+
+        let mut root_tampered = lease.clone();
+        root_tampered.controller_root = base.join("foreign-root");
+        assert!(
+            controller
+                .validate_controller_worktree_lease_binding("task.A", &root_tampered)
+                .is_err()
+        );
+        let mut path_tampered = lease;
+        path_tampered.worktree_path = expected_root.join("foreign-path");
+        assert!(
+            controller
+                .validate_controller_worktree_lease_binding("task.A", &path_tampered)
+                .is_err()
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn recovery_migrates_genuine_v2_action_intent_without_granting_worktree_authority() {
+        let (base, state) = temp_state("action-intent-v2-migration");
+        drop(state);
+        let primary = base.join("repo");
+        std::fs::create_dir_all(&primary).unwrap_or_else(|error| panic!("create primary: {error}"));
+        let primary = primary
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonical primary: {error}"));
+        let legacy_json = json!({
+            "schema_version": LEGACY_ACTION_INTENT_SCHEMA_VERSION,
+            "action_id": "action.legacy-v2",
+            "plan_id": "plan.fixture",
+            "plan_revision": 1,
+            "plan_digest": format!("sha256:{}", "a".repeat(64)),
+            "task_id": "task.A",
+            "task_contract_digest": format!("sha256:{}", "b".repeat(64)),
+            "attempt_id": "attempt.A.1",
+            "execution_epoch": 7,
+            "payload_digest": format!("sha256:{}", "c".repeat(64)),
+            "action_nonce": "nonce.legacy",
+            "policy_digest": format!("sha256:{}", "d".repeat(64)),
+            "repository_id": "repo.app",
+            "path": "src/a.rs",
+            "expected_source_digest": format!("sha256:{}", "e".repeat(64)),
+            "old_literal": "old",
+            "new_literal": "new",
+            "expected_post_digest": format!("sha256:{}", "f".repeat(64)),
+            "expected_target_mode": 420,
+            "artifact_store_root": base.join("cas")
+        });
+        assert!(legacy_json.get("worktree_lease_id").is_none());
+        assert!(legacy_json.get("execution_root").is_none());
+        let legacy = serde_json::from_value(legacy_json)
+            .unwrap_or_else(|error| panic!("decode genuine v2 fixture: {error}"));
+        let migrated = normalize_persisted_action_intent(legacy, &primary)
+            .unwrap_or_else(|error| panic!("migrate v2 intent: {error}"));
+        assert_eq!(migrated.schema_version, ACTION_INTENT_SCHEMA_VERSION);
+        assert_eq!(migrated.execution_root, primary);
+        assert_eq!(migrated.worktree_lease_id, None);
+
+        let mut forged = migrated;
+        forged.schema_version = LEGACY_ACTION_INTENT_SCHEMA_VERSION;
+        forged.execution_root = PathBuf::new();
+        forged.worktree_lease_id = Some("worktree.old-revision".to_owned());
+        assert!(normalize_persisted_action_intent(forged, &primary).is_err());
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]
@@ -9179,6 +10811,7 @@ mod tests {
             dependency_contract_digest: format!("sha256:{}", "6".repeat(64)),
             instruction_fingerprint_digest: format!("sha256:{}", "7".repeat(64)),
             source_fingerprints: BTreeMap::new(),
+            execution_provenance: None,
             acceptance_contract_digest: verification.acceptance_contract_digest.clone(),
             verification_id: verification.verification_id.clone(),
             verification_artifact_digest: artifact.digest.clone(),
@@ -9208,6 +10841,7 @@ mod tests {
                 verification_id: verification.verification_id.clone(),
                 verification_artifact_digest: artifact.digest.clone(),
                 repository_snapshot_digest: "snapshot.N+1".to_owned(),
+                change_set_digest: None,
                 carried_from_plan_revision: Some(1),
                 carried_from_plan_digest: Some(plan_one_digest.clone()),
             };
@@ -9221,6 +10855,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("persist binding: {error}"));
         }
         let mut active = active_fixture(&base, 2, &plan_two_digest);
+        active.plan_document["depth"] = json!({"mode": "D2"});
         active.tasks.insert(
             "A".to_owned(),
             TaskRuntime {
@@ -9232,6 +10867,14 @@ mod tests {
                 resource_deferrals_used: 0,
                 resource_retry_exhausted: false,
                 resource_deferred_from: None,
+                worktree_lease: None,
+                worktree_state: None,
+                change_set: None,
+                change_set_artifact_digest: None,
+                change_set_carry: None,
+                worktree_baseline: None,
+                worktree_composition: Vec::new(),
+                worktree_conflict: None,
                 task_contract_digest: upstream_digest,
                 task: upstream_task,
             },
@@ -9249,6 +10892,14 @@ mod tests {
                 resource_deferrals_used: 0,
                 resource_retry_exhausted: false,
                 resource_deferred_from: None,
+                worktree_lease: None,
+                worktree_state: None,
+                change_set: None,
+                change_set_artifact_digest: None,
+                change_set_carry: None,
+                worktree_baseline: None,
+                worktree_composition: Vec::new(),
+                worktree_conflict: None,
                 task_contract_digest: downstream_digest,
                 task: downstream_task.clone(),
             },
@@ -9256,10 +10907,370 @@ mod tests {
         let mut controller = Controller::new(state);
         controller.active = Some(active);
         let resolved =
-            controller.resolve_dependency_binding_digests(&downstream_task, "snapshot.N+1");
+            controller.resolve_dependency_binding_digests("B", &downstream_task, "snapshot.N+1");
         assert!(
             resolved.is_ok(),
             "carried N output must be consumable in N+1: {resolved:?}"
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn d3_carried_n_changeset_composes_into_fresh_n_plus_one_lease_and_authorizes_downstream() {
+        let (base, mut state) = temp_state("d3-carried-changeset-composition");
+        let repository_root = base.join("repo");
+        std::fs::create_dir_all(&repository_root)
+            .unwrap_or_else(|error| panic!("create repository: {error}"));
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&repository_root)
+                .args(args)
+                .output()
+                .unwrap_or_else(|error| panic!("git {args:?}: {error}"));
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Sovereign Test"]);
+        git(&["config", "user.email", "test@sovereign.invalid"]);
+        std::fs::write(repository_root.join("tracked.txt"), "base\n")
+            .unwrap_or_else(|error| panic!("write baseline: {error}"));
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "baseline"]);
+        let repository_root = repository_root
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonical repository: {error}"));
+        let mut registry = ProjectRegistry::new();
+        registry
+            .register("repo.app", &repository_root)
+            .unwrap_or_else(|error| panic!("register repository: {error}"));
+
+        let task_a = json!({
+            "task_id": "A",
+            "dependencies": [],
+            "dependency_bindings": [],
+            "implementation_contract": {"inputs": []},
+            "acceptance_criteria": [{
+                "criterion_id": "AC.A",
+                "evidence_freshness": "carry_forward_if_inputs_unchanged",
+                "required": true
+            }],
+            "expected_artifacts": [{"artifact_id": "artifact.A", "required": true}]
+        });
+        let task_b = json!({
+            "task_id": "B",
+            "dependencies": ["A"],
+            "dependency_bindings": [{
+                "upstream_task_id": "A",
+                "required_artifact_ids": ["artifact.A"],
+                "required_acceptance_criterion_ids": ["AC.A"],
+                "freshness": "carry_forward_if_inputs_unchanged"
+            }],
+            "implementation_contract": {"inputs": []},
+            "acceptance_criteria": [],
+            "expected_artifacts": []
+        });
+        let digest_a = digest_json(&task_a).unwrap_or_else(|error| panic!("digest A: {error}"));
+        let plan_one_digest = format!("sha256:{}", "1".repeat(64));
+        let plan_two_digest = format!("sha256:{}", "2".repeat(64));
+        let next_plan = json!({
+            "depth": {"mode": "D3"},
+            "repositories": [{"instructions": []}],
+            "tasks": [task_a.clone(), task_b.clone()]
+        });
+        let instruction_digest = plan_instruction_fingerprint_digest(&next_plan)
+            .unwrap_or_else(|error| panic!("instruction digest: {error}"));
+
+        let historical_lease = registry
+            .prepare_worktree_lease(
+                "repo.app",
+                &base.join("historical-worktrees"),
+                "plan.fixture",
+                1,
+                "A",
+                &digest_a,
+            )
+            .unwrap_or_else(|error| panic!("prepare historical lease: {error}"));
+        registry
+            .materialize_worktree(&historical_lease)
+            .unwrap_or_else(|error| panic!("materialize historical lease: {error}"));
+        let historical_baseline = registry
+            .capture_worktree_baseline(&historical_lease)
+            .unwrap_or_else(|error| panic!("historical baseline: {error}"));
+        std::fs::write(
+            historical_lease.worktree_path.join("tracked.txt"),
+            "from-N\n",
+        )
+        .unwrap_or_else(|error| panic!("historical mutation: {error}"));
+        let change_set = registry
+            .capture_change_set_from_baseline(&historical_lease, &historical_baseline)
+            .unwrap_or_else(|error| panic!("historical ChangeSet: {error}"));
+        let change_set_digest = change_set
+            .digest()
+            .unwrap_or_else(|error| panic!("ChangeSet digest: {error}"));
+
+        let artifact_store = ArtifactStore::open(base.join("cas"))
+            .unwrap_or_else(|error| panic!("artifact store: {error}"));
+        let change_set_artifact = artifact_store
+            .put(
+                &mut state,
+                &serde_json::to_vec(&change_set)
+                    .unwrap_or_else(|error| panic!("ChangeSet json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("ChangeSet artifact: {error}"));
+        state
+            .put_state(
+                "controller.change_set",
+                &revision_scoped_key("plan.fixture", 1, "A"),
+                &serde_json::to_string(&change_set)
+                    .unwrap_or_else(|error| panic!("durable ChangeSet json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist durable ChangeSet: {error}"));
+        let verification_artifact = artifact_store
+            .put(&mut state, b"verification")
+            .unwrap_or_else(|error| panic!("verification artifact: {error}"));
+        let verification = VerificationResultV1 {
+            schema_version: super::VERIFICATION_RESULT_SCHEMA_VERSION,
+            verification_id: "verification.A".to_owned(),
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            plan_digest: plan_one_digest.clone(),
+            task_id: "A".to_owned(),
+            task_contract_digest: digest_a.clone(),
+            attempt_id: "attempt.A.1".to_owned(),
+            execution_epoch: 1,
+            evaluator: "builtin.diff.scoped_change.v1".to_owned(),
+            acceptance_contract_digest: format!("sha256:{}", "3".repeat(64)),
+            diff_digest: change_set.diff_digest.clone(),
+            post_snapshot_digest: "worktree.snapshot.N".to_owned(),
+            expected_target_mode: 0o644,
+            observed_target_mode: 0o644,
+            evidence_ids: vec!["ev.N".to_owned()],
+            passed: true,
+            failure_code: None,
+        };
+        state
+            .put_state(
+                "controller.verification",
+                &revision_scoped_key("plan.fixture", 1, "verification.A"),
+                &serde_json::to_string(&verification)
+                    .unwrap_or_else(|error| panic!("verification json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist verification: {error}"));
+        state
+            .put_state(
+                "controller.compilation_evidence",
+                &revision_record_key("plan.fixture", 1),
+                &json!({"exact_evidence": []}).to_string(),
+            )
+            .unwrap_or_else(|error| panic!("persist compilation evidence: {error}"));
+        let source_fingerprints = BTreeMap::from([(
+            "tracked.txt".to_owned(),
+            super::path_fingerprint(
+                &historical_lease.worktree_path,
+                std::path::Path::new("tracked.txt"),
+            )
+            .unwrap_or_else(|error| panic!("post-mutation source fingerprint: {error}")),
+        )]);
+        assert!(!source_fingerprints.is_empty());
+        let proof = TaskCarryFingerprintV1 {
+            schema_version: super::TASK_CARRY_FINGERPRINT_SCHEMA_VERSION,
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            plan_digest: plan_one_digest.clone(),
+            task_id: "A".to_owned(),
+            task_contract_digest: digest_a.clone(),
+            implementation_inputs_digest: digest_json(&json!([]))
+                .unwrap_or_else(|error| panic!("inputs digest: {error}")),
+            dependency_contract_digest: digest_json(&json!([]))
+                .unwrap_or_else(|error| panic!("dependency digest: {error}")),
+            instruction_fingerprint_digest: instruction_digest,
+            source_fingerprints,
+            execution_provenance: Some(TaskCarryExecutionProvenanceV1 {
+                change_set_digest: change_set_digest.clone(),
+                composed_change_sets: Vec::new(),
+            }),
+            acceptance_contract_digest: verification.acceptance_contract_digest.clone(),
+            verification_id: verification.verification_id.clone(),
+            verification_artifact_digest: verification_artifact.digest.clone(),
+        };
+        state
+            .put_state(
+                "controller.task_carry_fingerprint",
+                &revision_scoped_key("plan.fixture", 1, "A"),
+                &serde_json::to_string(&proof)
+                    .unwrap_or_else(|error| panic!("carry proof json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist carry proof: {error}"));
+        for (namespace, kind, binding_id) in [
+            ("controller.artifact_binding", "artifact", "artifact.A"),
+            ("controller.acceptance_binding", "acceptance", "AC.A"),
+        ] {
+            let binding = VerifiedOutputBindingV1 {
+                schema_version: super::VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION,
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 1,
+                plan_digest: plan_one_digest.clone(),
+                task_id: "A".to_owned(),
+                task_contract_digest: digest_a.clone(),
+                attempt_id: "attempt.A.1".to_owned(),
+                binding_kind: kind.to_owned(),
+                binding_id: binding_id.to_owned(),
+                verification_id: verification.verification_id.clone(),
+                verification_artifact_digest: verification_artifact.digest.clone(),
+                repository_snapshot_digest: verification.post_snapshot_digest.clone(),
+                change_set_digest: Some(change_set_digest.clone()),
+                carried_from_plan_revision: None,
+                carried_from_plan_digest: None,
+            };
+            state
+                .put_state(
+                    namespace,
+                    &revision_scoped_key("plan.fixture", 1, &output_binding_key("A", binding_id)),
+                    &serde_json::to_string(&binding)
+                        .unwrap_or_else(|error| panic!("binding json: {error}")),
+                )
+                .unwrap_or_else(|error| panic!("persist binding: {error}"));
+        }
+
+        let mut previous = active_fixture(&repository_root, 1, &plan_one_digest);
+        previous.plan_document = json!({
+            "depth": {"mode": "D3"},
+            "repositories": [{"instructions": []}],
+            "tasks": [task_a.clone()]
+        });
+        let mut runtime_a =
+            fresh_task_runtime(&task_a).unwrap_or_else(|error| panic!("fresh A runtime: {error}"));
+        runtime_a.state = TaskState::Succeeded;
+        runtime_a.worktree_lease = Some(historical_lease.clone());
+        runtime_a.worktree_state = Some(WorktreeLifecycle::Released);
+        runtime_a.change_set = Some(change_set.clone());
+        runtime_a.change_set_artifact_digest = Some(change_set_artifact.digest.clone());
+        previous.tasks.insert("A".to_owned(), runtime_a);
+
+        let diff = PlanRevisionDiff {
+            plan_id: "plan.fixture".to_owned(),
+            from_revision: 1,
+            to_revision: 2,
+            from_plan_digest: plan_one_digest.clone(),
+            to_plan_digest: plan_two_digest.clone(),
+            scope: ReplanScope::Task,
+            invalidated_contract_ids: vec!["ASSUME.unrelated".to_owned()],
+            affected_task_ids: vec!["B".to_owned()],
+            unchanged_task_ids: vec!["A".to_owned()],
+            changed_task_ids: Vec::new(),
+            added_task_ids: vec!["B".to_owned()],
+            removed_task_ids: Vec::new(),
+        };
+        let unrelated_artifact = artifact_store
+            .put(&mut state, b"unrelated-artifact")
+            .unwrap_or_else(|error| panic!("unrelated artifact: {error}"));
+        let correct_change_set_artifact_digest = previous
+            .tasks
+            .get("A")
+            .and_then(|runtime| runtime.change_set_artifact_digest.clone())
+            .unwrap_or_else(|| panic!("previous A ChangeSet artifact missing"));
+        previous
+            .tasks
+            .get_mut("A")
+            .unwrap_or_else(|| panic!("tampered previous A missing"))
+            .change_set_artifact_digest = Some(unrelated_artifact.digest);
+        let tampered_build = build_superseding_runtime(
+            &state,
+            &registry,
+            &previous,
+            &next_plan,
+            &plan_two_digest,
+            &json!({"exact_evidence": []}),
+            &diff,
+            "primary.snapshot.N+1",
+        )
+        .unwrap_or_else(|error| panic!("build tampered superseding D3 runtime: {error}"));
+        assert_eq!(
+            tampered_build.tasks["A"].state,
+            TaskState::Planned,
+            "unrelated artifact metadata must not authorize ChangeSet carry"
+        );
+        previous
+            .tasks
+            .get_mut("A")
+            .unwrap_or_else(|| panic!("restore previous A missing"))
+            .change_set_artifact_digest = Some(correct_change_set_artifact_digest);
+
+        let build = build_superseding_runtime(
+            &state,
+            &registry,
+            &previous,
+            &next_plan,
+            &plan_two_digest,
+            &json!({"exact_evidence": []}),
+            &diff,
+            "primary.snapshot.N+1",
+        )
+        .unwrap_or_else(|error| panic!("build superseding D3 runtime: {error}"));
+        let carried_a = &build.tasks["A"];
+        assert_eq!(carried_a.state, TaskState::Succeeded);
+        assert!(carried_a.worktree_lease.is_none());
+        assert!(carried_a.worktree_state.is_none());
+        assert_eq!(carried_a.change_set.as_ref(), Some(&change_set));
+        let carried = carried_a
+            .change_set_carry
+            .as_ref()
+            .unwrap_or_else(|| panic!("explicit ChangeSet carry provenance missing"));
+        assert_eq!(carried.from_revision, 1);
+        assert_eq!(carried.to_revision, 2);
+        assert_eq!(carried.source_change_set_digest, change_set_digest);
+        for (namespace, key, value) in &build.carry_records {
+            state
+                .put_state(namespace, key, value)
+                .unwrap_or_else(|error| panic!("persist N+1 carry record: {error}"));
+        }
+
+        let mut active = active_fixture(&repository_root, 2, &plan_two_digest);
+        active.plan_document = next_plan;
+        active.tasks = build.tasks;
+        active.baseline = registry
+            .snapshot("repo.app")
+            .unwrap_or_else(|error| panic!("primary snapshot: {error}"));
+        let primary_diff = ExactRetriever::new(&registry)
+            .current_diff("repo.app")
+            .unwrap_or_else(|error| panic!("primary diff: {error}"));
+        active.baseline_diff_digest = primary_diff.digest;
+        active.baseline_diff_content = primary_diff.content;
+        let mut controller = Controller::new(state);
+        controller.active = Some(active);
+        controller
+            .ensure_task_worktree(&registry, "B")
+            .unwrap_or_else(|error| panic!("compose carried A into fresh B lease: {error}"));
+        let lease_b = controller
+            .task_worktree_lease("B")
+            .cloned()
+            .unwrap_or_else(|| panic!("fresh N+1 downstream lease missing"));
+        assert_eq!(lease_b.plan_revision, 2);
+        assert_ne!(lease_b.lease_id, historical_lease.lease_id);
+        assert_eq!(
+            std::fs::read_to_string(lease_b.worktree_path.join("tracked.txt"))
+                .unwrap_or_else(|error| panic!("read composed carried output: {error}")),
+            "from-N\n"
+        );
+        let readiness_binding = controller.resolve_dependency_binding_digests(
+            "B",
+            &task_b,
+            "deliberately-not-equal-to-primary-or-historical-snapshot",
+        );
+        assert!(
+            readiness_binding.is_ok(),
+            "carried readiness must bind exact composed ChangeSet membership: {readiness_binding:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository_root.join("tracked.txt"))
+                .unwrap_or_else(|error| panic!("read protected primary: {error}")),
+            "base\n"
         );
         drop(controller);
         let _ = std::fs::remove_dir_all(base);
@@ -9329,6 +11340,19 @@ mod tests {
             ),
             ("B", &task_b, &digest_b, BTreeMap::new()),
         ] {
+            let old_lease = WorktreeLease {
+                schema_version: 1,
+                lease_id: format!("worktree.old-{task_id}"),
+                repository_id: "repo.fixture".to_owned(),
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 1,
+                task_id: task_id.to_owned(),
+                task_contract_digest: task_digest.clone(),
+                primary_root: base.join("repo"),
+                controller_root: base.join("worktrees"),
+                worktree_path: base.join("worktrees").join(format!("old-{task_id}")),
+                base_head: "deadbeef".to_owned(),
+            };
             previous.tasks.insert(
                 task_id.to_owned(),
                 TaskRuntime {
@@ -9340,6 +11364,14 @@ mod tests {
                     resource_deferrals_used: 0,
                     resource_retry_exhausted: false,
                     resource_deferred_from: None,
+                    worktree_lease: Some(old_lease),
+                    worktree_state: Some(WorktreeLifecycle::Materialized),
+                    change_set: None,
+                    change_set_artifact_digest: None,
+                    change_set_carry: None,
+                    worktree_baseline: None,
+                    worktree_composition: Vec::new(),
+                    worktree_conflict: None,
                     task_contract_digest: task_digest.clone(),
                     task: task_value.clone(),
                 },
@@ -9386,6 +11418,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("dependency digest: {error}")),
                 instruction_fingerprint_digest: instruction_digest.clone(),
                 source_fingerprints,
+                execution_provenance: None,
                 acceptance_contract_digest: verification.acceptance_contract_digest.clone(),
                 verification_id: verification_id.clone(),
                 verification_artifact_digest: verification_artifact.digest.clone(),
@@ -9423,6 +11456,7 @@ mod tests {
                     verification_id: verification_id.clone(),
                     verification_artifact_digest: verification_artifact.digest.clone(),
                     repository_snapshot_digest: "snapshot.N".to_owned(),
+                    change_set_digest: None,
                     carried_from_plan_revision: None,
                     carried_from_plan_digest: None,
                 };
@@ -9468,6 +11502,12 @@ mod tests {
         .unwrap_or_else(|error| panic!("superseding runtime: {error}"));
         assert_eq!(build.tasks["A"].state, TaskState::Planned);
         assert_eq!(build.tasks["B"].state, TaskState::Planned);
+        assert!(build.tasks.values().all(|task| {
+            task.worktree_lease.is_none()
+                && task.worktree_state.is_none()
+                && task.change_set.is_none()
+                && task.change_set_artifact_digest.is_none()
+        }));
         assert!(build.carry_records.is_empty());
         let _ = std::fs::remove_dir_all(base);
     }

@@ -1,12 +1,14 @@
 #![cfg(target_os = "macos")]
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sovereign_context::{
     ContextBudget, ContextMode, ContextPacket, ContextPacketInput, ContextPlanner, EvidenceItem,
 };
 use sovereign_controller::{
-    Controller, ControllerError, ExecutionRuntime, ModelProposalV1, PermissionContext,
-    PlanValidity, ReadinessInputs, RecoveryManager, SchedulerView, TaskState,
+    CheckpointActionRecord, CheckpointManifest, Controller, ControllerError, ExecutionRuntime,
+    ModelProposalV1, PermissionContext, PlanValidity, ReadinessInputs, RecoveryManager,
+    SchedulerView, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_model::{
@@ -14,6 +16,7 @@ use sovereign_model::{
     ModelFinishReason, ModelLoadProfile, ModelResponse, ModelUsage,
 };
 use sovereign_plan::{
+    DepthClassifier, DepthFeatureInput, ExecutionDepth, M3PlanningInput,
     PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationInput, PlanCompilationRepository,
     PlanCompilationResult, PlanCompiler, PlanValidator, ValidationEnvironment,
 };
@@ -23,10 +26,13 @@ use sovereign_policy::{
     ModelCallBudget, PinnedExecutable, PolicyError,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence};
-use sovereign_state::{NewJournalEvent, StateStore};
+use sovereign_state::{
+    ActionTransition, NewActionRecord, NewCheckpointIntegrityRecord, NewJournalEvent, StateStore,
+};
 use sovereign_tools::{PermissionClass, ToolManifest};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -132,6 +138,111 @@ fn git_text(root: &Path, args: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap_or_else(|error| panic!("git output utf8: {error}"))
 }
 
+fn sha256_prefixed(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn append_modified_checkpoint(
+    state: &mut StateStore,
+    mutate: impl FnOnce(&mut CheckpointManifest),
+) {
+    let latest = state
+        .latest_checkpoint_integrity()
+        .unwrap_or_else(|error| panic!("latest checkpoint: {error}"))
+        .unwrap_or_else(|| panic!("checkpoint missing"));
+    let state_parent = state
+        .path()
+        .parent()
+        .unwrap_or_else(|| panic!("state parent missing"));
+    let store = ArtifactStore::open(state_parent.join("checkpoint-cas"))
+        .unwrap_or_else(|error| panic!("checkpoint store: {error}"));
+    let mut file = store
+        .open_artifact(state, &latest.payload_digest)
+        .unwrap_or_else(|error| panic!("open checkpoint manifest: {error}"));
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .unwrap_or_else(|error| panic!("read checkpoint manifest: {error}"));
+    let mut manifest: CheckpointManifest = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("decode checkpoint manifest: {error}"));
+    mutate(&mut manifest);
+    let bytes = serde_json::to_vec(&manifest)
+        .unwrap_or_else(|error| panic!("encode modified checkpoint manifest: {error}"));
+    let artifact = store
+        .put(state, &bytes)
+        .unwrap_or_else(|error| panic!("store modified checkpoint manifest: {error}"));
+    let checkpoint = state
+        .append_checkpoint_integrity(NewCheckpointIntegrityRecord {
+            payload_digest: &artifact.digest,
+            action_sequence: manifest.action_journal_sequence,
+        })
+        .unwrap_or_else(|error| panic!("append modified checkpoint: {error}"));
+    state
+        .add_artifact_reference(
+            &format!("checkpoint.manifest.{}", checkpoint.generation),
+            &artifact.digest,
+        )
+        .unwrap_or_else(|error| panic!("bind modified checkpoint artifact: {error}"));
+}
+
+fn latest_checkpoint_manifest(state: &StateStore) -> CheckpointManifest {
+    let latest = state
+        .latest_checkpoint_integrity()
+        .unwrap_or_else(|error| panic!("latest checkpoint: {error}"))
+        .unwrap_or_else(|| panic!("checkpoint missing"));
+    let state_parent = state
+        .path()
+        .parent()
+        .unwrap_or_else(|| panic!("state parent missing"));
+    let store = ArtifactStore::open(state_parent.join("checkpoint-cas"))
+        .unwrap_or_else(|error| panic!("checkpoint store: {error}"));
+    let mut file = store
+        .open_artifact(state, &latest.payload_digest)
+        .unwrap_or_else(|error| panic!("open checkpoint manifest: {error}"));
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .unwrap_or_else(|error| panic!("read checkpoint manifest: {error}"));
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("decode checkpoint manifest: {error}"))
+}
+
+fn replace_persisted_task_runtime(
+    state: &mut StateStore,
+    task_id: &str,
+    mutate: impl FnOnce(&mut Value),
+) {
+    let record = state
+        .state_records("controller.task")
+        .unwrap_or_else(|error| panic!("task records: {error}"))
+        .into_iter()
+        .find(|record| {
+            serde_json::from_str::<Value>(&record.value_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/task/task_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some(task_id)
+        })
+        .unwrap_or_else(|| panic!("persisted task {task_id} missing"));
+    let mut value: Value = serde_json::from_str(&record.value_json)
+        .unwrap_or_else(|error| panic!("decode persisted task: {error}"));
+    mutate(&mut value);
+    state
+        .put_state(
+            "controller.task",
+            &record.key,
+            &serde_json::to_string(&value)
+                .unwrap_or_else(|error| panic!("encode persisted task: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("replace persisted task: {error}"));
+    append_modified_checkpoint(state, |manifest| {
+        manifest.task_records.insert(task_id.to_owned(), value);
+    });
+}
+
 fn first_evidence_requirement_id(fixture: &CompiledFixture) -> String {
     fixture
         .compilation
@@ -154,6 +265,59 @@ struct TwoTaskContract {
     upstream: String,
     downstream: String,
     artifact: String,
+}
+
+fn worktree_graph_task(
+    local_id: &str,
+    file: &str,
+    dependencies: &[&str],
+    old_literal: &str,
+    new_literal: &str,
+) -> Value {
+    let local_id = format!("task-{local_id}");
+    let dependencies = dependencies
+        .iter()
+        .map(|dependency| format!("task-{dependency}"))
+        .collect::<Vec<_>>();
+    json!({
+        "local_id": local_id,
+        "repository_id": "repo.app",
+        "title": format!("Implement {local_id}"),
+        "objective": format!("Change {old_literal} to {new_literal} in {file}."),
+        "rationale": "The dependency-closed repository view requires this exact bounded mutation.",
+        "files": [file],
+        "symbols": [local_id],
+        "dependencies": dependencies,
+        "evidence_needs": [],
+        "expected_change": format!("Change {old_literal} to {new_literal} in {file}."),
+        "acceptance": [{
+            "kind": "diff",
+            "description": format!("The exact {old_literal}-to-{new_literal} delta is accepted."),
+            "manual_gate_id": Value::Null
+        }]
+    })
+}
+
+fn task_id_for_objective(fixture: &CompiledFixture, relation: &str) -> String {
+    fixture
+        .compilation
+        .as_ref()
+        .unwrap_or_else(|| panic!("compiled graph fixture missing"))
+        .plan()
+        .as_value()["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("compiled graph tasks missing"))
+        .iter()
+        .find(|task| {
+            task["objective"]
+                .as_str()
+                .is_some_and(|objective| objective.contains(relation))
+        })
+        .and_then(|task| task["task_id"].as_str())
+        .map_or_else(
+            || panic!("compiled task for relation {relation:?} missing"),
+            str::to_owned,
+        )
 }
 
 fn two_task_contract(fixture: &CompiledFixture) -> TwoTaskContract {
@@ -240,28 +404,83 @@ fn backend(responses: Vec<ModelResponse>) -> DeterministicFakeBackend {
 
 #[allow(clippy::too_many_lines)]
 fn compiled_fixture(label: &str, evidence_query: bool) -> CompiledFixture {
-    compiled_fixture_inner(label, evidence_query, false, None, None, false)
+    compiled_fixture_inner(
+        label,
+        evidence_query,
+        false,
+        None,
+        None,
+        false,
+        false,
+        None,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
 fn compiled_fixture_with_dirty_target(label: &str) -> CompiledFixture {
-    compiled_fixture_inner(label, false, true, None, None, false)
+    compiled_fixture_inner(label, false, true, None, None, false, false, None, None)
 }
 
 #[allow(clippy::too_many_lines)]
 fn compiled_fixture_with_task_model_call_cap(label: &str, cap: u64) -> CompiledFixture {
-    compiled_fixture_inner(label, false, false, Some(cap), None, false)
+    compiled_fixture_inner(
+        label,
+        false,
+        false,
+        Some(cap),
+        None,
+        false,
+        false,
+        None,
+        None,
+    )
 }
 
 fn compiled_fixture_with_target_mode(label: &str, mode: u32) -> CompiledFixture {
-    compiled_fixture_inner(label, false, false, None, Some(mode), false)
+    compiled_fixture_inner(
+        label,
+        false,
+        false,
+        None,
+        Some(mode),
+        false,
+        false,
+        None,
+        None,
+    )
 }
 
 fn compiled_two_task_fixture(label: &str) -> CompiledFixture {
-    compiled_fixture_inner(label, false, false, None, None, true)
+    compiled_fixture_inner(label, false, false, None, None, true, false, None, None)
 }
 
-#[allow(clippy::too_many_lines)]
+fn compiled_worktree_fixture(label: &str) -> CompiledFixture {
+    compiled_fixture_inner(label, false, false, None, None, false, true, None, None)
+}
+
+fn compiled_worktree_graph_fixture(label: &str, tasks: &[Value]) -> CompiledFixture {
+    compiled_fixture_inner(
+        label,
+        false,
+        false,
+        None,
+        None,
+        false,
+        true,
+        Some(json!({"tasks": tasks})),
+        Some(
+            "Change Save to Apply, Apply to Applied, Apply to Approved, baseline to branchthree, imported to finalized."
+                .to_owned(),
+        ),
+    )
+}
+
+#[allow(
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 fn compiled_fixture_inner(
     label: &str,
     evidence_query: bool,
@@ -269,6 +488,9 @@ fn compiled_fixture_inner(
     task_model_call_cap: Option<u64>,
     target_mode: Option<u32>,
     two_task: bool,
+    worktree_depth: bool,
+    planning_override: Option<Value>,
+    goal_statement_override: Option<String>,
 ) -> CompiledFixture {
     let repo = TestRepo::create(label);
     if let Some(mode) = target_mode {
@@ -335,7 +557,29 @@ fn compiled_fixture_inner(
             },
         )
         .unwrap_or_else(|error| panic!("context: {error}"));
-    let planning = if two_task {
+    let planning = if let Some(planning) = planning_override {
+        planning
+    } else if worktree_depth {
+        json!({
+            "tasks": [{
+                "local_id": "settings-label",
+                "repository_id": "repo.app",
+                "title": "Rename label",
+                "objective": "Change Save to Apply in SettingsForm.",
+                "rationale": "Exact source identifies the bounded edit.",
+                "files": ["src/settings/SettingsForm.tsx"],
+                "symbols": ["SettingsForm"],
+                "dependencies": [],
+                "evidence_needs": [],
+                "expected_change": "SettingsForm renders Apply.",
+                "acceptance": [{
+                    "kind": "diff",
+                    "description": "The scoped Save-to-Apply diff is accepted.",
+                    "manual_gate_id": Value::Null
+                }]
+            }]
+        })
+    } else if two_task {
         json!({
             "tasks": [
                 {
@@ -386,6 +630,26 @@ fn compiled_fixture_inner(
             .unwrap_or_else(|| panic!("policy max_model_calls missing"));
         *resource_cap = json!(cap);
     }
+    let m3 = worktree_depth.then(|| {
+        let mut decision = DepthClassifier.classify(&DepthFeatureInput {
+            repository_count: 1,
+            language_count: 1,
+            expected_files: 1,
+            expected_modules: 2,
+            architecture_uncertainty_percent: 60,
+            ..DepthFeatureInput::default()
+        });
+        decision.mode = ExecutionDepth::D3;
+        "controller worktree fixture".clone_into(&mut decision.reason);
+        M3PlanningInput {
+            depth: decision,
+            supplied_sources: Vec::new(),
+            additional_repositories: Vec::new(),
+            manual_gates: Vec::new(),
+            absence_evaluator: None,
+            replan: None,
+        }
+    });
     let input = PlanCompilationInput {
         schema_version: PLAN_COMPILATION_SCHEMA_VERSION,
         compilation_id: format!("compile.{label}"),
@@ -394,7 +658,8 @@ fn compiled_fixture_inner(
         project_name: "T07 fixture".to_owned(),
         workspace_roots: vec![snapshot.root.display().to_string()],
         goal_id: format!("goal.{label}"),
-        goal_statement: "Rename the Settings button from Save to Apply.".to_owned(),
+        goal_statement: goal_statement_override
+            .unwrap_or_else(|| "Rename the Settings button from Save to Apply.".to_owned()),
         goal_invariants: vec!["Preserve submit behavior.".to_owned()],
         goal_non_goals: vec!["No redesign.".to_owned()],
         repository: PlanCompilationRepository {
@@ -427,7 +692,7 @@ fn compiled_fixture_inner(
         diff_evaluator: "builtin.diff.scope_and_literal.v1".to_owned(),
         rollback_diff_evaluator: "builtin.diff.controller_patch_absent.v1".to_owned(),
         context_packet: packet.clone(),
-        m3: None,
+        m3,
         max_model_calls: 1,
         model_input_token_ceiling: 8_000,
         max_output_tokens: 512,
@@ -450,16 +715,30 @@ fn compiled_fixture_inner(
 }
 
 fn valid_execution_proposal(form_digest: &str) -> String {
+    execution_proposal(
+        "src/settings/SettingsForm.tsx",
+        form_digest,
+        "Save",
+        "Apply",
+    )
+}
+
+fn execution_proposal(
+    path: &str,
+    source_digest: &str,
+    old_literal: &str,
+    new_literal: &str,
+) -> String {
     json!({
         "schema_version": 1,
         "evidence_ids": ["file:repo.app:src/settings/SettingsForm.tsx"],
         "action": {
             "kind": "replace_literal",
             "repository_id": "repo.app",
-            "path": "src/settings/SettingsForm.tsx",
-            "expected_source_digest": form_digest,
-            "old_literal": "Save",
-            "new_literal": "Apply",
+            "path": path,
+            "expected_source_digest": source_digest,
+            "old_literal": old_literal,
+            "new_literal": new_literal,
             "expected_occurrences": 1
         }
     })
@@ -522,6 +801,50 @@ fn runtime_parts(fixture: &CompiledFixture) -> RuntimeParts {
             declared_risk_floor: CommandRisk::RepositoryMutation,
         },
     }
+}
+
+fn execute_worktree_replace(
+    controller: &mut Controller,
+    fixture: &CompiledFixture,
+    task_id: &str,
+    path: &str,
+    old_literal: &str,
+    new_literal: &str,
+) {
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, task_id, readiness())
+        .unwrap_or_else(|error| panic!("derive {task_id} ready lease: {error}"));
+    let lease = controller
+        .task_worktree_lease(task_id)
+        .cloned()
+        .unwrap_or_else(|| panic!("{task_id} worktree lease missing"));
+    let source = fixture
+        .registry
+        .read_worktree_path(&lease, Path::new(path), None)
+        .unwrap_or_else(|error| panic!("read {task_id} composed source {path}: {error}"));
+    let execution = backend(vec![model_response(
+        execution_proposal(path, &source.digest, old_literal, new_literal),
+        fixture.packet.metrics.final_serialized_input_tokens,
+    )]);
+    let parts = runtime_parts(fixture);
+    let isolation =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("seatbelt: {error}"));
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut budget = ModelCallBudget::new(1, 30_000);
+    let success = controller
+        .execute_replace(ready, &runtime, &fixture.packet, &mut budget)
+        .unwrap_or_else(|error| panic!("execute {task_id} {old_literal}->{new_literal}: {error}"));
+    assert!(success.verification.passed);
+    assert_eq!(controller.task_state(task_id), Some(TaskState::Succeeded));
 }
 
 struct SwapIsolation {
@@ -1629,4 +1952,687 @@ fn compiled_task_model_call_ceiling_cannot_be_refilled_by_caller_budget() {
     let source = fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
         .unwrap_or_else(|error| panic!("read source: {error}"));
     assert!(source.contains("Save"));
+}
+
+#[test]
+fn worktree_d3_execution_persists_change_set_and_never_mutates_primary() {
+    let mut fixture = compiled_worktree_fixture("worktree-d3-execution");
+    let primary_before = fixture
+        .registry
+        .snapshot("repo.app")
+        .unwrap_or_else(|error| panic!("primary before: {error}"));
+    let primary_source_before =
+        fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+            .unwrap_or_else(|error| panic!("primary source before: {error}"));
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .unwrap_or_else(|error| panic!("D3 ready: {error}"));
+    let lease = controller
+        .task_worktree_lease(&task_id)
+        .cloned()
+        .unwrap_or_else(|| panic!("D3 task worktree lease missing"));
+    assert!(lease.worktree_path.exists());
+    assert_eq!(
+        lease.worktree_path.parent(),
+        Some(
+            fixture
+                .repo
+                .state_path
+                .parent()
+                .unwrap_or_else(|| panic!("state parent"))
+                .join("worktrees")
+                .canonicalize()
+                .unwrap_or_else(|error| panic!("canonical worktrees: {error}"))
+                .as_path()
+        )
+    );
+
+    let execution = backend(vec![model_response(
+        valid_execution_proposal(&fixture.form_digest),
+        fixture.packet.metrics.final_serialized_input_tokens,
+    )]);
+    let parts = runtime_parts(&fixture);
+    let isolation =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("seatbelt: {error}"));
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut budget = ModelCallBudget::new(4, 30_000);
+    let success = controller
+        .execute_replace(ready, &runtime, &fixture.packet, &mut budget)
+        .unwrap_or_else(|error| panic!("execute D3 worktree edit: {error}"));
+    assert!(success.verification.passed);
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Succeeded));
+    let change_set = controller
+        .task_change_set(&task_id)
+        .unwrap_or_else(|| panic!("D3 ChangeSet missing"));
+    assert_eq!(change_set.lease_id, lease.lease_id);
+    assert!(change_set.diff_content.contains("Apply"));
+    assert!(change_set.diff_content.contains("Save"));
+    assert!(!lease.worktree_path.exists());
+    assert_eq!(
+        fixture
+            .registry
+            .snapshot("repo.app")
+            .unwrap_or_else(|error| panic!("primary after: {error}")),
+        primary_before
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+            .unwrap_or_else(|error| panic!("primary source after: {error}")),
+        primary_source_before
+    );
+}
+
+#[test]
+fn worktree_recovery_revalidates_exact_head_and_common_git_directory() {
+    let mut fixture = compiled_worktree_fixture("worktree-recovery");
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .unwrap_or_else(|error| panic!("D3 ready: {error}"));
+    let lease = controller
+        .task_worktree_lease(&task_id)
+        .cloned()
+        .unwrap_or_else(|| panic!("worktree lease missing"));
+    controller
+        .cancel_ready_lease(ready)
+        .unwrap_or_else(|error| panic!("cancel ready: {error}"));
+    drop(controller);
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen state: {error}"));
+    let (recovered, summary) = RecoveryManager::recover(state, &fixture.registry)
+        .unwrap_or_else(|error| panic!("recover exact worktree: {error}"));
+    assert!(!summary.mutation_blocked);
+    assert_eq!(recovered.task_worktree_lease(&task_id), Some(&lease));
+    drop(recovered);
+
+    git(
+        &lease.worktree_path,
+        &["commit", "--allow-empty", "-qm", "drift"],
+    );
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen drifted state: {error}"));
+    let error = RecoveryManager::recover(state, &fixture.registry)
+        .err()
+        .unwrap_or_else(|| panic!("drifted worktree recovery must fail closed"));
+    assert!(
+        error.to_string().contains("worktree HEAD differs")
+            || error.to_string().contains("worktree lease")
+    );
+}
+
+#[test]
+fn recovery_manager_rejects_persisted_worktree_root_and_path_tamper() {
+    for (label, field) in [
+        ("worktree-recovery-root-tamper", "controller_root"),
+        ("worktree-recovery-path-tamper", "worktree_path"),
+    ] {
+        let mut fixture = compiled_worktree_fixture(label);
+        let (mut controller, task_id) = controller_for(&mut fixture);
+        let ready = controller
+            .derive_ready_lease(&fixture.registry, &task_id, readiness())
+            .unwrap_or_else(|error| panic!("D3 ready before {field} tamper: {error}"));
+        let lease = controller
+            .task_worktree_lease(&task_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("worktree lease missing before {field} tamper"));
+        controller
+            .cancel_ready_lease(ready)
+            .unwrap_or_else(|error| panic!("cancel ready before {field} tamper: {error}"));
+        drop(controller);
+
+        let mut state = StateStore::open(&fixture.repo.state_path)
+            .unwrap_or_else(|error| panic!("reopen state for {field} tamper: {error}"));
+        let foreign = if field == "controller_root" {
+            fixture.repo.base.join("foreign-controller-root")
+        } else {
+            lease.controller_root.join("foreign-lease-path")
+        };
+        replace_persisted_task_runtime(&mut state, &task_id, |runtime| {
+            runtime["worktree_lease"][field] = json!(foreign);
+        });
+        drop(state);
+
+        let state = StateStore::open(&fixture.repo.state_path)
+            .unwrap_or_else(|error| panic!("reopen tampered state: {error}"));
+        let error = RecoveryManager::recover(state, &fixture.registry)
+            .err()
+            .unwrap_or_else(|| panic!("RecoveryManager must reject persisted {field} tamper"));
+        assert!(
+            error.to_string().contains("path/root-tampered"),
+            "unexpected {field} tamper recovery error: {error}"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn committed_v2_action_intent_recovers_as_primary_only_and_cannot_gain_worktree_authority() {
+    let mut fixture = compiled_worktree_fixture("committed-v2-action-intent");
+    let (controller, task_id) = controller_for(&mut fixture);
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Planned));
+    assert!(controller.task_worktree_lease(&task_id).is_none());
+    drop(controller);
+
+    let mut state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen state for v2 intent: {error}"));
+    let manifest = latest_checkpoint_manifest(&state);
+    let mut task_runtime = manifest
+        .task_records
+        .get(&task_id)
+        .cloned()
+        .unwrap_or_else(|| panic!("checkpoint task runtime missing"));
+    task_runtime["state"] = json!("verifying");
+    task_runtime["attempts_started"] = json!(1);
+    task_runtime["worktree_lease"] = Value::Null;
+    task_runtime["worktree_state"] = Value::Null;
+    task_runtime["change_set"] = Value::Null;
+    task_runtime["change_set_artifact_digest"] = Value::Null;
+    task_runtime["change_set_carry"] = Value::Null;
+    task_runtime["worktree_baseline"] = Value::Null;
+    task_runtime["worktree_composition"] = json!([]);
+    task_runtime["worktree_conflict"] = Value::Null;
+    let task_contract_digest = task_runtime
+        .get("task_contract_digest")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("task contract digest missing"))
+        .to_owned();
+    let task_record = state
+        .state_records("controller.task")
+        .unwrap_or_else(|error| panic!("task records: {error}"))
+        .into_iter()
+        .find(|record| {
+            serde_json::from_str::<Value>(&record.value_json)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/task/task_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some(task_id.as_str())
+        })
+        .unwrap_or_else(|| panic!("persisted task runtime missing"));
+    state
+        .put_state(
+            "controller.task",
+            &task_record.key,
+            &serde_json::to_string(&task_runtime)
+                .unwrap_or_else(|error| panic!("encode task runtime: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("persist task runtime: {error}"));
+
+    let attempt_id = "attempt.legacy-v2-primary.1".to_owned();
+    let attempt_runtime = json!({
+        "task_id": task_id,
+        "attempt_id": attempt_id,
+        "state": "verifying",
+        "task_contract_digest": task_contract_digest,
+        "repair_origin": null,
+        "baseline_digest": manifest.repository_snapshot_digest,
+        "pre_snapshot_digest": manifest.repository_snapshot_digest,
+        "pre_diff_digest": manifest.baseline_diff_digest,
+        "pre_changed_fingerprints": {}
+    });
+    state
+        .put_state(
+            "controller.attempt",
+            &attempt_id,
+            &serde_json::to_string(&attempt_runtime)
+                .unwrap_or_else(|error| panic!("encode attempt runtime: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("persist attempt runtime: {error}"));
+
+    let target = fixture.repo.root.join("src/settings/SettingsForm.tsx");
+    let expected_target_mode = fs::metadata(&target)
+        .unwrap_or_else(|error| panic!("target metadata: {error}"))
+        .permissions()
+        .mode()
+        & 0o7777;
+    let postimage = SOURCE.replacen("Save", "Apply", 1);
+    let expected_post_digest = sha256_prefixed(postimage.as_bytes());
+    fs::write(&target, &postimage)
+        .unwrap_or_else(|error| panic!("materialize historical primary effect: {error}"));
+
+    let action_id = "action.legacy-v2-primary".to_owned();
+    let payload_digest = sha256_prefixed(b"legacy-v2-primary-payload");
+    let result_store = ArtifactStore::open(fixture.repo.base.join("cas"))
+        .unwrap_or_else(|error| panic!("legacy result store: {error}"));
+    let result = result_store
+        .put(&mut state, b"legacy-v2-primary-committed-result")
+        .unwrap_or_else(|error| panic!("legacy result artifact: {error}"));
+    let epoch = state
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("execution epoch: {error}"));
+    state
+        .insert_action_record(NewActionRecord {
+            action_id: &action_id,
+            state: "prepared",
+            payload_digest: &payload_digest,
+            policy_digest: &manifest.policy_digest,
+            execution_epoch: epoch,
+            event_id: "event.legacy-v2-primary-prepared",
+            event_kind: "prepared",
+            payload_json: "{}",
+        })
+        .unwrap_or_else(|error| panic!("insert legacy action: {error}"));
+    state
+        .transition_action_with_event(ActionTransition {
+            action_id: &action_id,
+            expected_state: "prepared",
+            next_state: "committed",
+            expected_epoch: epoch,
+            event_id: "event.legacy-v2-primary-committed",
+            event_kind: "committed",
+            payload_json: "{}",
+            result_digest: Some(&result.digest),
+        })
+        .unwrap_or_else(|error| panic!("commit legacy action: {error}"));
+
+    let legacy = json!({
+        "schema_version": 2,
+        "action_id": action_id,
+        "plan_id": manifest.plan_id,
+        "plan_revision": manifest.plan_revision,
+        "plan_digest": manifest.plan_digest,
+        "task_id": task_id,
+        "task_contract_digest": task_contract_digest,
+        "attempt_id": attempt_id,
+        "execution_epoch": epoch,
+        "payload_digest": payload_digest,
+        "action_nonce": "nonce.legacy-v2-primary",
+        "policy_digest": manifest.policy_digest,
+        "repository_id": manifest.repository_id,
+        "path": "src/settings/SettingsForm.tsx",
+        "expected_source_digest": fixture.form_digest,
+        "old_literal": "Save",
+        "new_literal": "Apply",
+        "expected_post_digest": expected_post_digest,
+        "expected_target_mode": expected_target_mode,
+        "artifact_store_root": fixture.repo.base.join("cas")
+    });
+    assert!(legacy.get("worktree_lease_id").is_none());
+    assert!(legacy.get("execution_root").is_none());
+    let legacy_raw = serde_json::to_string(&legacy)
+        .unwrap_or_else(|error| panic!("encode genuine v2 intent: {error}"));
+    state
+        .put_state("controller.action_intent", &action_id, &legacy_raw)
+        .unwrap_or_else(|error| panic!("persist genuine v2 intent: {error}"));
+    let legacy_digest = sha256_prefixed(legacy_raw.as_bytes());
+    let action_sequence = state
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("latest action sequence: {error}"));
+    let checkpoint_actions = state
+        .action_records()
+        .unwrap_or_else(|error| panic!("checkpoint actions: {error}"))
+        .into_iter()
+        .map(|record| CheckpointActionRecord {
+            action_id: record.action_id,
+            state: record.state,
+            payload_digest: record.payload_digest,
+            policy_digest: record.policy_digest,
+            execution_epoch: record.execution_epoch,
+            result_digest: record.result_digest,
+            last_event_sequence: record.last_event_sequence,
+        })
+        .collect::<Vec<_>>();
+    append_modified_checkpoint(&mut state, |manifest| {
+        manifest.task_records.insert(task_id.clone(), task_runtime);
+        manifest
+            .attempt_records
+            .insert(attempt_id.clone(), attempt_runtime);
+        manifest.action_records = checkpoint_actions;
+        manifest.action_journal_sequence = action_sequence;
+        manifest.evidence_binding_digests.insert(
+            format!("controller.action_intent:{action_id}"),
+            legacy_digest,
+        );
+    });
+    drop(state);
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen checkpoint-bound v2 state: {error}"));
+    let (recovered, summary) = RecoveryManager::recover(state, &fixture.registry)
+        .unwrap_or_else(|error| panic!("recover genuine committed v2 intent: {error}"));
+    assert!(!summary.mutation_blocked);
+    assert_eq!(recovered.task_state(&task_id), Some(TaskState::Succeeded));
+    assert!(recovered.task_worktree_lease(&task_id).is_none());
+    assert!(recovered.task_change_set(&task_id).is_none());
+    assert_eq!(
+        recovered
+            .state()
+            .state_records("controller.task_carry_fingerprint")
+            .unwrap_or_else(|error| panic!("legacy carry records: {error}"))
+            .len(),
+        0,
+        "legacy primary recovery must not become modern D3/D4 carry authority"
+    );
+    assert_eq!(
+        recovered
+            .state()
+            .action_record(&action_id)
+            .unwrap_or_else(|error| panic!("recovered action record: {error}"))
+            .map(|record| record.state),
+        Some("committed".to_owned())
+    );
+    assert_eq!(
+        fs::read_to_string(&target)
+            .unwrap_or_else(|error| panic!("read recovered primary effect: {error}")),
+        postimage
+    );
+    drop(recovered);
+
+    let mut state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen state for forged v2 authority: {error}"));
+    let mut forged = legacy;
+    forged["worktree_lease_id"] = json!("worktree.forged-v2");
+    forged["execution_root"] = json!(fixture.repo.base.join("forged-worktree"));
+    let forged_raw = serde_json::to_string(&forged)
+        .unwrap_or_else(|error| panic!("encode forged v2 authority: {error}"));
+    state
+        .put_state("controller.action_intent", &action_id, &forged_raw)
+        .unwrap_or_else(|error| panic!("persist forged v2 authority: {error}"));
+    let forged_digest = sha256_prefixed(forged_raw.as_bytes());
+    append_modified_checkpoint(&mut state, |manifest| {
+        manifest.evidence_binding_digests.insert(
+            format!("controller.action_intent:{action_id}"),
+            forged_digest,
+        );
+    });
+    drop(state);
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen forged v2 state: {error}"));
+    let error = RecoveryManager::recover(state, &fixture.registry)
+        .err()
+        .unwrap_or_else(|| panic!("v2 intent with worktree fields must fail recovery"));
+    assert!(
+        error
+            .to_string()
+            .contains("legacy v2 action intent contains fields that did not exist in v2"),
+        "unexpected forged-v2 recovery error: {error}"
+    );
+}
+
+#[test]
+fn worktree_mutating_t1_to_t2_composes_verified_upstream_and_readiness_uses_composed_view() {
+    let mut fixture = compiled_worktree_graph_fixture(
+        "worktree-mutating-chain",
+        &[
+            worktree_graph_task("T1", "src/settings/SettingsForm.tsx", &[], "Save", "Apply"),
+            worktree_graph_task(
+                "T2",
+                "src/settings/SettingsForm.tsx",
+                &["T1"],
+                "Apply",
+                "Applied",
+            ),
+        ],
+    );
+    let t1 = task_id_for_objective(&fixture, "Save to Apply");
+    let t2 = task_id_for_objective(&fixture, "Apply to Applied");
+    let primary_before = fixture
+        .registry
+        .snapshot("repo.app")
+        .unwrap_or_else(|error| panic!("primary before chain: {error}"));
+    let (mut controller, _) = controller_for(&mut fixture);
+
+    execute_worktree_replace(
+        &mut controller,
+        &fixture,
+        &t1,
+        "src/settings/SettingsForm.tsx",
+        "Save",
+        "Apply",
+    );
+    let t1_change_set = controller
+        .task_change_set(&t1)
+        .cloned()
+        .unwrap_or_else(|| panic!("T1 ChangeSet missing"));
+    assert!(t1_change_set.diff_content.contains("Apply"));
+
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, &t2, readiness())
+        .unwrap_or_else(|error| {
+            panic!("T2 must become ready from composed T1 output, not primary: {error}")
+        });
+    let t2_lease = controller
+        .task_worktree_lease(&t2)
+        .cloned()
+        .unwrap_or_else(|| panic!("T2 worktree missing"));
+    let composed = fs::read_to_string(t2_lease.worktree_path.join("src/settings/SettingsForm.tsx"))
+        .unwrap_or_else(|error| panic!("read T2 composed form: {error}"));
+    assert!(composed.contains(">Apply</button>"));
+    assert!(!composed.contains(">Save</button>"));
+    assert!(
+        fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+            .unwrap_or_else(|error| panic!("read primary during T2: {error}"))
+            .contains(">Save</button>")
+    );
+    controller
+        .cancel_ready_lease(ready)
+        .unwrap_or_else(|error| panic!("cancel T2 preflight ready: {error}"));
+
+    execute_worktree_replace(
+        &mut controller,
+        &fixture,
+        &t2,
+        "src/settings/SettingsForm.tsx",
+        "Apply",
+        "Applied",
+    );
+    let t2_change_set = controller
+        .task_change_set(&t2)
+        .unwrap_or_else(|| panic!("T2 ChangeSet missing"));
+    assert!(t2_change_set.diff_content.contains("Applied"));
+    assert!(t2_change_set.diff_content.contains("Apply"));
+    assert!(!t2_change_set.diff_content.contains(">Save</button>"));
+    assert_eq!(
+        fixture
+            .registry
+            .snapshot("repo.app")
+            .unwrap_or_else(|error| panic!("primary after chain: {error}")),
+        primary_before
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn worktree_join_composes_shared_ancestor_once_and_branch_local_deltas_deterministically() {
+    let mut fixture = compiled_worktree_graph_fixture(
+        "worktree-join",
+        &[
+            worktree_graph_task("T1", "src/settings/SettingsForm.tsx", &[], "Save", "Apply"),
+            worktree_graph_task(
+                "T2",
+                "src/settings/SettingsForm.tsx",
+                &["T1"],
+                "Apply",
+                "Applied",
+            ),
+            worktree_graph_task("T3", "src/other.txt", &["T1"], "baseline", "branchthree"),
+            worktree_graph_task(
+                "T4",
+                "src/settings/SettingsImport.tsx",
+                &["T2", "T3"],
+                "imported",
+                "finalized",
+            ),
+        ],
+    );
+    let t1 = task_id_for_objective(&fixture, "Save to Apply");
+    let t2 = task_id_for_objective(&fixture, "Apply to Applied");
+    let t3 = task_id_for_objective(&fixture, "baseline to branchthree");
+    let t4 = task_id_for_objective(&fixture, "imported to finalized");
+    let primary_before = fixture
+        .registry
+        .snapshot("repo.app")
+        .unwrap_or_else(|error| panic!("join primary before: {error}"));
+    let (mut controller, _) = controller_for(&mut fixture);
+
+    execute_worktree_replace(
+        &mut controller,
+        &fixture,
+        &t1,
+        "src/settings/SettingsForm.tsx",
+        "Save",
+        "Apply",
+    );
+    execute_worktree_replace(
+        &mut controller,
+        &fixture,
+        &t2,
+        "src/settings/SettingsForm.tsx",
+        "Apply",
+        "Applied",
+    );
+    execute_worktree_replace(
+        &mut controller,
+        &fixture,
+        &t3,
+        "src/other.txt",
+        "baseline",
+        "branchthree",
+    );
+
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, &t4, readiness())
+        .unwrap_or_else(|error| panic!("join T4 ready: {error}"));
+    let t4_lease = controller
+        .task_worktree_lease(&t4)
+        .cloned()
+        .unwrap_or_else(|| panic!("join T4 lease missing"));
+    let form = fs::read_to_string(t4_lease.worktree_path.join("src/settings/SettingsForm.tsx"))
+        .unwrap_or_else(|error| panic!("read joined form: {error}"));
+    assert!(form.contains(">Applied</button>"));
+    assert_eq!(form.matches("Applied").count(), 1);
+    assert_eq!(
+        fs::read_to_string(t4_lease.worktree_path.join("src/other.txt"))
+            .unwrap_or_else(|error| panic!("read joined other: {error}")),
+        "branchthree other file\n"
+    );
+    controller
+        .cancel_ready_lease(ready)
+        .unwrap_or_else(|error| panic!("cancel T4 preflight ready: {error}"));
+
+    execute_worktree_replace(
+        &mut controller,
+        &fixture,
+        &t4,
+        "src/settings/SettingsImport.tsx",
+        "imported",
+        "finalized",
+    );
+    let t4_change_set = controller
+        .task_change_set(&t4)
+        .unwrap_or_else(|| panic!("T4 ChangeSet missing"));
+    assert_eq!(
+        t4_change_set.changed_paths,
+        vec![PathBuf::from("src/settings/SettingsImport.tsx")]
+    );
+    assert!(!t4_change_set.diff_content.contains("SettingsForm.tsx"));
+    assert!(!t4_change_set.diff_content.contains("src/other.txt"));
+    assert_eq!(
+        fixture
+            .registry
+            .snapshot("repo.app")
+            .unwrap_or_else(|error| panic!("join primary after: {error}")),
+        primary_before
+    );
+}
+
+#[test]
+fn worktree_join_conflict_is_durable_and_blocks_before_mutation() {
+    let mut fixture = compiled_worktree_graph_fixture(
+        "worktree-join-conflict",
+        &[
+            worktree_graph_task("T1", "src/settings/SettingsForm.tsx", &[], "Save", "Apply"),
+            worktree_graph_task(
+                "T2",
+                "src/settings/SettingsForm.tsx",
+                &["T1"],
+                "Apply",
+                "Applied",
+            ),
+            worktree_graph_task(
+                "T3",
+                "src/settings/SettingsForm.tsx",
+                &["T1"],
+                "Apply",
+                "Approved",
+            ),
+            worktree_graph_task(
+                "T4",
+                "src/settings/SettingsImport.tsx",
+                &["T2", "T3"],
+                "imported",
+                "finalized",
+            ),
+        ],
+    );
+    let t1 = task_id_for_objective(&fixture, "Save to Apply");
+    let t2 = task_id_for_objective(&fixture, "Apply to Applied");
+    let t3 = task_id_for_objective(&fixture, "Apply to Approved");
+    let t4 = task_id_for_objective(&fixture, "imported to finalized");
+    let (mut controller, _) = controller_for(&mut fixture);
+    execute_worktree_replace(
+        &mut controller,
+        &fixture,
+        &t1,
+        "src/settings/SettingsForm.tsx",
+        "Save",
+        "Apply",
+    );
+    execute_worktree_replace(
+        &mut controller,
+        &fixture,
+        &t2,
+        "src/settings/SettingsForm.tsx",
+        "Apply",
+        "Applied",
+    );
+    execute_worktree_replace(
+        &mut controller,
+        &fixture,
+        &t3,
+        "src/settings/SettingsForm.tsx",
+        "Apply",
+        "Approved",
+    );
+
+    let error = controller
+        .derive_ready_lease(&fixture.registry, &t4, readiness())
+        .err()
+        .unwrap_or_else(|| panic!("conflicting join must not become ready"));
+    assert!(error.to_string().contains("composition conflict"));
+    let conflict = controller
+        .task_worktree_conflict(&t4)
+        .cloned()
+        .unwrap_or_else(|| panic!("durable T4 conflict evidence missing"));
+    assert!(
+        conflict
+            .conflict_paths
+            .contains(&PathBuf::from("src/settings/SettingsForm.tsx"))
+    );
+    let durable_conflicts = controller
+        .state()
+        .state_records("controller.worktree_conflict")
+        .unwrap_or_else(|error| panic!("read durable conflict records: {error}"));
+    assert_eq!(durable_conflicts.len(), 1);
+    assert!(
+        fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+            .unwrap_or_else(|error| panic!("read conflict primary: {error}"))
+            .contains(">Save</button>")
+    );
 }

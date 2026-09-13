@@ -1,0 +1,69 @@
+{
+  "milestone_id": "M3",
+  "roadmap_version": "1.4-frozen",
+  "completed_at": "2026-09-13T14:24:23Z",
+  "required_tasks": [
+    "M3-T01",
+    "M3-T02",
+    "M3-T03",
+    "M3-T04"
+  ],
+  "all_required_tasks_completed": true,
+  "task_evidence": {
+    "implementation/evidence/M3-T01.json": "sha256:72feb11a0d569d29ae202600e1ecde41421c89eb4107df2ac18dedc2a1947159",
+    "implementation/evidence/M3-T02.json": "sha256:2630a876e23b16414b22f8c9a009f473dff4aedeb416165931f22e4dd1b7998c",
+    "implementation/evidence/M3-T03.json": "sha256:fa416fb890464dd6af799e46ff0f2ecb4c62754d038755cde0f4a229a0c9fe9f",
+    "implementation/evidence/M3-T04.json": "sha256:cc98b2ea4eafc0d07f05fb77273edef2c7d2ba0438409b62d39302577997016a"
+  },
+  "milestone_gates": {
+    "scenario_1_trivial_edit": {
+      "status": "passed",
+      "proof": "implementation/evidence/M1.json",
+      "proof_sha256": "sha256:fe3caf293e3ef670a992908b11df59f3520a8b91d4db5b80339d99437b73f2d1",
+      "detail": "The frozen scenario contract assigns Scenario 1's complete natural-language goal -> canonical PlanCompiler -> validated Plan IR v1.2 -> Controller execution/verification proof to M1. M1 milestone evidence records natural_language_compiler_controller_checkpoint_restart=passed and the representative real local-model qualification."
+    },
+    "scenarios_2_4_5_6_7_8_m3_available_behavior": {
+      "status": "passed",
+      "proof": "crates/sovereign-eval/tests/m3_scenario_gate.rs",
+      "proof_sha256": "sha256:9ad0a83e437a846a996298667d182c666015cc240c5e42f890decd05fb97afaf",
+      "detail": "Focused current-tree M3 scenario gate rerun passed 7/7. It covers multi-module DAG compilation, crash/checkpoint contract, bounded execution repair policy, genuine plan-failure assumptions, offline/non-destructive authority, and serialized M1/8GB heavy-lease policy. Deeper crash/replan/worktree execution behavior is additionally proven by M3-T03/M3-T04 evidence."
+    },
+    "scenario_3_cross_repository_compile_validate_only": {
+      "status": "passed",
+      "proof": "crates/sovereign-eval/tests/m3_scenario_gate.rs::scenario_3_cross_repository_auth_migration_compiles_validates_and_execution_stays_deferred",
+      "detail": "Scenario 3 compiles and validates as D4 with two repositories, while Controller activation rejects multi-repository execution at M3. Full cross-repository execution remains deferred to required M8-T01 exactly as frozen."
+    }
+  },
+  "focused_gate_verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-eval --test m3_scenario_gate --offline",
+      "status": "passed",
+      "detail": "7 passed; 0 failed; current live tree"
+    }
+  ],
+  "closure_verification_inherited_from_task_evidence": {
+    "controller": "45 tests passed",
+    "repo": "37 tests passed",
+    "crash_resume": "22/22 passed",
+    "m3_scenarios": "7/7 passed",
+    "cargo_fmt_check": "passed",
+    "git_diff_check": "passed",
+    "clippy_workspace_all_targets_D_warnings": "passed",
+    "cargo_check_workspace_all_targets": "passed",
+    "cargo_test_workspace": "passed",
+    "source_hash_reconciliation": "all six M3-T04 source hashes exactly match implementation/evidence/M3-T04.json; no regression signal exists, so duplicate heavy reruns were intentionally avoided"
+  },
+  "independent_read_only_audit": {
+    "worker": "worker-24",
+    "result": "CLOSABLE",
+    "blockers": [],
+    "scope": "exact live M3-T04 tree feeding the final M3 gate"
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d"
+  },
+  "network_runtime_dependency": false
+}
