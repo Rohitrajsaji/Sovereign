@@ -917,7 +917,7 @@ fn build_task(
     let task = json!({
         "task_id": task_id,
         "title": proposal.title,
-        "objective": proposal.objective,
+        "objective": input.goal_statement,
         "rationale": proposal.rationale,
         "requirement_ids": [requirement_id],
         "dependencies": dependencies,
@@ -974,7 +974,7 @@ fn build_task(
             "preconditions": [],
             "assumptions": [],
             "inputs": inputs,
-            "outputs": [proposal.expected_change],
+            "outputs": [proposal.expected_change, input.goal_statement],
             "invariants": invariants,
             "non_goals": input.goal_non_goals
         },

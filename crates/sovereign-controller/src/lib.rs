@@ -1424,6 +1424,26 @@ impl Controller {
             )
             .with_implicated(true),
         );
+        let repair_controller_prefix = failure
+            .failed_action_facts
+            .get("path")
+            .and_then(|path| {
+                let locator = format!("path:{path}");
+                base_context
+                    .items
+                    .iter()
+                    .find(|item| item.locator.as_deref() == Some(locator.as_str()))
+                    .map(|item| {
+                        format!(
+                            "Repair only the still-valid task using current failure/diff evidence. Controller authority and acceptance are unchanged. The prior failed_action_facts are rejected-attempt diagnostics, not repair instructions. For failed path {path}, current exact evidence {} has source_digest {}; use that exact current digest for expected_source_digest and derive old/new literals only from the immutable task/goal contract.",
+                            item.evidence_id, item.source_digest
+                        )
+                    })
+            })
+            .unwrap_or_else(|| {
+                "Repair only the still-valid task using current failure/diff evidence. Controller authority and acceptance are unchanged. The prior failed_action_facts are rejected-attempt diagnostics, not repair instructions; derive repair action fields from current exact evidence and the immutable task/goal contract."
+                    .to_owned()
+            });
         let repair_packet = ContextPlanner::default()
             .build_repair(
                 base_context.budget,
@@ -1438,9 +1458,7 @@ impl Controller {
                     failure_signature: failure.signature.clone(),
                     failure_record_digest: failure_record_digest.clone(),
                     failure_evidence_refs: failure.evidence_refs.clone(),
-                    controller_prefix:
-                        "Repair only the still-valid task using current failure/diff evidence. Controller authority and acceptance are unchanged."
-                            .to_owned(),
+                    controller_prefix: repair_controller_prefix,
                     task_contract: task_json,
                     current_state: format!(
                         "plan={plan_id}; task={task_id}; attempts_started={attempts_started}; same_failure_count={same_failure_count}; repair_pending=true"

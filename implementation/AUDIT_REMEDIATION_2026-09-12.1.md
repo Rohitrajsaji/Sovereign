@@ -8,7 +8,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
 
 1. **Context accounting and absolute model deadlines**
    - Status: implementation and short real-model accounting smoke verified in `implementation/evidence/M1-model-accounting-remediation.json`; representative full engineering packet remains part of gate 6.
-   - Status: **OPEN — required before M1 closure.**
+   - Status: **RESOLVED for M1 closure.** Backend accounting/deadline tests plus the representative full engineering packet in `implementation/evidence/M1-real-model-qualification.json` satisfy the remaining proof.
    - Current source owner: `crates/sovereign-model/src/lib.rs`.
    - Reconcile llama.cpp runtime window with explicit input allowance plus generation reserve.
    - Count the exact fully rendered chat/tool/template request before inference, including tool schemas and structured-output schema.
@@ -61,12 +61,12 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
    - Required tests/evidence: runtime Seatbelt probe, nested protected-root fixture, PATH-shim fixture, offline network fixture, selective-network request fail-closed fixture.
 
 6. **Representative M1 model qualification**
-   - Status: M1-T10 compiler qualification passed on the target machine with exact rendered/schema/output-reserve accounting and current evidence in `implementation/evidence/M1-T10-model-smoke.json`. M1-T07 Controller/edit/deterministic-verification behavior is closed with current evidence in `implementation/evidence/M1-T07.json`, and deterministic checkpoint/restart recovery is closed in `implementation/evidence/M1-T08.json`. Real-Qwen targeted repair plus the combined real-Qwen implementation+repair+restart engineering qualification remain open under M1-T09 and the final M1 engineering packet.
-   - Status: **OPEN — required before M1 closure.** Historical M1-T03 short smoke remains valid only for short tool-call viability.
-   - Planned proof owners: M1-T10, M1-T07, M1-T08, M1-T09 plus a current real-model full-packet report.
-   - Preserve M1-T03 short real tool-call smoke as valid evidence only for short tool-call viability (206 input tokens); do not represent it as an 8k engineering packet.
-   - Before M1 closure, exercise representative fully rendered packets with measured total tokens, actual prefill, peak/steady RSS, compressor/swap deltas, a real repository edit, deterministic verification, one bounded repair, and restart/resume.
-   - Required evidence is produced by the compiler/controller/repair/restart vertical-slice tasks, not by context-tier loading alone.
+   - Status: **RESOLVED — M1 representative real-model gate passed and milestone M1 is closed.**
+   - Evidence: `implementation/evidence/M1-real-model-qualification.json` (raw combined engineering packet) and `implementation/evidence/M1.json` (current-tree milestone binding).
+   - The passing target-machine run used pinned Qwen3-4B Q4_K_M through the managed llama.cpp runtime and exercised natural-language PlanCompiler compilation, Controller activation, a natural invalid initial proposal rejected by Controller, durable FailureRecord persistence, StateStore close/reopen + RecoveryManager, an unmodified real-Qwen targeted repair, Seatbelt-isolated repository edit, deterministic verification, and provider unload. No controlled fault injection was used in the observed passing branch.
+   - Exact rendered/schema/output-reserve token accounting, provider token usage, elapsed time, per-call prefill/decode peak RSS, startup/steady RSS, compressor/swap pressure, model/runtime hashes, and exact plan/task/attempt/action/evidence identifiers are retained in the raw report. The run materially exercised memory pressure/swap on the 8 GB target; this is preserved as release evidence.
+   - Historical M1-T03 remains evidence only for short tool-call viability; it is not recharacterized as the representative engineering packet.
+   - Independent final read-only audit worker-11 reported no concrete frozen-M1 blocker. Fresh format, strict workspace Clippy, full offline workspace tests, and `git diff --check` passed on the closing tree.
 
 ## M1-T07 closure update
 
@@ -74,7 +74,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
 - Current verification includes strict workspace Clippy, 3 Controller unit tests, 18 Controller integration tests, the natural-language compiler→Controller→real local isolated edit→deterministic verifier eval slice, and the full offline workspace suite.
 - Revalidated remediation properties include durable action-result semantics, no persisted `ready` bit, Controller-owned compiled model-call ceilings, exact current evidence/dependency bindings, ReadyLease checkpoint/evidence/epoch recomputation before dispatch, and exact preservation of pre-existing staged/unstaged/untracked user work and target file mode.
 - M1-T07 does not implement restart/recovery replay or a second repair attempt; those remain M1-T08 and M1-T09 respectively.
-- Representative real-model gate 6 remains OPEN; T07 closure must not be represented as the final M1 local-model engineering qualification.
+- Representative real-model gate 6 was later resolved by the final combined real-Qwen packet recorded in `implementation/evidence/M1.json`; T07 closure alone was not the final qualification.
 
 ## Product delivery steering
 
@@ -101,7 +101,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
 - Recovery now uses CAS-verified manifests and explicit trusted checkpoint/re-anchor ancestry; ordered post-checkpoint runtime replay must exactly reproduce authoritative task/attempt state, and repository baseline/plan-validity changes require the latest exact journal binding.
 - Pre-mutation recovery is checkpoint-bound to the exact persisted action intent and re-derived action identity, committed edits resume verification only, ambiguous dispatch remains mutation-blocking, and process recovery is fenced by a pre-spawn lease plus PID/PGID/birth identity.
 - M1-T08 does not perform a second repair model attempt or recompile a valid plan; that remains M1-T09.
-- Representative real-model gate 6 remains **OPEN**. T08 is deterministic restart/recovery closure, not the final real-Qwen implementation+repair+restart engineering qualification.
+- Representative real-model gate 6 was later resolved by the final combined real-Qwen packet recorded in `implementation/evidence/M1.json`; T08 itself remains only the deterministic restart/recovery closure.
 
 ### M1-T08 post-closure correction — 2026-09-13
 
@@ -109,14 +109,14 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
 - Repository baseline diff content is now self-digest validated in the trusted checkpoint manifest, post-checkpoint durable baseline correlation, and active-plan reconstruction. Older-checkpoint fallback cannot accept tampered `diff_content` paired with an unchanged digest/event and then bypass pre-existing user-hunk protection.
 - Recovery now enforces `execution_epoch` monotonicity before reconstruction/reaping/reconciliation using the maximum trusted floor from the checkpoint manifest, durable action authorities, and post-checkpoint Controller epoch events. Direct epoch rollback and fallback below later authoritative epoch both fail closed.
 - `crash_resume` expanded from 17 to 20 scenarios and passes 20/20. Strict workspace Clippy, state/tools/controller suites, vertical slice, full offline workspace tests, formatting, and `git diff --check` all pass on the corrected tree.
-- The final independent worker-9 read-only re-audit reports no remaining frozen-T08 blocker. `BUILD_STATE.json` remains at M1-T09 and representative real-model gate 6 remains **OPEN**.
+- The final independent worker-9 read-only re-audit reported no remaining frozen-T08 blocker. At that historical point `BUILD_STATE.json` remained at M1-T09; the representative real-model gate was subsequently resolved by `implementation/evidence/M1.json`.
 
 ## M1-T09 closure update
 
-- M1-T09 is durably complete with current-code evidence in `implementation/evidence/M1-T09.json`. The task closes the first targeted repair loop but does **not** close milestone M1; representative real-model gate 6 remains the active milestone gate.
+- M1-T09 is durably complete with current-code evidence in `implementation/evidence/M1-T09.json`. The task closed the first targeted repair loop but did **not** by itself close milestone M1; the representative real-model gate was subsequently resolved by the final combined packet in `implementation/evidence/M1.json`.
 - `FailureRecord v1` and `RepairPacket v1` are Controller-owned, plan/task/acceptance-bound, checkpoint-protected repair evidence. Failure records contain stable normalized codes/signatures plus a bounded actionable synopsis and failed-action facts; repair context includes current diff and implicated evidence while excluding prior transcripts, raw logs and hidden reasoning.
 - Repair never recompiles a still-valid plan or rewrites the task/acceptance contract. Attempt 2 persists explicit prior-attempt + FailureRecord-digest + RepairPacket-digest provenance and reuses the normal Controller proposal/authorization/tool/deterministic-verifier path.
 - Counter semantics are independently enforced: `max_attempts` counts started attempts, normalized identical failures count against `same_failure_limit`, and pre-attempt resource deferral consumes only its separate `resource_retry_limit` without fabricating an attempt/model call.
 - The causal repair regression uses a PlanCompiler-produced plan with `max_model_calls=2` and a repair-aware fake backend that refuses attempt 2 unless the real repair prompt includes the exact failure code, actionable diagnostic and failed literal. RecoveryManager counter/failure reconstruction, one pre-attempt resource deferral, second-attempt real local isolated edit, deterministic verification, unchanged plan/task/acceptance and identical-failure exhaustion all pass.
 - Current verification: strict workspace Clippy, context 9/9, Controller 4 unit + 18 integration, `repair_loop` 2/2, vertical slice 1/1, crash/restart 20/20, full offline workspace suite, formatting and `git diff --check`. The final independent worker-10 read-only re-audit reports no remaining frozen-T09 blocker and explicitly marks T09 closable.
-- Representative M1 model qualification gate 6 remains **OPEN**. Before M1 closure, run the current pinned local Qwen3-4B/llama.cpp implementation + bounded repair + restart/resume engineering packet with exact rendered/schema/output-reserve token accounting, prefill/peak/steady RSS, resource-pressure/compressor/swap observations, real repository edit, deterministic verification and exact plan/task/attempt/action/evidence IDs.
+- Representative M1 model qualification gate 6 is **RESOLVED** by `implementation/evidence/M1-real-model-qualification.json` plus the milestone binding in `implementation/evidence/M1.json`.

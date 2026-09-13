@@ -1,0 +1,223 @@
+{
+  "attempt_1_failure": {
+    "action_id": null,
+    "attempt_id": "attempt.c2de6e27ac92e3959d7d",
+    "controlled_post_model_fault": false,
+    "failure_category": "proposal_validation_failure",
+    "failure_code": "proposal_evidence_outside_context",
+    "failure_evidence_ids": [
+      "controller.prefix",
+      "task.contract",
+      "controller.current-state",
+      "file:repo.app:src/settings/SettingsForm.test.tsx",
+      "file:repo.app:src/settings/SettingsForm.tsx",
+      "proposal.output-schema"
+    ],
+    "failure_record_digest": "sha256:98c0bfa41a7ee65e169924c9e9d01619b1c20956f6e9fcd7a9557ede92ab0616",
+    "failure_signature": "proposal_validation_failure:proposal_evidence_outside_context:faf7873234b4a5d2",
+    "raw_real_response_preserved_only_as_sha256_and_metrics": true,
+    "raw_response_exact_valid": false
+  },
+  "attempt_2_success": {
+    "action_id": "action.12dcfce1e2c8f0b3fb82",
+    "action_result_digest": "a88b4ec3e817cfd1bcf5cd355ca0addcd0e314d23602c2b519a0844cd7781835",
+    "attempt_id": "attempt.084ae30f6d663c4a4038",
+    "verification_diff_digest": "sha256:0c588809a178a14c7fce65d4fa1da1c94377bed4055992c6079fd942fa6db8d7",
+    "verification_evidence_id": "evidence.verification.5d0b9bb234fe4d2e",
+    "verification_evidence_ids": [
+      "a88b4ec3e817cfd1bcf5cd355ca0addcd0e314d23602c2b519a0844cd7781835",
+      "sha256:0c588809a178a14c7fce65d4fa1da1c94377bed4055992c6079fd942fa6db8d7",
+      "sha256:efbfbf9d4a442248ce3527569505acfb28c09f7d29e86efef7bb43d6049609e7"
+    ],
+    "verification_id": "verification.b4efb36e05977d08b605",
+    "verification_passed": true,
+    "verification_post_snapshot_digest": "sha256:cfc3d7b52f2d620374b1e5f4a6b292d6e18d4b3a6635d4cb9e1c21d7fe361c72"
+  },
+  "compiler": {
+    "compilation_evidence_digest": "sha256:b08de33d6957fafd602988727a0fd0e4c4fbc36491319ab627fc959a5fdb256d",
+    "exact_evidence_ids": [
+      "file:repo.app:src/settings/SettingsForm.test.tsx",
+      "file:repo.app:src/settings/SettingsForm.tsx"
+    ],
+    "max_model_calls": 2,
+    "model_attempt_evidence": [
+      {
+        "accepted": true,
+        "attempt": 1,
+        "rejection_reason": null,
+        "request_digest": "sha256:1848072bf8c1a78d746aba9dc28d68e315fbf60e736e11232ad7a26c8f21a9b0",
+        "response_digest": "sha256:8d86f9f85fdf95e968705ad72b731e4a082e2afd0c36af7378bd365e2764e9a5"
+      }
+    ],
+    "model_calls_used": 1,
+    "plan_digest": "sha256:a94993b91d47aeb17925125c85ad491602db83288bd8c2b94b2e4b63902ab79c"
+  },
+  "controller": {
+    "acceptance_contract_sha256": "sha256:3b4f890e9f6cbdc761f16a45a603dc844410c99108a31f83dbe3b3e0d5f9c1c2",
+    "attempts_started_after_repair": 2,
+    "model_calls_used_after_repair": 2,
+    "plan_digest": "sha256:a94993b91d47aeb17925125c85ad491602db83288bd8c2b94b2e4b63902ab79c",
+    "plan_document_sha256": "sha256:a94993b91d47aeb17925125c85ad491602db83288bd8c2b94b2e4b63902ab79c",
+    "plan_id": "plan.d56b3ac04f3dea6c67e5",
+    "task_contract_digest": "sha256:992d6a1cd39ca960ff4059a7d77188717613f785f2c5cf28a910faade31432c6",
+    "task_id": "task.d56b3ac04f3dea6c67e5.01"
+  },
+  "host": {
+    "after_qualification_before_unload": {
+      "memory_pressure": "The system has 8589934592 (524288 pages with a page size of 16384).\nSystem-wide memory free percentage: 12%",
+      "swapusage": "vm.swapusage: total = 7168.00M  used = 6292.19M  free = 875.81M  (encrypted)",
+      "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                3627.\nPages active:                             28818.\nPages inactive:                           26406.\nPages speculative:                         1610.\nPages throttled:                              0.\nPages wired down:                        338661.\nPages purgeable:                              0.\n\"Translation faults\":                 541945067.\nPages copy-on-write:                   20763597.\nPages zero filled:                    110320593.\nPages reactivated:                    203334498.\nPages purged:                           9921387.\nFile-backed pages:                        26669.\nAnonymous pages:                          30166.\nPages stored in compressor:              984713.\nPages occupied by compressor:             89295.\nDecompressions:                       190454980.\nCompressions:                         204454666.\nPageins:                               36296761.\nPageouts:                                189722.\nSwapins:                                4146474.\nSwapouts:                               4805766."
+    },
+    "after_unload": {
+      "memory_pressure": "The system has 8589934592 (524288 pages with a page size of 16384).\nSystem-wide memory free percentage: 33%",
+      "swapusage": "vm.swapusage: total = 7168.00M  used = 6284.44M  free = 883.56M  (encrypted)",
+      "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                3773.\nPages active:                             42904.\nPages inactive:                          139845.\nPages speculative:                         2369.\nPages throttled:                              0.\nPages wired down:                        215727.\nPages purgeable:                              8.\n\"Translation faults\":                 541957300.\nPages copy-on-write:                   20763689.\nPages zero filled:                    110321287.\nPages reactivated:                    203336964.\nPages purged:                           9921452.\nFile-backed pages:                       150973.\nAnonymous pages:                          34145.\nPages stored in compressor:              954429.\nPages occupied by compressor:             83792.\nDecompressions:                       190462714.\nCompressions:                         204458401.\nPageins:                               36297965.\nPageouts:                                189722.\nSwapins:                                4146828.\nSwapouts:                               4805834."
+    },
+    "before_load": {
+      "memory_pressure": "The system has 8589934592 (524288 pages with a page size of 16384).\nSystem-wide memory free percentage: 63%",
+      "swapusage": "vm.swapusage: total = 6144.00M  used = 4821.88M  free = 1322.12M  (encrypted)",
+      "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               12860.\nPages active:                            149323.\nPages inactive:                          145036.\nPages speculative:                         3840.\nPages throttled:                              0.\nPages wired down:                         93147.\nPages purgeable:                           2580.\n\"Translation faults\":                 537308434.\nPages copy-on-write:                   20656795.\nPages zero filled:                    109955352.\nPages reactivated:                    200969764.\nPages purged:                           9891983.\nFile-backed pages:                       112354.\nAnonymous pages:                         185845.\nPages stored in compressor:              819448.\nPages occupied by compressor:             84283.\nDecompressions:                       187822273.\nCompressions:                         201573394.\nPageins:                               35589078.\nPageouts:                                188300.\nSwapins:                                3893204.\nSwapouts:                               4458778."
+    }
+  },
+  "immutability": {
+    "acceptance_contract_unchanged": true,
+    "plan_document_unchanged": true,
+    "task_contract_unchanged": true
+  },
+  "model": {
+    "id": "Qwen3-4B-Q4_K_M",
+    "parameter_class": "4B",
+    "path": "/Users/rohitrajsaji/Desktop/Sovereign/.models/Qwen3-4B-Q4_K_M.gguf",
+    "quantization": "Q4_K_M",
+    "sha256": "sha256:7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"
+  },
+  "model_lease": {
+    "context_input_tokens": 8192,
+    "output_reserve_tokens": 1536,
+    "post_load_steady_rss_kb": 1860272,
+    "process_absent_after_unload": true,
+    "server_context_tokens": 9728,
+    "startup_peak_rss_kb": 2002720
+  },
+  "real_model_calls": [
+    {
+      "delivered_response_sha256": "sha256:a51d3670d4041f438aed8382a0c7df8118dcc6b6a1f7a24ec08c39496ebeb858",
+      "elapsed_ms": 12074,
+      "fault_injected": false,
+      "finish_reason": "stop",
+      "phase": "plan_compiler",
+      "prefill_decode_peak_rss_kb": 1941984,
+      "prompt_sha256": "sha256:868c2dc865762153e7374622b2a54e179f1c60272e1b0b0c01be947511cf3ea0",
+      "provider_usage": {
+        "input_tokens": 361,
+        "output_tokens": 177
+      },
+      "raw_response_exact_valid": false,
+      "raw_response_sha256": "sha256:a51d3670d4041f438aed8382a0c7df8118dcc6b6a1f7a24ec08c39496ebeb858",
+      "repair_prompt_contains_failure_context": false,
+      "request_id": "compile.scenario1.m1-real-qualification.proposal.1",
+      "token_admission": {
+        "admitted_input_tokens": 624,
+        "rendered_input_tokens": 361,
+        "reserved_output_tokens": 768,
+        "server_context_tokens": 9728,
+        "structured_output_tokens": 263
+      }
+    },
+    {
+      "delivered_response_sha256": "sha256:e032f3e39a8349c19a54c8f477681b30ab1b06019c87c8254168167ea7c1767e",
+      "elapsed_ms": 10902,
+      "fault_injected": false,
+      "finish_reason": "stop",
+      "phase": "controller_initial",
+      "prefill_decode_peak_rss_kb": 1959488,
+      "prompt_sha256": "sha256:46bae1776dcb78ee33e5e678a1ee475722eef52f0c4a3e876f78afeb72d773f2",
+      "provider_usage": {
+        "input_tokens": 320,
+        "output_tokens": 160
+      },
+      "raw_response_exact_valid": false,
+      "raw_response_sha256": "sha256:e032f3e39a8349c19a54c8f477681b30ab1b06019c87c8254168167ea7c1767e",
+      "repair_prompt_contains_failure_context": false,
+      "request_id": "controller.task.d56b3ac04f3dea6c67e5.01.proposal",
+      "token_admission": {
+        "admitted_input_tokens": 553,
+        "rendered_input_tokens": 320,
+        "reserved_output_tokens": 512,
+        "server_context_tokens": 9728,
+        "structured_output_tokens": 233
+      }
+    },
+    {
+      "delivered_response_sha256": "sha256:40df7360a1c459e84b9b87a8b076caa02c42fa5019f3bb38b511e8f93ad5c162",
+      "elapsed_ms": 22920,
+      "fault_injected": false,
+      "finish_reason": "stop",
+      "phase": "controller_repair",
+      "prefill_decode_peak_rss_kb": 1961072,
+      "prompt_sha256": "sha256:298328d1ae655bf3c8597005ebc1e2e7d47ce3aa29bd132c2769e4c9956ab9e6",
+      "provider_usage": {
+        "input_tokens": 1307,
+        "output_tokens": 196
+      },
+      "raw_response_exact_valid": false,
+      "raw_response_sha256": "sha256:40df7360a1c459e84b9b87a8b076caa02c42fa5019f3bb38b511e8f93ad5c162",
+      "repair_prompt_contains_failure_context": true,
+      "request_id": "controller.task.d56b3ac04f3dea6c67e5.01.proposal",
+      "token_admission": {
+        "admitted_input_tokens": 1540,
+        "rendered_input_tokens": 1307,
+        "reserved_output_tokens": 512,
+        "server_context_tokens": 9728,
+        "structured_output_tokens": 233
+      }
+    }
+  ],
+  "recovery": {
+    "checkpoint_action_sequence": 6,
+    "checkpoint_generation": 4,
+    "execution_epoch_after": 2,
+    "execution_epoch_before": 1,
+    "fallback_checkpoint_used": false,
+    "mutation_blocked": false,
+    "replayed_events": 0
+  },
+  "repair": {
+    "contains_failure_synopsis": true,
+    "contains_prior_transcript_or_raw_log": false,
+    "failure_record_digest": "sha256:98c0bfa41a7ee65e169924c9e9d01619b1c20956f6e9fcd7a9557ede92ab0616",
+    "failure_signature": "proposal_validation_failure:proposal_evidence_outside_context:faf7873234b4a5d2",
+    "prior_attempt_id": "attempt.c2de6e27ac92e3959d7d",
+    "repair_evidence_ids": [
+      "controller.prefix",
+      "task.contract",
+      "controller.current-state",
+      "file:repo.app:src/settings/SettingsForm.test.tsx",
+      "file:repo.app:src/settings/SettingsForm.tsx",
+      "diff:repo.app",
+      "failure:task.d56b3ac04f3dea6c67e5.01:attempt.c2de6e27ac92e3959d7d",
+      "proposal.output-schema"
+    ],
+    "repair_packet_digest": "sha256:b7e184736c9efa27cc7d2b885ebe8cd8c70c652d3a2cbbb3abf0a7c7dbb501a2"
+  },
+  "repository_result": {
+    "changed_files": [
+      "src/settings/SettingsForm.tsx"
+    ],
+    "final_diff_sha256": "sha256:eb09e5374da243656514c6d560b621d006ff9cfcddd1f376bb41042f732851ba",
+    "target_contains_apply": true,
+    "target_contains_old_rendered_label": false
+  },
+  "runtime": {
+    "path": "/Users/rohitrajsaji/Desktop/Sovereign/.tools/llama-b10516/llama-b10516/llama-server",
+    "provider": "managed llama.cpp OpenAI-compatible loopback",
+    "sha256": "sha256:d0878274b8d6bd3c8ea26a78eb66cd1ffd943d007c62b9dff31c8aa99922d713",
+    "version": "version: 0.1.2-dev (build 10516, commit b95502ba9)\nbuilt with AppleClang 21.0.0.21000101 for Darwin arm64"
+  },
+  "schema": "sovereign-m1-real-qualification-v1",
+  "target": {
+    "architecture": "aarch64",
+    "os": "macos",
+    "profile": "MacBook Air M1 / 8 GB"
+  }
+}

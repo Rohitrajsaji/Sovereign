@@ -106,13 +106,15 @@ struct RuntimeHarness {
 struct RepairAwareFakeBackend {
     inner: DeterministicFakeBackend,
     completion_index: AtomicU64,
+    expected_source_digest: String,
 }
 
 impl RepairAwareFakeBackend {
-    fn new(inner: DeterministicFakeBackend) -> Self {
+    fn new(inner: DeterministicFakeBackend, expected_source_digest: String) -> Self {
         Self {
             inner,
             completion_index: AtomicU64::new(0),
+            expected_source_digest,
         }
     }
 }
@@ -139,9 +141,11 @@ impl ModelBackend for RepairAwareFakeBackend {
                 "replace_literal is not entailed by the immutable compiled literal contract",
             ) || !prompt.contains("Save button that does not exist")
                 || !prompt.contains("replace_literal_contract")
+                || !prompt.contains(&self.expected_source_digest)
+                || !prompt.contains("rejected-attempt diagnostics, not repair instructions")
             {
                 return Err(ModelError::InvalidResponse(
-                    "repair attempt was dispatched without actionable FailureRecord evidence"
+                    "repair attempt was dispatched without actionable FailureRecord/current-digest evidence"
                         .to_owned(),
                 ));
             }
@@ -406,7 +410,7 @@ fn fake_backend(prepared: &Prepared, second_attempt_succeeds: bool) -> RepairAwa
         ],
     )
     .unwrap_or_else(|error| panic!("create fake repair backend: {error}"));
-    RepairAwareFakeBackend::new(inner)
+    RepairAwareFakeBackend::new(inner, prepared.form_digest.clone())
 }
 
 fn compile_and_activate(

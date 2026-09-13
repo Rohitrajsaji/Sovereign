@@ -1,0 +1,77 @@
+{
+  "milestone_id": "M1",
+  "completed_at": "2026-09-13T05:09:10Z",
+  "required_tasks": [
+    "M1-T01",
+    "M1-T02",
+    "M1-T03",
+    "M1-T04",
+    "M1-T05",
+    "M1-T06",
+    "M1-T10",
+    "M1-T07",
+    "M1-T08",
+    "M1-T09"
+  ],
+  "all_required_tasks_completed": true,
+  "representative_real_model_gate": {
+    "status": "passed",
+    "evidence": "implementation/evidence/M1-real-model-qualification.json",
+    "evidence_sha256": "sha256:ecb06561f6e9dc40b8f26befb78e6ca2ca9684cf89c907cfc3e581fbab252086",
+    "command": "SOVEREIGN_MODEL_RUNTIME=\"$PWD/.tools/llama-b10516/llama-b10516/llama-server\" SOVEREIGN_MODEL_PATH=\"$PWD/.models/Qwen3-4B-Q4_K_M.gguf\" SOVEREIGN_M1_QUAL_REPORT=\"/tmp/sovereign-m1-real-qualification.json\" cargo test -p sovereign-eval --test m1_real_qualification --offline -- --ignored --nocapture",
+    "result": "1 passed; 0 failed",
+    "observed_branch": "natural invalid initial Qwen proposal rejected by Controller; no fault injection; raw and delivered hashes equal; bounded real-Qwen repair succeeded after durable recovery",
+    "model_sha256": "sha256:7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+    "runtime_sha256": "sha256:d0878274b8d6bd3c8ea26a78eb66cd1ffd943d007c62b9dff31c8aa99922d713",
+    "independent_read_only_audit": {
+      "worker": "worker-11",
+      "result": "closable; no concrete frozen-M1 blocker found on the current dirty tree"
+    }
+  },
+  "current_tree_source_bindings": {
+    "crates/sovereign-plan/src/compiler.rs": "sha256:a17f7975b7e6c27f77ba44bf41985040f0875fa496c582402281ee3505420b88",
+    "crates/sovereign-controller/src/lib.rs": "sha256:af4ed6e957bc8a531822f67c4866de011777077c4429a5f81a5ab1628c32a9a4",
+    "crates/sovereign-eval/tests/m1_real_qualification.rs": "sha256:2d1c83c46f30b3e7dc6263eeace80c6caa51cdb22148835159041a7258ca0756",
+    "crates/sovereign-plan/tests/minimal_compiler.rs": "sha256:820d6b86f9c797cfbd16c2da981d499a7416c14538f6ae6649c8f31156e71e92",
+    "crates/sovereign-eval/tests/repair_loop.rs": "sha256:1f96a73e527652712e77d62c21868719188d0bfee57d74b45d11379b4989de8e"
+  },
+  "milestone_gates": {
+    "natural_language_compiler_controller_checkpoint_restart": "passed",
+    "bounded_targeted_repair_without_recompile": "passed",
+    "minimum_deterministic_security_resource_kernel": "passed",
+    "representative_real_local_model_on_target_machine": "passed",
+    "bounded_exact_repository_retrieval_only": "passed"
+  },
+  "verification": [
+    {
+      "command": "cargo fmt --all -- --check",
+      "status": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test --workspace --offline",
+      "status": "passed"
+    },
+    {
+      "command": "cargo test -p sovereign-eval --test m1_real_qualification --offline -- --ignored --nocapture",
+      "status": "passed",
+      "environment": "pinned local Qwen3-4B Q4_K_M + llama.cpp build 10516"
+    }
+  ],
+  "resource_truth": {
+    "target_profile": "MacBook Air M1 / 8 GB",
+    "model_startup_peak_rss_kb": 2002720,
+    "model_post_load_steady_rss_kb": 1860272,
+    "max_observed_prefill_decode_peak_rss_kb": 1961072,
+    "memory_pressure_free_percent_before_load": 63,
+    "memory_pressure_free_percent_during_qualification": 12,
+    "memory_pressure_free_percent_after_unload": 33,
+    "swap_increased_during_run": true,
+    "process_absent_after_unload": true,
+    "note": "Representative qualification passed but materially exercised memory pressure/swap on the 8 GB target; evidence is preserved rather than normalized away."
+  },
+  "network_runtime_dependency": false
+}

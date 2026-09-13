@@ -291,6 +291,17 @@ fn minimal_compiler_simple_edit_is_one_valid_bounded_task_and_calls_only_complet
         result.plan().as_value()["tasks"].as_array().map(Vec::len),
         Some(1)
     );
+    assert_eq!(
+        result.plan().as_value()["tasks"][0]["objective"],
+        json!(input.goal_statement)
+    );
+    assert!(
+        result.plan().as_value()["tasks"][0]["implementation_contract"]["outputs"]
+            .as_array()
+            .is_some_and(|outputs| outputs
+                .iter()
+                .any(|value| value == &json!(input.goal_statement)))
+    );
     assert!(validator.is_valid(result.plan()));
     assert_eq!(backend.complete_calls(), 1);
     assert_eq!(backend.forbidden_calls.load(Ordering::Relaxed), 0);
