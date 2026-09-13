@@ -50,6 +50,13 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod roles;
+
+pub use roles::{
+    ROLE_OUTPUT_SCHEMA_VERSION, ROLE_PROFILE_SCHEMA_VERSION, RoleDisposition, RoleId, RoleOutputV1,
+    RoleProfile, RoleRegistry, RoleToolClass,
+};
+
 pub const MODEL_PROPOSAL_SCHEMA_VERSION: u32 = 1;
 pub const VERIFICATION_RESULT_SCHEMA_VERSION: u32 = 1;
 pub const FAILURE_RECORD_SCHEMA_VERSION: u32 = 1;

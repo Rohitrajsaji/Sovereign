@@ -388,6 +388,7 @@ pub enum ContextMode {
     Implementation,
     Repair,
     Reviewer,
+    Verifier,
 }
 
 /// Required canonical inputs plus already-routed candidate evidence.
@@ -723,6 +724,35 @@ impl<C: TokenCounter> ContextPlanner<C> {
         })
     }
 
+    /// Builds a fresh independent reviewer packet from current typed evidence.
+    /// Reviewer mode excludes prior-attempt transcripts, raw tool logs, full
+    /// repository payloads, and hidden implementer reasoning by construction.
+    ///
+    /// # Errors
+    /// Returns [`ContextError`] under the same bounded-packet conditions as
+    /// [`Self::build`].
+    pub fn build_reviewer(
+        &self,
+        budget: ContextBudget,
+        input: ContextPacketInput,
+    ) -> Result<ContextPacket, ContextError> {
+        self.build(ContextMode::Reviewer, budget, input)
+    }
+
+    /// Builds a fresh verifier packet from the same bounded independent-review evidence surface.
+    /// Verifier mode is distinct in the typed packet while excluding implementer trajectory, raw
+    /// tool logs, and full-repository payloads by construction.
+    ///
+    /// # Errors
+    /// Returns [`ContextError`] under the same bounded-packet conditions as [`Self::build`].
+    pub fn build_verifier(
+        &self,
+        budget: ContextBudget,
+        input: ContextPacketInput,
+    ) -> Result<ContextPacket, ContextError> {
+        self.build(ContextMode::Verifier, budget, input)
+    }
+
     /// Builds a failure-focused packet using the same bounded projection machinery as normal
     /// execution. Repair mode excludes prior-attempt transcript/hidden reasoning and admits only
     /// the current diff, failure evidence, tool schema, and explicitly implicated evidence.
@@ -843,7 +873,7 @@ fn allowed_in_mode(mode: ContextMode, item: &EvidenceItem) -> bool {
             | EvidenceKind::ToolSynopsis => item.implicated,
             _ => false,
         },
-        ContextMode::Reviewer => matches!(
+        ContextMode::Reviewer | ContextMode::Verifier => matches!(
             item.kind,
             EvidenceKind::Diff
                 | EvidenceKind::SourceSlice
