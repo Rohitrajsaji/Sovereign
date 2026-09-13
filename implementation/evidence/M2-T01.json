@@ -1,0 +1,165 @@
+{
+  "schema": "sovereign-task-evidence-v1",
+  "task": "M2-T01",
+  "status": "completed",
+  "completed_at": "2026-09-13T05:43:54Z",
+  "roadmap_version": "1.4-frozen",
+  "dependencies": [
+    "M1-T02"
+  ],
+  "dependency_evidence": [
+    "implementation/evidence/M1-T02.json"
+  ],
+  "acceptance": {
+    "derived_fts5_bm25_index": true,
+    "incremental_changed_file_refresh": true,
+    "deleted_file_removal": true,
+    "dirty_worktree_indexing": true,
+    "large_file_chunk_cap": true,
+    "source_manifest_freshness_before_query": true,
+    "git_invisible_ignored_file_first_query_refresh": true,
+    "per_hit_current_source_hash_validation_every_pass": true,
+    "bounded_source_race_refresh_or_fail_closed": true,
+    "source_hash_on_every_hit": true,
+    "delta_invalidated_before_snapshot_publish": true,
+    "incompatible_physical_derived_schema_drop_recreate": true,
+    "exact_source_remains_authority": true,
+    "sampled_peak_rss_during_index_work": true,
+    "fts_process_cache_contribution_bounded": true,
+    "mmap_disabled": true,
+    "wal_health_threshold_explicit": true
+  },
+  "lexical_fixture_tests": [
+    "lexical_cache_budget_math_reserves_hard_headroom",
+    "lexical_incremental_refresh_indexes_dirty_worktree_and_removes_deleted_files",
+    "lexical_stale_hit_is_rejected_and_exact_source_is_refreshed_before_return",
+    "lexical_first_query_for_new_term_refreshes_git_invisible_ignored_source",
+    "lexical_large_file_chunking_respects_per_chunk_and_per_file_caps",
+    "lexical_snapshot_publishes_only_after_delta_rows_are_invalidated",
+    "lexical_rebuild_is_derived_and_reproducible_from_source",
+    "lexical_incompatible_schema_drops_old_layout_and_rebuilds_from_source",
+    "lexical_resource_policy_and_medium_large_calibration_are_explicit_and_bounded",
+    "lexical_multiple_connections_keep_fts_process_cache_bounded"
+  ],
+  "target_machine_calibration": {
+    "profile": "MacBook Air M1 / 8 GB / macOS arm64",
+    "fixture_source_bytes": 9183195,
+    "index_db_bytes_observed_in_wal_mode": 4096,
+    "wal_bytes": 14312912,
+    "db_to_source_ratio": 0.0004460321271627141,
+    "db_plus_wal_to_source_ratio": 1.5590443195423815,
+    "wall_time_micros": 1126999,
+    "cpu_time_micros": 1150000,
+    "sampled_peak_process_rss_bytes": 21708800,
+    "peak_batch_source_bytes": 573951,
+    "batch_file_limit": 16,
+    "page_cache_kib": 2048,
+    "page_cache_per_connection_hard_limit_kib": 8192,
+    "process_fts_cache_reserved_kib": 2048,
+    "process_fts_cache_hard_limit_kib": 16384,
+    "sqlite_aggregate_cache_target_kib": 32768,
+    "sqlite_aggregate_cache_hard_limit_kib": 65536,
+    "sqlite_hard_headroom_after_fts_kib": 49152,
+    "mmap_size_bytes": 0,
+    "sqlite_page_size_bytes": 4096,
+    "wal_autocheckpoint_pages": 16384,
+    "wal_soft_checkpoint_bytes": 67108864,
+    "wal_health_event_threshold_bytes": 268435456,
+    "resource_health": "Healthy",
+    "resource_health_event": null,
+    "incremental_refresh": {
+      "changed_files": 1,
+      "deleted_files": 0,
+      "source_bytes": 9147392,
+      "index_db_bytes_observed_in_wal_mode": 4096,
+      "wal_bytes": 14399432,
+      "wall_time_micros": 800884,
+      "cpu_time_micros": 750000,
+      "sampled_peak_process_rss_bytes": 25870336,
+      "peak_batch_source_bytes": 67,
+      "batch_file_limit": 16,
+      "page_cache_kib": 2048,
+      "source_manifest_digest": "sha256:05181e296cb57740a5b351501f236f5455d9adff64fb360bea9249858a9f9e2b"
+    },
+    "notes": [
+      "Peak RSS is sampled while indexing is active after source scan and each indexing/deletion batch; it is not a before/after-only maximum.",
+      "The calibration corpus exceeds 8 MiB of source on the target machine.",
+      "The SQLite DB was observed in WAL mode, so DB bytes and WAL bytes are recorded separately; db_plus_wal_to_source_ratio captures the transient on-disk projection footprint at observation.",
+      "The 64 MiB WAL soft target is proven by the observed 4096-byte page size multiplied by 16384 autocheckpoint pages.",
+      "FTS cache admission is capped at 8 MiB per connection and 16 MiB process-local, leaving 48 MiB hard headroom below the 64 MiB architecture aggregate ceiling for canonical-state SQLite. This is an explicit FTS contribution bound, not a false claim that this module globally owns canonical-state cache admission."
+    ],
+    "source_manifest_digest": "sha256:6e2f7c1d2a3dbbb48e958d4df87371576ec4353343e5179b109e9f01dc18b8e7"
+  },
+  "independent_audit": {
+    "auditor": "worker-10",
+    "result": "semantically closable; all five prior code blockers fixed",
+    "remaining_issue_at_audit_time": "only stale M2-T01 evidence; this file regenerates that evidence from the repaired tree",
+    "resolution": "source-manifest digests for both rebuild and incremental refresh are now durable in this evidence artifact; final closure verification performed against the same test-side outputs"
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-repo --offline -- lexical",
+      "status": "passed",
+      "tests": "10 checks (1 unit + 9 integration)"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-repo --test lexical --offline -- --nocapture",
+      "status": "passed",
+      "tests": "9/9 integration; emitted rebuild/resource/incremental target-machine calibration"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-repo --offline",
+      "status": "passed",
+      "tests": "1 unit + 5 baseline + 3 exact + 9 lexical integration"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo clippy -p sovereign-repo --all-targets --offline -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo test --workspace --offline",
+      "status": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "status": "passed"
+    },
+    {
+      "command": "cargo fmt --all -- --check",
+      "status": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "status": "passed"
+    }
+  ],
+  "artifacts": {
+    "lexical_implementation": {
+      "path": "crates/sovereign-repo/src/lexical.rs",
+      "sha256": "f888d05b7dcd97369911ebb753d4047a2e85a0047990f19ae8eb6bfb924bcdcf"
+    },
+    "lexical_tests": {
+      "path": "crates/sovereign-repo/tests/lexical.rs",
+      "sha256": "1f56d89758f6d4ede5d7d16a750ccfa4f9537c66aaa0936f9e37c6ff0d34b048"
+    },
+    "repo_module_exports": {
+      "path": "crates/sovereign-repo/src/lib.rs",
+      "sha256": "6532a56eb8835f803d564d9e819e6bcd25af7429033c449e0936adb7d3647669"
+    },
+    "crate_manifest": {
+      "path": "crates/sovereign-repo/Cargo.toml",
+      "sha256": "3cf5b86fbee00e90ef4c61073d743acb2c24edac765a79d3c609253b0ced2069"
+    },
+    "cargo_lock": {
+      "path": "Cargo.lock",
+      "sha256": "8dbe95c3e8a791140683871c0444b55bcfeb09b1ee98aee6707da9f037cde97a"
+    }
+  },
+  "implementation_notes": [
+    "The lexical index is disposable derived state only; current filesystem/Git source remains authoritative.",
+    "Search computes the same bounded source manifest used by indexing before trusting BM25 output, including zero-hit queries, and exact-hash validates every result pass after refresh as well.",
+    "Repeated source churn consumes at most two refreshes before retrieval fails closed.",
+    "Incompatible physical derived layouts are dropped and recreated rather than migrated as canonical truth.",
+    "No semantic embedder or resident model is introduced by M2-T01."
+  ]
+}

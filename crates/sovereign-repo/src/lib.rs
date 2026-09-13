@@ -4,6 +4,13 @@
 //! symbol, dependency, and semantic projections are later derived extensions;
 //! they never replace source files or Git as repository truth.
 
+mod lexical;
+
+pub use lexical::{
+    IndexCalibration, IndexConfig, IndexResourceHealth, IndexSnapshot, LexicalHit, LexicalQuery,
+    LexicalRetriever, RefreshReport, ResourceHealthLevel,
+};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
