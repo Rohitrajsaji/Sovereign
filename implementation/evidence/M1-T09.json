@@ -1,0 +1,56 @@
+{
+  "schema": "sovereign-task-evidence-v1",
+  "task": "M1-T09",
+  "status": "completed",
+  "completed_at_utc": "2026-09-13T03:16:25Z",
+  "title": "Implement first targeted repair loop",
+  "dependency_evidence": [
+    "implementation/evidence/M1-T07.json",
+    "implementation/evidence/M1-T08.json"
+  ],
+  "source_hashes": {
+    "crates/sovereign-context/src/lib.rs": "sha256:5da945d1b65e20de3e64213cc05da58de43a52aa6ede13bb51afa69a476771e0",
+    "crates/sovereign-controller/src/lib.rs": "sha256:dc5f1a7f36dacb301aaee550d376597d4697c29aad00329cf1c55d60de254bfa",
+    "crates/sovereign-eval/tests/repair_loop.rs": "sha256:b400b0957aa1ed8d9256b8695633a6af0571c370f37601e6bbf0b79808fb35ec"
+  },
+  "implementation": {
+    "failure_record": "FailureRecord v1 is Controller-owned durable evidence bound to the active plan revision/digest, task/task-contract digest, failed attempt, stable normalized failure signature/code, bounded actionable synopsis, failed-action facts, exact evidence references, confidence and routing decision. Ordinary execution/proposal/verification failures do not claim assumption/precondition invalidation without explicit evidence.",
+    "repair_packet": "RepairPacket v1 binds the same immutable plan/task/acceptance contract plus prior attempt, FailureRecord digest/signature/evidence and a bounded ContextMode::Repair packet containing current diff, compact actionable failure evidence and implicated source/tool evidence while excluding prior transcript, raw tool logs and hidden reasoning.",
+    "controller_authority": "Only Controller admits repair from repair_pending (or its exact resource-deferred continuation), rechecks active-plan/task/acceptance identity and durable counters, derives fresh readiness/resource authority, starts a new attempt, and reuses the normal typed model proposal -> authorization -> tool -> deterministic verifier path. No PlanCompiler call occurs during repair and the valid plan/task contract is not rewritten.",
+    "counter_semantics": "max_attempts counts only actual started attempts, including the initial attempt; same_failure_limit is independently enforced over normalized failure signatures. Pre-attempt resource admission uses a separate bounded resource-deferral counter and does not increment attempts_started or model_calls_used.",
+    "restart_provenance": "FailureRecord and RepairPacket records are checkpoint-immutable bindings. Repair attempt runtime persists explicit prior-attempt, FailureRecord-digest and RepairPacket-digest provenance, so RecoveryManager reconstructs counters and repair ancestry without chat/model replay.",
+    "failure_normalization": "Failure signatures use stable category/code plus normalized diagnostic/action facts and strip volatile request IDs, timestamps, line-number/digit noise, content digests and action identity. Actionable diagnostics remain present in the model-facing FailureSynopsis even though volatile identity is removed from the circuit-breaker key.",
+    "failure_policy": "Controller applies the immutable task failure_policy for execution failure and attempts/same-failure exhaustion; unsupported/escalating routes fail closed rather than creating an extra retry."
+  },
+  "tests": [
+    "failed_attempt_recovers_resource_defers_then_targeted_repair_succeeds",
+    "identical_second_failure_blocks_third_repair",
+    "same_failure_circuit_breaker_requires_both_counters_below_limits",
+    "normalized_failure_signature_ignores_volatile_request_time_and_line_noise",
+    "repair_packet_excludes_prior_transcript_and_keeps_diff_failure_implicated_evidence"
+  ],
+  "verification": {
+    "cargo_fmt_workspace_check": "passed",
+    "cargo_clippy_workspace_all_targets_offline_deny_warnings": "passed",
+    "cargo_test_sovereign_context_offline": "passed: 9 context-packet tests",
+    "cargo_test_sovereign_controller_offline": "passed: 4 unit + 18 integration",
+    "cargo_test_sovereign_eval_repair_loop_offline": "passed: 2/2",
+    "cargo_test_sovereign_eval_vertical_slice_offline": "passed: 1/1",
+    "cargo_test_sovereign_eval_crash_resume_offline": "passed: 20/20",
+    "cargo_test_workspace_offline": "passed; compiler_real_local_8k_smoke remains intentionally ignored in the ordinary workspace suite",
+    "git_diff_check": "passed",
+    "independent_current_source_audit": "passed: worker-10 final read-only re-audit reported no remaining frozen M1-T09 blocker and explicitly marked T09 closable"
+  },
+  "completion_evidence": {
+    "attempt_1": "Compiler-produced plan starts attempt 1 with one model call. The deliberately invalid replace_literal proposal is rejected against the immutable compiled contract; Controller atomically closes the attempt, persists FailureRecord v1 with replace_literal_contract code, actionable diagnostic and rejected old-literal facts, and routes the unchanged task to repair_pending.",
+    "restart": "RecoveryManager reconstructs the same plan digest, repair_pending task, attempts_started=1, model_calls_used=1 and exact durable FailureRecord before any repair model call.",
+    "resource_deferral": "One constrained-host repair admission is denied before attempt start; task records one resource deferral while attempts_started=1, model_calls_used=1 and the outer model-call budget remain unchanged, then re-enters within resource_retry_limit.",
+    "attempt_2_packet": "RepairAwareFakeBackend refuses the second execution-model call unless the actual repair prompt contains the normalized replace_literal_contract failure code, exact actionable rejection diagnostic and the failed old literal. RepairPacket also contains current Diff + FailureSynopsis and excludes prior transcript/raw logs/hidden reasoning.",
+    "attempt_2_result": "Attempt 2 consumes the remaining model call, applies the bounded real local Seatbelt-isolated repository edit and passes fresh deterministic verification. The active plan document, task-contract digest and acceptance criteria are byte/digest unchanged across both attempts and restart.",
+    "identical_failure_ceiling": "A second identical normalized failure records the same signature, reaches the frozen 2/2 same-failure/attempt policy and blocks a third repair with no extra attempt or model call. Independent conjunctive ceiling behavior is also covered in the Controller unit test."
+  },
+  "m1_gate_6": {
+    "status": "open",
+    "reason": "M1-T09 closes deterministic targeted repair semantics with a causally guarded fake backend. It does not by itself satisfy the frozen representative-real-model milestone gate. A current local Qwen3-4B implementation + bounded repair + restart/resume engineering packet with rendered/schema/output-reserve accounting, prefill/RSS/resource-pressure/compressor/swap observations and exact plan/task/attempt/action/evidence IDs is still required before M1 may close."
+  }
+}

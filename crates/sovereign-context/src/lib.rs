@@ -407,6 +407,45 @@ pub struct ContextPacket {
     pub serialized_input: String,
 }
 
+/// Failure-focused M1 repair packet. This is a bounded projection over the same immutable
+/// task contract; it never carries a prior-attempt transcript or authority of its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepairPacket {
+    pub schema_version: u32,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub plan_digest: String,
+    pub task_id: String,
+    pub task_contract_digest: String,
+    pub acceptance_contract_digest: String,
+    pub prior_attempt_id: String,
+    pub failure_signature: String,
+    pub failure_record_digest: String,
+    pub failure_evidence_refs: Vec<String>,
+    pub context: ContextPacket,
+}
+
+/// Inputs used to construct one repair packet through the canonical context planner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepairPacketInput {
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub plan_digest: String,
+    pub task_id: String,
+    pub task_contract_digest: String,
+    pub acceptance_contract_digest: String,
+    pub prior_attempt_id: String,
+    pub failure_signature: String,
+    pub failure_record_digest: String,
+    pub failure_evidence_refs: Vec<String>,
+    pub controller_prefix: String,
+    pub task_contract: String,
+    pub current_state: String,
+    pub candidates: Vec<EvidenceItem>,
+    pub output_schema: String,
+}
+
 /// Deterministic token counter interface. M1 ships a pinned local fallback;
 /// model-provider authoritative usage may replace it at the integration layer.
 pub trait TokenCounter {
@@ -651,6 +690,45 @@ impl<C: TokenCounter> ContextPlanner<C> {
                 final_serialized_input_tokens: final_tokens,
             },
             serialized_input,
+        })
+    }
+
+    /// Builds a failure-focused packet using the same bounded projection machinery as normal
+    /// execution. Repair mode excludes prior-attempt transcript/hidden reasoning and admits only
+    /// the current diff, failure evidence, tool schema, and explicitly implicated evidence.
+    ///
+    /// # Errors
+    /// Returns [`ContextError`] when mandatory repair C0 or the final serialized packet exceeds
+    /// the supplied budget.
+    pub fn build_repair(
+        &self,
+        budget: ContextBudget,
+        input: RepairPacketInput,
+    ) -> Result<RepairPacket, ContextError> {
+        let context = self.build(
+            ContextMode::Repair,
+            budget,
+            ContextPacketInput {
+                controller_prefix: input.controller_prefix,
+                task_contract: input.task_contract,
+                current_state: input.current_state,
+                candidates: input.candidates,
+                output_schema: input.output_schema,
+            },
+        )?;
+        Ok(RepairPacket {
+            schema_version: 1,
+            plan_id: input.plan_id,
+            plan_revision: input.plan_revision,
+            plan_digest: input.plan_digest,
+            task_id: input.task_id,
+            task_contract_digest: input.task_contract_digest,
+            acceptance_contract_digest: input.acceptance_contract_digest,
+            prior_attempt_id: input.prior_attempt_id,
+            failure_signature: input.failure_signature,
+            failure_record_digest: input.failure_record_digest,
+            failure_evidence_refs: input.failure_evidence_refs,
+            context,
         })
     }
 

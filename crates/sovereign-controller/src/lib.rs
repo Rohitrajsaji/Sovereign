@@ -7,7 +7,10 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sovereign_context::{ContextPacket, EvidenceItem, EvidenceKind};
+use sovereign_context::{
+    ContextLevel, ContextPacket, ContextPlanner, EvidenceItem, EvidenceKind, PacketSection,
+    RepairPacket, RepairPacketInput, TrustClass,
+};
 use sovereign_evidence::{ArtifactStore, EvidenceError};
 use sovereign_model::{
     MODEL_SCHEMA_VERSION, ModelBackend, ModelError, ModelFinishReason, ModelMessage,
@@ -40,6 +43,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MODEL_PROPOSAL_SCHEMA_VERSION: u32 = 1;
 pub const VERIFICATION_RESULT_SCHEMA_VERSION: u32 = 1;
+pub const FAILURE_RECORD_SCHEMA_VERSION: u32 = 1;
 const M1_MODEL_OUTPUT_TOKENS: u32 = 512;
 const MAX_LITERAL_BYTES: usize = 4_096;
 const EVIDENCE_SATISFACTION_SCHEMA_VERSION: u32 = 1;
@@ -345,17 +349,45 @@ pub enum ReplaceLiteralKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExecutionFailureV1 {
+#[serde(deny_unknown_fields)]
+pub struct FailureRecordV1 {
     pub schema_version: u32,
     pub plan_id: String,
+    pub plan_revision: u32,
+    pub plan_digest: String,
     pub task_id: String,
+    pub task_contract_digest: String,
     pub attempt_id: String,
     pub action_id: Option<String>,
     pub result_digest: Option<String>,
     pub exit_code: Option<i32>,
+    pub failure_code: String,
     pub signature: String,
     pub category: String,
+    pub synopsis: String,
+    pub failed_action_facts: BTreeMap<String, String>,
+    pub evidence_refs: Vec<String>,
+    pub affected_contract_ids: Vec<String>,
+    pub confidence_milli: u16,
+    pub decision: String,
 }
+
+#[derive(Debug, Clone)]
+struct FailureRecordInput {
+    task_id: String,
+    attempt_id: String,
+    action_id: Option<String>,
+    result_digest: Option<String>,
+    exit_code: Option<i32>,
+    category: String,
+    failure_code: String,
+    diagnostic: String,
+    failed_action_facts: BTreeMap<String, String>,
+    evidence_refs: Vec<String>,
+}
+
+/// Backward-compatible name used by the M1-T07 execution-error surface.
+pub type ExecutionFailureV1 = FailureRecordV1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationResultV1 {
@@ -506,6 +538,12 @@ struct TaskRuntime {
     model_calls_used: u32,
     failure_counts: BTreeMap<String, u32>,
     retry_exhausted: bool,
+    #[serde(default)]
+    resource_deferrals_used: u32,
+    #[serde(default)]
+    resource_retry_exhausted: bool,
+    #[serde(default)]
+    resource_deferred_from: Option<TaskState>,
     task_contract_digest: String,
     task: Value,
 }
@@ -516,10 +554,21 @@ struct AttemptRuntime {
     attempt_id: String,
     state: AttemptState,
     task_contract_digest: String,
+    #[serde(default)]
+    repair_origin: Option<RepairAttemptOriginV1>,
     baseline_digest: String,
     pre_snapshot_digest: String,
     pre_diff_digest: String,
     pre_changed_fingerprints: BTreeMap<PathBuf, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepairAttemptOriginV1 {
+    schema_version: u32,
+    prior_attempt_id: String,
+    failure_record_digest: String,
+    repair_packet_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -601,6 +650,86 @@ impl Controller {
             .as_ref()
             .and_then(|active| active.tasks.get(task_id))
             .map(|task| task.model_calls_used)
+    }
+
+    #[must_use]
+    pub fn task_attempts_started(&self, task_id: &str) -> Option<u32> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.tasks.get(task_id))
+            .map(|task| task.attempts_started)
+    }
+
+    #[must_use]
+    pub fn task_resource_deferrals_used(&self, task_id: &str) -> Option<u32> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.tasks.get(task_id))
+            .map(|task| task.resource_deferrals_used)
+    }
+
+    #[must_use]
+    pub fn task_contract_digest(&self, task_id: &str) -> Option<&str> {
+        self.active
+            .as_ref()?
+            .tasks
+            .get(task_id)
+            .map(|task| task.task_contract_digest.as_str())
+    }
+
+    /// Returns the latest Controller-owned durable `FailureRecord v1` for a task.
+    ///
+    /// # Errors
+    /// Fails closed if the journal binding, durable record digest, or schema is inconsistent.
+    pub fn latest_failure_record(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<FailureRecordV1>, ControllerError> {
+        Ok(self
+            .latest_failure_record_with_digest(task_id)?
+            .map(|(record, _)| record))
+    }
+
+    fn latest_failure_record_with_digest(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<(FailureRecordV1, String)>, ControllerError> {
+        for event in self.state.journal()?.into_iter().rev() {
+            if event.entity_type != "controller" || event.event_kind != "failure_recorded" {
+                continue;
+            }
+            let payload: Value = serde_json::from_str(&event.payload_json)?;
+            if payload.get("task_id").and_then(Value::as_str) != Some(task_id) {
+                continue;
+            }
+            let record_key = required_str(&payload, "/record_key")?;
+            let expected_digest = required_str(&payload, "/failure_record_digest")?;
+            let raw = self
+                .state
+                .get_state("controller.failure_record", record_key)?
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "failure journal points to missing durable record".to_owned(),
+                    )
+                })?;
+            let actual_digest = sha256_prefixed(raw.as_bytes());
+            if actual_digest != expected_digest {
+                return Err(ControllerError::InvalidPlan(
+                    "durable FailureRecord digest differs from journal authority".to_owned(),
+                ));
+            }
+            let record: FailureRecordV1 = serde_json::from_str(&raw)?;
+            if record.schema_version != FAILURE_RECORD_SCHEMA_VERSION
+                || record.task_id != task_id
+                || format!("{}:{}", record.task_id, record.attempt_id) != record_key
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "durable FailureRecord binding is malformed".to_owned(),
+                ));
+            }
+            return Ok(Some((record, actual_digest)));
+        }
+        Ok(None)
     }
 
     #[must_use]
@@ -817,6 +946,9 @@ impl Controller {
                         model_calls_used: 0,
                         failure_counts: BTreeMap::new(),
                         retry_exhausted: false,
+                        resource_deferrals_used: 0,
+                        resource_retry_exhausted: false,
+                        resource_deferred_from: None,
                         task_contract_digest,
                         task: task.clone(),
                     },
@@ -884,8 +1016,18 @@ impl Controller {
     ) -> Result<ReadyLease, ControllerError> {
         self.require_current_baseline(registry)?;
         if self.task_state(task_id) == Some(TaskState::DeferredResource) {
-            self.transition_task(task_id, TaskState::Planned, "task_resource_recheck")?;
+            self.restore_resource_deferred_task(task_id, TaskState::Planned)?;
         }
+        self.derive_ready_lease_for_state(registry, task_id, inputs, TaskState::Planned)
+    }
+
+    fn derive_ready_lease_for_state(
+        &mut self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+        inputs: ReadinessInputs<'_>,
+        eligible_state: TaskState,
+    ) -> Result<ReadyLease, ControllerError> {
         let epoch = self.state.current_execution_epoch()?;
         let (plan_id, revision, plan_digest, task_digest, task_value, validity) = {
             let active = self.active_ref()?;
@@ -907,7 +1049,7 @@ impl Controller {
                 "active plan validity is not current".to_owned(),
             ));
         }
-        self.check_task_readiness(task_id, &task_value, inputs)?;
+        self.check_task_readiness(task_id, &task_value, inputs, eligible_state)?;
         let (checkpoint_generation, checkpoint_action_sequence, checkpoint_hash) =
             self.current_checkpoint_binding()?;
         let baseline_digest = snapshot_digest(&self.active_ref()?.baseline)?;
@@ -921,11 +1063,7 @@ impl Controller {
         ) {
             Ok(lease) => lease,
             Err(error @ PolicyError::ResourceDenied(_)) => {
-                self.transition_task(
-                    task_id,
-                    TaskState::DeferredResource,
-                    "task_deferred_resource",
-                )?;
+                self.record_pre_attempt_resource_deferral(task_id, eligible_state)?;
                 return Err(ControllerError::Policy(error));
             }
             Err(error) => return Err(ControllerError::Policy(error)),
@@ -958,6 +1096,140 @@ impl Controller {
         Ok(lease)
     }
 
+    fn derive_repair_lease(
+        &mut self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+        inputs: ReadinessInputs<'_>,
+    ) -> Result<ReadyLease, ControllerError> {
+        self.require_current_baseline(registry)?;
+        let (state, retry_exhausted, resource_retry_exhausted) = self
+            .active_ref()?
+            .tasks
+            .get(task_id)
+            .map(|task| {
+                (
+                    task.state,
+                    task.retry_exhausted,
+                    task.resource_retry_exhausted,
+                )
+            })
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        if retry_exhausted || resource_retry_exhausted {
+            return Err(ControllerError::NotReady(
+                "repair retry policy is exhausted".to_owned(),
+            ));
+        }
+        match state {
+            TaskState::RepairPending => {}
+            TaskState::DeferredResource => {
+                self.restore_resource_deferred_task(task_id, TaskState::RepairPending)?;
+            }
+            _ => {
+                return Err(ControllerError::NotReady(format!(
+                    "task state {state:?} is not eligible for repair"
+                )));
+            }
+        }
+        self.derive_ready_lease_for_state(registry, task_id, inputs, TaskState::RepairPending)
+    }
+
+    fn restore_resource_deferred_task(
+        &mut self,
+        task_id: &str,
+        expected_from: TaskState,
+    ) -> Result<(), ControllerError> {
+        {
+            let task = self
+                .active_mut()?
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+            if task.state != TaskState::DeferredResource
+                || task.resource_deferred_from != Some(expected_from)
+                || task.resource_retry_exhausted
+            {
+                return Err(ControllerError::NotReady(
+                    "resource-deferred task cannot re-enter this execution path".to_owned(),
+                ));
+            }
+            task.state = expected_from;
+            task.resource_deferred_from = None;
+        }
+        let task_json = serde_json::to_string(
+            self.active_ref()?
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?,
+        )?;
+        self.persist_runtime_records_with_events(
+            &[("controller.task".to_owned(), task_id.to_owned(), task_json)],
+            &[(
+                (if expected_from == TaskState::RepairPending {
+                    "task_repair_resource_recheck"
+                } else {
+                    "task_resource_recheck"
+                })
+                .to_owned(),
+                task_id.to_owned(),
+                json!({"state": expected_from}),
+            )],
+        )?;
+        self.checkpoint_now()?;
+        Ok(())
+    }
+
+    fn record_pre_attempt_resource_deferral(
+        &mut self,
+        task_id: &str,
+        expected_from: TaskState,
+    ) -> Result<(), ControllerError> {
+        let (used, limit, exhausted) = {
+            let task = self
+                .active_mut()?
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+            if task.state != expected_from {
+                return Err(ControllerError::InvalidPlan(
+                    "resource deferral source state changed unexpectedly".to_owned(),
+                ));
+            }
+            let limit = required_u32(&task.task, "/failure_policy/resource_retry_limit")?;
+            task.resource_deferrals_used = task.resource_deferrals_used.saturating_add(1);
+            task.resource_retry_exhausted = task.resource_deferrals_used > limit;
+            task.resource_deferred_from = Some(expected_from);
+            task.state = TaskState::DeferredResource;
+            (
+                task.resource_deferrals_used,
+                limit,
+                task.resource_retry_exhausted,
+            )
+        };
+        let task_json = serde_json::to_string(
+            self.active_ref()?
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?,
+        )?;
+        self.persist_runtime_records_with_events(
+            &[("controller.task".to_owned(), task_id.to_owned(), task_json)],
+            &[(
+                "task_deferred_resource".to_owned(),
+                task_id.to_owned(),
+                json!({
+                    "state": TaskState::DeferredResource,
+                    "deferred_from": expected_from,
+                    "resource_deferrals_used": used,
+                    "resource_retry_limit": limit,
+                    "retry_allowed": !exhausted,
+                }),
+            )],
+        )?;
+        self.checkpoint_now()?;
+        Ok(())
+    }
+
     /// Releases an unused derived readiness lease.
     ///
     /// # Errors
@@ -980,13 +1252,283 @@ impl Controller {
         context: &ContextPacket,
         model_budget: &mut ModelCallBudget,
     ) -> Result<ExecutionSuccess, ControllerError> {
-        let result = self.execute_replace_inner(&mut lease, runtime, context, model_budget);
+        let result = self.execute_replace_inner(&mut lease, runtime, context, model_budget, None);
         let release = self.resource_governor.release(&lease.resource_lease);
         match (result, release) {
             (Ok(success), Ok(())) => Ok(success),
             (Ok(_), Err(error)) => Err(ControllerError::Policy(error)),
             (Err(error), _) => Err(error),
         }
+    }
+
+    /// Executes one bounded targeted repair attempt against the same active task contract.
+    /// The repair packet is rebuilt from current diff/failure evidence and the existing bounded
+    /// context; no `PlanCompiler` call or plan/task-contract mutation occurs.
+    ///
+    /// # Errors
+    /// Returns a fail-closed readiness/policy/error result when retry counters, failure evidence,
+    /// resources, task contract, or current repository truth do not permit another attempt.
+    #[allow(clippy::too_many_lines)]
+    pub fn repair_replace<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        task_id: &str,
+        runtime: &ExecutionRuntime<'_, I>,
+        base_context: &ContextPacket,
+        readiness: ReadinessInputs<'_>,
+        model_budget: &mut ModelCallBudget,
+    ) -> Result<(ExecutionSuccess, RepairPacket), ControllerError> {
+        let (failure, failure_record_digest) = self
+            .latest_failure_record_with_digest(task_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady("durable FailureRecord v1 is missing".to_owned())
+            })?;
+        let (
+            plan_id,
+            plan_revision,
+            plan_digest,
+            task_contract_digest,
+            acceptance_contract_digest,
+            task_json,
+            attempts_started,
+            same_failure_count,
+        ) = {
+            let active = self.active_ref()?;
+            let task = active
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+            let repair_state_ok = task.state == TaskState::RepairPending
+                || (task.state == TaskState::DeferredResource
+                    && task.resource_deferred_from == Some(TaskState::RepairPending));
+            if !repair_state_ok || task.retry_exhausted || task.resource_retry_exhausted {
+                return Err(ControllerError::NotReady(
+                    "task is not eligible for targeted repair".to_owned(),
+                ));
+            }
+            if failure.schema_version != FAILURE_RECORD_SCHEMA_VERSION
+                || failure.decision != "repair"
+                || failure.plan_id != active.plan_id
+                || failure.plan_revision != active.revision
+                || failure.plan_digest != active.plan_digest
+                || failure.task_id != task_id
+                || failure.task_contract_digest != task.task_contract_digest
+            {
+                return Err(ControllerError::NotReady(
+                    "durable FailureRecord v1 is not bound to the current plan/task contract"
+                        .to_owned(),
+                ));
+            }
+            let prior_attempt = active.attempts.get(&failure.attempt_id).ok_or_else(|| {
+                ControllerError::NotReady("repair failure origin attempt is missing".to_owned())
+            })?;
+            if prior_attempt.task_id != task_id
+                || prior_attempt.state != AttemptState::Failed
+                || prior_attempt.task_contract_digest != task.task_contract_digest
+            {
+                return Err(ControllerError::NotReady(
+                    "repair failure origin attempt is not the exact failed task attempt".to_owned(),
+                ));
+            }
+            let count = task
+                .failure_counts
+                .get(&failure.signature)
+                .copied()
+                .unwrap_or(0);
+            let max_attempts = required_u32(&task.task, "/failure_policy/max_attempts")?;
+            let same_limit = required_u32(&task.task, "/failure_policy/same_failure_limit")?;
+            if count == 0 || !repair_allowed(task.attempts_started, max_attempts, count, same_limit)
+            {
+                return Err(ControllerError::NotReady(
+                    "repair retry policy is exhausted or unbound".to_owned(),
+                ));
+            }
+            let (_, acceptance_digest) = compiled_acceptance_contract(&task.task)?;
+            let contract_projection = repair_task_contract_projection(
+                task_id,
+                &task.task_contract_digest,
+                &acceptance_digest,
+                &task.task,
+            )?;
+            (
+                active.plan_id.clone(),
+                active.revision,
+                active.plan_digest.clone(),
+                task.task_contract_digest.clone(),
+                acceptance_digest,
+                contract_projection,
+                task.attempts_started,
+                count,
+            )
+        };
+
+        let current_diff = ExactRetriever::new(runtime.registry)
+            .current_diff(&self.active_ref()?.repository_id)?;
+        let mut candidates = base_context
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.section,
+                    PacketSection::DirectEvidence
+                        | PacketSection::RoutedExpansion
+                        | PacketSection::ToolEvidence
+                ) || item.kind == EvidenceKind::ToolSchema
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let implicated_path = failure
+            .action_id
+            .as_deref()
+            .and_then(|action_id| {
+                self.state
+                    .get_state("controller.action_intent", action_id)
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|raw| serde_json::from_str::<PersistedActionIntent>(&raw).ok())
+            .map(|intent| format!("path:{}", intent.path));
+        for item in &mut candidates {
+            if item.kind == EvidenceKind::ToolSchema
+                || failure.evidence_refs.contains(&item.evidence_id)
+                || implicated_path
+                    .as_deref()
+                    .is_some_and(|path| item.locator.as_deref() == Some(path))
+            {
+                item.implicated = true;
+            }
+        }
+        candidates.push(EvidenceItem::from_diff(
+            &current_diff,
+            "current diff for targeted repair",
+        ));
+        candidates.push(
+            EvidenceItem::new(
+                format!("failure:{}:{}", task_id, failure.attempt_id),
+                PacketSection::ToolEvidence,
+                ContextLevel::C1,
+                EvidenceKind::FailureSynopsis,
+                format!("controller://failure/{}/{}", task_id, failure.attempt_id),
+                failure_record_digest.clone(),
+                "controller_failure_record_v1",
+                TrustClass::Controller,
+                "exact prior failure for targeted repair",
+                serde_json::to_string(&json!({
+                    "attempt_id": failure.attempt_id,
+                    "category": failure.category,
+                    "failure_code": failure.failure_code,
+                    "failure_signature": failure.signature,
+                    "synopsis": failure.synopsis,
+                    "failed_action_facts": failure.failed_action_facts,
+                    "evidence_refs": failure.evidence_refs,
+                }))?,
+            )
+            .with_implicated(true),
+        );
+        let repair_packet = ContextPlanner::default()
+            .build_repair(
+                base_context.budget,
+                RepairPacketInput {
+                    plan_id: plan_id.clone(),
+                    plan_revision,
+                    plan_digest: plan_digest.clone(),
+                    task_id: task_id.to_owned(),
+                    task_contract_digest: task_contract_digest.clone(),
+                    acceptance_contract_digest: acceptance_contract_digest.clone(),
+                    prior_attempt_id: failure.attempt_id.clone(),
+                    failure_signature: failure.signature.clone(),
+                    failure_record_digest: failure_record_digest.clone(),
+                    failure_evidence_refs: failure.evidence_refs.clone(),
+                    controller_prefix:
+                        "Repair only the still-valid task using current failure/diff evidence. Controller authority and acceptance are unchanged."
+                            .to_owned(),
+                    task_contract: task_json,
+                    current_state: format!(
+                        "plan={plan_id}; task={task_id}; attempts_started={attempts_started}; same_failure_count={same_failure_count}; repair_pending=true"
+                    ),
+                    candidates,
+                    output_schema: "Strict ModelProposalV1 JSON: schema_version=1, evidence_ids, and exactly one replace_literal action with repository_id, path, expected_source_digest, old_literal, new_literal, expected_occurrences=1. The Controller enforces the full JSON Schema out-of-band."
+                        .to_owned(),
+                },
+            )
+            .map_err(|error| {
+                ControllerError::NotReady(format!("repair context rejected: {error}"))
+            })?;
+        if repair_packet.plan_id != plan_id
+            || repair_packet.plan_revision != plan_revision
+            || repair_packet.plan_digest != plan_digest
+            || repair_packet.task_contract_digest != task_contract_digest
+            || repair_packet.acceptance_contract_digest != acceptance_contract_digest
+            || repair_packet.failure_record_digest != failure_record_digest
+        {
+            return Err(ControllerError::InvalidPlan(
+                "repair packet changed immutable plan/task/acceptance/failure bindings".to_owned(),
+            ));
+        }
+        let packet_key = format!("{}:{}", task_id, attempts_started.saturating_add(1));
+        let packet_json = serde_json::to_string(&repair_packet)?;
+        let repair_packet_digest = sha256_prefixed(packet_json.as_bytes());
+        self.persist_runtime_records_with_events(
+            &[(
+                "controller.repair_packet".to_owned(),
+                packet_key.clone(),
+                packet_json,
+            )],
+            &[(
+                "repair_packet_built".to_owned(),
+                task_id.to_owned(),
+                json!({
+                    "prior_attempt_id": failure.attempt_id,
+                    "failure_signature": failure.signature,
+                    "failure_record_digest": failure_record_digest,
+                    "repair_packet_digest": repair_packet_digest,
+                    "plan_digest": plan_digest,
+                    "task_contract_digest": task_contract_digest,
+                    "acceptance_contract_digest": acceptance_contract_digest,
+                    "packet_key": packet_key,
+                }),
+            )],
+        )?;
+        self.checkpoint_now()?;
+
+        let mut lease = self.derive_repair_lease(runtime.registry, task_id, readiness)?;
+        let repair_origin = RepairAttemptOriginV1 {
+            schema_version: 1,
+            prior_attempt_id: failure.attempt_id.clone(),
+            failure_record_digest: repair_packet.failure_record_digest.clone(),
+            repair_packet_digest,
+        };
+        let result = self.execute_replace_inner(
+            &mut lease,
+            runtime,
+            &repair_packet.context,
+            model_budget,
+            Some(&repair_origin),
+        );
+        let release = self.resource_governor.release(&lease.resource_lease);
+        let success = match (result, release) {
+            (Ok(success), Ok(())) => success,
+            (Ok(_), Err(error)) => return Err(ControllerError::Policy(error)),
+            (Err(error), _) => return Err(error),
+        };
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::InvalidPlan("repair task disappeared".to_owned()))?;
+        let (_, final_acceptance_digest) = compiled_acceptance_contract(&task.task)?;
+        if active.plan_id != repair_packet.plan_id
+            || active.revision != repair_packet.plan_revision
+            || active.plan_digest != repair_packet.plan_digest
+            || task.task_contract_digest != repair_packet.task_contract_digest
+            || final_acceptance_digest != repair_packet.acceptance_contract_digest
+            || success.verification.acceptance_contract_digest
+                != repair_packet.acceptance_contract_digest
+        {
+            return Err(ControllerError::InvalidPlan(
+                "repair mutated the active plan/task/acceptance contract".to_owned(),
+            ));
+        }
+        Ok((success, repair_packet))
     }
 
     /// Resumes a crash-interrupted, not-yet-mutated replacement from the exact durable
@@ -1104,22 +1646,24 @@ impl Controller {
         runtime: &ExecutionRuntime<'_, I>,
         context: &ContextPacket,
         model_budget: &mut ModelCallBudget,
+        repair_origin: Option<&RepairAttemptOriginV1>,
     ) -> Result<ExecutionSuccess, ControllerError> {
         self.validate_ready_lease(lease, runtime.registry)?;
         let model_deadline_ms = self.task_model_deadline_ms(&lease.task_id)?;
         match self.consume_task_model_call(&lease.task_id, model_budget, model_deadline_ms) {
             Ok(()) => {}
             Err(ControllerError::Policy(error @ PolicyError::ResourceDenied(_))) => {
-                self.transition_task(
-                    &lease.task_id,
-                    TaskState::DeferredResource,
-                    "task_deferred_resource",
-                )?;
+                let current = self.task_state(&lease.task_id).ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "task disappeared before model admission".to_owned(),
+                    )
+                })?;
+                self.record_pre_attempt_resource_deferral(&lease.task_id, current)?;
                 return Err(ControllerError::Policy(error));
             }
             Err(error) => return Err(error),
         }
-        let attempt_id = self.start_attempt(lease, runtime.registry)?;
+        let attempt_id = self.start_attempt_with_origin(lease, runtime.registry, repair_origin)?;
         let proposal = match Self::request_model_proposal(
             runtime.backend,
             context,
@@ -1128,17 +1672,48 @@ impl Controller {
         ) {
             Ok(value) => value,
             Err(error) => {
-                let signature = sha256_prefixed(format!("proposal\0{error}").as_bytes());
-                self.fail_attempt_and_route(&attempt_id, &lease.task_id, &signature)?;
+                let failure = self.build_failure_record(FailureRecordInput {
+                    task_id: lease.task_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    action_id: None,
+                    result_digest: None,
+                    exit_code: None,
+                    category: "model_proposal_failure".to_owned(),
+                    failure_code: controller_failure_code(&error).to_owned(),
+                    diagnostic: error.to_string(),
+                    failed_action_facts: BTreeMap::new(),
+                    evidence_refs: context
+                        .items
+                        .iter()
+                        .map(|item| item.evidence_id.clone())
+                        .collect(),
+                })?;
+                let _ = self.route_failure_record(failure)?;
                 return Err(error);
             }
         };
+        let failed_proposal = proposal.clone();
         let validated =
             match self.validate_replace_proposal(runtime.registry, context, lease, proposal) {
                 Ok(value) => value,
                 Err(error) => {
-                    let signature = sha256_prefixed(format!("proposal\0{error}").as_bytes());
-                    self.fail_attempt_and_route(&attempt_id, &lease.task_id, &signature)?;
+                    let failure = self.build_failure_record(FailureRecordInput {
+                        task_id: lease.task_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        action_id: None,
+                        result_digest: None,
+                        exit_code: None,
+                        category: "proposal_validation_failure".to_owned(),
+                        failure_code: controller_failure_code(&error).to_owned(),
+                        diagnostic: error.to_string(),
+                        failed_action_facts: proposal_action_facts(&failed_proposal),
+                        evidence_refs: context
+                            .items
+                            .iter()
+                            .map(|item| item.evidence_id.clone())
+                            .collect(),
+                    })?;
+                    let _ = self.route_failure_record(failure)?;
                     return Err(error);
                 }
             };
@@ -1183,8 +1758,22 @@ impl Controller {
                     self.mark_unknown(attempt_id, &lease.task_id, &action.action_id)?;
                     return Err(ControllerError::UnknownAction(action.action_id));
                 }
-                let signature = sha256_prefixed(format!("runner\0{error}").as_bytes());
-                self.fail_attempt_and_route(attempt_id, &lease.task_id, &signature)?;
+                let failure = self.build_failure_record(FailureRecordInput {
+                    task_id: lease.task_id.clone(),
+                    attempt_id: attempt_id.to_owned(),
+                    action_id: Some(action.action_id.clone()),
+                    result_digest: None,
+                    exit_code: None,
+                    category: "tool_execution_failure".to_owned(),
+                    failure_code: tool_error_code(&error).to_owned(),
+                    diagnostic: error.to_string(),
+                    failed_action_facts: BTreeMap::from([(
+                        "action_id".to_owned(),
+                        action.action_id.clone(),
+                    )]),
+                    evidence_refs: vec![format!("action:{}", action.action_id)],
+                })?;
+                let _ = self.route_failure_record(failure)?;
                 return Err(ControllerError::Tool(error));
             }
         };
@@ -1192,7 +1781,7 @@ impl Controller {
         recovery_test_hook("after_mutation_checkpoint");
         if result.exit_code != Some(0) || result.terminated_for_limit.is_some() {
             let failure = self.execution_failure(lease, attempt_id, &action, &result)?;
-            self.fail_attempt_and_route(attempt_id, &lease.task_id, &failure.signature)?;
+            let failure = self.route_failure_record(failure)?;
             return Err(ControllerError::ExecutionFailed(Box::new(failure)));
         }
         self.transition_attempt(attempt_id, AttemptState::Verifying, "attempt_verifying")?;
@@ -1231,14 +1820,26 @@ impl Controller {
         )?;
         self.checkpoint_now()?;
         if !verification.passed {
-            let signature = sha256_prefixed(
-                format!(
-                    "verification\0{}",
-                    verification.failure_code.as_deref().unwrap_or("unknown")
-                )
-                .as_bytes(),
-            );
-            self.fail_attempt_and_route(attempt_id, &lease.task_id, &signature)?;
+            let failure_code = verification
+                .failure_code
+                .clone()
+                .unwrap_or_else(|| "unknown_verification_failure".to_owned());
+            let failure = self.build_failure_record(FailureRecordInput {
+                task_id: lease.task_id.clone(),
+                attempt_id: attempt_id.to_owned(),
+                action_id: Some(action.action_id.clone()),
+                result_digest: Some(artifact.digest.clone()),
+                exit_code: None,
+                category: "verification_failure".to_owned(),
+                diagnostic: format!("deterministic verification failed: {failure_code}"),
+                failure_code,
+                failed_action_facts: BTreeMap::from([(
+                    "action_id".to_owned(),
+                    action.action_id.clone(),
+                )]),
+                evidence_refs: vec![verification_evidence_id.clone()],
+            })?;
+            let _ = self.route_failure_record(failure)?;
             return Err(ControllerError::VerificationFailed(Box::new(verification)));
         }
         self.record_verified_output_bindings(&verification, &artifact.digest)?;
@@ -1268,6 +1869,7 @@ impl Controller {
         task_id: &str,
         task: &Value,
         inputs: ReadinessInputs<'_>,
+        eligible_state: TaskState,
     ) -> Result<(), ControllerError> {
         let state = self
             .active_ref()?
@@ -1275,9 +1877,9 @@ impl Controller {
             .get(task_id)
             .ok_or_else(|| ControllerError::NotReady("missing task".to_owned()))?
             .state;
-        if state != TaskState::Planned {
+        if state != eligible_state {
             return Err(ControllerError::NotReady(format!(
-                "task state {state:?} is not eligible"
+                "task state {state:?} is not eligible; expected {eligible_state:?}"
             )));
         }
         let dependencies = required_array(task, "/dependencies")?;
@@ -2265,14 +2867,26 @@ impl Controller {
         )?;
         self.checkpoint_now()?;
         if !verification.passed {
-            let signature = sha256_prefixed(
-                format!(
-                    "recovery-verification\0{}",
-                    verification.failure_code.as_deref().unwrap_or("unknown")
-                )
-                .as_bytes(),
-            );
-            self.fail_attempt_and_route(&intent.attempt_id, &intent.task_id, &signature)?;
+            let failure_code = verification
+                .failure_code
+                .clone()
+                .unwrap_or_else(|| "unknown_verification_failure".to_owned());
+            let failure = self.build_failure_record(FailureRecordInput {
+                task_id: intent.task_id.clone(),
+                attempt_id: intent.attempt_id.clone(),
+                action_id: Some(intent.action_id.clone()),
+                result_digest: Some(artifact.digest.clone()),
+                exit_code: None,
+                category: "verification_failure".to_owned(),
+                diagnostic: format!("recovery verification failed: {failure_code}"),
+                failure_code,
+                failed_action_facts: BTreeMap::from([(
+                    "action_id".to_owned(),
+                    intent.action_id.clone(),
+                )]),
+                evidence_refs: vec![verification_evidence_id],
+            })?;
+            let _ = self.route_failure_record(failure)?;
             return Err(ControllerError::VerificationFailed(Box::new(verification)));
         }
         self.record_verified_output_bindings(&verification, &artifact.digest)?;
@@ -2295,30 +2909,86 @@ impl Controller {
         if record.state != "committed" || record.result_digest.is_none() {
             return Err(ControllerError::UnknownAction(action.action_id.clone()));
         }
-        let result_digest = record.result_digest;
-        let signature = sha256_prefixed(
+        let category = if result.terminated_for_limit.is_some() {
+            "resource_failure"
+        } else {
+            "execution_failure"
+        };
+        let failure_code = if let Some(limit) = result.terminated_for_limit {
             format!(
-                "execution\0{:?}\0{:?}\0{}",
-                result.exit_code,
-                result.terminated_for_limit,
-                result_digest.as_deref().unwrap_or_default()
+                "resource_limit_{}",
+                normalized_failure_token(&format!("{limit:?}"))
             )
-            .as_bytes(),
-        );
-        Ok(ExecutionFailureV1 {
-            schema_version: 1,
-            plan_id: lease.plan_id.clone(),
+        } else {
+            format!("process_exit_{}", result.exit_code.unwrap_or(-1))
+        };
+        let diagnostic = raw_tool_failure_diagnostic(result);
+        self.build_failure_record(FailureRecordInput {
             task_id: lease.task_id.clone(),
             attempt_id: attempt_id.to_owned(),
             action_id: Some(action.action_id.clone()),
-            result_digest,
+            result_digest: record.result_digest,
             exit_code: result.exit_code,
+            category: category.to_owned(),
+            failure_code,
+            diagnostic,
+            failed_action_facts: BTreeMap::from([
+                ("action_id".to_owned(), action.action_id.clone()),
+                (
+                    "exit_code".to_owned(),
+                    result
+                        .exit_code
+                        .map_or_else(|| "none".to_owned(), |code| code.to_string()),
+                ),
+            ]),
+            evidence_refs: vec![format!("action:{}", action.action_id)],
+        })
+    }
+
+    fn build_failure_record(
+        &self,
+        input: FailureRecordInput,
+    ) -> Result<FailureRecordV1, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(&input.task_id)
+            .ok_or_else(|| ControllerError::InvalidPlan("failure task disappeared".to_owned()))?;
+        let synopsis = failure_synopsis(
+            &input.category,
+            &input.failure_code,
+            &input.diagnostic,
+            &input.failed_action_facts,
+        );
+        let signature = normalized_failure_signature(
+            &input.category,
+            &input.failure_code,
+            &input.diagnostic,
+            &input.failed_action_facts,
+        );
+        Ok(FailureRecordV1 {
+            schema_version: FAILURE_RECORD_SCHEMA_VERSION,
+            plan_id: active.plan_id.clone(),
+            plan_revision: active.revision,
+            plan_digest: active.plan_digest.clone(),
+            task_id: input.task_id,
+            task_contract_digest: task.task_contract_digest.clone(),
+            attempt_id: input.attempt_id,
+            action_id: input.action_id,
+            result_digest: input.result_digest,
+            exit_code: input.exit_code,
+            failure_code: input.failure_code,
             signature,
-            category: if result.terminated_for_limit.is_some() {
-                "resource_failure".to_owned()
-            } else {
-                "execution_failure".to_owned()
-            },
+            category: input.category,
+            synopsis,
+            failed_action_facts: input.failed_action_facts,
+            evidence_refs: input.evidence_refs,
+            // T09's ordinary execution/proposal/verification failures do not prove that a
+            // declared assumption or precondition became false. Replan-invalidating clauses are
+            // populated only by a classifier that has explicit evidence for that invalidation.
+            affected_contract_ids: Vec::new(),
+            confidence_milli: 1_000,
+            decision: "pending".to_owned(),
         })
     }
 
@@ -2326,6 +2996,15 @@ impl Controller {
         &mut self,
         lease: &ReadyLease,
         registry: &ProjectRegistry,
+    ) -> Result<String, ControllerError> {
+        self.start_attempt_with_origin(lease, registry, None)
+    }
+
+    fn start_attempt_with_origin(
+        &mut self,
+        lease: &ReadyLease,
+        registry: &ProjectRegistry,
+        repair_origin: Option<&RepairAttemptOriginV1>,
     ) -> Result<String, ControllerError> {
         let (repository_id, repository_root, baseline_diff_digest) = {
             let active = self.active_ref()?;
@@ -2376,6 +3055,7 @@ impl Controller {
             attempt_id: attempt_id.clone(),
             state: AttemptState::Executing,
             task_contract_digest: lease.task_contract_digest.clone(),
+            repair_origin: repair_origin.cloned(),
             baseline_digest: lease.baseline_digest.clone(),
             pre_snapshot_digest,
             pre_diff_digest: pre_diff.digest,
@@ -2412,7 +3092,11 @@ impl Controller {
             &[(
                 "attempt_started".to_owned(),
                 attempt_id.clone(),
-                json!({"task_id": lease.task_id, "attempt_number": attempt_number}),
+                json!({
+                    "task_id": lease.task_id,
+                    "attempt_number": attempt_number,
+                    "repair_origin": repair_origin,
+                }),
             )],
         )?;
         self.checkpoint_now()?;
@@ -2491,103 +3175,214 @@ impl Controller {
         Ok(())
     }
 
-    fn fail_attempt_and_route(
+    #[allow(clippy::too_many_lines)]
+    fn route_failure_record(
         &mut self,
-        attempt_id: &str,
-        task_id: &str,
-        signature: &str,
-    ) -> Result<(), ControllerError> {
-        let (attempt_was_failed, max_attempts, same_failure_limit, attempts_started, same_count) = {
+        mut failure: FailureRecordV1,
+    ) -> Result<FailureRecordV1, ControllerError> {
+        if failure.schema_version != FAILURE_RECORD_SCHEMA_VERSION
+            || failure.signature.is_empty()
+            || failure.confidence_milli > 1_000
+            || failure.decision != "pending"
+        {
+            return Err(ControllerError::InvalidPlan(
+                "FailureRecord v1 is malformed before routing".to_owned(),
+            ));
+        }
+        let record_key = format!("{}:{}", failure.task_id, failure.attempt_id);
+        {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&failure.task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("failure task disappeared".to_owned())
+            })?;
+            let attempt = active.attempts.get(&failure.attempt_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("failure attempt disappeared".to_owned())
+            })?;
+            if failure.plan_id != active.plan_id
+                || failure.plan_revision != active.revision
+                || failure.plan_digest != active.plan_digest
+                || failure.task_contract_digest != task.task_contract_digest
+                || attempt.task_id != failure.task_id
+                || attempt.task_contract_digest != failure.task_contract_digest
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "FailureRecord v1 authority bindings do not match active runtime".to_owned(),
+                ));
+            }
+            if attempt.state == AttemptState::Failed {
+                let raw = self
+                    .state
+                    .get_state("controller.failure_record", &record_key)?
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan(
+                            "failed attempt lacks its durable FailureRecord".to_owned(),
+                        )
+                    })?;
+                let existing: FailureRecordV1 = serde_json::from_str(&raw)?;
+                if existing.signature != failure.signature
+                    || existing.attempt_id != failure.attempt_id
+                    || existing.task_id != failure.task_id
+                {
+                    return Err(ControllerError::InvalidPlan(
+                        "failed attempt is already bound to another failure".to_owned(),
+                    ));
+                }
+                return Ok(existing);
+            }
+        }
+
+        let (
+            max_attempts,
+            same_failure_limit,
+            attempts_started,
+            same_count,
+            on_execution_failure,
+            on_attempts_exhausted,
+            on_same_failure_exhausted,
+        ) = {
             let active = self.active_mut()?;
             let attempt = active
                 .attempts
-                .get_mut(attempt_id)
+                .get_mut(&failure.attempt_id)
                 .ok_or_else(|| ControllerError::InvalidPlan("attempt disappeared".to_owned()))?;
-            let attempt_was_failed = attempt.state == AttemptState::Failed;
-            if !attempt_was_failed {
-                if !legal_attempt_transition(attempt.state, AttemptState::Failed) {
-                    return Err(ControllerError::InvalidPlan(format!(
-                        "illegal attempt transition {:?}->{:?}",
-                        attempt.state,
-                        AttemptState::Failed
-                    )));
-                }
-                attempt.state = AttemptState::Failed;
+            if !legal_attempt_transition(attempt.state, AttemptState::Failed) {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "illegal attempt transition {:?}->{:?}",
+                    attempt.state,
+                    AttemptState::Failed
+                )));
             }
+            attempt.state = AttemptState::Failed;
             let task = active
                 .tasks
-                .get_mut(task_id)
+                .get_mut(&failure.task_id)
                 .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?;
-            let count = task.failure_counts.entry(signature.to_owned()).or_insert(0);
+            let count = task
+                .failure_counts
+                .entry(failure.signature.clone())
+                .or_insert(0);
             *count = count.saturating_add(1);
             let max_attempts = required_u32(&task.task, "/failure_policy/max_attempts")?;
             let same_limit = required_u32(&task.task, "/failure_policy/same_failure_limit")?;
             (
-                attempt_was_failed,
                 max_attempts,
                 same_limit,
                 task.attempts_started,
                 *count,
+                required_str(&task.task, "/failure_policy/on_execution_failure")?.to_owned(),
+                required_str(&task.task, "/failure_policy/on_attempts_exhausted")?.to_owned(),
+                required_str(&task.task, "/failure_policy/on_same_failure_exhausted")?.to_owned(),
             )
         };
-        let retry_allowed = repair_allowed(
+        let capacity_allows_repair = repair_allowed(
             attempts_started,
             max_attempts,
             same_count,
             same_failure_limit,
         );
+        let requested_route = if attempts_started >= max_attempts {
+            on_attempts_exhausted.as_str()
+        } else if same_count >= same_failure_limit {
+            on_same_failure_exhausted.as_str()
+        } else {
+            on_execution_failure.as_str()
+        };
+        let decision = match requested_route {
+            "repair" if capacity_allows_repair => "repair",
+            "fail" => "fail",
+            _ => "block",
+        };
+        decision.clone_into(&mut failure.decision);
         {
             let task = self
                 .active_mut()?
                 .tasks
-                .get_mut(task_id)
+                .get_mut(&failure.task_id)
                 .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?;
-            task.state = TaskState::RepairPending;
-            task.retry_exhausted = !retry_allowed;
+            let next = if decision == "fail" {
+                TaskState::FailedTerminal
+            } else {
+                TaskState::RepairPending
+            };
+            if task.state != next && !legal_task_transition(task.state, next) {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "illegal task transition {:?}->{:?}",
+                    task.state, next
+                )));
+            }
+            task.state = next;
+            task.retry_exhausted = decision != "repair";
+            task.resource_deferred_from = None;
         }
         let attempt_json = serde_json::to_string(
             self.active_ref()?
                 .attempts
-                .get(attempt_id)
+                .get(&failure.attempt_id)
                 .ok_or_else(|| ControllerError::InvalidPlan("attempt disappeared".to_owned()))?,
         )?;
         let task_json = serde_json::to_string(
             self.active_ref()?
                 .tasks
-                .get(task_id)
+                .get(&failure.task_id)
                 .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?,
         )?;
-        let mut events = Vec::new();
-        if !attempt_was_failed {
-            events.push((
+        let failure_json = serde_json::to_string(&failure)?;
+        let failure_digest = sha256_prefixed(failure_json.as_bytes());
+        let events = vec![
+            (
                 "attempt_failed".to_owned(),
-                attempt_id.to_owned(),
+                failure.attempt_id.clone(),
                 json!({"state": AttemptState::Failed}),
-            ));
-        }
-        events.push((
-            "task_repair_pending".to_owned(),
-            task_id.to_owned(),
-            json!({
-                "failure_signature": signature,
-                "attempts_started": attempts_started,
-                "same_failure_count": same_count,
-                "retry_allowed": retry_allowed
-            }),
-        ));
+            ),
+            (
+                "failure_recorded".to_owned(),
+                failure.attempt_id.clone(),
+                json!({
+                    "task_id": failure.task_id,
+                    "signature": failure.signature,
+                    "category": failure.category,
+                    "decision": failure.decision,
+                    "record_key": record_key,
+                    "failure_record_digest": failure_digest,
+                    "evidence_refs": failure.evidence_refs,
+                }),
+            ),
+            (
+                "task_failure_routed".to_owned(),
+                failure.task_id.clone(),
+                json!({
+                    "failure_signature": failure.signature,
+                    "attempts_started": attempts_started,
+                    "same_failure_count": same_count,
+                    "retry_allowed": decision == "repair",
+                    "decision": failure.decision,
+                    "requested_route": requested_route,
+                    "failure_record_digest": failure_digest,
+                }),
+            ),
+        ];
         self.persist_runtime_records_with_events(
             &[
                 (
                     "controller.attempt".to_owned(),
-                    attempt_id.to_owned(),
+                    failure.attempt_id.clone(),
                     attempt_json,
                 ),
-                ("controller.task".to_owned(), task_id.to_owned(), task_json),
+                (
+                    "controller.task".to_owned(),
+                    failure.task_id.clone(),
+                    task_json,
+                ),
+                (
+                    "controller.failure_record".to_owned(),
+                    record_key,
+                    failure_json,
+                ),
             ],
             &events,
         )?;
         self.checkpoint_now()?;
-        Ok(())
+        Ok(failure)
     }
 
     fn mark_unknown(
@@ -2919,6 +3714,8 @@ impl Controller {
             "controller.acceptance_binding",
             "controller.verification",
             "controller.action_intent",
+            "controller.failure_record",
+            "controller.repair_packet",
         ] {
             for record in self.state.state_records(namespace)? {
                 evidence_binding_digests.insert(
@@ -3501,19 +4298,23 @@ fn validate_checkpoint_immutable_bindings(
     manifest: &CheckpointManifest,
 ) -> Result<(), ControllerError> {
     for (binding_key, expected_digest) in &manifest.evidence_binding_digests {
-        let Some(action_id) = binding_key.strip_prefix("controller.action_intent:") else {
+        let Some((namespace, key)) = binding_key.split_once(':') else {
             continue;
         };
-        let current = state
-            .get_state("controller.action_intent", action_id)?
-            .ok_or_else(|| {
-                ControllerError::InvalidPlan(format!(
-                    "checkpoint-bound action intent {action_id} is missing"
-                ))
-            })?;
+        if !matches!(
+            namespace,
+            "controller.action_intent" | "controller.failure_record" | "controller.repair_packet"
+        ) {
+            continue;
+        }
+        let current = state.get_state(namespace, key)?.ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "checkpoint-bound immutable record {namespace}:{key} is missing"
+            ))
+        })?;
         if sha256_prefixed(current.as_bytes()) != *expected_digest {
             return Err(ControllerError::InvalidPlan(format!(
-                "checkpoint-bound action intent {action_id} changed after checkpoint"
+                "checkpoint-bound immutable record {namespace}:{key} changed after checkpoint"
             )));
         }
     }
@@ -4459,6 +5260,332 @@ fn repair_allowed(
     attempts_started < max_attempts && same_failure_count < same_failure_limit
 }
 
+fn controller_failure_code(error: &ControllerError) -> &'static str {
+    match error {
+        ControllerError::ProposalRejected(message) => proposal_rejection_code(message),
+        ControllerError::Model(ModelError::InvalidContract(_)) => "model_invalid_contract",
+        ControllerError::Model(ModelError::InvalidResponse(_)) => "model_invalid_response",
+        ControllerError::Model(ModelError::NotLoaded) => "model_not_loaded",
+        ControllerError::Model(ModelError::AlreadyLoaded) => "model_already_loaded",
+        ControllerError::Model(ModelError::LeaseUnavailable(_)) => "model_lease_unavailable",
+        ControllerError::Model(ModelError::DeadlineExceeded(_)) => "model_deadline_exceeded",
+        ControllerError::Model(ModelError::ProviderStatus { .. }) => "model_provider_status",
+        ControllerError::Model(ModelError::ProviderExited(_)) => "model_provider_exited",
+        ControllerError::Model(ModelError::HttpProtocol(_)) => "model_http_protocol",
+        ControllerError::Model(ModelError::Io(_)) => "model_io",
+        ControllerError::Model(ModelError::Json(_)) => "model_json",
+        ControllerError::Model(ModelError::LockPoisoned(_)) => "model_lock_poisoned",
+        ControllerError::Repo(_) => "repository_error",
+        ControllerError::Policy(_) => "policy_error",
+        ControllerError::Tool(_) => "tool_error",
+        ControllerError::Evidence(_) => "evidence_error",
+        ControllerError::Json(_) => "json_error",
+        ControllerError::Io(_) => "io_error",
+        ControllerError::InvalidPlan(_) => "invalid_plan",
+        ControllerError::NotReady(_) => "not_ready",
+        ControllerError::ExecutionFailed(_) => "execution_failed",
+        ControllerError::VerificationFailed(_) => "verification_failed",
+        ControllerError::UnknownAction(_) => "unknown_action",
+        ControllerError::State(_) => "state_error",
+    }
+}
+
+fn proposal_rejection_code(message: &str) -> &'static str {
+    if message.starts_with("strict ModelProposalV1 decode failed") {
+        "proposal_decode"
+    } else if message.contains("finish normally without model tool calls") {
+        "proposal_finish_contract"
+    } else if message.contains("unsupported ModelProposalV1 schema_version") {
+        "proposal_schema_version"
+    } else if message.contains("evidence_ids violate deterministic bounds") {
+        "proposal_evidence_bounds"
+    } else if message.contains("evidence outside the current ContextPacket") {
+        "proposal_evidence_outside_context"
+    } else if message.contains("violates deterministic M1 bounds") {
+        "replace_literal_bounds"
+    } else if message.contains("outside exact active task scope") {
+        "replace_literal_scope"
+    } else if message.contains("pre-existing user-owned target hunk") {
+        "replace_literal_user_hunk"
+    } else if message.contains("immutable compiled literal contract") {
+        "replace_literal_contract"
+    } else if message.contains("preimage does not contain exactly one old literal") {
+        "replace_literal_preimage_count"
+    } else if message.contains("regular non-symlink file") {
+        "replace_literal_target_type"
+    } else {
+        "proposal_rejected"
+    }
+}
+
+fn tool_error_code(error: &ToolError) -> &'static str {
+    match error {
+        ToolError::Policy(PolicyError::Denied(_)) => "tool_policy_denied",
+        ToolError::Policy(PolicyError::IsolationUnavailable(_)) => "tool_isolation_unavailable",
+        ToolError::Policy(PolicyError::ResourceDenied(_)) => "tool_policy_resource_denied",
+        ToolError::Policy(PolicyError::Io(_)) => "tool_policy_io",
+        ToolError::State(_) => "tool_state",
+        ToolError::Evidence(_) => "tool_evidence",
+        ToolError::Io(_) => "tool_io",
+        ToolError::Authority(_) => "tool_authority",
+        ToolError::InvalidTransition(_) => "tool_invalid_transition",
+        ToolError::ResourceLimit(_) => "tool_resource_limit",
+        ToolError::RecoveryBlocked(_) => "tool_recovery_blocked",
+        ToolError::Clock(_) => "tool_clock",
+    }
+}
+
+fn proposal_action_facts(proposal: &ModelProposalV1) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            "repository_id".to_owned(),
+            proposal.action.repository_id.clone(),
+        ),
+        ("path".to_owned(), proposal.action.path.clone()),
+        (
+            "expected_source_digest".to_owned(),
+            proposal.action.expected_source_digest.clone(),
+        ),
+        (
+            "old_literal".to_owned(),
+            bounded_failure_text(&proposal.action.old_literal, 256),
+        ),
+        (
+            "new_literal".to_owned(),
+            bounded_failure_text(&proposal.action.new_literal, 256),
+        ),
+        (
+            "expected_occurrences".to_owned(),
+            proposal.action.expected_occurrences.to_string(),
+        ),
+    ])
+}
+
+fn failure_synopsis(
+    category: &str,
+    failure_code: &str,
+    diagnostic: &str,
+    facts: &BTreeMap<String, String>,
+) -> String {
+    let mut result = format!(
+        "category={category}; code={failure_code}; diagnostic={}",
+        bounded_failure_text(diagnostic, 512)
+    );
+    if !facts.is_empty() {
+        result.push_str("; failed_action={");
+        for (index, (key, value)) in facts.iter().enumerate() {
+            if index > 0 {
+                result.push_str(", ");
+            }
+            result.push_str(key);
+            result.push('=');
+            result.push_str(&bounded_failure_text(value, 256));
+        }
+        result.push('}');
+    }
+    bounded_failure_text(&result, 1_536)
+}
+
+fn normalized_failure_signature(
+    category: &str,
+    failure_code: &str,
+    diagnostic: &str,
+    facts: &BTreeMap<String, String>,
+) -> String {
+    let mut stable = format!(
+        "{}\0{}\0{}",
+        normalized_failure_token(category),
+        normalized_failure_token(failure_code),
+        normalize_failure_diagnostic(diagnostic)
+    );
+    for (key, value) in facts {
+        if matches!(
+            key.as_str(),
+            "action_id" | "expected_source_digest" | "result_digest"
+        ) {
+            continue;
+        }
+        stable.push('\0');
+        stable.push_str(key);
+        stable.push('=');
+        stable.push_str(&normalize_failure_diagnostic(value));
+    }
+    let digest = sha256_prefixed(stable.as_bytes());
+    format!(
+        "{}:{}:{}",
+        normalized_failure_token(category),
+        normalized_failure_token(failure_code),
+        digest_fragment(&digest, 16)
+    )
+}
+
+fn normalize_failure_diagnostic(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(normalize_failure_word)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn normalize_failure_word(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    for separator in ['=', ':'] {
+        if let Some((key, _)) = lower.split_once(separator) {
+            let normalized_key = key.trim_matches(|character: char| {
+                !(character.is_ascii_alphanumeric() || character == '_' || character == '-')
+            });
+            if matches!(
+                normalized_key,
+                "request_id"
+                    | "request-id"
+                    | "request"
+                    | "attempt_id"
+                    | "attempt-id"
+                    | "attempt"
+                    | "action_id"
+                    | "action-id"
+                    | "timestamp"
+                    | "time"
+            ) {
+                return format!("{normalized_key}=<volatile>");
+            }
+        }
+    }
+    let token = lower.trim_matches(|character: char| {
+        !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    });
+    let mixed_long_identifier = token.len() >= 16
+        && token
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+        && token.chars().any(|character| character.is_ascii_digit())
+        && token
+            .chars()
+            .any(|character| character.is_ascii_alphabetic());
+    if token.starts_with("req-")
+        || token.starts_with("req_")
+        || token.starts_with("request-")
+        || mixed_long_identifier
+    {
+        return "<volatile>".to_owned();
+    }
+    if let Some(index) = lower.find("sha256:") {
+        let digest_start = index.saturating_add(7);
+        let digest_end = digest_start.saturating_add(64);
+        if lower
+            .as_bytes()
+            .get(digest_start..digest_end)
+            .is_some_and(|digest| digest.iter().all(u8::is_ascii_hexdigit))
+        {
+            let mut result = lower[..digest_start].to_owned();
+            result.push_str("<digest>");
+            result.push_str(&lower[digest_end..]);
+            return result;
+        }
+    }
+    let mut result = String::with_capacity(lower.len());
+    let mut in_digits = false;
+    for character in lower.chars() {
+        if character.is_ascii_digit() {
+            if !in_digits {
+                result.push('#');
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            result.push(character);
+        }
+    }
+    result
+}
+
+fn normalized_failure_token(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                Some(character.to_ascii_lowercase())
+            } else {
+                None
+            }
+        })
+        .take(64)
+        .collect()
+}
+
+fn raw_tool_failure_diagnostic(result: &RawToolResult) -> String {
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let primary = stderr
+        .lines()
+        .chain(stdout.lines())
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("error") || lower.contains("failed") || lower.contains("panic")
+        })
+        .or_else(|| stderr.lines().find(|line| !line.trim().is_empty()))
+        .or_else(|| stdout.lines().find(|line| !line.trim().is_empty()))
+        .map_or(
+            "process exited without a retained diagnostic line",
+            str::trim,
+        );
+    bounded_failure_text(primary, 512)
+}
+
+fn bounded_failure_text(value: &str, max_chars: usize) -> String {
+    let mut result = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        result.push('…');
+    }
+    result
+}
+
+fn repair_task_contract_projection(
+    task_id: &str,
+    task_contract_digest: &str,
+    acceptance_contract_digest: &str,
+    task: &Value,
+) -> Result<String, ControllerError> {
+    let scope = task.pointer("/scope").cloned().unwrap_or(Value::Null);
+    let outputs = task
+        .pointer("/implementation_contract/outputs")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let invariants = task
+        .pointer("/implementation_contract/invariants")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let non_goals = task
+        .pointer("/implementation_contract/non_goals")
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    let acceptance = required_array(task, "/acceptance_criteria")?
+        .iter()
+        .map(|criterion| {
+            json!({
+                "criterion_id": criterion.get("criterion_id"),
+                "description": criterion.get("description"),
+                "kind": criterion.get("kind"),
+                "required": criterion.get("required"),
+            })
+        })
+        .collect::<Vec<_>>();
+    let projection = json!({
+        "task_id": task_id,
+        "task_contract_digest": task_contract_digest,
+        "acceptance_contract_digest": acceptance_contract_digest,
+        "title": task.get("title"),
+        "objective": task.get("objective"),
+        "scope": scope,
+        "outputs": outputs,
+        "invariants": invariants,
+        "non_goals": non_goals,
+        "acceptance": acceptance,
+        "constraints": task.get("constraints"),
+    });
+    Ok(serde_json::to_string(&canonicalize(&projection))?)
+}
+
 fn legal_attempt_transition(from: AttemptState, to: AttemptState) -> bool {
     matches!(
         (from, to),
@@ -4483,19 +5610,17 @@ fn legal_task_transition(from: TaskState, to: TaskState) -> bool {
         (
             TaskState::Planned,
             TaskState::Running | TaskState::DeferredResource
-        ) | (TaskState::DeferredResource, TaskState::Planned)
-            | (
-                TaskState::Running,
-                TaskState::Verifying
-                    | TaskState::RepairPending
-                    | TaskState::DeferredResource
-                    | TaskState::ReconcilingUnknown
-                    | TaskState::FailedTerminal
-            )
-            | (
-                TaskState::Verifying,
-                TaskState::Succeeded | TaskState::RepairPending
-            )
+        ) | (
+            TaskState::Running,
+            TaskState::Verifying
+                | TaskState::RepairPending
+                | TaskState::DeferredResource
+                | TaskState::ReconcilingUnknown
+                | TaskState::FailedTerminal
+        ) | (
+            TaskState::Verifying,
+            TaskState::Succeeded | TaskState::RepairPending | TaskState::FailedTerminal
+        )
     )
 }
 
@@ -5085,8 +6210,10 @@ fn unix_millis() -> Result<i64, ControllerError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExactRequirementProbe, exact_requirement_probe, explicit_replace_relation, repair_allowed,
+        ExactRequirementProbe, exact_requirement_probe, explicit_replace_relation,
+        normalized_failure_signature, repair_allowed,
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn same_failure_circuit_breaker_requires_both_counters_below_limits() {
@@ -5094,6 +6221,39 @@ mod tests {
         assert!(!repair_allowed(2, 2, 1, 2));
         assert!(!repair_allowed(1, 3, 2, 2));
         assert!(!repair_allowed(2, 2, 2, 2));
+    }
+
+    #[test]
+    fn normalized_failure_signature_ignores_volatile_request_time_and_line_noise() {
+        let facts = BTreeMap::from([
+            (
+                "path".to_owned(),
+                "src/settings/SettingsForm.tsx".to_owned(),
+            ),
+            ("old_literal".to_owned(), "Save".to_owned()),
+            ("new_literal".to_owned(), "Apply".to_owned()),
+        ]);
+        let first = normalized_failure_signature(
+            "proposal_validation_failure",
+            "replace_literal_preimage_count",
+            "request_id=req-alpha123 timestamp=2026-09-13T03:01:22Z model proposal rejected at line 41: replace_literal preimage does not contain exactly one old literal",
+            &facts,
+        );
+        let second = normalized_failure_signature(
+            "proposal_validation_failure",
+            "replace_literal_preimage_count",
+            "request_id=req-zeta999 timestamp=2026-09-13T03:07:55Z model proposal rejected at line 912: replace_literal preimage does not contain exactly one old literal",
+            &facts,
+        );
+        assert_eq!(first, second);
+
+        let different = normalized_failure_signature(
+            "proposal_validation_failure",
+            "replace_literal_scope",
+            "model proposal rejected: replace_literal path is outside exact active task scope",
+            &facts,
+        );
+        assert_ne!(first, different);
     }
 
     #[test]

@@ -4,8 +4,9 @@
   "architecture_revision": "2026-09-12.7",
   "plan_ir_version": "1.2",
   "implementation_started": true,
-  "updated_at": "2026-09-13T02:12:20Z",
-  "current_task": "M1-T09",
+  "updated_at": "2026-09-13T03:16:25Z",
+  "current_task": null,
+  "current_gate": "M1-real-model-qualification",
   "active_steering": {
     "audit_remediation": "implementation/AUDIT_REMEDIATION_2026-09-12.1.md",
     "product_delivery_amendment": "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md",
@@ -70,6 +71,10 @@
     "M1-T08": {
       "status": "completed",
       "evidence": "implementation/evidence/M1-T08.json"
+    },
+    "M1-T09": {
+      "status": "completed",
+      "evidence": "implementation/evidence/M1-T09.json"
     }
   },
   "completed_milestones": {
