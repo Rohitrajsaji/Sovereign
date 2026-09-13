@@ -102,3 +102,11 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
 - Pre-mutation recovery is checkpoint-bound to the exact persisted action intent and re-derived action identity, committed edits resume verification only, ambiguous dispatch remains mutation-blocking, and process recovery is fenced by a pre-spawn lease plus PID/PGID/birth identity.
 - M1-T08 does not perform a second repair model attempt or recompile a valid plan; that remains M1-T09.
 - Representative real-model gate 6 remains **OPEN**. T08 is deterministic restart/recovery closure, not the final real-Qwen implementation+repair+restart engineering qualification.
+
+### M1-T08 post-closure correction — 2026-09-13
+
+- A fresh independent audit after the original T08 closure found two concrete recovery-integrity defects; T09 work was stashed and T08 was corrected before continuing.
+- Repository baseline diff content is now self-digest validated in the trusted checkpoint manifest, post-checkpoint durable baseline correlation, and active-plan reconstruction. Older-checkpoint fallback cannot accept tampered `diff_content` paired with an unchanged digest/event and then bypass pre-existing user-hunk protection.
+- Recovery now enforces `execution_epoch` monotonicity before reconstruction/reaping/reconciliation using the maximum trusted floor from the checkpoint manifest, durable action authorities, and post-checkpoint Controller epoch events. Direct epoch rollback and fallback below later authoritative epoch both fail closed.
+- `crash_resume` expanded from 17 to 20 scenarios and passes 20/20. Strict workspace Clippy, state/tools/controller suites, vertical slice, full offline workspace tests, formatting, and `git diff --check` all pass on the corrected tree.
+- The final independent worker-9 read-only re-audit reports no remaining frozen-T08 blocker. `BUILD_STATE.json` remains at M1-T09 and representative real-model gate 6 remains **OPEN**.

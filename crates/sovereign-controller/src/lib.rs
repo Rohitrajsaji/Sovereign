@@ -3309,6 +3309,14 @@ impl RecoveryManager {
             &manifest,
             trusted_checkpoint.action_sequence,
         )?;
+        let execution_epoch_before = state.current_execution_epoch()?;
+        let execution_epoch_floor =
+            recovery_execution_epoch_floor(&state, &manifest, trusted_checkpoint.action_sequence)?;
+        if execution_epoch_before < execution_epoch_floor {
+            return Err(ControllerError::InvalidPlan(format!(
+                "durable execution epoch {execution_epoch_before} is below trusted recovery floor {execution_epoch_floor}"
+            )));
+        }
         let active = reconstruct_active_plan(&state, registry, &manifest)?;
         let trusted_recovery_intent_digests = manifest
             .evidence_binding_digests
@@ -3318,7 +3326,6 @@ impl RecoveryManager {
                     .map(|action_id| (action_id.to_owned(), digest.clone()))
             })
             .collect();
-        let execution_epoch_before = state.current_execution_epoch()?;
         let mut controller = Controller {
             state,
             active: Some(active),
@@ -3459,6 +3466,8 @@ fn validate_checkpoint_manifest(
         || manifest.compiler_plan_digest != manifest.plan_digest
         || digest_json(&manifest.plan_document)? != manifest.plan_digest
         || snapshot_digest(&manifest.repository_snapshot)? != manifest.repository_snapshot_digest
+        || sha256_prefixed(manifest.baseline_diff_content.as_bytes())
+            != manifest.baseline_diff_digest
         || manifest.repository_snapshot.repository_id != manifest.repository_id
         || manifest.repository_snapshot.root != manifest.repository_root
     {
@@ -3600,6 +3609,11 @@ fn validate_post_checkpoint_baseline_correlation(
             ControllerError::InvalidPlan("durable repository baseline is missing".to_owned())
         })?;
     let current_baseline: PersistedRepositoryBaseline = serde_json::from_str(&raw_baseline)?;
+    if sha256_prefixed(current_baseline.diff_content.as_bytes()) != current_baseline.diff_digest {
+        return Err(ControllerError::InvalidPlan(
+            "durable repository baseline diff content does not match its digest".to_owned(),
+        ));
+    }
     let current_snapshot_digest = snapshot_digest(&current_baseline.snapshot)?;
     let baseline_changed = current_snapshot_digest != manifest.repository_snapshot_digest
         || current_baseline.diff_digest != manifest.baseline_diff_digest
@@ -3638,6 +3652,33 @@ fn validate_post_checkpoint_baseline_correlation(
         }
     }
     Ok(())
+}
+
+fn recovery_execution_epoch_floor(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+) -> Result<i64, ControllerError> {
+    let mut floor = manifest.execution_epoch;
+    for record in state.action_records()? {
+        floor = floor.max(record.execution_epoch);
+    }
+    for event in state.journal_after(checkpoint_sequence)? {
+        if event.entity_type != "controller" {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        for key in [
+            "execution_epoch",
+            "execution_epoch_before",
+            "execution_epoch_after",
+        ] {
+            if let Some(epoch) = payload.get(key).and_then(Value::as_i64) {
+                floor = floor.max(epoch);
+            }
+        }
+    }
+    Ok(floor)
 }
 
 fn require_checkpoint_bound_recovery_intents<'a>(
@@ -3705,6 +3746,11 @@ fn reconstruct_active_plan(
             ControllerError::InvalidPlan("durable repository baseline is missing".to_owned())
         })?;
     let baseline: PersistedRepositoryBaseline = serde_json::from_str(&raw_baseline)?;
+    if sha256_prefixed(baseline.diff_content.as_bytes()) != baseline.diff_digest {
+        return Err(ControllerError::InvalidPlan(
+            "durable repository baseline diff content does not match its digest".to_owned(),
+        ));
+    }
     let repository_id = required_str(&plan_document, "/repositories/0/repository_id")?.to_owned();
     let registered = registry.repository(&repository_id).ok_or_else(|| {
         ControllerError::InvalidPlan(format!(

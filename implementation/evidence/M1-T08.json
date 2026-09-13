@@ -10,21 +10,21 @@
   "source_hashes": {
     "Cargo.lock": "sha256:dc3c415e9e4dcae980220bf9e8ea81ca253b7770d50743e85c9ef94c76c4d0ea",
     "crates/sovereign-controller/Cargo.toml": "sha256:3a2fa8b61e9232401579036adb205e76ad462c159181a6482cfce25a16b9e63e",
-    "crates/sovereign-controller/src/lib.rs": "sha256:e1ff6b1904c2c71e937673b67808eef3504b7c688737a0a91cda8e3da3aa107a",
+    "crates/sovereign-controller/src/lib.rs": "sha256:8ca8f10fb0df690aa510ef1c1cf826a8391a4f120a27efbd85ca902cdbbc6e4f",
     "crates/sovereign-state/src/lib.rs": "sha256:319bfa1808a48304c7664e6b42a575853e87d14b54126dd33a98ed7a3638c294",
     "crates/sovereign-tools/Cargo.toml": "sha256:eb0f48f6e7c5367902dc8e600c0dd7b40e386d25265bb57ec5d4d4cd0590bbc2",
     "crates/sovereign-tools/src/lib.rs": "sha256:94025dfb6ba380a79a10d1c29b6cacc7eb49e8f3daad56fabde88247eced36e0",
     "crates/sovereign-eval/Cargo.toml": "sha256:759a5de83d32117be8e6bcc78820482b69d8943bdfdc00c2c49827630598ab92",
-    "crates/sovereign-eval/tests/crash_resume.rs": "sha256:287673b6a6f1fb243bc3e90ca7515c77dad8df7e7049c170eb06a302f9438946"
+    "crates/sovereign-eval/tests/crash_resume.rs": "sha256:900bda391f3bcdc1ef62dbbc2d1b37f0c2fb3292c588e841898e87176e86391a"
   },
   "implementation": {
     "checkpoint_manifest": "CheckpointManifest is canonical-JSON serialized, published to the evidence CAS before the immutable checkpoint-integrity row, and binds canonical Plan IR, compiler provenance, task/attempt runtimes, repository snapshot/diff, evidence/dependency/output bindings, current action records, process leases, journal sequence, and execution epoch.",
     "integrity_and_ancestry": "Recovery runs bounded SQLite integrity checks, verifies checkpoint CAS digests, walks only explicit trusted hash/recovery-anchor ancestry, falls back to an older manifest-valid trusted checkpoint, preserves corrupt physical rows for audit, and appends a recovery re-anchor from the exact trusted generation/hash.",
-    "authoritative_replay": "Controller task/attempt state changes are persisted atomically with runtime-bound journal payloads. Recovery replays ordered post-checkpoint runtime payloads from the trusted manifest and requires exact equality with current SQLite. Baseline/plan-validity drift is accepted only when the latest relevant post-checkpoint transition exactly binds the current snapshot/diff/validity.",
+    "authoritative_replay": "Controller task/attempt state changes are persisted atomically with runtime-bound journal payloads. Recovery replays ordered post-checkpoint runtime payloads from the trusted manifest and requires exact equality with current SQLite. Baseline/plan-validity drift is accepted only when the latest relevant post-checkpoint transition exactly binds the current snapshot/diff/validity, and both trusted-manifest and current durable diff content must self-hash to the stored diff digest before reconstruction or mutation.",
     "intent_exactness": "Pre-mutation recovery uses a checkpoint-bound persisted action intent, revalidates plan/task/origin-attempt/repository/path/source/old/new/postimage/mode bindings, re-derives the prior action identity/nonce from the exact semantics, and refuses post-recovery semantic tampering.",
     "no_model_or_edit_replay": "A pre-mutation crash resumes the exact durable intent without another model call; a committed edit resumes deterministic verification only; an ambiguous dispatched side effect becomes unknown/reconciling and cannot be replayed.",
     "process_recovery": "ProcessRunner persists a pending_spawn ownership lease before spawn, upgrades it to PGID + leader PID/birth identity after spawn, and recovery reaps only when exact identity is proven; identity-less, PID-reused, or escaped/unproven descendants remain mutation-blocking.",
-    "epoch_and_unknown": "Recovery advances execution_epoch monotonically to invalidate stale leases/authorizations, reconciles historical actions under their original epoch through recovery-only transitions, and readiness consults current action state rather than historical unknown events.",
+    "epoch_and_unknown": "Recovery enforces a monotonic execution_epoch floor derived from the trusted checkpoint, durable action records, and authoritative post-checkpoint Controller epoch events before reconstruction/reconciliation, then advances the epoch to invalidate stale leases/authorizations. Historical actions reconcile under their original epoch and readiness consults current action state rather than historical unknown events.",
     "plan_boundary": "Recovery reconstructs privately from the durable canonical plan while public activation remains owned opaque PlanCompilationResult only. Superseded plan checkpoints remain blocked without explicit N+1 carry-forward validation.",
     "t09_boundary": "T08 contains no second repair model attempt and does not recompile/replan a valid durable plan; actual targeted repair remains M1-T09."
   },
@@ -45,7 +45,10 @@
     "unjournaled_repository_baseline_and_validity_drift_is_rejected_during_recovery",
     "recovery_normalized_attempt_state_survives_second_restart",
     "older_checkpoint_fallback_replays_model_and_attempt_transitions_exactly",
-    "crash_worker_entry"
+    "crash_worker_entry",
+    "fallback_rejects_baseline_diff_content_tamper_before_reconstruction",
+    "recovery_rejects_execution_epoch_rollback_below_trusted_manifest",
+    "fallback_rejects_epoch_below_later_authoritative_journal_epoch"
   ],
   "verification": {
     "cargo_fmt_workspace_check": "passed",
@@ -54,15 +57,15 @@
     "cargo_test_sovereign_tools_offline": "passed: 9 runner tests",
     "cargo_test_sovereign_controller_offline": "passed: 3 unit + 18 integration",
     "cargo_test_sovereign_eval_vertical_slice_offline": "passed: 1/1",
-    "cargo_test_sovereign_eval_crash_resume_offline": "passed: 17/17",
+    "cargo_test_sovereign_eval_crash_resume_offline": "passed: 20/20",
     "cargo_test_workspace_offline": "passed; real local compiler smoke remains intentionally ignored under normal workspace tests",
     "git_diff_check": "passed",
-    "independent_current_source_audit": "passed: worker-8 final read-only re-audit reported no blocker and M1-T08 closable"
+    "independent_current_source_audit": "passed: worker-9 final read-only re-audit after post-closure corrections reported no blocker and M1-T08 closable"
   },
   "completion_evidence": {
-    "crash_matrix": "17/17 deterministic crash/restart scenarios pass on current source",
+    "crash_matrix": "20/20 deterministic crash/restart scenarios pass on current source",
     "state_transition_guarantee": "task/attempt transitions and recovery normalization bind exact resulting runtime records into the same SQLite transaction as the journal event; fallback recovery replays those ordered payloads and compares exact final state",
-    "checkpoint_chain": "CAS-backed manifests plus immutable checkpoint rows, trusted-ancestry fallback, and recovery re-anchor are exercised including corrupt hash tail and missing re-anchor CAS object",
+    "checkpoint_chain": "CAS-backed manifests plus immutable checkpoint rows, trusted-ancestry fallback, and recovery re-anchor are exercised including corrupt hash tail, missing re-anchor CAS object, baseline diff-content tamper during fallback, and execution-epoch rollback below trusted/later authority.",
     "action_replay_safety": "committed edits are never dispatched again; ambiguous dispatched side effects block; exact pre-mutation intent survives two recoveries without a second model call",
     "process_ownership": "pending_spawn pre-spawn lease and PID/PGID/birth-safe recovery are exercised; identity-less window remains blocked",
     "current_code_verified": true
@@ -70,5 +73,15 @@
   "m1_gate_6": {
     "status": "open",
     "reason": "T08 closes deterministic checkpoint/restart behavior with fake-model/controller crash fixtures. Representative real-Qwen repair plus combined real-model restart/resume engineering qualification remains required under M1-T09 and the final M1 packet."
+  },
+  "post_closure_correction": {
+    "corrected_at_utc": "2026-09-13T02:35:03Z",
+    "reason": "A fresh independent audit found two concrete frozen-T08 recovery defects after the original closure commit; both were corrected before T09 continued.",
+    "fixes": [
+      "Recovery now rejects trusted-manifest or durable repository-baseline diff content whose SHA-256 does not equal its stored diff digest before reconstruction/mutation.",
+      "Recovery now rejects controller_runtime execution_epoch rollback below the maximum trusted floor from the recoverable checkpoint, durable action authorities, and post-checkpoint Controller epoch events."
+    ],
+    "verification": "full offline workspace verification passed; crash_resume 20/20; independent worker-9 re-audit reported no blocker",
+    "build_state": "remains M1-T09; real-model gate 6 remains open"
   }
 }

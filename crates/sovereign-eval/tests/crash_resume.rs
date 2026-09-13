@@ -1202,8 +1202,125 @@ fn unjournaled_repository_baseline_and_validity_drift_is_rejected_during_recover
     assert!(
         error
             .to_string()
-            .contains("baseline/plan validity differs from checkpoint without an exact post-checkpoint transition event")
+            .contains("durable repository baseline diff content does not match its digest")
     );
+}
+
+#[test]
+fn fallback_rejects_baseline_diff_content_tamper_before_reconstruction() {
+    let fixture = Fixture::create("fallback-baseline-content-tamper");
+    let _task_id = run_to_success(&fixture);
+
+    let mut state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("state for baseline-content tamper: {error}"));
+    let raw_baseline = state
+        .get_state("controller.repository_baseline", "active")
+        .unwrap_or_else(|error| panic!("read repository baseline: {error}"))
+        .unwrap_or_else(|| panic!("repository baseline missing"));
+    let mut baseline: Value = serde_json::from_str(&raw_baseline)
+        .unwrap_or_else(|error| panic!("baseline json: {error}"));
+    let content = baseline["diff_content"]
+        .as_str()
+        .unwrap_or_else(|| panic!("baseline diff content missing"));
+    baseline["diff_content"] =
+        Value::String(format!("{content}\n# tampered without digest update\n"));
+    state
+        .put_state(
+            "controller.repository_baseline",
+            "active",
+            &baseline.to_string(),
+        )
+        .unwrap_or_else(|error| panic!("write baseline-content tamper: {error}"));
+    drop(state);
+
+    let connection = Connection::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("open sqlite for fallback corruption: {error}"));
+    connection
+        .execute_batch(
+            "DROP TRIGGER checkpoint_integrity_no_update;\
+             UPDATE checkpoint_integrity SET checkpoint_hash='sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+             WHERE generation=2;\
+             CREATE TRIGGER checkpoint_integrity_no_update \
+             BEFORE UPDATE ON checkpoint_integrity \
+             BEGIN \
+                 SELECT RAISE(ABORT, 'checkpoint integrity rows are immutable'); \
+             END;",
+        )
+        .unwrap_or_else(|error| panic!("force older checkpoint fallback: {error}"));
+    drop(connection);
+
+    let registry = registry_for(&fixture.root);
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("reopen tampered fallback state: {error}"));
+    let Err(error) = RecoveryManager::recover(state, &registry) else {
+        panic!("fallback must reject baseline diff content tamper");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("durable repository baseline diff content does not match its digest")
+    );
+}
+
+#[test]
+fn recovery_rejects_execution_epoch_rollback_below_trusted_manifest() {
+    let fixture = Fixture::create("epoch-rollback-manifest");
+    let _task_id = run_to_success(&fixture);
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("state before epoch rollback: {error}"));
+    let current_epoch = state
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("current epoch: {error}"));
+    assert!(current_epoch > 0);
+    drop(state);
+
+    let connection = Connection::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("open sqlite for epoch rollback: {error}"));
+    connection
+        .execute(
+            "UPDATE controller_runtime SET execution_epoch=?1 WHERE singleton=1",
+            [current_epoch - 1],
+        )
+        .unwrap_or_else(|error| panic!("rollback execution epoch: {error}"));
+    drop(connection);
+
+    let registry = registry_for(&fixture.root);
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("reopen epoch-rolled state: {error}"));
+    let Err(error) = RecoveryManager::recover(state, &registry) else {
+        panic!("execution epoch rollback below trusted manifest must fail closed");
+    };
+    assert!(error.to_string().contains("below trusted recovery floor"));
+}
+
+#[test]
+fn fallback_rejects_epoch_below_later_authoritative_journal_epoch() {
+    let fixture = Fixture::create("epoch-rollback-fallback");
+    let _task_id = run_to_success(&fixture);
+    let connection = Connection::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("open sqlite for fallback epoch rollback: {error}"));
+    connection
+        .execute_batch(
+            "DROP TRIGGER checkpoint_integrity_no_update;\
+             UPDATE checkpoint_integrity SET checkpoint_hash='sha256:0000000000000000000000000000000000000000000000000000000000000000' \
+             WHERE generation=2;\
+             UPDATE controller_runtime SET execution_epoch=1 WHERE singleton=1;\
+             CREATE TRIGGER checkpoint_integrity_no_update \
+             BEFORE UPDATE ON checkpoint_integrity \
+             BEGIN \
+                 SELECT RAISE(ABORT, 'checkpoint integrity rows are immutable'); \
+             END;",
+        )
+        .unwrap_or_else(|error| panic!("force fallback and epoch rollback: {error}"));
+    drop(connection);
+
+    let registry = registry_for(&fixture.root);
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("reopen fallback epoch state: {error}"));
+    let Err(error) = RecoveryManager::recover(state, &registry) else {
+        panic!("fallback must honor later authoritative execution epoch");
+    };
+    assert!(error.to_string().contains("below trusted recovery floor"));
 }
 
 #[test]
