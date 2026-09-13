@@ -297,6 +297,7 @@ fn compile_and_activate(
         diff_evaluator: "builtin.diff.scope_and_literal.v1".to_owned(),
         rollback_diff_evaluator: "builtin.diff.controller_patch_absent.v1".to_owned(),
         context_packet: prepared.packet.clone(),
+        m3: None,
         max_model_calls: 1,
         model_input_token_ceiling: 8_000,
         max_output_tokens: 512,

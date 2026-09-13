@@ -327,6 +327,7 @@ fn compiler_vertical_slice_starts_from_natural_language_and_exact_repository_evi
         diff_evaluator: diff_evaluator.to_owned(),
         rollback_diff_evaluator: rollback_evaluator.to_owned(),
         context_packet: prepared.packet.clone(),
+        m3: None,
         max_model_calls: 1,
         model_input_token_ceiling: 8_000,
         max_output_tokens: 512,

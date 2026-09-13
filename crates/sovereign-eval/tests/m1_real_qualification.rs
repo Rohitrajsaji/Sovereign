@@ -483,6 +483,7 @@ fn compilation_input(prepared: &Prepared) -> PlanCompilationInput {
         diff_evaluator: "builtin.diff.scope_and_literal.v1".to_owned(),
         rollback_diff_evaluator: "builtin.diff.controller_patch_absent.v1".to_owned(),
         context_packet: prepared.packet.clone(),
+        m3: None,
         max_model_calls: 2,
         model_input_token_ceiling: 8_192,
         max_output_tokens: 768,

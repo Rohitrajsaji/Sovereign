@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "task_id": "M3-T02",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "f96c56e",
+  "status": "completed",
+  "completed_at": "2026-09-13T09:16:04Z",
+  "verified_at": "2026-09-13T09:17:38Z",
+  "scope": [
+    "deepen the existing M1 canonical PlanCompiler::compile path for depth-aware supplied plans and deterministic bounded multi-task DAGs",
+    "strengthen PlanValidator contracts required by M3-T02 without introducing a second planning or execution authority",
+    "preserve M1 compiler behavior through m3: None compatibility at all legacy call sites",
+    "compile/validate multi-repository plans only; Controller production execution authority remains single-repository until M8"
+  ],
+  "interfaces": [
+    "PlanCompiler",
+    "PlanCompilationInput",
+    "CompilationEvidence",
+    "M3PlanningInput",
+    "GovernedEvaluatorRef",
+    "PreauthorizedManualGate",
+    "SuppliedPlanningSourceKind",
+    "SuppliedPlanningSourceRef"
+  ],
+  "canonical_compiler_contract": {
+    "single_path": "M3 is an optional PlanCompilationInput.m3 extension inside the same PlanCompiler::compile introduced by M1-T10; no parallel compiler or planning authority exists.",
+    "m1_compatibility": "All legacy M1/controller/eval call sites use m3: None; legacy compiler fixtures remain green and M3-only CompilationEvidence fields are omitted from legacy serialization.",
+    "validator_authority": "Every normalized candidate remains subject to PlanValidator; supplied human/external/model plans cannot bypass validation.",
+    "revision": 1,
+    "supersedes_revision": null,
+    "model_call_ceiling": 2,
+    "repair_policy": "At most one bounded validator/proposal repair is possible when the caller/model budget permits the second compiler call; no hidden planner retry path exists."
+  },
+  "depth_contract": {
+    "source": "caller-owned M3-T01 DepthDecision",
+    "persistence": "DepthDecision is serialized verbatim into Plan IR depth; PlanCompiler does not recompute or replace it.",
+    "task_cap": "effective task count is the minimum of deterministic depth cap, authoritative policy.retry.max_tasks_per_revision, and the hard M3 compiler ceiling."
+  },
+  "dag_contract": {
+    "authoritative_graph": "task.dependencies[] is the sole hard dependency DAG",
+    "topology": "BTree-backed deterministic topological normalization produces stable ordering and IDs from goal/repository/context/depth identity.",
+    "dependency_bindings": "Every hard dependency has exactly one dependency_binding, and validator resolution requires its upstream artifact/criterion targets to exist and be required contracts.",
+    "supplemental_edges": "top-level edges[] are derived produces_for relationships only and do not create a second hard DAG."
+  },
+  "trust_and_evidence_contract": {
+    "untrusted_proposal_surface": "M3 proposal structs and JSON schema deny unknown fields and expose no policy, permission, tool, pin, activation, approval, grant, external-authority, or side-effect-authority fields.",
+    "authoritative_fields": "Normalization copies caller-owned policy/role/skills and only caller-pinned tools; proposal content cannot widen them.",
+    "supplied_source_binding": "Supplied human/external/spec planning sources must resolve to bounded ContextPacket evidence by evidence_id plus exact source_digest and content_digest, and remain recorded as untrusted provenance.",
+    "unknown_paths": "Unknown proposed paths are removed from executable scope, force bounded discovery/read-only behavior, and become explicit exact evidence requirements before mutation can proceed.",
+    "absence": "Negative/absence claims normalize only to evaluator_pass using the caller-owned governed evaluator. query_completed records acquisition completion only and can never prove absence.",
+    "manual_acceptance": "Manual criteria are accepted only when their gate ID already exists in caller-owned M3PlanningInput.manual_gates; an untrusted proposal cannot mint approval authority."
+  },
+  "validator_contract": {
+    "required_dependency_targets": true,
+    "duplicate_verification_step_ids_rejected": true,
+    "criterion_step_links_bidirectional": true,
+    "verification_evidence_type_compatible": true,
+    "artifact_steps_target_required_artifacts": true,
+    "governed_evaluators": [
+      "builtin.<id>.v<digits>",
+      "governed:<id>@<version>#sha256:<64hex>"
+    ],
+    "revision_and_replan_ceilings": "Existing PlanValidator task/revision/replan budget checks remain authoritative."
+  },
+  "compiled_plan_ir_fixture_corpus": [
+    {
+      "test": "compiler_m3_multimodule_dag_is_topological_and_bindings_are_one_for_one",
+      "proof": "out-of-order multi-module tasks normalize to deterministic topo order with stable IDs, hard dependencies, and one-for-one required upstream bindings"
+    },
+    {
+      "test": "compiler_m3_depth_and_supplied_human_plan_are_persisted_verbatim_and_digest_bound",
+      "proof": "DepthDecision persists verbatim and supplied human-plan provenance is exact source/content digest bound"
+    },
+    {
+      "test": "compiler_m3_external_or_model_data_cannot_add_authority_fields_and_repairs_once",
+      "proof": "deny-unknown malicious authority fields are rejected and only the bounded repair call can recover"
+    },
+    {
+      "test": "compiler_m3_absence_is_evaluator_pass_and_query_completed_is_only_acquisition",
+      "proof": "absence is governed evaluator_pass while query_completed remains acquisition-only"
+    },
+    {
+      "test": "compiler_m3_unknown_path_is_evidence_not_executable_scope",
+      "proof": "unknown paths become execution-gating evidence rather than invented mutable scope"
+    },
+    {
+      "test": "compiler_m3_depth_and_policy_caps_fail_closed_without_hidden_calls",
+      "proof": "depth/policy/global task caps reject oversize plans without hidden model calls"
+    },
+    {
+      "test": "compiler_m3_validator_invalid_candidate_gets_only_one_bounded_repair",
+      "proof": "PlanValidator-invalid candidate gets at most one budgeted repair before fail-closed rejection"
+    },
+    {
+      "test": "compiler_m3_manual_acceptance_requires_preauthorized_gate",
+      "proof": "caller-preauthorized manual gate succeeds and attacker-authored gate fails"
+    }
+  ],
+  "plan_validator_diagnostics": {
+    "accepted_supplied_plan": "valid normalized supplied-plan fixtures produce a PlanValidator-clean Plan IR candidate",
+    "rejected_supplied_plan": [
+      "unknown authority fields are proposal/schema rejected before normalization",
+      "missing/orphan/non-required dependency binding targets are rejected with DependencyBinding diagnostics",
+      "ungoverned evaluator references are rejected with EvidenceContract/AcceptanceContract diagnostics",
+      "orphan or non-bidirectional criterion-step links are rejected with AcceptanceContract diagnostics",
+      "duplicate verification step IDs are rejected with DuplicateId",
+      "unpreauthorized manual gates fail closed as proposal rejection"
+    ]
+  },
+  "controller_boundary": {
+    "production_controller_changed": false,
+    "production_controller_hash": "sha256:bafcb1d285e186719ba8411dcf8b544720d5d665c69b95ffdaca2b96c249abc8",
+    "execution_rule": "Controller activation still accepts only compiler-owned PlanCompilationResult and rejects plans whose active scope contains anything other than exactly one repository; M3 multi-repository plans therefore compile/validate but remain execution-fail-closed until M8."
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-plan --offline -- compiler",
+      "result": "passed",
+      "detail": "21 relevant tests: 8 M3 compiler + 10 legacy M1 compiler + 3 compiler-filtered validator regressions"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-plan --offline",
+      "result": "passed",
+      "detail": "47/47 integration tests: 8 compiler_m3 + 7 depth + 10 minimal_compiler + 22 validator; doc tests pass"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-controller --offline",
+      "result": "passed",
+      "detail": "25/25 test cases: 4 unit + 21 t07; doc tests pass"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-plan -p sovereign-controller --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test --workspace --offline",
+      "result": "passed",
+      "detail": "full current-tree offline workspace regression passed; only the two pre-existing explicitly local-Qwen-gated tests remain ignored"
+    }
+  ],
+  "implementation_worker_report": {
+    "worker": "worker-14",
+    "result": "implemented; no blockers",
+    "notes": "Worker implemented M3-T02 only, made no evidence/BUILD_STATE/commit edits, and reported no Controller production authority expansion."
+  },
+  "independent_audit": {
+    "worker": "worker-15",
+    "result": "CLOSABLE",
+    "blockers": [],
+    "notes": "Fresh independent read-only audit of HEAD f96c56e/current dirty tree verified the same canonical compiler path, M1 compatibility, verbatim depth, deterministic bounded DAG/bindings, untrusted authority denial, digest-bound supplied sources, unknown-path evidence, governed absence semantics, preauthorized manual gates, bounded calls/repair/task ceilings, revision=1, and cross-repository execution fail-closed until M8. The auditor independently reran the frozen compiler filter, full sovereign-plan, Controller T07, strict plan+controller clippy, fmt, git diff check, and full offline workspace with no blocker."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d"
+  },
+  "source_hashes": {
+    "crates/sovereign-plan/src/compiler.rs": "sha256:79587faddaaf949d3888cf53b2c9cd9cd60ffb418eac72bb5f3321cc8cf07ae1",
+    "crates/sovereign-plan/src/lib.rs": "sha256:2dde73980ed16f2699a288ef2b3d5ce8d9ad1db7779622f7bab53c3298a5e39d",
+    "crates/sovereign-plan/tests/compiler_m3.rs": "sha256:fc1d2b2d6bfffb27b8bb92320335c01f0c893eeb3452f927f40a93032341ea34",
+    "crates/sovereign-plan/tests/minimal_compiler.rs": "sha256:e51e56583b10a1518e9a19f8e55a4a40e244d0a1128bc61458a17a03ba197755",
+    "crates/sovereign-plan/tests/validator.rs": "sha256:2b36cd5146240255b9f2f8d9a338ddee3e50ac0e31af2f286c35335d65f1e3b8",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:1b988bf939dc65ee44addacffbe2ea091214b2514a0f788fde7fa1ec8d431587",
+    "crates/sovereign-eval/tests/compiler_real_smoke.rs": "sha256:b2606dfc80b1bcc6742d844598f303ed56fec4870208653274e432c3bd32e862",
+    "crates/sovereign-eval/tests/compiler_vertical_slice.rs": "sha256:6581473f88c7be651adf8623536a0d6ce8e4e6279a7e3cb82b1f66c3231101a2",
+    "crates/sovereign-eval/tests/crash_resume.rs": "sha256:38f46fd5bdd473982c94a344cd596ffb5b1e1b869945761d36f7101ae323cd94",
+    "crates/sovereign-eval/tests/m1_real_qualification.rs": "sha256:21b20dfd2f52f792dc741e26b81555055a2b36d3ddb031964a674e17826ab492",
+    "crates/sovereign-eval/tests/repair_loop.rs": "sha256:dcd4a88f1f927675a27ebbadce368d58bcd464781e97f60451271de0297b22de",
+    "crates/sovereign-eval/tests/vertical_slice.rs": "sha256:7090ff9f4a5561e12b6be4ffc31c802a5df157c7b9b92539255f47ee566b0137"
+  }
+}

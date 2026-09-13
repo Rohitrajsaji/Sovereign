@@ -4,9 +4,10 @@ mod compiler;
 mod depth;
 
 pub use compiler::{
-    CompilationEvidence, CompilationEvidenceHandle, ModelAttemptEvidence,
-    PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationError, PlanCompilationInput,
-    PlanCompilationRepository, PlanCompilationResult, PlanCompiler,
+    CompilationEvidence, CompilationEvidenceHandle, GovernedEvaluatorRef, M3PlanningInput,
+    ModelAttemptEvidence, PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationError,
+    PlanCompilationInput, PlanCompilationRepository, PlanCompilationResult, PlanCompiler,
+    PreauthorizedManualGate, SuppliedPlanningSourceKind, SuppliedPlanningSourceRef,
 };
 pub use depth::{DepthClassifier, DepthDecision, DepthFeatureInput, DepthFeatures, ExecutionDepth};
 
@@ -461,6 +462,7 @@ fn validate_task_references<'a>(
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .filter(|item| item.get("required").and_then(Value::as_bool) == Some(true))
             .filter_map(|item| item.get("artifact_id").and_then(Value::as_str))
             .collect();
         for artifact in strings_at(binding, &["required_artifact_ids"]) {
@@ -468,7 +470,9 @@ fn validate_task_references<'a>(
                 diagnostics.push(ValidationDiagnostic::new(
                     DiagnosticCode::DependencyBinding,
                     format!("{path}/dependency_bindings/{binding_index}/required_artifact_ids"),
-                    format!("artifact {artifact} is not produced by {upstream_id}"),
+                    format!(
+                        "artifact {artifact} is not a required output produced by {upstream_id}"
+                    ),
                 ));
             }
         }
@@ -477,6 +481,7 @@ fn validate_task_references<'a>(
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
+            .filter(|item| item.get("required").and_then(Value::as_bool) == Some(true))
             .filter_map(|item| item.get("criterion_id").and_then(Value::as_str))
             .collect();
         for criterion in strings_at(binding, &["required_acceptance_criterion_ids"]) {
@@ -486,7 +491,9 @@ fn validate_task_references<'a>(
                     format!(
                         "{path}/dependency_bindings/{binding_index}/required_acceptance_criterion_ids"
                     ),
-                    format!("criterion {criterion} is not owned by {upstream_id}"),
+                    format!(
+                        "criterion {criterion} is not a required accepted output owned by {upstream_id}"
+                    ),
                 ));
             }
         }
@@ -502,6 +509,7 @@ fn validate_task_references<'a>(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_evidence_and_acceptance(
     task: &Value,
     path: &str,
@@ -524,24 +532,64 @@ fn validate_evidence_and_acceptance(
                 format!("duplicate evidence requirement id {id}"),
             ));
         }
+        if requirement.get("satisfaction").and_then(Value::as_str) == Some("evaluator_pass") {
+            let evaluator = requirement.get("evaluator").and_then(Value::as_str);
+            if evaluator.is_none_or(|value| !governed_evaluator(value)) {
+                diagnostics.push(ValidationDiagnostic::new(
+                    DiagnosticCode::EvidenceContract,
+                    format!("{path}/evidence_requirements/{index}/evaluator"),
+                    "evaluator_pass requires a governed builtin or digest-pinned evaluator",
+                ));
+            }
+        }
     }
 
-    let steps: BTreeMap<&str, &Value> = task
+    let mut steps = BTreeMap::<&str, &Value>::new();
+    for (step_index, step) in task
         .pointer("/verification/steps")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|step| {
-            step.get("step_id")
-                .and_then(Value::as_str)
-                .map(|id| (id, step))
-        })
-        .collect();
+        .enumerate()
+    {
+        let Some(step_id) = step.get("step_id").and_then(Value::as_str) else {
+            continue;
+        };
+        if steps.insert(step_id, step).is_some() {
+            diagnostics.push(ValidationDiagnostic::new(
+                DiagnosticCode::DuplicateId,
+                format!("{path}/verification/steps/{step_index}/step_id"),
+                format!("duplicate verification step {step_id}"),
+            ));
+        }
+        if matches!(
+            step.get("kind").and_then(Value::as_str),
+            Some("assertion" | "diff")
+        ) {
+            let evaluator = step.get("evaluator").and_then(Value::as_str);
+            if evaluator.is_none_or(|value| !governed_evaluator(value)) {
+                diagnostics.push(ValidationDiagnostic::new(
+                    DiagnosticCode::AcceptanceContract,
+                    format!("{path}/verification/steps/{step_index}/evaluator"),
+                    "assertion/diff verification requires a governed builtin or digest-pinned evaluator",
+                ));
+            }
+        }
+    }
     let required_evidence: BTreeSet<_> =
         strings_at(task, &["verification", "required_evidence_types"])
             .into_iter()
             .collect();
+    let required_artifacts: BTreeSet<_> = task
+        .get("expected_artifacts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|artifact| artifact.get("required").and_then(Value::as_bool) == Some(true))
+        .filter_map(|artifact| artifact.get("artifact_id").and_then(Value::as_str))
+        .collect();
     let mut criterion_ids = BTreeSet::new();
+    let mut criteria_by_id = BTreeMap::<&str, &Value>::new();
     for (criterion_index, criterion) in task
         .get("acceptance_criteria")
         .and_then(Value::as_array)
@@ -559,6 +607,7 @@ fn validate_evidence_and_acceptance(
                 format!("duplicate acceptance criterion {criterion_id}"),
             ));
         }
+        criteria_by_id.insert(criterion_id, criterion);
         let evidence_type = criterion.get("evidence_type").and_then(Value::as_str);
         if criterion.get("required").and_then(Value::as_bool) == Some(true) {
             if let Some(kind) = evidence_type
@@ -602,6 +651,42 @@ fn validate_evidence_and_acceptance(
                     format!("{path}/verification/steps"),
                     format!(
                         "verification step {step_id} evidence type does not match {criterion_id}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    for (step_id, step) in &steps {
+        for criterion_id in strings_at(step, &["criterion_ids"]) {
+            let Some(criterion) = criteria_by_id.get(criterion_id) else {
+                diagnostics.push(ValidationDiagnostic::new(
+                    DiagnosticCode::AcceptanceContract,
+                    format!("{path}/verification/steps"),
+                    format!(
+                        "verification step {step_id} references missing criterion {criterion_id}"
+                    ),
+                ));
+                continue;
+            };
+            if !strings_at(criterion, &["verification_step_ids"]).contains(step_id) {
+                diagnostics.push(ValidationDiagnostic::new(
+                    DiagnosticCode::AcceptanceContract,
+                    format!("{path}/verification/steps"),
+                    format!(
+                        "verification step {step_id} is not linked back from criterion {criterion_id}"
+                    ),
+                ));
+            }
+        }
+        if step.get("kind").and_then(Value::as_str) == Some("artifact") {
+            let artifact_id = step.get("artifact_id").and_then(Value::as_str);
+            if artifact_id.is_none_or(|id| !required_artifacts.contains(id)) {
+                diagnostics.push(ValidationDiagnostic::new(
+                    DiagnosticCode::AcceptanceContract,
+                    format!("{path}/verification/steps"),
+                    format!(
+                        "artifact verification step {step_id} must target a required expected artifact"
                     ),
                 ));
             }
@@ -935,6 +1020,55 @@ fn validate_rollback(task: &Value, path: &str, diagnostics: &mut Vec<ValidationD
             "non-none rollback requires typed verification evidence",
         ));
     }
+    for (index, step) in task
+        .pointer("/rollback/verification_steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if matches!(
+            step.get("kind").and_then(Value::as_str),
+            Some("assertion" | "diff")
+        ) {
+            let evaluator = step.get("evaluator").and_then(Value::as_str);
+            if evaluator.is_none_or(|value| !governed_evaluator(value)) {
+                diagnostics.push(ValidationDiagnostic::new(
+                    DiagnosticCode::RollbackPolicy,
+                    format!("{path}/rollback/verification_steps/{index}/evaluator"),
+                    "rollback assertion/diff requires a governed builtin or digest-pinned evaluator",
+                ));
+            }
+        }
+    }
+}
+
+fn governed_evaluator(value: &str) -> bool {
+    if let Some(version) = value
+        .strip_prefix("builtin.")
+        .and_then(|rest| rest.rsplit_once(".v"))
+    {
+        return !version.0.is_empty()
+            && !version.1.is_empty()
+            && version
+                .1
+                .chars()
+                .all(|character| character.is_ascii_digit());
+    }
+    let Some(rest) = value.strip_prefix("governed:") else {
+        return false;
+    };
+    let Some((identity, digest)) = rest.rsplit_once('#') else {
+        return false;
+    };
+    let Some((evaluator_id, version)) = identity.rsplit_once('@') else {
+        return false;
+    };
+    !evaluator_id.is_empty()
+        && !version.is_empty()
+        && digest.strip_prefix("sha256:").is_some_and(|hex| {
+            hex.len() == 64 && hex.chars().all(|character| character.is_ascii_hexdigit())
+        })
 }
 
 fn validate_failure_routing(task: &Value, path: &str, diagnostics: &mut Vec<ValidationDiagnostic>) {

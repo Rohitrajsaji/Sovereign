@@ -376,3 +376,79 @@ fn canonical_digest_is_stable_for_equivalent_object_key_order() {
     };
     assert_eq!(left_digest, right_digest);
 }
+
+#[test]
+fn compiler_validator_dependency_bindings_require_required_upstream_outputs() {
+    let mut optional_artifact = fixture();
+    add_second_task(&mut optional_artifact, "task.second");
+    task_mut(&mut optional_artifact, 0)["dependencies"] = json!(["task.second"]);
+    task_mut(&mut optional_artifact, 0)["dependency_bindings"] = json!([binding("task.second")]);
+    task_mut(&mut optional_artifact, 1)["expected_artifacts"][0]["required"] = json!(false);
+    assert_code(
+        &diagnostics(optional_artifact),
+        DiagnosticCode::DependencyBinding,
+    );
+
+    let mut optional_criterion = fixture();
+    add_second_task(&mut optional_criterion, "task.second");
+    task_mut(&mut optional_criterion, 0)["dependencies"] = json!(["task.second"]);
+    task_mut(&mut optional_criterion, 0)["dependency_bindings"] = json!([binding("task.second")]);
+    task_mut(&mut optional_criterion, 1)["acceptance_criteria"][0]["required"] = json!(false);
+    assert_code(
+        &diagnostics(optional_criterion),
+        DiagnosticCode::DependencyBinding,
+    );
+}
+
+#[test]
+fn compiler_validator_requires_governed_evaluators_for_evaluator_pass_and_diff() {
+    let mut evidence = fixture();
+    task_mut(&mut evidence, 0)["evidence_requirements"][0]["satisfaction"] =
+        json!("evaluator_pass");
+    task_mut(&mut evidence, 0)["evidence_requirements"][0]["evaluator"] =
+        json!("untrusted.evaluator");
+    assert_code(&diagnostics(evidence), DiagnosticCode::EvidenceContract);
+
+    let mut verification = fixture();
+    task_mut(&mut verification, 0)["verification"]["steps"][0]["evaluator"] =
+        json!("untrusted.evaluator");
+    assert_code(
+        &diagnostics(verification),
+        DiagnosticCode::AcceptanceContract,
+    );
+
+    let mut governed = fixture();
+    task_mut(&mut governed, 0)["evidence_requirements"][0]["satisfaction"] =
+        json!("evaluator_pass");
+    task_mut(&mut governed, 0)["evidence_requirements"][0]["evaluator"] = json!(format!(
+        "governed:absence.zero-hit@1.0.0#sha256:{}",
+        "a".repeat(64)
+    ));
+    let diagnostics = diagnostics(governed);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::EvidenceContract),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn compiler_validator_verification_links_are_bidirectional_and_step_ids_unique() {
+    let mut orphan = fixture();
+    let mut extra = task_mut(&mut orphan, 0)["verification"]["steps"][0].clone();
+    extra["step_id"] = json!("verify.orphan-extra");
+    task_mut(&mut orphan, 0)["verification"]["steps"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("steps array"))
+        .push(extra);
+    assert_code(&diagnostics(orphan), DiagnosticCode::AcceptanceContract);
+
+    let mut duplicate = fixture();
+    let extra = task_mut(&mut duplicate, 0)["verification"]["steps"][0].clone();
+    task_mut(&mut duplicate, 0)["verification"]["steps"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("steps array"))
+        .push(extra);
+    assert_code(&diagnostics(duplicate), DiagnosticCode::DuplicateId);
+}
