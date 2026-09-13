@@ -7,12 +7,14 @@
 //! existing [`PlanValidator`] to accept that candidate before returning it.
 
 use super::{
-    DepthDecision, ExecutionDepth, PlanIr, PlanValidator, ValidationDiagnostic, canonicalize,
+    DepthDecision, ExecutionDepth, PlanAssumption, PlanAssumptionEvidence, PlanIr, PlanReplanInput,
+    PlanRevisionDiff, PlanValidator, ReplanScope, ValidationDiagnostic, canonicalize,
+    smallest_replan_scope_tasks,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sovereign_context::{ContextLevel, ContextPacket, EvidenceKind};
+use sovereign_context::{ContextLevel, ContextPacket, EvidenceKind, TrustClass};
 use sovereign_model::{
     M1_HARD_INPUT_CONTEXT_TOKENS, MODEL_SCHEMA_VERSION, ModelBackend, ModelError,
     ModelFinishReason, ModelMessage, ModelMessageRole, ModelOutputContract, ModelRequest,
@@ -38,6 +40,7 @@ const MAX_M3_ADDITIONAL_REPOSITORIES: usize = 8;
 const MAX_M3_MANUAL_GATES: usize = 16;
 const MAX_M3_ACCEPTANCE: usize = 4;
 const MAX_M3_EVIDENCE_NEEDS: usize = 8;
+const MAX_M3_ASSUMPTIONS: usize = 8;
 
 /// Exact repository baseline supplied by deterministic repository/controller
 /// code. Model output never authors or widens these values.
@@ -107,6 +110,8 @@ pub struct M3PlanningInput {
     pub additional_repositories: Vec<PlanCompilationRepository>,
     pub manual_gates: Vec<PreauthorizedManualGate>,
     pub absence_evaluator: Option<GovernedEvaluatorRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replan: Option<PlanReplanInput>,
 }
 
 /// Canonical bounded compiler input v1.
@@ -754,7 +759,7 @@ impl<'a> PlanCompiler<'a> {
             PlanCompilationError::InvalidInput("M3 proposal requires M3 planning input".to_owned())
         })?;
         let depth_digest = canonical_digest(&extension.depth)?;
-        let seed = sha256_hex(
+        let initial_seed = sha256_hex(
             format!(
                 "{}\0{}\0{}\0{}\0{}",
                 input.goal_id,
@@ -765,15 +770,116 @@ impl<'a> PlanCompiler<'a> {
             )
             .as_bytes(),
         );
-        let stem = &seed[..20];
-        let plan_id = format!("plan.{stem}");
-        let requirement_id = format!("REQ.{stem}");
+        let initial_stem = &initial_seed[..20];
+        let (plan_id, revision, supersedes_revision, requirement_id, stem) =
+            if let Some(replan) = &extension.replan {
+                let previous_digest = canonical_digest(&replan.previous_plan)?;
+                if previous_digest != replan.previous_plan_digest {
+                    return Err(PlanCompilationError::InvalidInput(
+                        "replan previous_plan digest does not match trusted previous_plan_digest"
+                            .to_owned(),
+                    ));
+                }
+                let plan_id = replan
+                    .previous_plan
+                    .get("plan_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        PlanCompilationError::InvalidInput(
+                            "replan previous plan lacks plan_id".to_owned(),
+                        )
+                    })?
+                    .to_owned();
+                let previous_revision = replan
+                    .previous_plan
+                    .get("revision")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        PlanCompilationError::InvalidInput(
+                            "replan previous plan lacks a valid revision".to_owned(),
+                        )
+                    })?;
+                let requirement_id = replan
+                    .previous_plan
+                    .pointer("/requirements/0/requirement_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        PlanCompilationError::InvalidInput(
+                            "replan previous plan lacks its required requirement id".to_owned(),
+                        )
+                    })?
+                    .to_owned();
+                let stem = plan_id
+                    .strip_prefix("plan.")
+                    .unwrap_or(plan_id.as_str())
+                    .to_owned();
+                (
+                    plan_id,
+                    previous_revision.saturating_add(1),
+                    Some(previous_revision),
+                    requirement_id,
+                    stem,
+                )
+            } else {
+                (
+                    format!("plan.{initial_stem}"),
+                    1,
+                    None,
+                    format!("REQ.{initial_stem}"),
+                    initial_stem.to_owned(),
+                )
+            };
         let topo = topological_m3_tasks(proposal).map_err(PlanCompilationError::InvalidInput)?;
 
         let mut task_ids = BTreeMap::new();
+        let prior_tasks = extension
+            .replan
+            .as_ref()
+            .map(|replan| plan_task_map(&replan.previous_plan))
+            .transpose()
+            .map_err(PlanCompilationError::InvalidInput)?
+            .unwrap_or_default();
+        for (task_id, task) in &prior_tasks {
+            let (artifact_id, criterion_id) = primary_task_output_ids(task).map_err(|message| {
+                PlanCompilationError::InvalidInput(format!(
+                    "previous task {task_id} cannot participate in replanning: {message}"
+                ))
+            })?;
+            task_ids.insert(
+                task_id.clone(),
+                M3NormalizedIds {
+                    task_id: task_id.clone(),
+                    artifact_id,
+                    primary_criterion_id: criterion_id,
+                },
+            );
+        }
+        let affected = extension
+            .replan
+            .as_ref()
+            .map(|replan| {
+                replan
+                    .affected_task_ids
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
         for (position, index) in topo.iter().copied().enumerate() {
             let local_id = &proposal.tasks[index].local_id;
-            let task_id = format!("task.{stem}.{:02}", position + 1);
+            if prior_tasks.contains_key(local_id) && !affected.contains(local_id) {
+                return Err(PlanCompilationError::InvalidInput(format!(
+                    "replan proposal attempted to rewrite unaffected task {local_id}"
+                )));
+            }
+            let task_id = if affected.contains(local_id) {
+                local_id.clone()
+            } else if extension.replan.is_some() {
+                format!("task.{stem}.r{revision}.{:02}", position + 1)
+            } else {
+                format!("task.{stem}.{:02}", position + 1)
+            };
             let fragment = sanitize_id_fragment(&task_id);
             task_ids.insert(
                 local_id.clone(),
@@ -790,7 +896,7 @@ impl<'a> PlanCompiler<'a> {
             .iter()
             .map(|repository| (repository.repository_id.as_str(), *repository))
             .collect::<BTreeMap<_, _>>();
-        let mut tasks = Vec::with_capacity(topo.len());
+        let mut rebuilt_tasks = Vec::with_capacity(topo.len());
         let mut required_evidence_types = BTreeSet::new();
         for (position, index) in topo.iter().copied().enumerate() {
             let proposed = &proposal.tasks[index];
@@ -802,6 +908,7 @@ impl<'a> PlanCompiler<'a> {
                 extension,
                 proposed,
                 ids,
+                &requirement_id,
                 position + 1,
                 &task_ids,
                 &repository_map,
@@ -815,36 +922,31 @@ impl<'a> PlanCompiler<'a> {
             {
                 required_evidence_types.insert(evidence_type.to_owned());
             }
-            tasks.push(task);
+            rebuilt_tasks.push(task);
         }
-
-        let mut edges = Vec::new();
-        for (to_position, index) in topo.iter().copied().enumerate() {
-            let proposed = &proposal.tasks[index];
-            let to = task_ids.get(&proposed.local_id).ok_or_else(|| {
-                PlanCompilationError::InvalidInput("M3 task id missing".to_owned())
-            })?;
-            let mut dependencies = proposed.dependencies.clone();
-            dependencies.sort();
-            for dependency in dependencies {
-                let from = task_ids.get(&dependency).ok_or_else(|| {
-                    PlanCompilationError::InvalidInput(format!(
-                        "M3 dependency {dependency} disappeared during normalization"
-                    ))
-                })?;
-                edges.push(json!({
-                    "edge_id": format!("edge.{stem}.{:03}", edges.len() + 1),
-                    "from": from.task_id,
-                    "to": to.task_id,
-                    "kind": "produces_for",
-                    "contract": format!(
-                        "{} consumes the required output contract of {}.",
-                        proposed.local_id, dependency
-                    )
-                }));
+        let tasks = if extension.replan.is_some() {
+            let mut combined = prior_tasks
+                .iter()
+                .filter(|(task_id, _)| !affected.contains(*task_id))
+                .map(|(_, task)| (*task).clone())
+                .collect::<Vec<_>>();
+            combined.extend(rebuilt_tasks);
+            topological_plan_tasks(&combined).map_err(PlanCompilationError::InvalidInput)?
+        } else {
+            rebuilt_tasks
+        };
+        for task in &tasks {
+            for evidence_type in task
+                .pointer("/verification/required_evidence_types")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                required_evidence_types.insert(evidence_type.to_owned());
             }
-            let _ = to_position;
         }
+        let edges = build_plan_edges(&tasks, &stem)?;
 
         let repository_values = repositories
             .iter()
@@ -889,56 +991,85 @@ impl<'a> PlanCompiler<'a> {
             }));
         }
 
-        let mut plan = json!({
-            "ir_version": "1.2",
-            "plan_id": plan_id,
-            "revision": 1,
-            "supersedes_revision": Value::Null,
-            "compiled_at": input.compiled_at,
-            "compiler_version": self.compiler_version,
-            "project": {
-                "project_id": input.project_id,
-                "name": input.project_name,
-                "workspace_roots": input.workspace_roots,
-            },
-            "goal": {
-                "goal_id": input.goal_id,
-                "statement": input.goal_statement,
-                "source": {"kind": "user", "locator": format!("compilation:{}", input.compilation_id)},
-                "invariants": input.goal_invariants,
-                "non_goals": input.goal_non_goals,
-            },
-            "requirements": [{
-                "requirement_id": requirement_id,
-                "priority": "must",
-                "kind": "functional",
-                "text": input.goal_statement,
-                "source": {"kind": "user", "locator": format!("compilation:{}", input.compilation_id)},
-                "evidence_expectations": required_evidence_types,
-            }],
-            "repositories": repository_values,
-            "depth": depth,
-            "policy": input.policy,
-            "tasks": tasks,
-            "edges": edges,
-            "completion_gate": {
-                "require_all_must_requirements": true,
-                "require_fresh_acceptance": true,
-                "require_all_required_tasks_resolved": true,
-                "require_no_unknown_actions": true,
-                "require_artifact_digests": true,
-                "require_scope_audit": true,
-                "require_final_checkpoint": true,
-                "require_final_repository_revisions": true,
-                "checks": [{
-                    "check_id": format!("check.{stem}.acceptance"),
-                    "kind": "acceptance",
-                    "required_evidence_types": required_evidence_types,
-                }]
-            },
-            "provenance": provenance
-        });
+        let mut plan = if let Some(replan) = &extension.replan {
+            let mut next = replan.previous_plan.clone();
+            next["revision"] = json!(revision);
+            next["supersedes_revision"] = json!(supersedes_revision);
+            next["compiled_at"] = json!(input.compiled_at);
+            next["compiler_version"] = json!(self.compiler_version);
+            next["tasks"] = Value::Array(tasks);
+            next["edges"] = Value::Array(edges);
+            let prior_provenance = next
+                .get("provenance")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let mut combined_provenance = prior_provenance;
+            combined_provenance.extend(provenance);
+            next["provenance"] = Value::Array(combined_provenance);
+            next
+        } else {
+            json!({
+                "ir_version": "1.2",
+                "plan_id": plan_id,
+                "revision": revision,
+                "supersedes_revision": Value::Null,
+                "compiled_at": input.compiled_at,
+                "compiler_version": self.compiler_version,
+                "project": {
+                    "project_id": input.project_id,
+                    "name": input.project_name,
+                    "workspace_roots": input.workspace_roots,
+                },
+                "goal": {
+                    "goal_id": input.goal_id,
+                    "statement": input.goal_statement,
+                    "source": {"kind": "user", "locator": format!("compilation:{}", input.compilation_id)},
+                    "invariants": input.goal_invariants,
+                    "non_goals": input.goal_non_goals,
+                },
+                "requirements": [{
+                    "requirement_id": requirement_id,
+                    "priority": "must",
+                    "kind": "functional",
+                    "text": input.goal_statement,
+                    "source": {"kind": "user", "locator": format!("compilation:{}", input.compilation_id)},
+                    "evidence_expectations": required_evidence_types,
+                }],
+                "repositories": repository_values,
+                "depth": depth,
+                "policy": input.policy,
+                "tasks": tasks,
+                "edges": edges,
+                "completion_gate": {
+                    "require_all_must_requirements": true,
+                    "require_fresh_acceptance": true,
+                    "require_all_required_tasks_resolved": true,
+                    "require_no_unknown_actions": true,
+                    "require_artifact_digests": true,
+                    "require_scope_audit": true,
+                    "require_final_checkpoint": true,
+                    "require_final_repository_revisions": true,
+                    "checks": [{
+                        "check_id": format!("check.{stem}.acceptance"),
+                        "kind": "acceptance",
+                        "required_evidence_types": required_evidence_types,
+                    }]
+                },
+                "provenance": provenance
+            })
+        };
         plan = canonicalize(&plan);
+        if let Some(replan) = &extension.replan {
+            PlanRevisionDiff::between(
+                &replan.previous_plan,
+                &plan,
+                replan.scope,
+                &replan.invalidated_contract_ids,
+                &replan.affected_task_ids,
+            )
+            .map_err(PlanCompilationError::InvalidInput)?;
+        }
         Ok(PlanIr::from_value(plan))
     }
 }
@@ -984,8 +1115,19 @@ struct M3TaskProposal {
     symbols: Vec<String>,
     dependencies: Vec<String>,
     evidence_needs: Vec<M3EvidenceNeedProposal>,
+    #[serde(default)]
+    assumptions: Vec<M3AssumptionProposal>,
     expected_change: String,
     acceptance: Vec<M3AcceptanceProposal>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct M3AssumptionProposal {
+    text: String,
+    invalidation_scope: ReplanScope,
+    evidence_ids: Vec<String>,
+    fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -1051,6 +1193,21 @@ struct M3NormalizedIds {
 }
 
 fn m3_proposal_schema(max_tasks: usize) -> Value {
+    let assumption_schema = json!({
+        "type": "array",
+        "maxItems": MAX_M3_ASSUMPTIONS,
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["text", "invalidation_scope", "evidence_ids", "fingerprints"],
+            "properties": {
+                "text": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "invalidation_scope": {"enum": ["task", "dependency_branch", "plan"]},
+                "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 512}},
+                "fingerprints": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 512}}
+            }
+        }
+    });
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -1091,6 +1248,7 @@ fn m3_proposal_schema(max_tasks: usize) -> Value {
                                 }
                             }
                         },
+                        "assumptions": assumption_schema,
                         "expected_change": {"type": "string", "minLength": 1, "maxLength": MAX_PROPOSAL_TEXT_BYTES},
                         "acceptance": {
                             "type": "array",
@@ -1152,6 +1310,18 @@ fn parse_and_bound_m3_proposal(
         .iter()
         .map(|gate| gate.gate_id.as_str())
         .collect::<BTreeSet<_>>();
+    let prior_task_ids = extension
+        .replan
+        .as_ref()
+        .map(|replan| plan_task_ids(&replan.previous_plan))
+        .transpose()?
+        .unwrap_or_default();
+    let context_evidence_ids = input
+        .context_packet
+        .items
+        .iter()
+        .map(|item| item.evidence_id.as_str())
+        .collect::<BTreeSet<_>>();
     let mut local_ids = BTreeSet::new();
     for task in &proposal.tasks {
         if !valid_plan_id(&task.local_id)
@@ -1167,6 +1337,7 @@ fn parse_and_bound_m3_proposal(
             || task.files.len() > MAX_PROPOSAL_FILES
             || task.symbols.len() > MAX_PROPOSAL_SYMBOLS
             || task.evidence_needs.len() > MAX_M3_EVIDENCE_NEEDS
+            || task.assumptions.len() > MAX_M3_ASSUMPTIONS
             || task.acceptance.is_empty()
             || task.acceptance.len() > MAX_M3_ACCEPTANCE
             || task.files.iter().any(|path| !valid_relative_path(path))
@@ -1183,6 +1354,26 @@ fn parse_and_bound_m3_proposal(
         }) {
             return Err(
                 "M3 evidence need is invalid or absence lacks caller-governed evaluator".to_owned(),
+            );
+        }
+        if task.assumptions.iter().any(|assumption| {
+            assumption.text.trim().is_empty()
+                || assumption.text.len() > 1_024
+                || assumption.evidence_ids.is_empty()
+                || assumption.evidence_ids.len() > 8
+                || assumption
+                    .evidence_ids
+                    .iter()
+                    .any(|id| !context_evidence_ids.contains(id.as_str()))
+                || assumption.fingerprints.len() > 16
+                || assumption
+                    .fingerprints
+                    .iter()
+                    .any(|fingerprint| fingerprint.is_empty() || fingerprint.len() > 512)
+        }) {
+            return Err(
+                "M3 assumption must be bounded and backed by current ContextPacket evidence"
+                    .to_owned(),
             );
         }
         for acceptance in &task.acceptance {
@@ -1213,7 +1404,7 @@ fn parse_and_bound_m3_proposal(
     for task in &proposal.tasks {
         let mut seen = BTreeSet::new();
         for dependency in &task.dependencies {
-            if !local_ids.contains(dependency)
+            if (!local_ids.contains(dependency) && !prior_task_ids.contains(dependency))
                 || dependency == &task.local_id
                 || !seen.insert(dependency)
             {
@@ -1238,13 +1429,21 @@ fn topological_m3_tasks(proposal: &M3PlanProposal) -> Result<Vec<usize>, String>
     let mut indegree = proposal
         .tasks
         .iter()
-        .map(|task| (task.local_id.as_str(), task.dependencies.len()))
+        .map(|task| {
+            (
+                task.local_id.as_str(),
+                task.dependencies
+                    .iter()
+                    .filter(|dependency| by_id.contains_key(dependency.as_str()))
+                    .count(),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let mut outgoing = BTreeMap::<&str, BTreeSet<&str>>::new();
     for task in &proposal.tasks {
         for dependency in &task.dependencies {
             if !by_id.contains_key(dependency.as_str()) {
-                return Err(format!("dependency {dependency} does not resolve"));
+                continue;
             }
             outgoing
                 .entry(dependency.as_str())
@@ -1277,6 +1476,136 @@ fn topological_m3_tasks(proposal: &M3PlanProposal) -> Result<Vec<usize>, String>
         return Err("M3 hard dependency graph contains a cycle".to_owned());
     }
     Ok(ordered)
+}
+
+fn plan_task_map(plan: &Value) -> Result<BTreeMap<String, &Value>, String> {
+    let tasks = plan
+        .get("tasks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "plan lacks tasks[]".to_owned())?;
+    let mut map = BTreeMap::new();
+    for task in tasks {
+        let task_id = task
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "plan task lacks task_id".to_owned())?;
+        if map.insert(task_id.to_owned(), task).is_some() {
+            return Err(format!("duplicate task {task_id}"));
+        }
+    }
+    Ok(map)
+}
+
+fn plan_task_ids(plan: &Value) -> Result<BTreeSet<String>, String> {
+    Ok(plan_task_map(plan)?.into_keys().collect())
+}
+
+fn primary_task_output_ids(task: &Value) -> Result<(String, String), String> {
+    let artifact_id = task
+        .pointer("/expected_artifacts/0/artifact_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "task lacks primary expected artifact".to_owned())?;
+    let criterion_id = task
+        .pointer("/acceptance_criteria/0/criterion_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "task lacks primary acceptance criterion".to_owned())?;
+    Ok((artifact_id.to_owned(), criterion_id.to_owned()))
+}
+
+fn topological_plan_tasks(tasks: &[Value]) -> Result<Vec<Value>, String> {
+    let by_id = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| {
+            task.get("task_id")
+                .and_then(Value::as_str)
+                .map(|task_id| (task_id.to_owned(), index))
+                .ok_or_else(|| "normalized task lacks task_id".to_owned())
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if by_id.len() != tasks.len() {
+        return Err("normalized task ids are not unique".to_owned());
+    }
+    let mut indegree = BTreeMap::new();
+    let mut outgoing = BTreeMap::<String, BTreeSet<String>>::new();
+    for task in tasks {
+        let task_id = task
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "normalized task lacks task_id".to_owned())?;
+        let dependencies = task
+            .get("dependencies")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("task {task_id} lacks dependencies[]"))?;
+        indegree.insert(task_id.to_owned(), dependencies.len());
+        for dependency in dependencies {
+            let dependency = dependency
+                .as_str()
+                .ok_or_else(|| format!("task {task_id} dependency is not a string"))?;
+            if !by_id.contains_key(dependency) {
+                return Err(format!(
+                    "task {task_id} depends on missing task {dependency}"
+                ));
+            }
+            outgoing
+                .entry(dependency.to_owned())
+                .or_default()
+                .insert(task_id.to_owned());
+        }
+    }
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(task_id, count)| (*count == 0).then_some(task_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(tasks.len());
+    while let Some(task_id) = ready.pop_first() {
+        let index = *by_id
+            .get(&task_id)
+            .ok_or_else(|| "topological task disappeared".to_owned())?;
+        ordered.push(tasks[index].clone());
+        for dependent in outgoing.get(&task_id).into_iter().flatten() {
+            let count = indegree
+                .get_mut(dependent)
+                .ok_or_else(|| "topological indegree disappeared".to_owned())?;
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                ready.insert(dependent.clone());
+            }
+        }
+    }
+    if ordered.len() != tasks.len() {
+        return Err("normalized hard dependency graph contains a cycle".to_owned());
+    }
+    Ok(ordered)
+}
+
+fn build_plan_edges(tasks: &[Value], stem: &str) -> Result<Vec<Value>, PlanCompilationError> {
+    let mut edges = Vec::new();
+    for task in tasks {
+        let to = task
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| PlanCompilationError::InvalidInput("task lacks task_id".to_owned()))?;
+        let mut dependencies = task
+            .get("dependencies")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        dependencies.sort();
+        for from in dependencies {
+            edges.push(json!({
+                "edge_id": format!("edge.{stem}.{:03}", edges.len() + 1),
+                "from": from,
+                "to": to,
+                "kind": "produces_for",
+                "contract": format!("{to} consumes the required output contract of {from}.")
+            }));
+        }
+    }
+    Ok(edges)
 }
 
 fn effective_m3_task_cap(input: &PlanCompilationInput) -> Result<usize, PlanCompilationError> {
@@ -1404,6 +1733,15 @@ fn context_item_by_id<'a>(
         .find(|item| item.evidence_id == evidence_id)
 }
 
+const fn assumption_trust(trust: TrustClass) -> &'static str {
+    match trust {
+        TrustClass::Controller | TrustClass::Verification => "governed",
+        TrustClass::Derived => "validated",
+        TrustClass::Repository | TrustClass::Tool => "observed",
+        TrustClass::Untrusted => "untrusted",
+    }
+}
+
 const fn supplied_source_plan_kind(kind: SuppliedPlanningSourceKind) -> &'static str {
     match kind {
         SuppliedPlanningSourceKind::ArchitectureDocument
@@ -1470,6 +1808,7 @@ fn build_m3_task(
     extension: &M3PlanningInput,
     proposal: &M3TaskProposal,
     ids: &M3NormalizedIds,
+    requirement_id: &str,
     ordinal: usize,
     task_ids: &BTreeMap<String, M3NormalizedIds>,
     repository_map: &BTreeMap<&str, &PlanCompilationRepository>,
@@ -1618,6 +1957,12 @@ fn build_m3_task(
                 )
             }
         };
+        let evidence_freshness = match acceptance.kind {
+            M3AcceptanceKind::Manual => "current_attempt",
+            M3AcceptanceKind::Diff | M3AcceptanceKind::Artifact => {
+                "carry_forward_if_inputs_unchanged"
+            }
+        };
         verification_evidence_types.insert(evidence_type.to_owned());
         acceptance_criteria.push(json!({
             "criterion_id": criterion_id,
@@ -1625,7 +1970,7 @@ fn build_m3_task(
             "kind": kind,
             "verification_step_ids": [step_id],
             "evidence_type": evidence_type,
-            "evidence_freshness": "current_attempt",
+            "evidence_freshness": evidence_freshness,
             "required": true
         }));
         verification_steps.push(verification_step);
@@ -1646,7 +1991,7 @@ fn build_m3_task(
             "upstream_task_id": upstream.task_id,
             "required_artifact_ids": [upstream.artifact_id],
             "required_acceptance_criterion_ids": [upstream.primary_criterion_id],
-            "freshness": "same_plan_revision"
+            "freshness": "carry_forward_if_inputs_unchanged"
         }));
     }
 
@@ -1686,6 +2031,54 @@ fn build_m3_task(
         .take(16)
         .map(|handle| format!("{} {}", handle.evidence_id, handle.source_digest))
         .collect::<Vec<_>>();
+    let assumptions = proposal
+        .assumptions
+        .iter()
+        .enumerate()
+        .map(|(index, assumption)| {
+            let basis_items = assumption
+                .evidence_ids
+                .iter()
+                .map(|evidence_id| {
+                    let item = context_item_by_id(&input.context_packet, evidence_id).ok_or_else(
+                        || {
+                            PlanCompilationError::InvalidInput(format!(
+                                "assumption evidence {evidence_id} disappeared from ContextPacket"
+                            ))
+                        },
+                    )?;
+                    Ok(item)
+                })
+                .collect::<Result<Vec<_>, PlanCompilationError>>()?;
+            let basis_evidence = basis_items
+                .iter()
+                .map(|item| PlanAssumptionEvidence {
+                    evidence_id: item.evidence_id.clone(),
+                    digest: item.content_digest.clone(),
+                    locator: item
+                        .locator
+                        .clone()
+                        .unwrap_or_else(|| item.source_uri.clone()),
+                    trust: assumption_trust(item.trust_class).to_owned(),
+                    freshness: input.compiled_at.clone(),
+                })
+                .collect::<Vec<_>>();
+            let mut fingerprints = basis_items
+                .iter()
+                .map(|item| item.source_digest.clone())
+                .collect::<Vec<_>>();
+            fingerprints.sort();
+            fingerprints.dedup();
+            let assumption_id = format!("ASSUME.{task_fragment}.{:02}", index + 1);
+            Ok(PlanAssumption {
+                assumption_id,
+                text: assumption.text.clone(),
+                invalidation_scope: assumption.invalidation_scope,
+                basis_evidence,
+                fingerprints,
+            })
+        })
+        .collect::<Result<Vec<_>, PlanCompilationError>>()?;
     let max_evidence_items =
         u64::try_from(input.context_packet.items.len().clamp(1, 200)).unwrap_or(200);
     let scope_resolution = if unknown_files.is_empty() {
@@ -1705,7 +2098,7 @@ fn build_m3_task(
         "title": proposal.title,
         "objective": proposal.objective,
         "rationale": proposal.rationale,
-        "requirement_ids": [format!("REQ.{}", ids.task_id.split('.').nth(1).unwrap_or("m3"))],
+        "requirement_ids": [requirement_id],
         "dependencies": dependencies,
         "dependency_bindings": dependency_bindings,
         "scope": {
@@ -1758,7 +2151,7 @@ fn build_m3_task(
         },
         "implementation_contract": {
             "preconditions": [],
-            "assumptions": [],
+            "assumptions": assumptions,
             "inputs": inputs,
             "outputs": [proposal.expected_change, input.goal_statement],
             "invariants": invariants,
@@ -2026,7 +2419,136 @@ fn validate_m3_compilation_input(input: &PlanCompilationInput) -> Result<(), Pla
             "M3 governed absence evaluator requires id, version and SHA-256 digest".to_owned(),
         ));
     }
+    if let Some(replan) = &extension.replan {
+        validate_replan_input(input, replan)?;
+    }
     Ok(())
+}
+
+fn validate_replan_input(
+    input: &PlanCompilationInput,
+    replan: &PlanReplanInput,
+) -> Result<(), PlanCompilationError> {
+    if canonical_digest(&replan.previous_plan)? != replan.previous_plan_digest {
+        return Err(PlanCompilationError::InvalidInput(
+            "trusted replan previous plan digest mismatch".to_owned(),
+        ));
+    }
+    if replan.invalidated_contract_ids.is_empty() || replan.affected_task_ids.is_empty() {
+        return Err(PlanCompilationError::InvalidInput(
+            "replan requires explicit invalidated stable contracts and affected tasks".to_owned(),
+        ));
+    }
+    let previous_goal_id = replan
+        .previous_plan
+        .pointer("/goal/goal_id")
+        .and_then(Value::as_str);
+    let previous_goal_statement = replan
+        .previous_plan
+        .pointer("/goal/statement")
+        .and_then(Value::as_str);
+    if previous_goal_id != Some(input.goal_id.as_str())
+        || previous_goal_statement != Some(input.goal_statement.as_str())
+        || replan.previous_plan.pointer("/policy") != Some(&input.policy)
+    {
+        return Err(PlanCompilationError::InvalidInput(
+            "replan cannot change root goal or authoritative policy".to_owned(),
+        ));
+    }
+    let previous_repository_id = replan
+        .previous_plan
+        .pointer("/repositories/0/repository_id")
+        .and_then(Value::as_str);
+    if previous_repository_id != Some(input.repository.repository_id.as_str()) {
+        return Err(PlanCompilationError::InvalidInput(
+            "replan primary repository identity differs from previous revision".to_owned(),
+        ));
+    }
+
+    let mut expected_scope = ReplanScope::Task;
+    let mut expected_affected = BTreeSet::new();
+    for contract_id in &replan.invalidated_contract_ids {
+        let (owner_task_id, contract_scope) =
+            resolve_stable_contract(&replan.previous_plan, contract_id).ok_or_else(|| {
+                PlanCompilationError::InvalidInput(format!(
+                    "replan invalidated contract {contract_id} does not resolve in previous Plan IR"
+                ))
+            })?;
+        expected_scope = expected_scope.max(contract_scope);
+        let affected =
+            smallest_replan_scope_tasks(&replan.previous_plan, &owner_task_id, contract_scope)
+                .map_err(PlanCompilationError::InvalidInput)?;
+        expected_affected.extend(affected);
+    }
+    if replan.scope != expected_scope {
+        return Err(PlanCompilationError::InvalidInput(format!(
+            "replan scope {:?} differs from stable-contract minimum {:?}",
+            replan.scope, expected_scope
+        )));
+    }
+    let declared = replan
+        .affected_task_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if declared != expected_affected {
+        return Err(PlanCompilationError::InvalidInput(
+            "replan affected task set is not the exact smallest valid dependency scope".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_stable_contract(plan: &Value, contract_id: &str) -> Option<(String, ReplanScope)> {
+    for task in plan.get("tasks")?.as_array()? {
+        let task_id = task.get("task_id")?.as_str()?;
+        for assumption in task
+            .pointer("/implementation_contract/assumptions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if assumption.get("assumption_id").and_then(Value::as_str) == Some(contract_id) {
+                let scope = serde_json::from_value::<ReplanScope>(
+                    assumption.get("invalidation_scope")?.clone(),
+                )
+                .ok()?;
+                return Some((task_id.to_owned(), scope));
+            }
+        }
+        for clause in task
+            .pointer("/implementation_contract/preconditions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if clause.get("clause_id").and_then(Value::as_str) == Some(contract_id) {
+                return Some((task_id.to_owned(), ReplanScope::Task));
+            }
+        }
+        for clause in task
+            .pointer("/implementation_contract/invariants")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if clause.get("clause_id").and_then(Value::as_str) == Some(contract_id) {
+                return Some((task_id.to_owned(), ReplanScope::Plan));
+            }
+        }
+        for binding in task
+            .get("dependency_bindings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let upstream = binding.get("upstream_task_id").and_then(Value::as_str)?;
+            if contract_id == format!("binding:{task_id}:{upstream}") {
+                return Some((upstream.to_owned(), ReplanScope::DependencyBranch));
+            }
+        }
+    }
+    None
 }
 
 fn valid_repository_input(repository: &PlanCompilationRepository) -> bool {

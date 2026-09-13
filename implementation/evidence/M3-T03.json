@@ -1,0 +1,214 @@
+{
+  "schema_version": 1,
+  "task_id": "M3-T03",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "3a1dadc",
+  "status": "completed",
+  "completed_at": "2026-09-13T11:07:41Z",
+  "verified_at": "2026-09-13T11:07:41Z",
+  "scope": [
+    "distinguish ordinary task execution failure from Controller-verified falsification of stable plan assumptions",
+    "compute the smallest authorized replan scope from task.dependencies[] only",
+    "activate immutable direct N+1 plan revisions while preserving one active revision and historical N audit rows",
+    "carry unaffected succeeded work across revisions only when contract, dependency/output, input/source, acceptance-freshness, verification, and unknown-action/process-lease guards remain valid",
+    "recover crash-safe supersession without unioning stale N runtime into active N+1"
+  ],
+  "interfaces": [
+    "FailureClassifier",
+    "PlanAssumption",
+    "ReplanScope",
+    "PlanRevisionDiff"
+  ],
+  "failure_classification_contract": {
+    "ordinary_execution_failure": "compiler/test/runtime/tool/model/resource failures remain execution failures while stable plan assumptions remain valid; retry exhaustion alone never promotes them to plan failure",
+    "plan_failure_authority": "only Controller-revalidated evidence that falsifies a named stable contract can create plan_failure/stable_contract_invalidated and authorize replan_smallest_scope",
+    "forged_or_stale_evidence": "free-text/forged contract IDs, missing bounded evidence, unchanged observed fingerprints, stale repository evidence, and caller-only assertions fail closed",
+    "proof_tests": [
+      "compiler_test_runtime_failure_without_verified_clause_stays_execution_failure",
+      "missing_planned_api_with_changed_stable_fingerprint_triggers_task_replan",
+      "unchanged_assumption_fingerprint_cannot_be_promoted_to_plan_failure"
+    ]
+  },
+  "smallest_scope_contract": {
+    "authoritative_graph": "task.dependencies[] is the sole hard DAG used for smallest-scope reasoning",
+    "task_scope": "task-scope additions are rejected",
+    "dependency_branch_scope": "changed+added branch members may connect additions; unchanged shared upstream ancestors cannot bridge unrelated siblings into the authorized branch",
+    "disconnected_additions": "rejected",
+    "connected_split_helper": "accepted when connected to a retained changed branch node",
+    "full_plan_scope": "reserved for verified full-plan invariant invalidation and still subject to Controller evidence revalidation",
+    "proof_tests": [
+      "changed_producer_binding_replans_exact_descendant_branch_and_preserves_unrelated_branch",
+      "smallest_scope_is_computed_only_from_dependencies_dag",
+      "revision_diff_rejects_matching_ids_when_authorized_affected_contract_was_not_replanned",
+      "revision_diff_rejects_changes_to_unaffected_branch",
+      "dependency_branch_replan_rejects_disconnected_new_task",
+      "dependency_branch_replan_rejects_sibling_added_through_unaffected_upstream",
+      "dependency_branch_replan_allows_connected_split_task"
+    ]
+  },
+  "revision_contract": {
+    "direct_supersession": "N+1 must preserve plan_id, set revision=N+1, supersedes_revision=N, and match the canonical PlanRevisionDiff",
+    "one_active": "atomic activation marks N superseded and N+1 active in one StateStore transaction before in-memory replacement",
+    "history": "revision-scoped task/attempt/evidence/output/failure/repair/verification/carry/lineage records preserve N rows rather than deleting or overwriting them",
+    "activation_event": "plan_revision_activated binds from/to revision and digests, diff/carry/runtime-map digests, execution epoch, repository snapshot/baseline, and plan validity",
+    "counter_preservation": "unaffected task retry/resource/model counters remain preserved across supersession"
+  },
+  "carry_forward_contract": {
+    "initial_success_requires_real_attempt": "guarded carry freshness is future reuse policy only; first success still requires a real current attempt and deterministic verification",
+    "local_eligibility": [
+      "previous revision runtime is Succeeded",
+      "task contract digest is identical",
+      "acceptance freshness permits cross-revision carry",
+      "dependency-binding freshness permits cross-revision carry",
+      "compilation/input/instruction/source fingerprints are fresh",
+      "previous task carry fingerprint is exact",
+      "immutable source-revision verification artifact exists and validates"
+    ],
+    "dependency_closed_n_plus_one": "build_superseding_runtime first collects locally eligible candidates, then reaches a fixed point where a task may carry only after every hard upstream has itself actually carried into N+1; carried_task_ids is therefore transitive N+1 dependency closure, not old-N success",
+    "source_revision_immutability": "carried outputs preserve the immutable N verification record and create N+1 binding/provenance pointing to carried_from_plan_revision/digest rather than fabricating N+1 verification",
+    "downstream_readiness": "N+1 dependency consumption validates the carried output binding plus N+1 carry fingerprint/provenance; carried task state alone is insufficient",
+    "positive_proof_tests": [
+      "deterministic_acceptance_allows_guarded_carry_but_not_current_task_revision",
+      "n_plus_one_dependency_consumes_carried_output_through_explicit_old_revision_provenance"
+    ],
+    "negative_proof_tests": [
+      "dependency_binding_same_plan_revision_is_never_cross_revision_carry_authority",
+      "carry_forward_rejects_compilation_input_source_drift",
+      "dependent_carry_requires_upstream_to_actually_carry_into_n_plus_one"
+    ],
+    "dependency_closed_negative": "A carry failure leaves A Planned; a locally eligible dependent B also remains Planned and emits no N+1 carry/output records. The same fixed point prevents transitive descendants from carrying until their upstream chain has actually carried."
+  },
+  "replan_budget_and_lineage_contract": {
+    "stable_scope_lineage": "scope lineage fallback hashes plan_id + scope + initial affected task IDs and does not key ceilings on invalidated clause IDs",
+    "unrelated_replans": "unchanged task lineage is retained so reopen/replan through another clause cannot reset the same scope budget",
+    "split_inheritance": "changed/added split successors inherit the active scope lineage",
+    "ambiguity": "multiple inherited lineage IDs fail closed instead of choosing one",
+    "proof_tests": [
+      "scope_lineage_survives_unrelated_replan_and_reopen_and_split_inherits_it",
+      "ambiguous_scope_lineage_and_nonterminal_process_leases_fail_closed"
+    ]
+  },
+  "unknown_and_process_lease_fence": {
+    "terminal_states": [
+      "reaped",
+      "reaped_recovery"
+    ],
+    "activation_blockers": [
+      "pending_spawn",
+      "active",
+      "unknown state",
+      "unknown schema",
+      "unresolved unknown action"
+    ],
+    "shared_predicate": "activation and recovery use the same process_lease_is_terminal predicate",
+    "proof_tests": [
+      "ambiguous_scope_lineage_and_nonterminal_process_leases_fail_closed",
+      "kill_after_spawn_before_identity_lease_stays_recovery_blocked",
+      "orphan_process_group_is_reaped_before_recovery_continues",
+      "historical_unknown_that_is_now_failed_does_not_block_recovered_readiness"
+    ]
+  },
+  "atomic_recovery_contract": {
+    "activation_atomicity": "N lifecycle supersession, N+1 active document/runtime/attempt/carry/lineage records, active pointer, scope counter, and plan_revision_activated event are persisted transactionally",
+    "pre_activation_crash": "old invalidated/replan-pending state remains recoverable and no half-active N+1 is inferred",
+    "post_activation_pre_checkpoint": "recovery validates the one authoritative N->N+1 activation event plus bound digests and switches to N+1 while retaining N history",
+    "tamper_detection": "runtime-map/diff/carry-plan digest mismatch rejects recovery",
+    "superseded_checkpoint": "trusted N checkpoint cannot become active after valid N+1 activation without explicit carry-forward proof",
+    "proof_tests": [
+      "post_activation_pre_checkpoint_recovery_switches_to_n_plus_one_without_deleting_n_rows",
+      "post_activation_pre_checkpoint_recovery_rejects_tampered_n_plus_one_runtime_digest",
+      "superseded_plan_checkpoint_is_blocked_without_explicit_carry_forward"
+    ]
+  },
+  "status_compatibility": {
+    "pre_plan": "durable status/approvals remain read-only and usable before any active compiler plan exists; task/attempt/evidence projections are empty while queued goals/control/actions/approvals remain visible",
+    "active_revision": "when an active plan exists, status projects only exact active plan_id/revision/digest rows and durable-pointer/in-memory mismatches fail closed",
+    "proof_tests": [
+      "durable_status_is_read_only_and_empty_before_plan_activation",
+      "durable_status_uses_only_durable_active_revision_rows_after_reopen",
+      "approval_rendering_is_read_only_and_empty_without_durable_requests",
+      "goal_submission_is_truthfully_queued_and_visible_in_status"
+    ]
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-eval --test plan_failure --offline",
+      "result": "passed",
+      "detail": "11/11"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-plan --offline",
+      "result": "passed",
+      "detail": "compiler_m3 10/10; depth 7/7; minimal_compiler 10/10; validator 22/22"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-controller dependent_carry_requires_upstream_to_actually_carry_into_n_plus_one --offline",
+      "result": "passed",
+      "detail": "1/1 exact dependency-closed carry regression"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-controller --offline",
+      "result": "passed",
+      "detail": "11 unit + 23 t07"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-eval --test crash_resume --offline",
+      "result": "passed",
+      "detail": "22/22"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-plan -p sovereign-controller -p sovereign-eval --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test --workspace --offline",
+      "result": "passed",
+      "detail": "workspace-wide; only compiler_real_local_8k_smoke and m1_real_qwen_implementation_repair_restart_qualification remain explicitly ignored local-model gates already handled by prior durable M1 qualification"
+    }
+  ],
+  "implementation_worker_report": {
+    "worker": "worker-20",
+    "result": "latest dependency-closed carry blocker fixed; no blockers",
+    "notes": "Separated local carry eligibility from fixed-point N+1 dependency closure; added adversarial A->B carry-failure regression; no evidence/BUILD_STATE/commit changes by worker."
+  },
+  "independent_audit": {
+    "worker": "worker-21",
+    "result": "CLOSABLE",
+    "blockers": [],
+    "notes": "Fresh post-worker-20 exact-tree read-only audit confirmed the prior sole cross-revision carry blocker is fixed; A failure blocks B and transitively C, positive carry/provenance/readiness remain valid, and branch-scope, lineage, lease/recovery, revision-scoped status, pre-plan CLI compatibility, and direct immutable atomic N->N+1 history remain sound."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429"
+  },
+  "source_hashes": {
+    "Cargo.lock": "sha256:8007a0d3715fa3d0ec882c09473154caccd6e6cececfefeadb3a582465c01611",
+    "crates/sovereign-controller/src/lib.rs": "sha256:caf5b7a4abf9da6b23015ce20ea3b792e0a2095d78fc76c671b7941d5b96af31",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:06afd32496908dc5421e9cd0a84c69589f17f67e836f67979bf31c83af85b0f4",
+    "crates/sovereign-eval/Cargo.toml": "sha256:ed4d65a7404c2558ea4d7caaaf85ba72a5af49c9f4a30faa1e9caaaf844d3b8a",
+    "crates/sovereign-eval/tests/crash_resume.rs": "sha256:deac53355366ea0a36ab45ab63354b9c1d65026288309f42cf8ab45b885fdba0",
+    "crates/sovereign-eval/tests/plan_failure.rs": "sha256:9c7198710adf9da05ee460c587a03bf4c2955bc60b02fdb7500cfd212c0bf8af",
+    "crates/sovereign-plan/src/compiler.rs": "sha256:8883e0b63538d4a6c64cd346a968e75bb94553da8b621a50e6fee58c54121b68",
+    "crates/sovereign-plan/src/lib.rs": "sha256:8f6661710945292801f595198fe09bdf60d2ae955264b2693445b5e754fe4262",
+    "crates/sovereign-plan/src/replan.rs": "sha256:412770e0c9d666d37b6277dd66d2955916ba98f0896bdea92ff50ca8418997d5",
+    "crates/sovereign-plan/tests/compiler_m3.rs": "sha256:70a13551e9bb7c373670dc9653930419ac0036cc9e02d4b4b3c11e7ef57130ef",
+    "crates/sovereign-plan/tests/validator.rs": "sha256:997bab49e0873ad78703930a7bf0d632c150e8ef98abb347b68a7ae547e8c539"
+  }
+}

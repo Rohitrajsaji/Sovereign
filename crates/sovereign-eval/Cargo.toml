@@ -12,6 +12,7 @@ sovereign-context = { path = "../sovereign-context" }
 [dev-dependencies]
 rusqlite.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sovereign-controller = { path = "../sovereign-controller", features = ["recovery-test-hooks"] }
 sovereign-evidence = { path = "../sovereign-evidence" }
 sovereign-model = { path = "../sovereign-model" }

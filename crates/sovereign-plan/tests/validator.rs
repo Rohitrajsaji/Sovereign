@@ -304,12 +304,12 @@ fn task_revision_and_replan_ceilings_are_enforced() {
     revision["supersedes_revision"] = json!(4);
     assert_code(&diagnostics(revision), DiagnosticCode::RevisionBudget);
 
-    let mut replan = fixture();
-    replan["revision"] = json!(4);
-    replan["supersedes_revision"] = json!(3);
-    replan["policy"]["retry"]["max_plan_revisions"] = json!(10);
-    replan["policy"]["retry"]["max_replans_per_scope"] = json!(2);
-    assert_code(&diagnostics(replan), DiagnosticCode::RevisionBudget);
+    let mut independent_scope_history = fixture();
+    independent_scope_history["revision"] = json!(4);
+    independent_scope_history["supersedes_revision"] = json!(3);
+    independent_scope_history["policy"]["retry"]["max_plan_revisions"] = json!(10);
+    independent_scope_history["policy"]["retry"]["max_replans_per_scope"] = json!(2);
+    assert!(diagnostics(independent_scope_history).is_empty());
 }
 
 #[test]

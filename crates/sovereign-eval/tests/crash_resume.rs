@@ -2,6 +2,7 @@
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sovereign_context::{
     ContextBudget, ContextMode, ContextPacket, ContextPacketInput, ContextPlanner, EvidenceItem,
 };
@@ -15,7 +16,7 @@ use sovereign_model::{
 };
 use sovereign_plan::{
     PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationInput, PlanCompilationRepository, PlanCompiler,
-    PlanValidator, ValidationEnvironment,
+    PlanIr, PlanRevisionDiff, PlanValidator, ReplanScope, ValidationEnvironment,
 };
 use sovereign_policy::{
     CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, IsolatedCommand,
@@ -23,9 +24,11 @@ use sovereign_policy::{
     PinnedExecutable, PolicyError,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot};
-use sovereign_state::{ActionTransition, NewActionRecord, StateStore};
+use sovereign_state::{
+    ActionTransition, NewActionRecord, NewJournalEvent, StateRecordUpdate, StateStore,
+};
 use sovereign_tools::{PermissionClass, ToolManifest, process_group_leader_identity};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -318,6 +321,254 @@ fn compile_and_activate(
         .activate(compilation, &prepared.registry)
         .unwrap_or_else(|error| panic!("activate: {error}"));
     (controller, activation.task_ids[0].clone())
+}
+
+fn canonical_value_digest(value: &Value) -> String {
+    PlanIr::from_value(value.clone())
+        .canonical_digest()
+        .unwrap_or_else(|error| panic!("canonical digest: {error}"))
+}
+
+fn raw_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+#[allow(clippy::too_many_lines)]
+fn install_uncheckpointed_supersession(
+    state: &mut StateStore,
+    task_id: &str,
+    tamper_task_runtime_digest: bool,
+) -> String {
+    let active_raw = state
+        .get_state("controller.plan", "active")
+        .unwrap_or_else(|error| panic!("read active plan: {error}"))
+        .unwrap_or_else(|| panic!("active plan record missing"));
+    let active: Value =
+        serde_json::from_str(&active_raw).unwrap_or_else(|error| panic!("active json: {error}"));
+    let plan_id = active["plan_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("active plan id"))
+        .to_owned();
+    let goal_id = active["goal_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("active goal id"))
+        .to_owned();
+    let previous_digest = active["plan_digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("active plan digest"))
+        .to_owned();
+    let previous_document_raw = state
+        .get_state("controller.plan_document", "active")
+        .unwrap_or_else(|error| panic!("read active plan document: {error}"))
+        .unwrap_or_else(|| panic!("active plan document missing"));
+    let previous_document: Value = serde_json::from_str(&previous_document_raw)
+        .unwrap_or_else(|error| panic!("previous plan json: {error}"));
+    let mut next_document = previous_document.clone();
+    next_document["revision"] = json!(2);
+    next_document["supersedes_revision"] = json!(1);
+    next_document["tasks"][0]["title"] = json!("Replanned Settings submit label");
+    let next_digest = canonical_value_digest(&next_document);
+    let diff = PlanRevisionDiff::between(
+        &previous_document,
+        &next_document,
+        ReplanScope::Task,
+        &["ASSUME.fixture-invalidated".to_owned()],
+        &[task_id.to_owned()],
+    )
+    .unwrap_or_else(|error| panic!("revision diff: {error}"));
+    let diff_json =
+        serde_json::to_string(&diff).unwrap_or_else(|error| panic!("diff json: {error}"));
+    let diff_digest = raw_sha256(diff_json.as_bytes());
+
+    let task = next_document["tasks"][0].clone();
+    let task_contract_digest = canonical_value_digest(&task);
+    let task_runtime = json!({
+        "state": "planned",
+        "attempts_started": 0,
+        "model_calls_used": 0,
+        "failure_counts": {},
+        "retry_exhausted": false,
+        "resource_deferrals_used": 0,
+        "resource_retry_exhausted": false,
+        "resource_deferred_from": Value::Null,
+        "task_contract_digest": task_contract_digest,
+        "task": task
+    });
+    let task_runtime_values = BTreeMap::from([(task_id.to_owned(), task_runtime.clone())]);
+    let task_runtime_map_digest = if tamper_task_runtime_digest {
+        format!("sha256:{}", "f".repeat(64))
+    } else {
+        canonical_value_digest(
+            &serde_json::to_value(&task_runtime_values)
+                .unwrap_or_else(|error| panic!("task runtime map: {error}")),
+        )
+    };
+    let attempt_runtime_map_digest = canonical_value_digest(&json!({}));
+    let carry_record_digests = BTreeMap::<String, String>::new();
+    let carry_proof_digest = canonical_value_digest(
+        &serde_json::to_value(&carry_record_digests)
+            .unwrap_or_else(|error| panic!("carry digest map: {error}")),
+    );
+    let compilation_evidence = json!({
+        "schema": "fixture-post-checkpoint-supersession",
+        "plan_digest": next_digest,
+        "validator_passed": true
+    });
+    let compilation_evidence_digest = canonical_value_digest(&compilation_evidence);
+    let baseline_raw = state
+        .get_state("controller.repository_baseline", "active")
+        .unwrap_or_else(|error| panic!("read baseline: {error}"))
+        .unwrap_or_else(|| panic!("baseline missing"));
+    let baseline: Value = serde_json::from_str(&baseline_raw)
+        .unwrap_or_else(|error| panic!("baseline json: {error}"));
+    let baseline_snapshot: RepositorySnapshot =
+        serde_json::from_value(baseline["snapshot"].clone())
+            .unwrap_or_else(|error| panic!("baseline snapshot json: {error}"));
+    let repository_snapshot_digest = raw_sha256(
+        baseline_snapshot
+            .manifest_json()
+            .unwrap_or_else(|error| panic!("baseline snapshot manifest: {error}"))
+            .as_bytes(),
+    );
+    let baseline_diff_digest = baseline["diff_digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("baseline diff digest"))
+        .to_owned();
+    let epoch = state
+        .advance_execution_epoch()
+        .unwrap_or_else(|error| panic!("advance epoch: {error}"));
+    let revision_key = format!("{plan_id}@r2");
+    let active_plan_json = json!({
+        "plan_id": plan_id,
+        "goal_id": goal_id,
+        "revision": 2,
+        "plan_digest": next_digest,
+        "compilation_evidence_digest": compilation_evidence_digest,
+        "validity": "current"
+    })
+    .to_string();
+    let revision_record_json = json!({
+        "plan_id": plan_id,
+        "revision": 2,
+        "plan_digest": next_digest,
+        "compilation_evidence_digest": compilation_evidence_digest,
+        "previous_plan_digest": previous_digest,
+        "plan_document": next_document
+    })
+    .to_string();
+    let prior_lifecycle = json!({
+        "plan_id": plan_id,
+        "revision": 1,
+        "plan_digest": previous_digest,
+        "status": "superseded",
+        "superseded_by_revision": 2,
+        "superseded_by_digest": next_digest
+    })
+    .to_string();
+    let next_lifecycle = json!({
+        "plan_id": plan_id,
+        "revision": 2,
+        "plan_digest": next_digest,
+        "status": "active",
+        "superseded_by_revision": Value::Null,
+        "superseded_by_digest": Value::Null
+    })
+    .to_string();
+    let task_key = format!("{plan_id}@r2:{task_id}");
+    let prior_revision_key = format!("{plan_id}@r1");
+    let task_runtime_json = task_runtime.to_string();
+    let next_document_json = next_document.to_string();
+    let compilation_json = compilation_evidence.to_string();
+    let activation_payload = json!({
+        "from_revision": 1,
+        "to_revision": 2,
+        "from_plan_digest": previous_digest,
+        "to_plan_digest": next_digest,
+        "plan_revision_diff_digest": diff_digest,
+        "carry_proof_digest": carry_proof_digest,
+        "task_runtime_map_digest": task_runtime_map_digest,
+        "attempt_runtime_map_digest": attempt_runtime_map_digest,
+        "execution_epoch": epoch,
+        "repository_snapshot_digest": repository_snapshot_digest,
+        "baseline_diff_digest": baseline_diff_digest,
+        "plan_validity": "current"
+    });
+    let activation_json = activation_payload.to_string();
+    let event_id = format!(
+        "fixture.supersession.{}",
+        &raw_sha256(activation_json.as_bytes())[7..27]
+    );
+    let records = vec![
+        ("controller.plan", "active", active_plan_json.as_str()),
+        (
+            "controller.plan_document",
+            "active",
+            next_document_json.as_str(),
+        ),
+        (
+            "controller.plan_revision",
+            revision_key.as_str(),
+            revision_record_json.as_str(),
+        ),
+        (
+            "controller.plan_revision_diff",
+            revision_key.as_str(),
+            diff_json.as_str(),
+        ),
+        (
+            "controller.compilation_evidence",
+            revision_key.as_str(),
+            compilation_json.as_str(),
+        ),
+        (
+            "controller.plan_revision_lifecycle",
+            prior_revision_key.as_str(),
+            prior_lifecycle.as_str(),
+        ),
+        (
+            "controller.plan_revision_lifecycle",
+            revision_key.as_str(),
+            next_lifecycle.as_str(),
+        ),
+        (
+            "controller.task",
+            task_key.as_str(),
+            task_runtime_json.as_str(),
+        ),
+    ];
+    let owned_records = records
+        .iter()
+        .map(|(namespace, key, value_json)| {
+            (
+                (*namespace).to_owned(),
+                (*key).to_owned(),
+                (*value_json).to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let updates = owned_records
+        .iter()
+        .map(|(namespace, key, value_json)| StateRecordUpdate {
+            namespace,
+            key,
+            value_json,
+        })
+        .collect::<Vec<_>>();
+    state
+        .put_state_records_with_events(
+            &updates,
+            &[NewJournalEvent {
+                event_id: &event_id,
+                entity_type: "controller",
+                entity_id: &plan_id,
+                event_kind: "plan_revision_activated",
+                payload_json: &activation_json,
+            }],
+        )
+        .unwrap_or_else(|error| panic!("publish supersession: {error}"));
+    next_digest
 }
 
 struct RuntimeParts {
@@ -1353,6 +1604,84 @@ fn superseded_plan_checkpoint_is_blocked_without_explicit_carry_forward() {
     };
     assert!(error.to_string().contains("superseded plan"));
     assert!(source(&fixture.root).contains("Save"));
+}
+
+#[test]
+fn post_activation_pre_checkpoint_recovery_switches_to_n_plus_one_without_deleting_n_rows() {
+    let fixture = Fixture::create("supersession-switch");
+    let prepared = prepare(&fixture.root);
+    let backend = fake_backend(&prepared, false);
+    let (controller, task_id) = compile_and_activate(&fixture.base, &prepared, &backend);
+    drop(controller);
+
+    let mut state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("state for supersession: {error}"));
+    assert!(
+        state
+            .get_state("controller.task", &task_id)
+            .unwrap_or_else(|error| panic!("read N task: {error}"))
+            .is_some(),
+        "revision N runtime must exist before supersession"
+    );
+    let next_digest = install_uncheckpointed_supersession(&mut state, &task_id, false);
+    drop(state);
+
+    let registry = registry_for(&fixture.root);
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("reopen supersession state: {error}"));
+    let (recovered, summary) = RecoveryManager::recover(state, &registry)
+        .unwrap_or_else(|error| panic!("recover N+1 activation: {error}"));
+    assert_eq!(summary.plan_digest, next_digest);
+    assert_eq!(recovered.task_state(&task_id), Some(TaskState::Planned));
+    drop(recovered);
+
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("inspect recovered supersession: {error}"));
+    assert!(
+        state
+            .get_state("controller.task", &task_id)
+            .unwrap_or_else(|error| panic!("read historical N task: {error}"))
+            .is_some(),
+        "historical N task runtime must remain auditable"
+    );
+    let active_raw = state
+        .get_state("controller.plan", "active")
+        .unwrap_or_else(|error| panic!("read recovered active plan: {error}"))
+        .unwrap_or_else(|| panic!("recovered active plan missing"));
+    let active: Value = serde_json::from_str(&active_raw)
+        .unwrap_or_else(|error| panic!("recovered active plan json: {error}"));
+    let plan_id = active["plan_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("recovered plan id"));
+    assert_eq!(active["revision"], json!(2));
+    assert!(
+        state
+            .get_state("controller.task", &format!("{plan_id}@r2:{task_id}"))
+            .unwrap_or_else(|error| panic!("read active N+1 task: {error}"))
+            .is_some(),
+        "N+1 runtime must use its revision-scoped namespace"
+    );
+}
+
+#[test]
+fn post_activation_pre_checkpoint_recovery_rejects_tampered_n_plus_one_runtime_digest() {
+    let fixture = Fixture::create("supersession-tamper");
+    let prepared = prepare(&fixture.root);
+    let backend = fake_backend(&prepared, false);
+    let (controller, task_id) = compile_and_activate(&fixture.base, &prepared, &backend);
+    drop(controller);
+    let mut state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("state for supersession tamper: {error}"));
+    let _ = install_uncheckpointed_supersession(&mut state, &task_id, true);
+    drop(state);
+
+    let registry = registry_for(&fixture.root);
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("reopen tampered supersession: {error}"));
+    let Err(error) = RecoveryManager::recover(state, &registry) else {
+        panic!("tampered N+1 runtime digest must block recovery");
+    };
+    assert!(error.to_string().contains("task runtime map differs"));
 }
 
 #[test]

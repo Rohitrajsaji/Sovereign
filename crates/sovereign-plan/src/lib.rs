@@ -2,6 +2,7 @@
 
 mod compiler;
 mod depth;
+mod replan;
 
 pub use compiler::{
     CompilationEvidence, CompilationEvidenceHandle, GovernedEvaluatorRef, M3PlanningInput,
@@ -10,6 +11,10 @@ pub use compiler::{
     PreauthorizedManualGate, SuppliedPlanningSourceKind, SuppliedPlanningSourceRef,
 };
 pub use depth::{DepthClassifier, DepthDecision, DepthFeatureInput, DepthFeatures, ExecutionDepth};
+pub use replan::{
+    PlanAssumption, PlanAssumptionEvidence, PlanReplanInput, PlanRevisionDiff, ReplanScope,
+    smallest_replan_scope_tasks,
+};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -308,20 +313,10 @@ fn validate_revision_budgets(document: &Value, diagnostics: &mut Vec<ValidationD
             format!("revision {revision} exceeds max_plan_revisions {max_revisions}"),
         ));
     }
-    if let Some(max_replans) = retry
-        .and_then(|value| value.get("max_replans_per_scope"))
-        .and_then(Value::as_u64)
-        && revision.saturating_sub(1) > max_replans
-    {
-        diagnostics.push(ValidationDiagnostic::new(
-            DiagnosticCode::RevisionBudget,
-            "/revision",
-            format!(
-                "candidate lineage requires at least {} replans, above max_replans_per_scope {max_replans}",
-                revision.saturating_sub(1)
-            ),
-        ));
-    }
+    // `max_replans_per_scope` is a lineage-history budget, not a property of a
+    // standalone Plan IR document. The Controller enforces it from durable
+    // revision-diff history for the exact affected scope. Treating `revision-1`
+    // as one scope's replan count incorrectly rejects independent branch replans.
     let task_count = document
         .get("tasks")
         .and_then(Value::as_array)

@@ -677,6 +677,11 @@ fn durable_status_exposes_controller_state_and_evidence_without_mutation_authori
         .state()
         .latest_journal_sequence()
         .unwrap_or_else(|error| panic!("journal before status: {error}"));
+    drop(controller);
+    let controller = Controller::new(
+        StateStore::open(&fixture.repo.state_path)
+            .unwrap_or_else(|error| panic!("reopen state for status: {error}")),
+    );
     let view = controller
         .durable_status()
         .unwrap_or_else(|error| panic!("durable status: {error}"));
@@ -690,6 +695,140 @@ fn durable_status_exposes_controller_state_and_evidence_without_mutation_authori
     assert!(view.actions.is_empty());
     assert!(!view.evidence.is_empty());
     assert!(view.approval_requests.is_empty());
+}
+
+#[test]
+fn durable_status_is_read_only_and_empty_before_plan_activation() {
+    let fixture = TestRepo::create("status-before-plan");
+    let mut controller = Controller::new(
+        StateStore::open(&fixture.state_path)
+            .unwrap_or_else(|error| panic!("open pre-plan state: {error}")),
+    );
+    let intent = controller
+        .submit_goal_intent("Build inventory")
+        .unwrap_or_else(|error| panic!("submit goal: {error}"));
+    let before_sequence = controller
+        .state()
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("journal before status: {error}"));
+
+    let view = controller
+        .durable_status()
+        .unwrap_or_else(|error| panic!("pre-plan status: {error}"));
+    let after_sequence = controller
+        .state()
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("journal after status: {error}"));
+
+    assert_eq!(before_sequence, after_sequence, "status read mutated state");
+    assert!(view.active_plan.is_none());
+    assert!(view.tasks.is_empty());
+    assert!(view.attempts.is_empty());
+    assert!(view.evidence.is_empty());
+    assert!(view.approval_requests.is_empty());
+    assert_eq!(view.goal_intents.len(), 1);
+    assert_eq!(view.goal_intents[0].goal_id, intent.goal_id);
+}
+
+#[test]
+fn durable_status_uses_only_durable_active_revision_rows_after_reopen() {
+    let fixture = TestRepo::create("status-revision-scope");
+    let mut state = StateStore::open(&fixture.state_path)
+        .unwrap_or_else(|error| panic!("open revision-scoped status state: {error}"));
+    let plan_id = "plan.status-scope";
+    let current_digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    state
+        .put_state(
+            "controller.plan",
+            "active",
+            &json!({
+                "plan_id": plan_id,
+                "goal_id": "goal.status-scope",
+                "revision": 2,
+                "plan_digest": current_digest,
+                "compilation_evidence_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+                "validity": "current"
+            })
+            .to_string(),
+        )
+        .unwrap_or_else(|error| panic!("write active status pointer: {error}"));
+    state
+        .put_state("controller.task", "task.rev1", r#"{"marker":"rev1-task"}"#)
+        .unwrap_or_else(|error| panic!("write historical task: {error}"));
+    state
+        .put_state(
+            "controller.task",
+            &format!("{plan_id}@r2:task.rev2"),
+            r#"{"marker":"rev2-task"}"#,
+        )
+        .unwrap_or_else(|error| panic!("write current task: {error}"));
+    state
+        .put_state(
+            "controller.attempt",
+            "attempt.rev1",
+            r#"{"marker":"rev1-attempt"}"#,
+        )
+        .unwrap_or_else(|error| panic!("write historical attempt: {error}"));
+    state
+        .put_state(
+            "controller.attempt",
+            &format!("{plan_id}@r2:attempt.rev2"),
+            r#"{"marker":"rev2-attempt"}"#,
+        )
+        .unwrap_or_else(|error| panic!("write current attempt: {error}"));
+    state
+        .put_state(
+            "controller.verification",
+            "verification.rev1",
+            &json!({
+                "plan_id": plan_id,
+                "plan_revision": 1,
+                "plan_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "marker": "rev1-verification"
+            })
+            .to_string(),
+        )
+        .unwrap_or_else(|error| panic!("write historical verification: {error}"));
+    state
+        .put_state(
+            "controller.verification",
+            &format!("{plan_id}@r2:verification.rev2"),
+            &json!({
+                "plan_id": plan_id,
+                "plan_revision": 2,
+                "plan_digest": current_digest,
+                "marker": "rev2-verification"
+            })
+            .to_string(),
+        )
+        .unwrap_or_else(|error| panic!("write current verification: {error}"));
+    state
+        .put_state(
+            "controller.evidence_item",
+            "evidence.rev1",
+            r#"{"marker":"rev1-evidence"}"#,
+        )
+        .unwrap_or_else(|error| panic!("write historical evidence: {error}"));
+    state
+        .put_state(
+            "controller.evidence_item",
+            &format!("{plan_id}@r2:evidence.rev2"),
+            r#"{"marker":"rev2-evidence"}"#,
+        )
+        .unwrap_or_else(|error| panic!("write current evidence: {error}"));
+
+    let view = Controller::new(state)
+        .durable_status()
+        .unwrap_or_else(|error| panic!("revision-scoped status: {error}"));
+
+    assert_eq!(view.tasks, vec![json!({"marker": "rev2-task"})]);
+    assert_eq!(view.attempts, vec![json!({"marker": "rev2-attempt"})]);
+    assert_eq!(view.evidence.len(), 2);
+    assert!(
+        view.evidence
+            .iter()
+            .all(|value| !value.to_string().contains("rev1"))
+    );
 }
 
 #[test]

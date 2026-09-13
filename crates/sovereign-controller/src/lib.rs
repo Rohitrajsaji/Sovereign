@@ -16,7 +16,10 @@ use sovereign_model::{
     MODEL_SCHEMA_VERSION, ModelBackend, ModelError, ModelFinishReason, ModelMessage,
     ModelMessageRole, ModelOutputContract, ModelRequest,
 };
-use sovereign_plan::PlanCompilationResult;
+use sovereign_plan::{
+    PlanCompilationResult, PlanReplanInput, PlanRevisionDiff, ReplanScope,
+    smallest_replan_scope_tasks,
+};
 use sovereign_policy::{
     CommandMode, CommandPolicy, CommandRisk, HeavyLeaseClass, HostPressureSnapshot,
     IsolationRequest, M1ResourceGovernor, ModelCallBudget, PolicyError, ResourceGovernor,
@@ -48,6 +51,7 @@ const M1_MODEL_OUTPUT_TOKENS: u32 = 512;
 const MAX_LITERAL_BYTES: usize = 4_096;
 const EVIDENCE_SATISFACTION_SCHEMA_VERSION: u32 = 1;
 const VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION: u32 = 1;
+const TASK_CARRY_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
 pub const CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const RECOVERY_PROCESS_LEASE_SCHEMA_VERSION: u32 = 1;
 pub const EXECUTION_CONTROL_SCHEMA_VERSION: u32 = 1;
@@ -217,6 +221,12 @@ pub struct ControllerStatusView {
     pub evidence: Vec<Value>,
     pub goal_intents: Vec<GoalIntentV1>,
     pub approval_requests: Vec<Value>,
+}
+
+struct DurableStatusActiveProjection {
+    tasks: Vec<Value>,
+    attempts: Vec<Value>,
+    evidence: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -426,6 +436,105 @@ pub struct FailureRecordV1 {
     pub decision: String,
 }
 
+/// One Controller-verified observation that falsifies a stable Plan IR contract.
+/// Evidence references must be revalidated against current repository truth before
+/// this input is passed to [`FailureClassifier::classify_verified`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StableContractInvalidation {
+    pub contract_id: String,
+    pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub observed_fingerprints: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClassificationKind {
+    ExecutionFailure,
+    PlanFailure,
+}
+
+/// Deterministic result of classifying already-verified invalidation evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailureClassification {
+    pub kind: FailureClassificationKind,
+    pub scope: Option<ReplanScope>,
+    pub affected_task_ids: Vec<String>,
+    pub affected_contract_ids: Vec<String>,
+    pub evidence_refs: Vec<String>,
+}
+
+/// Public deterministic failure classifier. Retry exhaustion never participates
+/// in this decision; only stable Plan IR contract invalidation does.
+pub struct FailureClassifier;
+
+impl FailureClassifier {
+    /// Classifies evidence after the Controller has verified every referenced item
+    /// against current repository truth. Empty invalidation is execution failure.
+    ///
+    /// # Errors
+    /// Returns a fail-closed Controller error when a cited stable contract does not
+    /// resolve, its fingerprint is not actually falsified, or the failing task lies
+    /// outside the deterministic invalidation scope.
+    pub fn classify_verified(
+        plan: &Value,
+        failing_task_id: &str,
+        invalidations: &[StableContractInvalidation],
+    ) -> Result<FailureClassification, ControllerError> {
+        if invalidations.is_empty() {
+            return Ok(FailureClassification {
+                kind: FailureClassificationKind::ExecutionFailure,
+                scope: None,
+                affected_task_ids: Vec::new(),
+                affected_contract_ids: Vec::new(),
+                evidence_refs: Vec::new(),
+            });
+        }
+        let mut scope = ReplanScope::Task;
+        let mut affected = BTreeSet::new();
+        let mut contract_ids = BTreeSet::new();
+        let mut evidence_refs = BTreeSet::new();
+        for invalidation in invalidations {
+            if invalidation.evidence_refs.is_empty() {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "stable contract {} lacks invalidation evidence",
+                    invalidation.contract_id
+                )));
+            }
+            let resolved = resolve_stable_plan_contract(plan, &invalidation.contract_id)?;
+            if !resolved.fingerprints.is_empty()
+                && (invalidation.observed_fingerprints.is_empty()
+                    || resolved.fingerprints == invalidation.observed_fingerprints)
+            {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "stable assumption {} was not falsified by changed fingerprints",
+                    invalidation.contract_id
+                )));
+            }
+            scope = scope.max(resolved.scope);
+            affected.extend(
+                smallest_replan_scope_tasks(plan, &resolved.owner_task_id, resolved.scope)
+                    .map_err(ControllerError::InvalidPlan)?,
+            );
+            contract_ids.insert(invalidation.contract_id.clone());
+            evidence_refs.extend(invalidation.evidence_refs.iter().cloned());
+        }
+        if !affected.contains(failing_task_id) {
+            return Err(ControllerError::InvalidPlan(format!(
+                "failing task {failing_task_id} is outside the invalidated dependency scope"
+            )));
+        }
+        Ok(FailureClassification {
+            kind: FailureClassificationKind::PlanFailure,
+            scope: Some(scope),
+            affected_task_ids: affected.into_iter().collect(),
+            affected_contract_ids: contract_ids.into_iter().collect(),
+            evidence_refs: evidence_refs.into_iter().collect(),
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 struct FailureRecordInput {
     task_id: String,
@@ -585,6 +694,27 @@ struct VerifiedOutputBindingV1 {
     verification_id: String,
     verification_artifact_digest: String,
     repository_snapshot_digest: String,
+    #[serde(default)]
+    carried_from_plan_revision: Option<u32>,
+    #[serde(default)]
+    carried_from_plan_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TaskCarryFingerprintV1 {
+    schema_version: u32,
+    plan_id: String,
+    plan_revision: u32,
+    plan_digest: String,
+    task_id: String,
+    task_contract_digest: String,
+    implementation_inputs_digest: String,
+    dependency_contract_digest: String,
+    instruction_fingerprint_digest: String,
+    source_fingerprints: BTreeMap<String, String>,
+    acceptance_contract_digest: String,
+    verification_id: String,
+    verification_artifact_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -813,25 +943,23 @@ impl Controller {
                 .map(|record| Ok(serde_json::from_str(&record.value_json)?))
                 .collect()
         };
-        let mut evidence = decode_values("controller.verification")?;
-        evidence.extend(decode_values("controller.evidence_satisfaction")?);
-        evidence.extend(decode_values("controller.evidence_item")?);
+        let active_plan = self
+            .state
+            .get_state("controller.plan", "active")?
+            .map(|raw| serde_json::from_str::<Value>(&raw))
+            .transpose()?;
+        let projection = self.durable_status_active_projection(active_plan.as_ref())?;
         let goal_intents = self
             .state
             .state_records("controller.goal_intent")?
             .into_iter()
             .map(|record| Ok(serde_json::from_str(&record.value_json)?))
             .collect::<Result<Vec<GoalIntentV1>, ControllerError>>()?;
-        let active_plan = self
-            .state
-            .get_state("controller.plan", "active")?
-            .map(|raw| serde_json::from_str(&raw))
-            .transpose()?;
         Ok(ControllerStatusView {
             execution_control: self.execution_control()?,
             active_plan,
-            tasks: decode_values("controller.task")?,
-            attempts: decode_values("controller.attempt")?,
+            tasks: projection.tasks,
+            attempts: projection.attempts,
             actions: self
                 .state
                 .action_records()?
@@ -847,9 +975,110 @@ impl Controller {
                     updated_at_ms: record.updated_at_ms,
                 })
                 .collect(),
-            evidence,
+            evidence: projection.evidence,
             goal_intents,
             approval_requests: decode_values("controller.approval_request")?,
+        })
+    }
+
+    fn durable_status_active_projection(
+        &self,
+        active_plan: Option<&Value>,
+    ) -> Result<DurableStatusActiveProjection, ControllerError> {
+        let durable_scope = if let Some(durable) = active_plan {
+            Some((
+                required_str(durable, "/plan_id")?.to_owned(),
+                required_u32(durable, "/revision")?,
+                required_str(durable, "/plan_digest")?.to_owned(),
+            ))
+        } else {
+            None
+        };
+        let active_scope = if let Some(active) = self.active.as_ref() {
+            match durable_scope.as_ref() {
+                Some((plan_id, revision, plan_digest))
+                    if plan_id != &active.plan_id
+                        || *revision != active.revision
+                        || plan_digest != &active.plan_digest =>
+                {
+                    return Err(ControllerError::InvalidPlan(
+                        "durable active-plan pointer differs from Controller runtime".to_owned(),
+                    ));
+                }
+                _ => {}
+            }
+            Some((
+                active.plan_id.clone(),
+                active.revision,
+                active.plan_digest.clone(),
+            ))
+        } else {
+            durable_scope
+        };
+        let Some((plan_id, revision, plan_digest)) = active_scope else {
+            return Ok(DurableStatusActiveProjection {
+                tasks: Vec::new(),
+                attempts: Vec::new(),
+                evidence: Vec::new(),
+            });
+        };
+
+        let tasks = if let Some(active) = self.active.as_ref() {
+            active
+                .tasks
+                .values()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            self.state
+                .state_records("controller.task")?
+                .into_iter()
+                .filter(|record| key_belongs_to_revision(&record.key, &plan_id, revision))
+                .map(|record| Ok(serde_json::from_str(&record.value_json)?))
+                .collect::<Result<Vec<_>, ControllerError>>()?
+        };
+        let attempts = if let Some(active) = self.active.as_ref() {
+            active
+                .attempts
+                .values()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            self.state
+                .state_records("controller.attempt")?
+                .into_iter()
+                .filter(|record| key_belongs_to_revision(&record.key, &plan_id, revision))
+                .map(|record| Ok(serde_json::from_str(&record.value_json)?))
+                .collect::<Result<Vec<_>, ControllerError>>()?
+        };
+        let mut evidence = self
+            .state
+            .state_records("controller.verification")?
+            .into_iter()
+            .filter_map(|record| {
+                let value: Value = serde_json::from_str(&record.value_json).ok()?;
+                (value.get("plan_id").and_then(Value::as_str) == Some(plan_id.as_str())
+                    && value.get("plan_revision").and_then(Value::as_u64)
+                        == Some(u64::from(revision))
+                    && value.get("plan_digest").and_then(Value::as_str)
+                        == Some(plan_digest.as_str()))
+                .then_some(Ok(value))
+            })
+            .collect::<Result<Vec<_>, ControllerError>>()?;
+        for namespace in [
+            "controller.evidence_satisfaction",
+            "controller.evidence_item",
+        ] {
+            for record in self.state.state_records(namespace)? {
+                if key_belongs_to_revision(&record.key, &plan_id, revision) {
+                    evidence.push(serde_json::from_str(&record.value_json)?);
+                }
+            }
+        }
+        Ok(DurableStatusActiveProjection {
+            tasks,
+            attempts,
+            evidence,
         })
     }
 
@@ -870,6 +1099,7 @@ impl Controller {
         &self,
         task_id: &str,
     ) -> Result<Option<(FailureRecordV1, String)>, ControllerError> {
+        let active = self.active_ref()?;
         for event in self.state.journal()?.into_iter().rev() {
             if event.entity_type != "controller" || event.event_kind != "failure_recorded" {
                 continue;
@@ -895,22 +1125,405 @@ impl Controller {
                 ));
             }
             let record: FailureRecordV1 = serde_json::from_str(&raw)?;
+            let expected_record_key = revision_scoped_key(
+                &record.plan_id,
+                record.plan_revision,
+                &format!("{}:{}", record.task_id, record.attempt_id),
+            );
             if record.schema_version != FAILURE_RECORD_SCHEMA_VERSION
                 || record.task_id != task_id
-                || format!("{}:{}", record.task_id, record.attempt_id) != record_key
+                || expected_record_key != record_key
             {
                 return Err(ControllerError::InvalidPlan(
                     "durable FailureRecord binding is malformed".to_owned(),
                 ));
+            }
+            if record.plan_id != active.plan_id
+                || record.plan_revision != active.revision
+                || record.plan_digest != active.plan_digest
+            {
+                continue;
             }
             return Ok(Some((record, actual_digest)));
         }
         Ok(None)
     }
 
+    fn durable_plan_failure_classification(
+        &self,
+    ) -> Result<FailureClassification, ControllerError> {
+        let active = self.active_ref()?;
+        for event in self.state.journal()?.into_iter().rev() {
+            if event.entity_type != "controller" || event.event_kind != "failure_recorded" {
+                continue;
+            }
+            let payload: Value = serde_json::from_str(&event.payload_json)?;
+            if payload.get("category").and_then(Value::as_str) != Some("plan_failure") {
+                continue;
+            }
+            let record_key = required_str(&payload, "/record_key")?;
+            let expected_digest = required_str(&payload, "/failure_record_digest")?;
+            let raw = self
+                .state
+                .get_state("controller.failure_record", record_key)?
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "plan-failure journal points to missing durable record".to_owned(),
+                    )
+                })?;
+            if sha256_prefixed(raw.as_bytes()) != expected_digest {
+                return Err(ControllerError::InvalidPlan(
+                    "durable plan-failure record differs from journal binding".to_owned(),
+                ));
+            }
+            let record: FailureRecordV1 = serde_json::from_str(&raw)?;
+            if record.plan_id != active.plan_id
+                || record.plan_revision != active.revision
+                || record.plan_digest != active.plan_digest
+                || record.category != "plan_failure"
+                || record.decision != "replan_smallest_scope"
+                || record.affected_contract_ids.is_empty()
+                || record.evidence_refs.is_empty()
+            {
+                continue;
+            }
+            let mut scope = ReplanScope::Task;
+            let mut affected = BTreeSet::new();
+            for contract_id in &record.affected_contract_ids {
+                let resolved = resolve_stable_plan_contract(&active.plan_document, contract_id)?;
+                scope = scope.max(resolved.scope);
+                affected.extend(
+                    smallest_replan_scope_tasks(
+                        &active.plan_document,
+                        &resolved.owner_task_id,
+                        resolved.scope,
+                    )
+                    .map_err(ControllerError::InvalidPlan)?,
+                );
+            }
+            if !affected.contains(&record.task_id) {
+                return Err(ControllerError::InvalidPlan(
+                    "durable plan-failure task is outside its recomputed invalidation scope"
+                        .to_owned(),
+                ));
+            }
+            let mut affected_contract_ids = record.affected_contract_ids.clone();
+            affected_contract_ids.sort();
+            affected_contract_ids.dedup();
+            let mut evidence_refs = record.evidence_refs.clone();
+            evidence_refs.sort();
+            evidence_refs.dedup();
+            return Ok(FailureClassification {
+                kind: FailureClassificationKind::PlanFailure,
+                scope: Some(scope),
+                affected_task_ids: affected.into_iter().collect(),
+                affected_contract_ids,
+                evidence_refs,
+            });
+        }
+        Err(ControllerError::NotReady(
+            "active invalidated revision lacks durable plan-failure authority".to_owned(),
+        ))
+    }
+
     #[must_use]
     pub fn plan_validity(&self) -> Option<PlanValidity> {
         self.active.as_ref().map(|active| active.validity)
+    }
+
+    /// Verifies explicit current repository evidence against stable Plan IR contracts,
+    /// records a genuine plan failure, and invalidates revision N without consuming an
+    /// execution-repair retry. Retry exhaustion is deliberately absent from this API.
+    ///
+    /// # Errors
+    /// Returns a fail-closed Controller error when the baseline/evidence is stale,
+    /// the contract cannot be deterministically falsified, or the attempt/runtime
+    /// bindings do not match the active revision.
+    #[allow(clippy::too_many_lines)]
+    pub fn record_plan_failure(
+        &mut self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+        attempt_id: &str,
+        context: &ContextPacket,
+        invalidations: &[StableContractInvalidation],
+    ) -> Result<FailureClassification, ControllerError> {
+        self.require_current_baseline(registry)?;
+        let (repository_id, plan_document, plan_id, plan_revision, plan_digest) = {
+            let active = self.active_ref()?;
+            if active.validity != PlanValidity::Current {
+                return Err(ControllerError::NotReady(
+                    "plan failure classification requires the current active revision".to_owned(),
+                ));
+            }
+            (
+                active.repository_id.clone(),
+                active.plan_document.clone(),
+                active.plan_id.clone(),
+                active.revision,
+                active.plan_digest.clone(),
+            )
+        };
+        let mut verified_invalidations = Vec::with_capacity(invalidations.len());
+        let mut evidence_records = Vec::new();
+        for invalidation in invalidations {
+            let resolved_contract =
+                resolve_stable_plan_contract(&plan_document, &invalidation.contract_id)?;
+            let mut observed = BTreeSet::new();
+            let mut verified_items = Vec::new();
+            for evidence_id in &invalidation.evidence_refs {
+                let item = context
+                    .items
+                    .iter()
+                    .find(|item| item.evidence_id == *evidence_id)
+                    .ok_or_else(|| {
+                        ControllerError::NotReady(format!(
+                            "plan invalidation evidence {evidence_id} is absent from bounded current context"
+                        ))
+                    })?;
+                Self::validate_exact_context_evidence(registry, &repository_id, item)?;
+                observed.insert(item.source_digest.clone());
+                verified_items.push(item);
+                let logical_key = format!(
+                    "plan-failure:{}:{}",
+                    invalidation.contract_id,
+                    digest_fragment(&item.content_digest, 20)
+                );
+                let key = revision_scoped_key(&plan_id, plan_revision, &logical_key);
+                evidence_records.push((
+                    "controller.evidence_item".to_owned(),
+                    key,
+                    serde_json::to_string(item)?,
+                ));
+            }
+            if !invalidation.observed_fingerprints.is_empty()
+                && invalidation
+                    .observed_fingerprints
+                    .iter()
+                    .any(|fingerprint| !observed.contains(fingerprint))
+            {
+                return Err(ControllerError::NotReady(format!(
+                    "plan invalidation {} cites an unverified observed fingerprint",
+                    invalidation.contract_id
+                )));
+            }
+            match &resolved_contract.kind {
+                ResolvedStableContractKind::Assumption => {
+                    let contract_specific = verified_items.iter().any(|item| {
+                        resolved_contract.basis_locators.iter().any(|locator| {
+                            item.locator.as_deref() == Some(locator.as_str())
+                                || item.source_uri == *locator
+                        }) && !resolved_contract.fingerprints.contains(&item.source_digest)
+                    });
+                    if !contract_specific {
+                        return Err(ControllerError::NotReady(format!(
+                            "evidence does not deterministically falsify assumption {} at its recorded basis locator",
+                            invalidation.contract_id
+                        )));
+                    }
+                }
+                ResolvedStableContractKind::DependencyBinding { downstream_task_id } => {
+                    if !self.dependency_binding_is_stably_invalidated(
+                        &resolved_contract.owner_task_id,
+                        downstream_task_id,
+                    )? {
+                        return Err(ControllerError::NotReady(format!(
+                            "dependency binding {} has no deterministic contract mismatch",
+                            invalidation.contract_id
+                        )));
+                    }
+                }
+                ResolvedStableContractKind::Precondition
+                | ResolvedStableContractKind::Invariant => {
+                    return Err(ControllerError::NotReady(format!(
+                        "stable contract {} lacks a machine-revalidatable falsification rule",
+                        invalidation.contract_id
+                    )));
+                }
+            }
+            verified_invalidations.push(StableContractInvalidation {
+                contract_id: invalidation.contract_id.clone(),
+                evidence_refs: invalidation.evidence_refs.clone(),
+                observed_fingerprints: observed.into_iter().collect(),
+            });
+        }
+        let classification =
+            FailureClassifier::classify_verified(&plan_document, task_id, &verified_invalidations)?;
+        if classification.kind != FailureClassificationKind::PlanFailure {
+            return Err(ControllerError::InvalidPlan(
+                "execution failure cannot enter the plan-revision path".to_owned(),
+            ));
+        }
+
+        let (task_contract_digest, attempt_json, task_json, failure) = {
+            let active = self.active_mut()?;
+            let attempt = active.attempts.get_mut(attempt_id).ok_or_else(|| {
+                ControllerError::NotReady(format!("unknown attempt {attempt_id}"))
+            })?;
+            if attempt.task_id != task_id
+                || !legal_attempt_transition(attempt.state, AttemptState::Failed)
+            {
+                return Err(ControllerError::NotReady(
+                    "plan failure must bind the current executing/verifying attempt".to_owned(),
+                ));
+            }
+            attempt.state = AttemptState::Failed;
+            let task = active
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+            if !matches!(task.state, TaskState::Running | TaskState::Verifying) {
+                return Err(ControllerError::NotReady(
+                    "plan failure task is not running/verifying".to_owned(),
+                ));
+            }
+            task.state = TaskState::RepairPending;
+            task.resource_deferred_from = None;
+            active.validity = PlanValidity::Invalidated;
+            let task_contract_digest = task.task_contract_digest.clone();
+            let diagnostic = format!(
+                "verified stable Plan IR contracts invalidated: {}",
+                classification.affected_contract_ids.join(",")
+            );
+            let signature = normalized_failure_signature(
+                "plan_failure",
+                "stable_contract_invalidated",
+                &diagnostic,
+                &BTreeMap::new(),
+            );
+            let failure = FailureRecordV1 {
+                schema_version: FAILURE_RECORD_SCHEMA_VERSION,
+                plan_id: plan_id.clone(),
+                plan_revision,
+                plan_digest: plan_digest.clone(),
+                task_id: task_id.to_owned(),
+                task_contract_digest: task_contract_digest.clone(),
+                attempt_id: attempt_id.to_owned(),
+                action_id: None,
+                result_digest: None,
+                exit_code: None,
+                failure_code: "stable_contract_invalidated".to_owned(),
+                signature,
+                category: "plan_failure".to_owned(),
+                synopsis: diagnostic,
+                failed_action_facts: BTreeMap::new(),
+                evidence_refs: classification.evidence_refs.clone(),
+                affected_contract_ids: classification.affected_contract_ids.clone(),
+                confidence_milli: 1_000,
+                decision: "replan_smallest_scope".to_owned(),
+            };
+            (
+                task_contract_digest,
+                serde_json::to_string(attempt)?,
+                serde_json::to_string(task)?,
+                failure,
+            )
+        };
+        let epoch = self.state.advance_execution_epoch()?;
+        let failure_json = serde_json::to_string(&failure)?;
+        let failure_digest = sha256_prefixed(failure_json.as_bytes());
+        let failure_key =
+            revision_scoped_key(&plan_id, plan_revision, &format!("{task_id}:{attempt_id}"));
+        let (plan_json, snapshot_digest_value, baseline_diff_digest) = {
+            let active = self.active_ref()?;
+            (
+                serde_json::to_string(&json!({
+                    "plan_id": active.plan_id,
+                    "goal_id": active.goal_id,
+                    "revision": active.revision,
+                    "plan_digest": active.plan_digest,
+                    "compilation_evidence_digest": active.compilation_evidence_digest,
+                    "validity": active.validity,
+                }))?,
+                snapshot_digest(&active.baseline)?,
+                active.baseline_diff_digest.clone(),
+            )
+        };
+        let mut records = vec![
+            (
+                "controller.attempt".to_owned(),
+                attempt_id.to_owned(),
+                attempt_json,
+            ),
+            ("controller.task".to_owned(), task_id.to_owned(), task_json),
+            (
+                "controller.failure_record".to_owned(),
+                failure_key.clone(),
+                failure_json,
+            ),
+            ("controller.plan".to_owned(), "active".to_owned(), plan_json),
+        ];
+        records.extend(evidence_records);
+        self.persist_runtime_records_with_events(
+            &records,
+            &[
+                (
+                    "attempt_failed".to_owned(),
+                    attempt_id.to_owned(),
+                    json!({"state": AttemptState::Failed}),
+                ),
+                (
+                    "failure_recorded".to_owned(),
+                    attempt_id.to_owned(),
+                    json!({
+                        "task_id": task_id,
+                        "category": "plan_failure",
+                        "decision": "replan_smallest_scope",
+                        "record_key": failure_key,
+                        "failure_record_digest": failure_digest,
+                        "affected_contract_ids": classification.affected_contract_ids,
+                        "evidence_refs": classification.evidence_refs,
+                    }),
+                ),
+                (
+                    "plan_failure_invalidated".to_owned(),
+                    repository_id,
+                    json!({
+                        "task_id": task_id,
+                        "task_contract_digest": task_contract_digest,
+                        "execution_epoch": epoch,
+                        "repository_snapshot_digest": snapshot_digest_value,
+                        "baseline_diff_digest": baseline_diff_digest,
+                        "plan_validity": PlanValidity::Invalidated,
+                    }),
+                ),
+            ],
+        )?;
+        self.checkpoint_now()?;
+        Ok(classification)
+    }
+
+    /// Returns the exact trusted N -> N+1 compiler input derived from the current
+    /// invalidated revision and a Controller classification.
+    /// Builds the exact trusted N -> N+1 compiler input for a durable plan failure.
+    ///
+    /// # Errors
+    /// Returns a fail-closed Controller error unless the active revision is invalidated
+    /// and the classification exactly matches durable Controller plan-failure authority.
+    pub fn replan_input(
+        &self,
+        classification: &FailureClassification,
+    ) -> Result<PlanReplanInput, ControllerError> {
+        if classification.kind != FailureClassificationKind::PlanFailure {
+            return Err(ControllerError::InvalidPlan(
+                "execution failure has no replan input".to_owned(),
+            ));
+        }
+        let active = self.active_ref()?;
+        if active.validity != PlanValidity::Invalidated {
+            return Err(ControllerError::NotReady(
+                "active revision is not invalidated".to_owned(),
+            ));
+        }
+        Ok(PlanReplanInput {
+            previous_plan: active.plan_document.clone(),
+            previous_plan_digest: active.plan_digest.clone(),
+            scope: classification.scope.ok_or_else(|| {
+                ControllerError::InvalidPlan("plan failure classification lacks scope".to_owned())
+            })?,
+            invalidated_contract_ids: classification.affected_contract_ids.clone(),
+            affected_task_ids: classification.affected_task_ids.clone(),
+        })
     }
 
     #[must_use]
@@ -937,6 +1550,7 @@ impl Controller {
     /// # Errors
     /// Returns a fail-closed readiness/evidence error when the requirement, evidence,
     /// count semantics, or freshness binding is invalid.
+    #[allow(clippy::too_many_lines)]
     pub fn record_exact_evidence_satisfaction(
         &mut self,
         registry: &ProjectRegistry,
@@ -1001,7 +1615,11 @@ impl Controller {
         let evidence_record_keys = selected
             .iter()
             .map(|item| {
-                let key = evidence_item_key(task_id, requirement_id, &item.evidence_id);
+                let key = revision_scoped_key(
+                    &plan_id,
+                    plan_revision,
+                    &evidence_item_key(task_id, requirement_id, &item.evidence_id),
+                );
                 self.state.put_state(
                     "controller.evidence_item",
                     &key,
@@ -1012,7 +1630,7 @@ impl Controller {
             .collect::<Result<Vec<_>, ControllerError>>()?;
         let record = EvidenceSatisfactionV1 {
             schema_version: EVIDENCE_SATISFACTION_SCHEMA_VERSION,
-            plan_id,
+            plan_id: plan_id.clone(),
             plan_revision,
             plan_digest,
             task_id: task_id.to_owned(),
@@ -1031,7 +1649,11 @@ impl Controller {
         let record_digest = digest_json(&record_json)?;
         self.state.put_state(
             "controller.evidence_satisfaction",
-            &evidence_satisfaction_key(task_id, requirement_id),
+            &revision_scoped_key(
+                &plan_id,
+                plan_revision,
+                &evidence_satisfaction_key(task_id, requirement_id),
+            ),
             &serde_json::to_string(&record)?,
         )?;
         self.append_controller_event(
@@ -1148,6 +1770,7 @@ impl Controller {
         let plan_digest = compilation.plan_digest().to_owned();
         let compiler_plan_digest = plan_digest.clone();
         let compilation_evidence_digest = compilation.compilation_evidence_digest().to_owned();
+        let compilation_evidence_json = serde_json::to_string(compilation.compilation_evidence())?;
         let epoch = self.state.advance_execution_epoch()?;
         let task_ids = tasks.keys().cloned().collect::<Vec<_>>();
         self.active = Some(ActivePlan {
@@ -1169,6 +1792,12 @@ impl Controller {
             attempts: BTreeMap::new(),
         });
         self.persist_all_runtime()?;
+        let revision_key = revision_record_key(&plan_id, revision);
+        self.state.put_state(
+            "controller.compilation_evidence",
+            &revision_key,
+            &compilation_evidence_json,
+        )?;
         self.append_controller_event("plan_activated", &plan_id, &json!({"epoch": epoch}))?;
         self.checkpoint_now()?;
         Ok(ActivationSummary {
@@ -1178,6 +1807,400 @@ impl Controller {
             execution_epoch: epoch,
             task_ids,
         })
+    }
+
+    /// Atomically supersedes invalidated revision N with validated immutable N+1.
+    /// Historical runtime/evidence rows remain untouched under their revision keys.
+    ///
+    /// # Errors
+    /// Returns a fail-closed Controller error when compiler authority, direct lineage,
+    /// scope/budget/carry proofs, repository baseline, or durable failure authority do
+    /// not match the active invalidated revision.
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    pub fn activate_superseding_revision(
+        &mut self,
+        compilation: PlanCompilationResult,
+        classification: &FailureClassification,
+        registry: &ProjectRegistry,
+    ) -> Result<(ActivationSummary, PlanRevisionDiff), ControllerError> {
+        if classification.kind != FailureClassificationKind::PlanFailure {
+            return Err(ControllerError::InvalidPlan(
+                "only a verified plan failure may supersede the active revision".to_owned(),
+            ));
+        }
+        let durable_classification = self.durable_plan_failure_classification()?;
+        if durable_classification != *classification {
+            return Err(ControllerError::InvalidPlan(
+                "superseding classification does not match durable Controller plan-failure authority"
+                    .to_owned(),
+            ));
+        }
+        if self.any_unknown_action()? || has_unresolved_process_lease(&self.state)? {
+            return Err(ControllerError::NotReady(
+                "unknown action or active process lease must be reconciled before replanning"
+                    .to_owned(),
+            ));
+        }
+        if compilation.plan().canonical_digest()? != compilation.plan_digest()
+            || !compilation.compilation_evidence().validator_passed()
+            || compilation.compilation_evidence().plan_digest() != compilation.plan_digest()
+        {
+            return Err(ControllerError::InvalidPlan(
+                "superseding compiler result lacks exact validator/digest authority".to_owned(),
+            ));
+        }
+        let next_plan = compilation.plan().as_value().clone();
+        let next_plan_digest = compilation.plan_digest().to_owned();
+        let next_compilation_evidence_digest = compilation.compilation_evidence_digest().to_owned();
+        let next_compilation_evidence = serde_json::to_value(compilation.compilation_evidence())?;
+        let scope = classification.scope.ok_or_else(|| {
+            ControllerError::InvalidPlan("plan failure classification lacks scope".to_owned())
+        })?;
+
+        let (
+            previous_plan,
+            previous_plan_id,
+            previous_revision,
+            previous_plan_digest,
+            goal_id,
+            repository_id,
+            repository_root,
+            previous_tasks,
+        ) = {
+            let active = self.active_ref()?;
+            if active.validity != PlanValidity::Invalidated {
+                return Err(ControllerError::NotReady(
+                    "superseding activation requires invalidated active revision N".to_owned(),
+                ));
+            }
+            (
+                active.plan_document.clone(),
+                active.plan_id.clone(),
+                active.revision,
+                active.plan_digest.clone(),
+                active.goal_id.clone(),
+                active.repository_id.clone(),
+                active.repository_root.clone(),
+                active.tasks.clone(),
+            )
+        };
+        if required_str(&next_plan, "/plan_id")? != previous_plan_id
+            || required_u32(&next_plan, "/revision")? != previous_revision.saturating_add(1)
+            || next_plan.get("supersedes_revision").and_then(Value::as_u64)
+                != Some(u64::from(previous_revision))
+        {
+            return Err(ControllerError::InvalidPlan(
+                "superseding plan must be immutable N+1 directly over active N".to_owned(),
+            ));
+        }
+        let repositories = required_array(&next_plan, "/repositories")?;
+        if repositories.len() != 1
+            || required_str(&repositories[0], "/repository_id")? != repository_id
+        {
+            return Err(ControllerError::InvalidPlan(
+                "cross-repository execution remains fail-closed until M8".to_owned(),
+            ));
+        }
+        let registered = registry.repository(&repository_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!("repository {repository_id} is not registered"))
+        })?;
+        if registered.root != repository_root {
+            return Err(ControllerError::InvalidPlan(
+                "registered repository root changed across plan revision".to_owned(),
+            ));
+        }
+        let current_snapshot = registry.snapshot(&repository_id)?;
+        if current_snapshot.head.as_deref() != optional_str(&repositories[0], "/baseline/head")
+            || current_snapshot.branch.as_deref()
+                != optional_str(&repositories[0], "/baseline/branch")
+            || current_snapshot.dirty_digest
+                != required_str(&repositories[0], "/baseline/dirty_digest")?
+        {
+            return Err(ControllerError::NotReady(
+                "superseding compiler repository baseline is stale".to_owned(),
+            ));
+        }
+        let current_diff = ExactRetriever::new(registry).current_diff(&repository_id)?;
+        let current_snapshot_digest = snapshot_digest(&current_snapshot)?;
+        let diff = PlanRevisionDiff::between(
+            &previous_plan,
+            &next_plan,
+            scope,
+            &classification.affected_contract_ids,
+            &classification.affected_task_ids,
+        )
+        .map_err(ControllerError::InvalidPlan)?;
+
+        let max_replans = next_plan
+            .pointer("/policy/retry/max_replans_per_scope")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan("missing max_replans_per_scope".to_owned())
+            })?;
+        let lineage_id = scope_lineage_id(&self.state, self.active_ref()?, classification)?;
+        let scope_counter_key = lineage_id.clone();
+        let used_replans = self
+            .state
+            .get_state("controller.replan_scope_counter", &scope_counter_key)?
+            .map(|raw| serde_json::from_str::<Value>(&raw))
+            .transpose()?
+            .and_then(|value| value.get("count").and_then(Value::as_u64))
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(0);
+        if used_replans >= max_replans {
+            return Err(ControllerError::NotReady(format!(
+                "replan scope budget exhausted: used={used_replans}, limit={max_replans}"
+            )));
+        }
+
+        let previous_active = ActivePlan {
+            plan_document: previous_plan.clone(),
+            compiler_plan_digest: previous_plan_digest.clone(),
+            plan_id: previous_plan_id.clone(),
+            goal_id: goal_id.clone(),
+            revision: previous_revision,
+            plan_digest: previous_plan_digest.clone(),
+            compilation_evidence_digest: self.active_ref()?.compilation_evidence_digest.clone(),
+            policy_digest: self.active_ref()?.policy_digest.clone(),
+            repository_id: repository_id.clone(),
+            repository_root: repository_root.clone(),
+            baseline: self.active_ref()?.baseline.clone(),
+            baseline_diff_digest: self.active_ref()?.baseline_diff_digest.clone(),
+            baseline_diff_content: self.active_ref()?.baseline_diff_content.clone(),
+            validity: PlanValidity::Invalidated,
+            tasks: previous_tasks,
+            attempts: self.active_ref()?.attempts.clone(),
+        };
+        let runtime_build = build_superseding_runtime(
+            &self.state,
+            registry,
+            &previous_active,
+            &next_plan,
+            &next_plan_digest,
+            &next_compilation_evidence,
+            &diff,
+            &current_snapshot_digest,
+        )?;
+        let policy_digest = digest_json(
+            next_plan
+                .get("policy")
+                .ok_or_else(|| ControllerError::InvalidPlan("plan policy missing".to_owned()))?,
+        )?;
+        let next_revision = diff.to_revision;
+        let next_active = ActivePlan {
+            plan_document: next_plan.clone(),
+            compiler_plan_digest: next_plan_digest.clone(),
+            plan_id: previous_plan_id.clone(),
+            goal_id,
+            revision: next_revision,
+            plan_digest: next_plan_digest.clone(),
+            compilation_evidence_digest: next_compilation_evidence_digest.clone(),
+            policy_digest,
+            repository_id: repository_id.clone(),
+            repository_root,
+            baseline: current_snapshot.clone(),
+            baseline_diff_digest: current_diff.digest.clone(),
+            baseline_diff_content: current_diff.content.clone(),
+            validity: PlanValidity::Current,
+            tasks: runtime_build.tasks,
+            attempts: BTreeMap::new(),
+        };
+
+        let revision_key = revision_record_key(&previous_plan_id, next_revision);
+        if self
+            .state
+            .get_state("controller.plan_revision", &revision_key)?
+            .is_some()
+            || self
+                .state
+                .get_state("controller.plan_revision_diff", &revision_key)?
+                .is_some()
+        {
+            return Err(ControllerError::InvalidPlan(
+                "superseding revision history key already exists".to_owned(),
+            ));
+        }
+        let epoch = self.state.advance_execution_epoch()?;
+        let diff_json = serde_json::to_string(&diff)?;
+        let diff_digest = sha256_prefixed(diff_json.as_bytes());
+        let carry_record_digests = runtime_build
+            .carry_records
+            .iter()
+            .map(|(namespace, key, value_json)| {
+                (
+                    format!("{namespace}:{key}"),
+                    sha256_prefixed(value_json.as_bytes()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let carry_proof_digest = digest_json(&serde_json::to_value(&carry_record_digests)?)?;
+        let task_runtime_values = next_active
+            .tasks
+            .iter()
+            .map(|(task_id, runtime)| Ok((task_id.clone(), serde_json::to_value(runtime)?)))
+            .collect::<Result<BTreeMap<_, _>, serde_json::Error>>()?;
+        let task_runtime_map_digest = digest_json(&serde_json::to_value(&task_runtime_values)?)?;
+        let attempt_runtime_map_digest = digest_json(&json!({}))?;
+        let plan_record_json = serde_json::to_string(&json!({
+            "plan_id": next_active.plan_id,
+            "goal_id": next_active.goal_id,
+            "revision": next_active.revision,
+            "plan_digest": next_active.plan_digest,
+            "compilation_evidence_digest": next_active.compilation_evidence_digest,
+            "validity": next_active.validity,
+        }))?;
+        let baseline_json = serde_json::to_string(&PersistedRepositoryBaseline {
+            snapshot: current_snapshot,
+            diff_digest: current_diff.digest.clone(),
+            diff_content: current_diff.content,
+        })?;
+        let revision_record_json = serde_json::to_string(&json!({
+            "plan_id": previous_plan_id,
+            "revision": next_revision,
+            "plan_digest": next_plan_digest,
+            "compilation_evidence_digest": next_compilation_evidence_digest,
+            "previous_plan_digest": previous_plan_digest,
+            "plan_document": next_plan,
+        }))?;
+        let scope_counter_json = serde_json::to_string(&json!({
+            "plan_id": diff.plan_id,
+            "lineage_id": lineage_id,
+            "scope": diff.scope,
+            "affected_task_ids": diff.affected_task_ids,
+            "count": used_replans.saturating_add(1),
+        }))?;
+        let mut records = vec![
+            (
+                "controller.plan".to_owned(),
+                "active".to_owned(),
+                plan_record_json,
+            ),
+            (
+                "controller.plan_document".to_owned(),
+                "active".to_owned(),
+                serde_json::to_string(&next_active.plan_document)?,
+            ),
+            (
+                "controller.repository_baseline".to_owned(),
+                "active".to_owned(),
+                baseline_json,
+            ),
+            (
+                "controller.plan_revision".to_owned(),
+                revision_key.clone(),
+                revision_record_json,
+            ),
+            (
+                "controller.plan_revision_diff".to_owned(),
+                revision_key.clone(),
+                diff_json,
+            ),
+            (
+                "controller.compilation_evidence".to_owned(),
+                revision_key.clone(),
+                serde_json::to_string(&next_compilation_evidence)?,
+            ),
+            (
+                "controller.plan_revision_lifecycle".to_owned(),
+                revision_record_key(&previous_plan_id, previous_revision),
+                serde_json::to_string(&json!({
+                    "plan_id": previous_plan_id,
+                    "revision": previous_revision,
+                    "plan_digest": previous_plan_digest,
+                    "status": "superseded",
+                    "superseded_by_revision": next_revision,
+                    "superseded_by_digest": next_plan_digest,
+                }))?,
+            ),
+            (
+                "controller.plan_revision_lifecycle".to_owned(),
+                revision_key.clone(),
+                serde_json::to_string(&json!({
+                    "plan_id": previous_plan_id,
+                    "revision": next_revision,
+                    "plan_digest": next_plan_digest,
+                    "status": "active",
+                    "superseded_by_revision": Value::Null,
+                    "superseded_by_digest": Value::Null,
+                }))?,
+            ),
+            (
+                "controller.replan_scope_counter".to_owned(),
+                scope_counter_key,
+                scope_counter_json,
+            ),
+        ];
+        for (task_id, runtime) in &next_active.tasks {
+            records.push((
+                "controller.task".to_owned(),
+                revision_scoped_key(&previous_plan_id, next_revision, task_id),
+                serde_json::to_string(runtime)?,
+            ));
+        }
+        records.extend(lineage_records_for_supersession(
+            &self.state,
+            &previous_active,
+            &diff,
+            &lineage_id,
+        )?);
+        records.extend(runtime_build.carry_records);
+        let activation_payload = json!({
+            "from_revision": previous_revision,
+            "to_revision": next_revision,
+            "from_plan_digest": previous_active.plan_digest,
+            "to_plan_digest": next_active.plan_digest,
+            "plan_revision_diff_digest": diff_digest,
+            "carry_proof_digest": carry_proof_digest,
+            "task_runtime_map_digest": task_runtime_map_digest,
+            "attempt_runtime_map_digest": attempt_runtime_map_digest,
+            "execution_epoch": epoch,
+            "repository_snapshot_digest": current_snapshot_digest,
+            "baseline_diff_digest": next_active.baseline_diff_digest,
+            "plan_validity": PlanValidity::Current,
+        });
+        let activation_json = serde_json::to_string(&activation_payload)?;
+        let event_seed = sha256_prefixed(
+            format!(
+                "plan_revision_activated\0{}\0{}\0{}",
+                previous_plan_id,
+                self.state.latest_journal_sequence()?,
+                activation_json
+            )
+            .as_bytes(),
+        );
+        let updates = records
+            .iter()
+            .map(|(namespace, key, value_json)| StateRecordUpdate {
+                namespace,
+                key,
+                value_json,
+            })
+            .collect::<Vec<_>>();
+        self.state.put_state_records_with_events(
+            &updates,
+            &[NewJournalEvent {
+                event_id: &format!("controller.{}", &event_seed[7..27]),
+                entity_type: "controller",
+                entity_id: &previous_plan_id,
+                event_kind: "plan_revision_activated",
+                payload_json: &activation_json,
+            }],
+        )?;
+        recovery_test_hook("after_plan_revision_activation_commit");
+        self.active = Some(next_active);
+        self.checkpoint_now()?;
+        let task_ids = self.active_ref()?.tasks.keys().cloned().collect::<Vec<_>>();
+        Ok((
+            ActivationSummary {
+                plan_id: previous_plan_id,
+                plan_digest: next_plan_digest,
+                revision: next_revision,
+                execution_epoch: epoch,
+                task_ids,
+            },
+            diff,
+        ))
     }
 
     /// Derives one ephemeral readiness lease from current authoritative guards.
@@ -1660,7 +2683,10 @@ impl Controller {
                 "repair packet changed immutable plan/task/acceptance/failure bindings".to_owned(),
             ));
         }
-        let packet_key = format!("{}:{}", task_id, attempts_started.saturating_add(1));
+        let packet_key = active_scoped_key(
+            self.active_ref()?,
+            &format!("{}:{}", task_id, attempts_started.saturating_add(1)),
+        );
         let packet_json = serde_json::to_string(&repair_packet)?;
         let repair_packet_digest = sha256_prefixed(packet_json.as_bytes());
         self.persist_runtime_records_with_events(
@@ -2006,7 +3032,11 @@ impl Controller {
             .add_artifact_reference(&verification_evidence_id, &artifact.digest)?;
         self.state.put_state(
             "controller.verification",
-            &verification.verification_id,
+            &revision_scoped_key(
+                &verification.plan_id,
+                verification.plan_revision,
+                &verification.verification_id,
+            ),
             &serde_json::to_string(&verification)?,
         )?;
         self.append_controller_event(
@@ -2240,7 +3270,7 @@ impl Controller {
                 .state
                 .get_state(
                     "controller.evidence_satisfaction",
-                    &evidence_satisfaction_key(task_id, requirement_id),
+                    &active_scoped_key(active, &evidence_satisfaction_key(task_id, requirement_id)),
                 )?
                 .ok_or_else(|| {
                     ControllerError::NotReady(format!(
@@ -2368,6 +3398,60 @@ impl Controller {
         Ok(dependency_records)
     }
 
+    fn dependency_binding_is_stably_invalidated(
+        &self,
+        upstream_task_id: &str,
+        downstream_task_id: &str,
+    ) -> Result<bool, ControllerError> {
+        let active = self.active_ref()?;
+        let downstream = active.tasks.get(downstream_task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "dependency invalidation downstream task {downstream_task_id} is missing"
+            ))
+        })?;
+        let upstream = active.tasks.get(upstream_task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "dependency invalidation upstream task {upstream_task_id} is missing"
+            ))
+        })?;
+        let binding = required_array(&downstream.task, "/dependency_bindings")?
+            .iter()
+            .find(|binding| optional_str(binding, "/upstream_task_id") == Some(upstream_task_id))
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "dependency binding {downstream_task_id}->{upstream_task_id} is absent"
+                ))
+            })?;
+        for (namespace, pointer) in [
+            ("controller.artifact_binding", "/required_artifact_ids"),
+            (
+                "controller.acceptance_binding",
+                "/required_acceptance_criterion_ids",
+            ),
+        ] {
+            for binding_id in required_array(binding, pointer)? {
+                let binding_id = binding_id.as_str().ok_or_else(|| {
+                    ControllerError::InvalidPlan("dependency output id must be string".to_owned())
+                })?;
+                let key =
+                    active_scoped_key(active, &output_binding_key(upstream_task_id, binding_id));
+                let Some(raw) = self.state.get_state(namespace, &key)? else {
+                    return Ok(false);
+                };
+                let record: VerifiedOutputBindingV1 = serde_json::from_str(&raw)?;
+                if record.task_contract_digest != upstream.task_contract_digest
+                    || record.plan_id != active.plan_id
+                    || record.plan_revision != active.revision
+                    || record.plan_digest != active.plan_digest
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn validated_output_binding_digest(
         &self,
         namespace: &str,
@@ -2388,7 +3472,10 @@ impl Controller {
         };
         let raw = self
             .state
-            .get_state(namespace, &output_binding_key(upstream_task_id, binding_id))?
+            .get_state(
+                namespace,
+                &active_scoped_key(active, &output_binding_key(upstream_task_id, binding_id)),
+            )?
             .ok_or_else(|| {
                 ControllerError::NotReady(format!(
                     "missing verified dependency output binding {binding_id}"
@@ -2418,9 +3505,23 @@ impl Controller {
                 "verified dependency output binding {binding_id} lost its evidence artifact"
             )));
         }
+        let verification_revision = record
+            .carried_from_plan_revision
+            .unwrap_or(record.plan_revision);
+        let verification_plan_digest = record
+            .carried_from_plan_digest
+            .as_deref()
+            .unwrap_or(record.plan_digest.as_str());
         let verification_raw = self
             .state
-            .get_state("controller.verification", &record.verification_id)?
+            .get_state(
+                "controller.verification",
+                &revision_scoped_key(
+                    &record.plan_id,
+                    verification_revision,
+                    &record.verification_id,
+                ),
+            )?
             .ok_or_else(|| {
                 ControllerError::NotReady(format!(
                     "verified dependency output binding {binding_id} lost its verification record"
@@ -2428,12 +3529,43 @@ impl Controller {
             })?;
         let verification: VerificationResultV1 = serde_json::from_str(&verification_raw)?;
         if !verification.passed
+            || verification.plan_id != record.plan_id
+            || verification.plan_revision != verification_revision
+            || verification.plan_digest != verification_plan_digest
             || verification.task_id != upstream_task_id
             || verification.task_contract_digest != upstream_task_contract_digest
-            || verification.post_snapshot_digest != current_snapshot_digest
         {
             return Err(ControllerError::NotReady(format!(
                 "verified dependency output binding {binding_id} has invalid acceptance evidence"
+            )));
+        }
+        if record.carried_from_plan_revision.is_some() {
+            let carry_key = active_scoped_key(active, upstream_task_id);
+            let carry_raw = self
+                .state
+                .get_state("controller.task_carry_fingerprint", &carry_key)?
+                .ok_or_else(|| {
+                    ControllerError::NotReady(format!(
+                        "carried dependency output binding {binding_id} lost its carry proof"
+                    ))
+                })?;
+            let carry: TaskCarryFingerprintV1 = serde_json::from_str(&carry_raw)?;
+            if carry.schema_version != TASK_CARRY_FINGERPRINT_SCHEMA_VERSION
+                || carry.plan_id != active.plan_id
+                || carry.plan_revision != active.revision
+                || carry.plan_digest != active.plan_digest
+                || carry.task_id != upstream_task_id
+                || carry.task_contract_digest != upstream_task_contract_digest
+                || carry.verification_id != record.verification_id
+                || carry.verification_artifact_digest != record.verification_artifact_digest
+            {
+                return Err(ControllerError::NotReady(format!(
+                    "carried dependency output binding {binding_id} has invalid carry provenance"
+                )));
+            }
+        } else if verification.post_snapshot_digest != current_snapshot_digest {
+            return Err(ControllerError::NotReady(format!(
+                "verified dependency output binding {binding_id} is stale for the current snapshot"
             )));
         }
         Ok(digest_json(&serde_json::to_value(record)?)?)
@@ -3054,7 +4186,11 @@ impl Controller {
             .add_artifact_reference(&verification_evidence_id, &artifact.digest)?;
         self.state.put_state(
             "controller.verification",
-            &verification.verification_id,
+            &revision_scoped_key(
+                &verification.plan_id,
+                verification.plan_revision,
+                &verification.verification_id,
+            ),
             &serde_json::to_string(&verification)?,
         )?;
         self.append_controller_event(
@@ -3386,7 +4522,11 @@ impl Controller {
                 "FailureRecord v1 is malformed before routing".to_owned(),
             ));
         }
-        let record_key = format!("{}:{}", failure.task_id, failure.attempt_id);
+        let record_key = revision_scoped_key(
+            &failure.plan_id,
+            failure.plan_revision,
+            &format!("{}:{}", failure.task_id, failure.attempt_id),
+        );
         {
             let active = self.active_ref()?;
             let task = active.tasks.get(&failure.task_id).ok_or_else(|| {
@@ -3647,7 +4787,74 @@ impl Controller {
                 verification_artifact_digest,
             )?;
         }
+        self.persist_task_carry_fingerprint(
+            verification,
+            verification_artifact_digest,
+            &task_contract_digest,
+        )?;
         self.checkpoint_now()?;
+        Ok(())
+    }
+
+    fn persist_task_carry_fingerprint(
+        &mut self,
+        verification: &VerificationResultV1,
+        verification_artifact_digest: &str,
+        task_contract_digest: &str,
+    ) -> Result<(), ControllerError> {
+        let active = self.active_ref()?;
+        let task = active.tasks.get(&verification.task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan("carry fingerprint task disappeared".to_owned())
+        })?;
+        let mut source_fingerprints = BTreeMap::new();
+        for path in required_array(&task.task, "/scope/files")? {
+            let path = path.as_str().ok_or_else(|| {
+                ControllerError::InvalidPlan("task scope file must be a string".to_owned())
+            })?;
+            source_fingerprints.insert(
+                path.to_owned(),
+                path_fingerprint(&active.repository_root, Path::new(path))?,
+            );
+        }
+        let implementation_inputs_digest = digest_json(
+            task.task
+                .pointer("/implementation_contract/inputs")
+                .ok_or_else(|| ControllerError::InvalidPlan("task inputs missing".to_owned()))?,
+        )?;
+        let dependency_contract_digest =
+            digest_json(task.task.get("dependency_bindings").ok_or_else(|| {
+                ControllerError::InvalidPlan("task bindings missing".to_owned())
+            })?)?;
+        let instruction_fingerprint_digest = digest_json(
+            active
+                .plan_document
+                .pointer("/repositories/0/instructions")
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan("repository instructions missing".to_owned())
+                })?,
+        )?;
+        let (_, acceptance_contract_digest) = compiled_acceptance_contract(&task.task)?;
+        let record = TaskCarryFingerprintV1 {
+            schema_version: TASK_CARRY_FINGERPRINT_SCHEMA_VERSION,
+            plan_id: active.plan_id.clone(),
+            plan_revision: active.revision,
+            plan_digest: active.plan_digest.clone(),
+            task_id: verification.task_id.clone(),
+            task_contract_digest: task_contract_digest.to_owned(),
+            implementation_inputs_digest,
+            dependency_contract_digest,
+            instruction_fingerprint_digest,
+            source_fingerprints,
+            acceptance_contract_digest,
+            verification_id: verification.verification_id.clone(),
+            verification_artifact_digest: verification_artifact_digest.to_owned(),
+        };
+        let key = active_scoped_key(active, &verification.task_id);
+        self.state.put_state(
+            "controller.task_carry_fingerprint",
+            &key,
+            &serde_json::to_string(&record)?,
+        )?;
         Ok(())
     }
 
@@ -3675,10 +4882,15 @@ impl Controller {
             verification_id: verification.verification_id.clone(),
             verification_artifact_digest: verification_artifact_digest.to_owned(),
             repository_snapshot_digest: verification.post_snapshot_digest.clone(),
+            carried_from_plan_revision: None,
+            carried_from_plan_digest: None,
         };
         self.state.put_state(
             namespace,
-            &output_binding_key(&verification.task_id, binding_id),
+            &active_scoped_key(
+                active,
+                &output_binding_key(&verification.task_id, binding_id),
+            ),
             &serde_json::to_string(&record)?,
         )?;
         self.append_controller_event(
@@ -3915,6 +5127,11 @@ impl Controller {
             "controller.repair_packet",
         ] {
             for record in self.state.state_records(namespace)? {
+                if namespace != "controller.action_intent"
+                    && !key_belongs_to_revision(&record.key, &active.plan_id, active.revision)
+                {
+                    continue;
+                }
                 evidence_binding_digests.insert(
                     format!("{}:{}", record.namespace, record.key),
                     sha256_prefixed(record.value_json.as_bytes()),
@@ -4004,6 +5221,34 @@ impl Controller {
         )?;
         self.state
             .put_state("controller.plan_document", "active", &plan_document_json)?;
+        let revision_record = {
+            let active = self.active_ref()?;
+            serde_json::to_string(&json!({
+                "plan_id": active.plan_id,
+                "revision": active.revision,
+                "plan_digest": active.plan_digest,
+                "compilation_evidence_digest": active.compilation_evidence_digest,
+                "plan_document": active.plan_document,
+            }))?
+        };
+        let revision_key = {
+            let active = self.active_ref()?;
+            revision_record_key(&active.plan_id, active.revision)
+        };
+        self.state
+            .put_state("controller.plan_revision", &revision_key, &revision_record)?;
+        self.state.put_state(
+            "controller.plan_revision_lifecycle",
+            &revision_key,
+            &serde_json::to_string(&json!({
+                "plan_id": self.active_ref()?.plan_id,
+                "revision": self.active_ref()?.revision,
+                "plan_digest": self.active_ref()?.plan_digest,
+                "status": "active",
+                "superseded_by_revision": Value::Null,
+                "superseded_by_digest": Value::Null,
+            }))?,
+        )?;
         self.state
             .put_state("controller.repository_baseline", "active", &baseline_json)?;
         for task_id in task_ids {
@@ -4014,8 +5259,8 @@ impl Controller {
                 serde_json::to_string(self.active_ref()?.attempts.get(&attempt_id).ok_or_else(
                     || ControllerError::InvalidPlan("attempt disappeared".to_owned()),
                 )?)?;
-            self.state
-                .put_state("controller.attempt", &attempt_id, &value)?;
+            let key = active_scoped_key(self.active_ref()?, &attempt_id);
+            self.state.put_state("controller.attempt", &key, &value)?;
         }
         Ok(())
     }
@@ -4029,7 +5274,8 @@ impl Controller {
                 .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?;
             serde_json::to_string(task)?
         };
-        self.state.put_state("controller.task", task_id, &value)?;
+        let key = active_scoped_key(self.active_ref()?, task_id);
+        self.state.put_state("controller.task", &key, &value)?;
         Ok(())
     }
 
@@ -4176,7 +5422,23 @@ impl Controller {
                 format!("controller.{}", &seed[7..27])
             })
             .collect::<Vec<_>>();
-        let updates = records
+        let (plan_id, revision) = {
+            let active = self.active_ref()?;
+            (active.plan_id.clone(), active.revision)
+        };
+        let scoped_records = records
+            .iter()
+            .map(|(namespace, key, value_json)| {
+                let key = if matches!(namespace.as_str(), "controller.task" | "controller.attempt")
+                {
+                    revision_scoped_key(&plan_id, revision, key)
+                } else {
+                    key.clone()
+                };
+                (namespace.clone(), key, value_json.clone())
+            })
+            .collect::<Vec<_>>();
+        let updates = scoped_records
             .iter()
             .map(|(namespace, key, value_json)| StateRecordUpdate {
                 namespace,
@@ -4213,6 +5475,12 @@ impl Controller {
             ControllerError::InvalidPlan("controller event payload must be an object".to_owned())
         })?;
         let active = self.active_ref()?;
+        object.insert("plan_id".to_owned(), Value::String(active.plan_id.clone()));
+        object.insert("plan_revision".to_owned(), json!(active.revision));
+        object.insert(
+            "plan_digest".to_owned(),
+            Value::String(active.plan_digest.clone()),
+        );
         if let Some(task) = active.tasks.get(entity_id) {
             object.insert("task_id".to_owned(), Value::String(entity_id.to_owned()));
             object.insert("task_runtime".to_owned(), serde_json::to_value(task)?);
@@ -4382,11 +5650,22 @@ impl RecoveryManager {
         validate_checkpoint_manifest(&manifest, &trusted_checkpoint)?;
         validate_checkpoint_immutable_bindings(&state, &manifest)?;
         let fallback_checkpoint_used = trusted_checkpoint.generation != physical_latest.generation;
-        let replayed_events = validate_post_checkpoint_runtime_correlation(
+        let supersession = validate_post_checkpoint_supersession(
             &state,
             &manifest,
             trusted_checkpoint.action_sequence,
         )?;
+        let replayed_events = if supersession.is_some() {
+            state
+                .journal_after(trusted_checkpoint.action_sequence)?
+                .len()
+        } else {
+            validate_post_checkpoint_runtime_correlation(
+                &state,
+                &manifest,
+                trusted_checkpoint.action_sequence,
+            )?
+        };
         validate_post_checkpoint_execution_control(
             &state,
             &manifest,
@@ -4400,7 +5679,7 @@ impl RecoveryManager {
                 "durable execution epoch {execution_epoch_before} is below trusted recovery floor {execution_epoch_floor}"
             )));
         }
-        let active = reconstruct_active_plan(&state, registry, &manifest)?;
+        let active = reconstruct_active_plan(&state, registry, &manifest, supersession.as_ref())?;
         let trusted_recovery_intent_digests = manifest
             .evidence_binding_digests
             .iter()
@@ -4489,9 +5768,13 @@ impl RecoveryManager {
                 .tasks
                 .values()
                 .any(|task| task.state == TaskState::ReconcilingUnknown);
+        let (recovered_plan_id, recovered_plan_digest) = {
+            let active = controller.active_ref()?;
+            (active.plan_id.clone(), active.plan_digest.clone())
+        };
         let summary = RecoverySummary {
-            plan_id: manifest.plan_id,
-            plan_digest: manifest.plan_digest,
+            plan_id: recovered_plan_id,
+            plan_digest: recovered_plan_digest,
             checkpoint_generation: trusted_checkpoint.generation,
             checkpoint_action_sequence: trusted_checkpoint.action_sequence,
             replayed_events,
@@ -4607,6 +5890,258 @@ fn validate_checkpoint_immutable_bindings(
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+struct ValidatedSupersession {
+    plan_id: String,
+    revision: u32,
+    plan_digest: String,
+    compilation_evidence_digest: String,
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_post_checkpoint_supersession(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+) -> Result<Option<ValidatedSupersession>, ControllerError> {
+    let raw_active = state
+        .get_state("controller.plan", "active")?
+        .ok_or_else(|| ControllerError::InvalidPlan("active plan state is missing".to_owned()))?;
+    let active: Value = serde_json::from_str(&raw_active)?;
+    let active_plan_id = required_str(&active, "/plan_id")?;
+    let active_revision = required_u32(&active, "/revision")?;
+    let active_plan_digest = required_str(&active, "/plan_digest")?;
+    if active_plan_id == manifest.plan_id
+        && active_revision == manifest.plan_revision
+        && active_plan_digest == manifest.plan_digest
+    {
+        return Ok(None);
+    }
+    if active_plan_id != manifest.plan_id
+        || active_revision != manifest.plan_revision.saturating_add(1)
+    {
+        return Err(ControllerError::InvalidPlan(
+            "superseded plan checkpoint diverges from durable active plan without one adjacent trusted supersession"
+                .to_owned(),
+        ));
+    }
+    let active_validity: PlanValidity = serde_json::from_value(
+        active
+            .get("validity")
+            .cloned()
+            .ok_or_else(|| ControllerError::InvalidPlan("active validity missing".to_owned()))?,
+    )?;
+    if active_validity != PlanValidity::Current {
+        return Err(ControllerError::InvalidPlan(
+            "post-checkpoint superseding revision is not current".to_owned(),
+        ));
+    }
+    let activation_events = state
+        .journal_after(checkpoint_sequence)?
+        .into_iter()
+        .filter(|event| {
+            event.entity_type == "controller"
+                && event.entity_id == manifest.plan_id
+                && event.event_kind == "plan_revision_activated"
+        })
+        .collect::<Vec<_>>();
+    if activation_events.len() != 1 {
+        return Err(ControllerError::InvalidPlan(format!(
+            "post-checkpoint supersession requires exactly one activation event, found {}",
+            activation_events.len()
+        )));
+    }
+    let payload: Value = serde_json::from_str(&activation_events[0].payload_json)?;
+    if required_u32(&payload, "/from_revision")? != manifest.plan_revision
+        || required_u32(&payload, "/to_revision")? != active_revision
+        || required_str(&payload, "/from_plan_digest")? != manifest.plan_digest
+        || required_str(&payload, "/to_plan_digest")? != active_plan_digest
+    {
+        return Err(ControllerError::InvalidPlan(
+            "activation event does not bind exact checkpoint N to active N+1".to_owned(),
+        ));
+    }
+    let event_epoch = payload
+        .get("execution_epoch")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| ControllerError::InvalidPlan("activation event epoch missing".to_owned()))?;
+    if state.current_execution_epoch()? != event_epoch {
+        return Err(ControllerError::InvalidPlan(
+            "post-activation execution epoch changed before N+1 checkpoint".to_owned(),
+        ));
+    }
+
+    let raw_document = state
+        .get_state("controller.plan_document", "active")?
+        .ok_or_else(|| ControllerError::InvalidPlan("active plan document missing".to_owned()))?;
+    let active_document: Value = serde_json::from_str(&raw_document)?;
+    if digest_json(&active_document)? != active_plan_digest {
+        return Err(ControllerError::InvalidPlan(
+            "active N+1 plan document digest mismatch".to_owned(),
+        ));
+    }
+    let revision_key = revision_record_key(active_plan_id, active_revision);
+    let revision_raw = state
+        .get_state("controller.plan_revision", &revision_key)?
+        .ok_or_else(|| ControllerError::InvalidPlan("N+1 revision record missing".to_owned()))?;
+    let revision_record: Value = serde_json::from_str(&revision_raw)?;
+    if required_str(&revision_record, "/plan_id")? != active_plan_id
+        || required_u32(&revision_record, "/revision")? != active_revision
+        || required_str(&revision_record, "/plan_digest")? != active_plan_digest
+        || required_str(&revision_record, "/previous_plan_digest")? != manifest.plan_digest
+        || revision_record.get("plan_document") != Some(&active_document)
+    {
+        return Err(ControllerError::InvalidPlan(
+            "N+1 immutable revision record is misbound".to_owned(),
+        ));
+    }
+    let compilation_evidence_digest =
+        required_str(&revision_record, "/compilation_evidence_digest")?.to_owned();
+    if active
+        .get("compilation_evidence_digest")
+        .and_then(Value::as_str)
+        != Some(compilation_evidence_digest.as_str())
+    {
+        return Err(ControllerError::InvalidPlan(
+            "active N+1 compiler evidence digest differs from revision record".to_owned(),
+        ));
+    }
+    let compilation_raw = state
+        .get_state("controller.compilation_evidence", &revision_key)?
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan("N+1 compilation evidence record missing".to_owned())
+        })?;
+    let compilation_value: Value = serde_json::from_str(&compilation_raw)?;
+    if digest_json(&compilation_value)? != compilation_evidence_digest {
+        return Err(ControllerError::InvalidPlan(
+            "N+1 compilation evidence digest mismatch".to_owned(),
+        ));
+    }
+
+    let diff_raw = state
+        .get_state("controller.plan_revision_diff", &revision_key)?
+        .ok_or_else(|| ControllerError::InvalidPlan("N+1 revision diff missing".to_owned()))?;
+    if sha256_prefixed(diff_raw.as_bytes()) != required_str(&payload, "/plan_revision_diff_digest")?
+    {
+        return Err(ControllerError::InvalidPlan(
+            "N+1 revision diff differs from activation event binding".to_owned(),
+        ));
+    }
+    let diff: PlanRevisionDiff = serde_json::from_str(&diff_raw)?;
+    let recomputed = PlanRevisionDiff::between(
+        &manifest.plan_document,
+        &active_document,
+        diff.scope,
+        &diff.invalidated_contract_ids,
+        &diff.affected_task_ids,
+    )
+    .map_err(ControllerError::InvalidPlan)?;
+    if recomputed != diff {
+        return Err(ControllerError::InvalidPlan(
+            "N+1 revision diff does not match canonical adjacent plans".to_owned(),
+        ));
+    }
+
+    let task_runtime_values = required_array(&active_document, "/tasks")?
+        .iter()
+        .map(|task| {
+            let task_id = required_str(task, "/task_id")?;
+            let key = revision_scoped_key(active_plan_id, active_revision, task_id);
+            let raw = state.get_state("controller.task", &key)?.ok_or_else(|| {
+                ControllerError::InvalidPlan(format!("N+1 runtime {task_id} missing"))
+            })?;
+            let runtime: Value = serde_json::from_str(&raw)?;
+            Ok((task_id.to_owned(), runtime))
+        })
+        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+    if digest_json(&serde_json::to_value(&task_runtime_values)?)?
+        != required_str(&payload, "/task_runtime_map_digest")?
+    {
+        return Err(ControllerError::InvalidPlan(
+            "N+1 task runtime map differs from activation event binding".to_owned(),
+        ));
+    }
+    let attempt_values = state
+        .state_records("controller.attempt")?
+        .into_iter()
+        .filter_map(|record| {
+            logical_key_for_revision(&record.key, active_plan_id, active_revision)
+                .map(|attempt_id| (attempt_id, record.value_json))
+        })
+        .map(|(attempt_id, raw)| Ok((attempt_id, serde_json::from_str::<Value>(&raw)?)))
+        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+    if digest_json(&serde_json::to_value(&attempt_values)?)?
+        != required_str(&payload, "/attempt_runtime_map_digest")?
+    {
+        return Err(ControllerError::InvalidPlan(
+            "N+1 attempt runtime map differs from activation event binding".to_owned(),
+        ));
+    }
+    let mut carry_record_digests = BTreeMap::new();
+    for namespace in [
+        "controller.task_carry_fingerprint",
+        "controller.artifact_binding",
+        "controller.acceptance_binding",
+    ] {
+        for record in state.state_records(namespace)? {
+            if key_belongs_to_revision(&record.key, active_plan_id, active_revision) {
+                carry_record_digests.insert(
+                    format!("{namespace}:{}", record.key),
+                    sha256_prefixed(record.value_json.as_bytes()),
+                );
+            }
+        }
+    }
+    if digest_json(&serde_json::to_value(&carry_record_digests)?)?
+        != required_str(&payload, "/carry_proof_digest")?
+    {
+        return Err(ControllerError::InvalidPlan(
+            "N+1 carry proof set differs from activation event binding".to_owned(),
+        ));
+    }
+
+    let baseline_raw = state
+        .get_state("controller.repository_baseline", "active")?
+        .ok_or_else(|| ControllerError::InvalidPlan("active N+1 baseline missing".to_owned()))?;
+    let baseline: PersistedRepositoryBaseline = serde_json::from_str(&baseline_raw)?;
+    if snapshot_digest(&baseline.snapshot)?
+        != required_str(&payload, "/repository_snapshot_digest")?
+        || baseline.diff_digest != required_str(&payload, "/baseline_diff_digest")?
+    {
+        return Err(ControllerError::InvalidPlan(
+            "N+1 baseline differs from activation event binding".to_owned(),
+        ));
+    }
+    let previous_lifecycle_raw = state
+        .get_state(
+            "controller.plan_revision_lifecycle",
+            &revision_record_key(active_plan_id, manifest.plan_revision),
+        )?
+        .ok_or_else(|| ControllerError::InvalidPlan("N lifecycle record missing".to_owned()))?;
+    let previous_lifecycle: Value = serde_json::from_str(&previous_lifecycle_raw)?;
+    let active_lifecycle_raw = state
+        .get_state("controller.plan_revision_lifecycle", &revision_key)?
+        .ok_or_else(|| ControllerError::InvalidPlan("N+1 lifecycle record missing".to_owned()))?;
+    let active_lifecycle: Value = serde_json::from_str(&active_lifecycle_raw)?;
+    if previous_lifecycle.get("status").and_then(Value::as_str) != Some("superseded")
+        || previous_lifecycle
+            .get("superseded_by_revision")
+            .and_then(Value::as_u64)
+            != Some(u64::from(active_revision))
+        || active_lifecycle.get("status").and_then(Value::as_str) != Some("active")
+    {
+        return Err(ControllerError::InvalidPlan(
+            "plan revision lifecycle does not show exactly N superseded by active N+1".to_owned(),
+        ));
+    }
+    Ok(Some(ValidatedSupersession {
+        plan_id: active_plan_id.to_owned(),
+        revision: active_revision,
+        plan_digest: active_plan_digest.to_owned(),
+        compilation_evidence_digest,
+    }))
+}
+
 fn validate_post_checkpoint_runtime_correlation(
     state: &StateStore,
     manifest: &CheckpointManifest,
@@ -4641,14 +6176,16 @@ fn validate_post_checkpoint_runtime_correlation(
             replayed_attempts.insert(event.entity_id.clone(), runtime.clone());
         }
     }
-    let current_tasks = state
-        .state_records("controller.task")?
-        .into_iter()
-        .map(|record| {
-            Ok((
-                record.key,
-                serde_json::from_str::<Value>(&record.value_json)?,
-            ))
+    let current_tasks = replayed_tasks
+        .keys()
+        .map(|task_id| {
+            let key = revision_scoped_key(&manifest.plan_id, manifest.plan_revision, task_id);
+            let raw = state.get_state("controller.task", &key)?.ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "active revision task runtime {task_id} is missing"
+                ))
+            })?;
+            Ok((task_id.clone(), serde_json::from_str::<Value>(&raw)?))
         })
         .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
     if replayed_tasks != current_tasks {
@@ -4657,14 +6194,18 @@ fn validate_post_checkpoint_runtime_correlation(
         ));
     }
 
-    let current_attempts = state
-        .state_records("controller.attempt")?
-        .into_iter()
-        .map(|record| {
-            Ok((
-                record.key,
-                serde_json::from_str::<Value>(&record.value_json)?,
-            ))
+    let current_attempts = replayed_attempts
+        .keys()
+        .map(|attempt_id| {
+            let key = revision_scoped_key(&manifest.plan_id, manifest.plan_revision, attempt_id);
+            let raw = state
+                .get_state("controller.attempt", &key)?
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!(
+                        "active revision attempt runtime {attempt_id} is missing"
+                    ))
+                })?;
+            Ok((attempt_id.clone(), serde_json::from_str::<Value>(&raw)?))
         })
         .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
     if replayed_attempts != current_attempts {
@@ -4758,7 +6299,9 @@ fn validate_post_checkpoint_baseline_correlation(
                     && event.entity_id == manifest.repository_id
                     && matches!(
                         event.event_kind.as_str(),
-                        "verified_baseline_advanced" | "plan_stale_evidence"
+                        "verified_baseline_advanced"
+                            | "plan_stale_evidence"
+                            | "plan_failure_invalidated"
                     )
             })
             .is_some_and(|event| {
@@ -4842,6 +6385,7 @@ fn reconstruct_active_plan(
     state: &StateStore,
     registry: &ProjectRegistry,
     manifest: &CheckpointManifest,
+    supersession: Option<&ValidatedSupersession>,
 ) -> Result<ActivePlan, ControllerError> {
     let raw_plan = state
         .get_state("controller.plan", "active")?
@@ -4850,14 +6394,28 @@ fn reconstruct_active_plan(
     let active_plan_id = required_str(&plan_record, "/plan_id")?;
     let active_plan_digest = required_str(&plan_record, "/plan_digest")?;
     let active_revision = required_u32(&plan_record, "/revision")?;
-    if active_plan_id != manifest.plan_id
-        || active_plan_digest != manifest.plan_digest
-        || active_revision != manifest.plan_revision
-    {
-        return Err(ControllerError::InvalidPlan(
-            "checkpoint belongs to a superseded plan; explicit N+1 carry-forward proof is required"
-                .to_owned(),
-        ));
+    match supersession {
+        Some(validated) => {
+            if active_plan_id != validated.plan_id
+                || active_plan_digest != validated.plan_digest
+                || active_revision != validated.revision
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "durable active plan differs from validated N+1 supersession".to_owned(),
+                ));
+            }
+        }
+        None => {
+            if active_plan_id != manifest.plan_id
+                || active_plan_digest != manifest.plan_digest
+                || active_revision != manifest.plan_revision
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "checkpoint belongs to a superseded plan without validated N+1 activation"
+                        .to_owned(),
+                ));
+            }
+        }
     }
     let raw_document = state
         .get_state("controller.plan_document", "active")?
@@ -4901,21 +6459,18 @@ fn reconstruct_active_plan(
         .map(|task| Ok((required_str(task, "/task_id")?.to_owned(), task)))
         .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
     let mut tasks = BTreeMap::new();
-    for record in state.state_records("controller.task")? {
-        let runtime: TaskRuntime = serde_json::from_str(&record.value_json)?;
-        let plan_task = plan_task_map.get(&record.key).ok_or_else(|| {
-            ControllerError::InvalidPlan(format!(
-                "durable task {} is absent from active canonical plan",
-                record.key
-            ))
+    for (task_id, plan_task) in &plan_task_map {
+        let key = revision_scoped_key(active_plan_id, active_revision, task_id);
+        let raw = state.get_state("controller.task", &key)?.ok_or_else(|| {
+            ControllerError::InvalidPlan(format!("durable active task {task_id} is missing"))
         })?;
+        let runtime: TaskRuntime = serde_json::from_str(&raw)?;
         if runtime.task_contract_digest != digest_json(plan_task)? || &runtime.task != *plan_task {
             return Err(ControllerError::InvalidPlan(format!(
-                "durable task {} contract is stale or altered",
-                record.key
+                "durable task {task_id} contract is stale or altered"
             )));
         }
-        tasks.insert(record.key, runtime);
+        tasks.insert(task_id.clone(), runtime);
     }
     if tasks.len() != plan_task_map.len() {
         return Err(ControllerError::InvalidPlan(
@@ -4925,9 +6480,19 @@ fn reconstruct_active_plan(
     let attempts = state
         .state_records("controller.attempt")?
         .into_iter()
-        .map(|record| {
-            let attempt: AttemptRuntime = serde_json::from_str(&record.value_json)?;
-            Ok((record.key, attempt))
+        .filter_map(|record| {
+            let logical_key =
+                logical_key_for_revision(&record.key, active_plan_id, active_revision)?;
+            Some((logical_key, record.value_json))
+        })
+        .map(|(attempt_id, raw)| {
+            let attempt: AttemptRuntime = serde_json::from_str(&raw)?;
+            if !tasks.contains_key(&attempt.task_id) {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "active attempt {attempt_id} belongs to a superseded task"
+                )));
+            }
+            Ok((attempt_id, attempt))
         })
         .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
     let validity: PlanValidity =
@@ -4936,7 +6501,11 @@ fn reconstruct_active_plan(
         })?)?;
     let compilation_evidence_digest =
         required_str(&plan_record, "/compilation_evidence_digest")?.to_owned();
-    if compilation_evidence_digest != manifest.compilation_evidence_digest {
+    let expected_compilation_evidence_digest = supersession
+        .map_or(manifest.compilation_evidence_digest.as_str(), |validated| {
+            validated.compilation_evidence_digest.as_str()
+        });
+    if compilation_evidence_digest != expected_compilation_evidence_digest {
         return Err(ControllerError::InvalidPlan(
             "active compiler evidence digest differs from checkpoint plan provenance".to_owned(),
         ));
@@ -4973,17 +6542,13 @@ fn reap_recovery_process_leases(
     let mut unresolved_actions = BTreeSet::new();
     for record in state.state_records("controller.process_lease")? {
         let mut lease: RecoveryProcessLease = serde_json::from_str(&record.value_json)?;
-        if lease.schema_version != RECOVERY_PROCESS_LEASE_SCHEMA_VERSION
-            || !matches!(
-                lease.state.as_str(),
-                "active" | "reaped" | "reaped_recovery"
-            )
+        if process_lease_is_terminal(&lease) {
+            continue;
+        }
+        if lease.schema_version != RECOVERY_PROCESS_LEASE_SCHEMA_VERSION || lease.state != "active"
         {
             unresolved.push(lease.lease_id.clone());
             unresolved_actions.insert(lease.action_id.clone());
-            continue;
-        }
-        if lease.state != "active" {
             continue;
         }
         let reaped = match (lease.process_group_id, lease.leader_identity.as_deref()) {
@@ -5372,6 +6937,7 @@ pub struct DeterministicVerifier;
 
 impl DeterministicVerifier {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     fn verify(
         state: &StateStore,
         active: &ActivePlan,
@@ -5412,8 +6978,14 @@ impl DeterministicVerifier {
         let freshness_ok = required_array(&task.task, "/acceptance_criteria")?
             .iter()
             .all(|criterion| {
-                criterion.get("evidence_freshness").and_then(Value::as_str)
-                    == Some("current_attempt")
+                matches!(
+                    criterion.get("evidence_freshness").and_then(Value::as_str),
+                    Some(
+                        "current_attempt"
+                            | "current_task_revision"
+                            | "carry_forward_if_inputs_unchanged"
+                    )
+                )
             });
         let bindings_ok = active.validity == PlanValidity::Current
             && active.plan_id == lease.plan_id
@@ -6055,6 +7627,697 @@ fn evidence_item_key(task_id: &str, requirement_id: &str, evidence_id: &str) -> 
     )
 }
 
+fn revision_scoped_key(plan_id: &str, revision: u32, logical_key: &str) -> String {
+    if revision == 1 {
+        logical_key.to_owned()
+    } else {
+        format!("{plan_id}@r{revision}:{logical_key}")
+    }
+}
+
+fn revision_scoped_prefix(plan_id: &str, revision: u32) -> Option<String> {
+    (revision > 1).then(|| format!("{plan_id}@r{revision}:"))
+}
+
+fn key_belongs_to_revision(key: &str, plan_id: &str, revision: u32) -> bool {
+    revision_scoped_prefix(plan_id, revision)
+        .map_or_else(|| !key.contains("@r"), |prefix| key.starts_with(&prefix))
+}
+
+fn logical_key_for_revision(key: &str, plan_id: &str, revision: u32) -> Option<String> {
+    if revision == 1 {
+        (!key.contains("@r")).then(|| key.to_owned())
+    } else {
+        key.strip_prefix(&format!("{plan_id}@r{revision}:"))
+            .map(str::to_owned)
+    }
+}
+
+fn active_scoped_key(active: &ActivePlan, logical_key: &str) -> String {
+    revision_scoped_key(&active.plan_id, active.revision, logical_key)
+}
+
+fn revision_record_key(plan_id: &str, revision: u32) -> String {
+    format!("{plan_id}@r{revision}")
+}
+
+fn fresh_task_runtime(task: &Value) -> Result<TaskRuntime, ControllerError> {
+    Ok(TaskRuntime {
+        state: TaskState::Planned,
+        attempts_started: 0,
+        model_calls_used: 0,
+        failure_counts: BTreeMap::new(),
+        retry_exhausted: false,
+        resource_deferrals_used: 0,
+        resource_retry_exhausted: false,
+        resource_deferred_from: None,
+        task_contract_digest: digest_json(task)?,
+        task: task.clone(),
+    })
+}
+
+fn acceptance_permits_cross_revision_carry(task: &Value) -> Result<bool, ControllerError> {
+    Ok(required_array(task, "/acceptance_criteria")?
+        .iter()
+        .filter(|criterion| criterion.get("required").and_then(Value::as_bool) == Some(true))
+        .all(|criterion| {
+            criterion.get("evidence_freshness").and_then(Value::as_str)
+                == Some("carry_forward_if_inputs_unchanged")
+        }))
+}
+
+fn dependency_bindings_permit_cross_revision_carry(task: &Value) -> Result<bool, ControllerError> {
+    Ok(required_array(task, "/dependency_bindings")?
+        .iter()
+        .all(|binding| {
+            binding.get("freshness").and_then(Value::as_str)
+                == Some("carry_forward_if_inputs_unchanged")
+        }))
+}
+
+fn task_inputs_digest(task: &Value) -> Result<String, ControllerError> {
+    Ok(digest_json(
+        task.pointer("/implementation_contract/inputs")
+            .ok_or_else(|| ControllerError::InvalidPlan("task inputs missing".to_owned()))?,
+    )?)
+}
+
+fn task_dependency_contract_digest(task: &Value) -> Result<String, ControllerError> {
+    Ok(digest_json(task.get("dependency_bindings").ok_or_else(
+        || ControllerError::InvalidPlan("task bindings missing".to_owned()),
+    )?)?)
+}
+
+fn plan_instruction_fingerprint_digest(plan: &Value) -> Result<String, ControllerError> {
+    Ok(digest_json(
+        plan.pointer("/repositories/0/instructions")
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan("repository instructions missing".to_owned())
+            })?,
+    )?)
+}
+
+fn scope_lineage_id(
+    state: &StateStore,
+    active: &ActivePlan,
+    classification: &FailureClassification,
+) -> Result<String, ControllerError> {
+    let mut existing = BTreeSet::new();
+    for task_id in &classification.affected_task_ids {
+        let key = active_scoped_key(active, task_id);
+        if let Some(raw) = state.get_state("controller.replan_task_lineage", &key)? {
+            let value: Value = serde_json::from_str(&raw)?;
+            let lineage_id = required_str(&value, "/lineage_id")?;
+            existing.insert(lineage_id.to_owned());
+        }
+    }
+    if existing.len() > 1 {
+        return Err(ControllerError::InvalidPlan(format!(
+            "replan scope has ambiguous inherited lineages: {}",
+            existing.into_iter().collect::<Vec<_>>().join(",")
+        )));
+    }
+    if let Some(lineage_id) = existing.into_iter().next() {
+        return Ok(lineage_id);
+    }
+    let digest = digest_json(&json!({
+        "plan_id": active.plan_id,
+        "scope": classification.scope,
+        "initial_affected_task_ids": classification.affected_task_ids,
+    }))?;
+    Ok(format!("replan-lineage.{}", digest_fragment(&digest, 32)))
+}
+
+fn process_lease_is_terminal(lease: &RecoveryProcessLease) -> bool {
+    lease.schema_version == RECOVERY_PROCESS_LEASE_SCHEMA_VERSION
+        && matches!(lease.state.as_str(), "reaped" | "reaped_recovery")
+}
+
+fn has_unresolved_process_lease(state: &StateStore) -> Result<bool, ControllerError> {
+    for record in state.state_records("controller.process_lease")? {
+        let lease: RecoveryProcessLease = serde_json::from_str(&record.value_json)?;
+        if !process_lease_is_terminal(&lease) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn lineage_records_for_supersession(
+    state: &StateStore,
+    previous: &ActivePlan,
+    diff: &PlanRevisionDiff,
+    lineage_id: &str,
+) -> Result<Vec<(String, String, String)>, ControllerError> {
+    let changed_or_added = diff
+        .changed_task_ids
+        .iter()
+        .chain(&diff.added_task_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let next_revision = diff.to_revision;
+    let mut records = Vec::new();
+    for task_id in diff
+        .unchanged_task_ids
+        .iter()
+        .chain(&diff.changed_task_ids)
+        .chain(&diff.added_task_ids)
+    {
+        let inherited = if changed_or_added.contains(task_id) {
+            Some(lineage_id.to_owned())
+        } else {
+            let old_key = revision_scoped_key(&previous.plan_id, previous.revision, task_id);
+            state
+                .get_state("controller.replan_task_lineage", &old_key)?
+                .map(|raw| -> Result<String, ControllerError> {
+                    let value: Value = serde_json::from_str(&raw)?;
+                    if required_str(&value, "/plan_id")? != previous.plan_id
+                        || required_u32(&value, "/revision")? != previous.revision
+                        || required_str(&value, "/task_id")? != task_id
+                    {
+                        return Err(ControllerError::InvalidPlan(format!(
+                            "replan lineage record for {task_id} is misbound"
+                        )));
+                    }
+                    Ok(required_str(&value, "/lineage_id")?.to_owned())
+                })
+                .transpose()?
+        };
+        if let Some(task_lineage_id) = inherited {
+            records.push((
+                "controller.replan_task_lineage".to_owned(),
+                revision_scoped_key(&previous.plan_id, next_revision, task_id),
+                serde_json::to_string(&json!({
+                    "plan_id": previous.plan_id,
+                    "revision": next_revision,
+                    "task_id": task_id,
+                    "lineage_id": task_lineage_id,
+                }))?,
+            ));
+        }
+    }
+    Ok(records)
+}
+
+struct SupersedingRuntimeBuild {
+    tasks: BTreeMap<String, TaskRuntime>,
+    carry_records: Vec<(String, String, String)>,
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn build_superseding_runtime(
+    state: &StateStore,
+    registry: &ProjectRegistry,
+    previous: &ActivePlan,
+    next_plan: &Value,
+    next_plan_digest: &str,
+    next_compilation_evidence: &Value,
+    diff: &PlanRevisionDiff,
+    current_snapshot_digest: &str,
+) -> Result<SupersedingRuntimeBuild, ControllerError> {
+    let next_revision = diff.to_revision;
+    let next_task_values = required_array(next_plan, "/tasks")?;
+    let next_task_map = next_task_values
+        .iter()
+        .map(|task| Ok((required_str(task, "/task_id")?.to_owned(), task)))
+        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+    let unchanged = diff
+        .unchanged_task_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut tasks = BTreeMap::new();
+    let mut carry_records = Vec::new();
+    let instruction_digest = plan_instruction_fingerprint_digest(next_plan)?;
+    let mut local_carry_candidates = BTreeMap::new();
+
+    for (task_id, task) in &next_task_map {
+        let mut runtime = fresh_task_runtime(task)?;
+        if unchanged.contains(task_id) {
+            let previous_runtime = previous.tasks.get(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "unchanged task {task_id} is missing from previous runtime"
+                ))
+            })?;
+            if previous_runtime.task_contract_digest != runtime.task_contract_digest
+                || previous_runtime.task != **task
+            {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "unchanged task {task_id} contract differs across revisions"
+                )));
+            }
+            runtime.attempts_started = previous_runtime.attempts_started;
+            runtime.model_calls_used = previous_runtime.model_calls_used;
+            runtime.failure_counts = previous_runtime.failure_counts.clone();
+            runtime.retry_exhausted = previous_runtime.retry_exhausted;
+            runtime.resource_deferrals_used = previous_runtime.resource_deferrals_used;
+            runtime.resource_retry_exhausted = previous_runtime.resource_retry_exhausted;
+            runtime.resource_deferred_from = previous_runtime.resource_deferred_from;
+            runtime.state = if previous_runtime.retry_exhausted {
+                TaskState::RepairPending
+            } else if previous_runtime.resource_retry_exhausted {
+                TaskState::DeferredResource
+            } else {
+                TaskState::Planned
+            };
+
+            if previous_runtime.state == TaskState::Succeeded
+                && acceptance_permits_cross_revision_carry(task)?
+                && dependency_bindings_permit_cross_revision_carry(task)?
+                && compilation_inputs_are_fresh_for_carry(
+                    state,
+                    registry,
+                    previous,
+                    task,
+                    next_compilation_evidence,
+                )?
+            {
+                let old_key = revision_scoped_key(&previous.plan_id, previous.revision, task_id);
+                if let Some(raw) = state.get_state("controller.task_carry_fingerprint", &old_key)? {
+                    let proof: TaskCarryFingerprintV1 = serde_json::from_str(&raw)?;
+                    let proof_matches = proof.schema_version
+                        == TASK_CARRY_FINGERPRINT_SCHEMA_VERSION
+                        && proof.plan_id == previous.plan_id
+                        && proof.plan_revision == previous.revision
+                        && proof.plan_digest == previous.plan_digest
+                        && proof.task_id == *task_id
+                        && proof.task_contract_digest == runtime.task_contract_digest
+                        && proof.implementation_inputs_digest == task_inputs_digest(task)?
+                        && proof.dependency_contract_digest
+                            == task_dependency_contract_digest(task)?
+                        && proof.instruction_fingerprint_digest == instruction_digest
+                        && proof.source_fingerprints.iter().all(|(path, fingerprint)| {
+                            path_fingerprint(&previous.repository_root, Path::new(path))
+                                .is_ok_and(|current| current == *fingerprint)
+                        });
+                    let verification_ok = if proof_matches
+                        && state
+                            .artifact_metadata(&proof.verification_artifact_digest)?
+                            .is_some()
+                    {
+                        state
+                            .get_state(
+                                "controller.verification",
+                                &revision_scoped_key(
+                                    &proof.plan_id,
+                                    proof.plan_revision,
+                                    &proof.verification_id,
+                                ),
+                            )?
+                            .is_some_and(|verification_raw| {
+                                serde_json::from_str::<VerificationResultV1>(&verification_raw)
+                                    .is_ok_and(|verification| {
+                                        verification.passed
+                                            && verification.task_id == *task_id
+                                            && verification.task_contract_digest
+                                                == runtime.task_contract_digest
+                                    })
+                            })
+                    } else {
+                        false
+                    };
+                    if verification_ok {
+                        local_carry_candidates.insert(task_id.clone(), proof);
+                    }
+                }
+            }
+        }
+        tasks.insert(task_id.clone(), runtime);
+    }
+
+    // Cross-revision carry must be dependency-closed in N+1, not merely valid
+    // against historical N outputs. Resolve roots first and then transitively
+    // admit dependents only after every hard upstream itself carried into N+1.
+    let mut carried_task_ids = BTreeSet::new();
+    loop {
+        let mut changed = false;
+        for (task_id, proof) in &local_carry_candidates {
+            if carried_task_ids.contains(task_id) {
+                continue;
+            }
+            let task = next_task_map.get(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "carry candidate {task_id} disappeared from superseding plan"
+                ))
+            })?;
+            if !validate_prior_dependency_outputs_for_carry(
+                state,
+                previous,
+                task,
+                &next_task_map,
+                &carried_task_ids,
+            )? {
+                continue;
+            }
+            let runtime = tasks.get_mut(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "carry candidate {task_id} disappeared from superseding runtime"
+                ))
+            })?;
+            runtime.state = TaskState::Succeeded;
+            let mut next_proof = proof.clone();
+            next_proof.plan_revision = next_revision;
+            next_plan_digest.clone_into(&mut next_proof.plan_digest);
+            carry_records.push((
+                "controller.task_carry_fingerprint".to_owned(),
+                revision_scoped_key(&previous.plan_id, next_revision, task_id),
+                serde_json::to_string(&next_proof)?,
+            ));
+            carry_verified_output_records(
+                state,
+                previous,
+                next_revision,
+                next_plan_digest,
+                current_snapshot_digest,
+                task,
+                &next_proof,
+                &mut carry_records,
+            )?;
+            carried_task_ids.insert(task_id.clone());
+            changed = true;
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(SupersedingRuntimeBuild {
+        tasks,
+        carry_records,
+    })
+}
+
+fn validate_prior_dependency_outputs_for_carry(
+    state: &StateStore,
+    previous: &ActivePlan,
+    task: &Value,
+    next_task_map: &BTreeMap<String, &Value>,
+    carried_task_ids: &BTreeSet<String>,
+) -> Result<bool, ControllerError> {
+    for binding in required_array(task, "/dependency_bindings")? {
+        if binding.get("freshness").and_then(Value::as_str)
+            != Some("carry_forward_if_inputs_unchanged")
+        {
+            return Ok(false);
+        }
+        let upstream_id = required_str(binding, "/upstream_task_id")?;
+        let Some(old_upstream) = previous.tasks.get(upstream_id) else {
+            return Ok(false);
+        };
+        let Some(new_upstream) = next_task_map.get(upstream_id) else {
+            return Ok(false);
+        };
+        if !carried_task_ids.contains(upstream_id)
+            || old_upstream.state != TaskState::Succeeded
+            || old_upstream.task_contract_digest != digest_json(new_upstream)?
+        {
+            return Ok(false);
+        }
+        for (namespace, pointer) in [
+            ("controller.artifact_binding", "/required_artifact_ids"),
+            (
+                "controller.acceptance_binding",
+                "/required_acceptance_criterion_ids",
+            ),
+        ] {
+            for binding_id in required_array(binding, pointer)? {
+                let binding_id = binding_id.as_str().ok_or_else(|| {
+                    ControllerError::InvalidPlan("dependency binding id must be string".to_owned())
+                })?;
+                let key = revision_scoped_key(
+                    &previous.plan_id,
+                    previous.revision,
+                    &output_binding_key(upstream_id, binding_id),
+                );
+                let Some(raw) = state.get_state(namespace, &key)? else {
+                    return Ok(false);
+                };
+                let record: VerifiedOutputBindingV1 = serde_json::from_str(&raw)?;
+                if record.plan_id != previous.plan_id
+                    || record.plan_revision != previous.revision
+                    || record.plan_digest != previous.plan_digest
+                    || record.task_contract_digest != old_upstream.task_contract_digest
+                    || state
+                        .artifact_metadata(&record.verification_artifact_digest)?
+                        .is_none()
+                {
+                    return Ok(false);
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn compilation_inputs_are_fresh_for_carry(
+    state: &StateStore,
+    registry: &ProjectRegistry,
+    previous: &ActivePlan,
+    task: &Value,
+    next_compilation_evidence: &Value,
+) -> Result<bool, ControllerError> {
+    let previous_evidence_raw = state
+        .get_state(
+            "controller.compilation_evidence",
+            &revision_record_key(&previous.plan_id, previous.revision),
+        )?
+        .ok_or_else(|| {
+            ControllerError::NotReady(
+                "previous revision lacks durable compilation input fingerprints".to_owned(),
+            )
+        })?;
+    let previous_evidence: Value = serde_json::from_str(&previous_evidence_raw)?;
+    let previous_handles = previous_evidence
+        .get("exact_evidence")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "previous compilation evidence lacks exact_evidence".to_owned(),
+            )
+        })?;
+    let next_handles = next_compilation_evidence
+        .get("exact_evidence")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "next compilation evidence lacks exact_evidence".to_owned(),
+            )
+        })?;
+    for input in required_array(task, "/implementation_contract/inputs")? {
+        let input = input.as_str().ok_or_else(|| {
+            ControllerError::InvalidPlan("task implementation input must be a string".to_owned())
+        })?;
+        let Some((evidence_id, expected_source_digest)) = input.split_once(' ') else {
+            return Ok(false);
+        };
+        let Some(old_handle) = previous_handles.iter().find(|handle| {
+            handle.get("evidence_id").and_then(Value::as_str) == Some(evidence_id)
+                && handle.get("source_digest").and_then(Value::as_str)
+                    == Some(expected_source_digest)
+        }) else {
+            return Ok(false);
+        };
+        let Some(next_handle) = next_handles.iter().find(|handle| {
+            handle.get("evidence_id").and_then(Value::as_str) == Some(evidence_id)
+                && handle.get("source_digest").and_then(Value::as_str)
+                    == Some(expected_source_digest)
+                && handle.get("content_digest") == old_handle.get("content_digest")
+                && handle.get("source_uri") == old_handle.get("source_uri")
+        }) else {
+            return Ok(false);
+        };
+        let source_uri = old_handle
+            .get("source_uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "compilation evidence handle lacks source_uri".to_owned(),
+                )
+            })?;
+        let repo_prefix = format!("repo://{}/", previous.repository_id);
+        if let Some(relative) = source_uri.strip_prefix(&repo_prefix) {
+            let current = ExactRetriever::new(registry).read_path(
+                &previous.repository_id,
+                Path::new(relative),
+                Some(expected_source_digest),
+            );
+            if current.is_err() {
+                return Ok(false);
+            }
+        } else if next_handle != old_handle {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn carry_verified_output_records(
+    state: &StateStore,
+    previous: &ActivePlan,
+    next_revision: u32,
+    next_plan_digest: &str,
+    current_snapshot_digest: &str,
+    task: &Value,
+    proof: &TaskCarryFingerprintV1,
+    records: &mut Vec<(String, String, String)>,
+) -> Result<(), ControllerError> {
+    let task_id = required_str(task, "/task_id")?;
+    for (namespace, items_pointer, id_field) in [
+        (
+            "controller.artifact_binding",
+            "/expected_artifacts",
+            "artifact_id",
+        ),
+        (
+            "controller.acceptance_binding",
+            "/acceptance_criteria",
+            "criterion_id",
+        ),
+    ] {
+        for item in required_array(task, items_pointer)?
+            .iter()
+            .filter(|item| item.get("required").and_then(Value::as_bool) == Some(true))
+        {
+            let binding_id = item.get(id_field).and_then(Value::as_str).ok_or_else(|| {
+                ControllerError::InvalidPlan("carried output id missing".to_owned())
+            })?;
+            let old_key = revision_scoped_key(
+                &previous.plan_id,
+                previous.revision,
+                &output_binding_key(task_id, binding_id),
+            );
+            let raw = state.get_state(namespace, &old_key)?.ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "carried task {task_id} lost verified output {binding_id}"
+                ))
+            })?;
+            let mut binding: VerifiedOutputBindingV1 = serde_json::from_str(&raw)?;
+            if binding.verification_id != proof.verification_id
+                || binding.verification_artifact_digest != proof.verification_artifact_digest
+            {
+                return Err(ControllerError::NotReady(format!(
+                    "carried task {task_id} output {binding_id} does not match carry proof"
+                )));
+            }
+            binding.carried_from_plan_revision = Some(previous.revision);
+            binding.carried_from_plan_digest = Some(previous.plan_digest.clone());
+            binding.plan_revision = next_revision;
+            next_plan_digest.clone_into(&mut binding.plan_digest);
+            current_snapshot_digest.clone_into(&mut binding.repository_snapshot_digest);
+            records.push((
+                namespace.to_owned(),
+                revision_scoped_key(
+                    &previous.plan_id,
+                    next_revision,
+                    &output_binding_key(task_id, binding_id),
+                ),
+                serde_json::to_string(&binding)?,
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct ResolvedStableContract {
+    owner_task_id: String,
+    scope: ReplanScope,
+    fingerprints: Vec<String>,
+    kind: ResolvedStableContractKind,
+    basis_locators: Vec<String>,
+}
+
+enum ResolvedStableContractKind {
+    Assumption,
+    Precondition,
+    Invariant,
+    DependencyBinding { downstream_task_id: String },
+}
+
+fn resolve_stable_plan_contract(
+    plan: &Value,
+    contract_id: &str,
+) -> Result<ResolvedStableContract, ControllerError> {
+    for task in required_array(plan, "/tasks")? {
+        let task_id = required_str(task, "/task_id")?;
+        for assumption in required_array(task, "/implementation_contract/assumptions")? {
+            if optional_str(assumption, "/assumption_id") == Some(contract_id) {
+                let scope: ReplanScope = serde_json::from_value(
+                    assumption
+                        .get("invalidation_scope")
+                        .cloned()
+                        .ok_or_else(|| {
+                            ControllerError::InvalidPlan(
+                                "assumption lacks invalidation_scope".to_owned(),
+                            )
+                        })?,
+                )?;
+                let fingerprints = assumption
+                    .get("fingerprints")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+                let basis_locators = assumption
+                    .get("basis_evidence")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|item| item.get("locator").and_then(Value::as_str))
+                    .map(str::to_owned)
+                    .collect();
+                return Ok(ResolvedStableContract {
+                    owner_task_id: task_id.to_owned(),
+                    scope,
+                    fingerprints,
+                    kind: ResolvedStableContractKind::Assumption,
+                    basis_locators,
+                });
+            }
+        }
+        for clause in required_array(task, "/implementation_contract/preconditions")? {
+            if optional_str(clause, "/clause_id") == Some(contract_id) {
+                return Ok(ResolvedStableContract {
+                    owner_task_id: task_id.to_owned(),
+                    scope: ReplanScope::Task,
+                    fingerprints: Vec::new(),
+                    kind: ResolvedStableContractKind::Precondition,
+                    basis_locators: Vec::new(),
+                });
+            }
+        }
+        for clause in required_array(task, "/implementation_contract/invariants")? {
+            if optional_str(clause, "/clause_id") == Some(contract_id) {
+                return Ok(ResolvedStableContract {
+                    owner_task_id: task_id.to_owned(),
+                    scope: ReplanScope::Plan,
+                    fingerprints: Vec::new(),
+                    kind: ResolvedStableContractKind::Invariant,
+                    basis_locators: Vec::new(),
+                });
+            }
+        }
+        for binding in required_array(task, "/dependency_bindings")? {
+            let upstream = required_str(binding, "/upstream_task_id")?;
+            if contract_id == format!("binding:{task_id}:{upstream}") {
+                return Ok(ResolvedStableContract {
+                    owner_task_id: upstream.to_owned(),
+                    scope: ReplanScope::DependencyBranch,
+                    fingerprints: Vec::new(),
+                    kind: ResolvedStableContractKind::DependencyBinding {
+                        downstream_task_id: task_id.to_owned(),
+                    },
+                    basis_locators: Vec::new(),
+                });
+            }
+        }
+    }
+    Err(ControllerError::InvalidPlan(format!(
+        "stable plan contract {contract_id} does not resolve"
+    )))
+}
+
 fn exact_requirement_probe(query: &str) -> Option<ExactRequirementProbe> {
     if let Some(contract) = query.strip_prefix("exact:path=") {
         let mut clauses = contract.split(';');
@@ -6327,9 +8590,13 @@ fn compiled_acceptance_contract(task: &Value) -> Result<(String, String), Contro
         .filter(|criterion| criterion.get("required").and_then(Value::as_bool) == Some(true))
     {
         let criterion_id = required_str(criterion, "/criterion_id")?;
-        if criterion.get("evidence_freshness").and_then(Value::as_str) != Some("current_attempt") {
+        if !matches!(
+            criterion.get("evidence_freshness").and_then(Value::as_str),
+            Some("current_attempt" | "carry_forward_if_inputs_unchanged")
+        ) {
             return Err(ControllerError::InvalidPlan(
-                "M1 deterministic verifier requires current_attempt acceptance evidence".to_owned(),
+                "deterministic verifier requires current-attempt evidence or guarded carry-forward freshness"
+                    .to_owned(),
             ));
         }
         let evidence_type = required_str(criterion, "/evidence_type")?;
@@ -6553,10 +8820,25 @@ fn unix_millis() -> Result<i64, ControllerError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExactRequirementProbe, exact_requirement_probe, explicit_replace_relation,
-        normalized_failure_signature, repair_allowed,
+        ActivePlan, Controller, ExactRequirementProbe, FailureClassification,
+        FailureClassificationKind, PlanValidity, RecoveryProcessLease, TaskCarryFingerprintV1,
+        TaskRuntime, TaskState, VerificationResultV1, VerifiedOutputBindingV1,
+        acceptance_permits_cross_revision_carry, build_superseding_runtime,
+        compilation_inputs_are_fresh_for_carry, compiled_acceptance_contract,
+        dependency_bindings_permit_cross_revision_carry, digest_json, exact_requirement_probe,
+        explicit_replace_relation, has_unresolved_process_lease, lineage_records_for_supersession,
+        normalized_failure_signature, output_binding_key, plan_instruction_fingerprint_digest,
+        process_lease_is_terminal, repair_allowed, revision_record_key, revision_scoped_key,
+        scope_lineage_id,
     };
+    use serde_json::{Value, json};
+    use sovereign_evidence::ArtifactStore;
+    use sovereign_plan::{PlanRevisionDiff, ReplanScope};
+    use sovereign_repo::{ProjectRegistry, RepositorySnapshot};
+    use sovereign_state::StateStore;
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn same_failure_circuit_breaker_requires_both_counters_below_limits() {
@@ -6623,5 +8905,763 @@ mod tests {
             "Settings",
             "Apply"
         ));
+    }
+
+    #[test]
+    fn carry_forward_rejects_compilation_input_source_drift() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let base = std::env::temp_dir().join(format!(
+            "sovereign-controller-carry-input-drift-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap_or_else(|error| panic!("temp dir: {error}"));
+        let mut state = StateStore::open(base.join("state.sqlite3"))
+            .unwrap_or_else(|error| panic!("state: {error}"));
+        let previous_compilation = json!({
+            "exact_evidence": [{
+                "evidence_id": "ev.input",
+                "source_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "content_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "source_uri": "repo://repo.app/src/lib.rs"
+            }]
+        });
+        state
+            .put_state(
+                "controller.compilation_evidence",
+                &revision_record_key("plan.fixture", 1),
+                &previous_compilation.to_string(),
+            )
+            .unwrap_or_else(|error| panic!("persist compilation evidence: {error}"));
+        let empty_change = json!({
+            "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "paths": []
+        });
+        let baseline: RepositorySnapshot = serde_json::from_value(json!({
+            "repository_id": "repo.app",
+            "root": base,
+            "head": Value::Null,
+            "branch": Value::Null,
+            "staged": empty_change,
+            "unstaged": empty_change,
+            "untracked": empty_change,
+            "dirty_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "protected_changes_present": false
+        }))
+        .unwrap_or_else(|error| panic!("baseline: {error}"));
+        let previous = ActivePlan {
+            plan_document: json!({}),
+            compiler_plan_digest:
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+            plan_id: "plan.fixture".to_owned(),
+            goal_id: "goal.fixture".to_owned(),
+            revision: 1,
+            plan_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                .to_owned(),
+            compilation_evidence_digest:
+                "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
+            policy_digest:
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            repository_id: "repo.app".to_owned(),
+            repository_root: PathBuf::from("/nonexistent-fixture"),
+            baseline,
+            baseline_diff_digest:
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            baseline_diff_content: String::new(),
+            validity: PlanValidity::Current,
+            tasks: BTreeMap::new(),
+            attempts: BTreeMap::new(),
+        };
+        let task = json!({
+            "implementation_contract": {
+                "inputs": ["ev.input sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+            }
+        });
+        let next_compilation = json!({
+            "exact_evidence": [{
+                "evidence_id": "ev.input",
+                "source_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+                "content_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "source_uri": "repo://repo.app/src/lib.rs"
+            }]
+        });
+        let fresh = compilation_inputs_are_fresh_for_carry(
+            &state,
+            &ProjectRegistry::new(),
+            &previous,
+            &task,
+            &next_compilation,
+        )
+        .unwrap_or_else(|error| panic!("carry freshness: {error}"));
+        assert!(
+            !fresh,
+            "changed compilation input source digest must block carry"
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn temp_state(label: &str) -> (PathBuf, StateStore) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let base = std::env::temp_dir().join(format!(
+            "sovereign-controller-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&base).unwrap_or_else(|error| panic!("temp dir: {error}"));
+        let state = StateStore::open(base.join("state.sqlite3"))
+            .unwrap_or_else(|error| panic!("state: {error}"));
+        (base, state)
+    }
+
+    fn empty_snapshot(root: &std::path::Path) -> RepositorySnapshot {
+        let empty_change = json!({
+            "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "paths": []
+        });
+        serde_json::from_value(json!({
+            "repository_id": "repo.app",
+            "root": root,
+            "head": Value::Null,
+            "branch": Value::Null,
+            "staged": empty_change,
+            "unstaged": empty_change,
+            "untracked": empty_change,
+            "dirty_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "protected_changes_present": false
+        }))
+        .unwrap_or_else(|error| panic!("snapshot: {error}"))
+    }
+
+    fn active_fixture(root: &std::path::Path, revision: u32, plan_digest: &str) -> ActivePlan {
+        ActivePlan {
+            plan_document: json!({}),
+            compiler_plan_digest: plan_digest.to_owned(),
+            plan_id: "plan.fixture".to_owned(),
+            goal_id: "goal.fixture".to_owned(),
+            revision,
+            plan_digest: plan_digest.to_owned(),
+            compilation_evidence_digest:
+                "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
+            policy_digest:
+                "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
+            repository_id: "repo.app".to_owned(),
+            repository_root: root.to_path_buf(),
+            baseline: empty_snapshot(root),
+            baseline_diff_digest:
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            baseline_diff_content: String::new(),
+            validity: PlanValidity::Current,
+            tasks: BTreeMap::new(),
+            attempts: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn deterministic_acceptance_allows_guarded_carry_but_not_current_task_revision() {
+        let task = |freshness: &str| {
+            json!({
+                "acceptance_criteria": [{
+                    "criterion_id": "AC.1",
+                    "description": "accepted",
+                    "kind": "diff",
+                    "verification_step_ids": ["verify.1"],
+                    "evidence_type": "diff_result",
+                    "evidence_freshness": freshness,
+                    "required": true
+                }],
+                "verification": {
+                    "steps": [{
+                        "step_id": "verify.1",
+                        "criterion_ids": ["AC.1"],
+                        "kind": "diff",
+                        "evidence_type": "diff_result",
+                        "evaluator": "builtin.diff.scoped_change.v1"
+                    }],
+                    "required_evidence_types": ["diff_result"]
+                }
+            })
+        };
+        assert!(compiled_acceptance_contract(&task("current_attempt")).is_ok());
+        assert!(compiled_acceptance_contract(&task("carry_forward_if_inputs_unchanged")).is_ok());
+        assert!(compiled_acceptance_contract(&task("current_task_revision")).is_err());
+        assert!(
+            !acceptance_permits_cross_revision_carry(&task("current_attempt"))
+                .unwrap_or_else(|error| panic!("freshness: {error}"))
+        );
+    }
+
+    #[test]
+    fn dependency_binding_same_plan_revision_is_never_cross_revision_carry_authority() {
+        let task = |freshness: &str| {
+            json!({
+                "dependency_bindings": [{
+                    "upstream_task_id": "A",
+                    "required_artifact_ids": ["artifact.A"],
+                    "required_acceptance_criterion_ids": ["AC.A"],
+                    "freshness": freshness
+                }]
+            })
+        };
+        assert!(
+            !dependency_bindings_permit_cross_revision_carry(&task("same_plan_revision"))
+                .unwrap_or_else(|error| panic!("binding freshness: {error}"))
+        );
+        assert!(
+            dependency_bindings_permit_cross_revision_carry(&task(
+                "carry_forward_if_inputs_unchanged"
+            ))
+            .unwrap_or_else(|error| panic!("binding freshness: {error}"))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn n_plus_one_dependency_consumes_carried_output_through_explicit_old_revision_provenance() {
+        let (base, mut state) = temp_state("carried-dependency-provenance");
+        let artifact_store = ArtifactStore::open(base.join("cas"))
+            .unwrap_or_else(|error| panic!("artifact store: {error}"));
+        let artifact = artifact_store
+            .put(&mut state, b"verification")
+            .unwrap_or_else(|error| panic!("verification artifact: {error}"));
+        let plan_one_digest = format!("sha256:{}", "1".repeat(64));
+        let plan_two_digest = format!("sha256:{}", "2".repeat(64));
+        let upstream_task = json!({"task_id":"A"});
+        let upstream_digest =
+            digest_json(&upstream_task).unwrap_or_else(|error| panic!("upstream digest: {error}"));
+        let downstream_task = json!({
+            "task_id": "B",
+            "dependency_bindings": [{
+                "upstream_task_id": "A",
+                "required_artifact_ids": ["artifact.A"],
+                "required_acceptance_criterion_ids": ["AC.A"],
+                "freshness": "carry_forward_if_inputs_unchanged"
+            }]
+        });
+        let verification = VerificationResultV1 {
+            schema_version: super::VERIFICATION_RESULT_SCHEMA_VERSION,
+            verification_id: "verification.A".to_owned(),
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            plan_digest: plan_one_digest.clone(),
+            task_id: "A".to_owned(),
+            task_contract_digest: upstream_digest.clone(),
+            attempt_id: "attempt.A.1".to_owned(),
+            execution_epoch: 1,
+            evaluator: "builtin.diff.scoped_change.v1".to_owned(),
+            acceptance_contract_digest: format!("sha256:{}", "3".repeat(64)),
+            diff_digest: format!("sha256:{}", "4".repeat(64)),
+            post_snapshot_digest: "snapshot.N".to_owned(),
+            expected_target_mode: 0o644,
+            observed_target_mode: 0o644,
+            evidence_ids: vec!["ev.N".to_owned()],
+            passed: true,
+            failure_code: None,
+        };
+        state
+            .put_state(
+                "controller.verification",
+                &revision_scoped_key("plan.fixture", 1, "verification.A"),
+                &serde_json::to_string(&verification)
+                    .unwrap_or_else(|error| panic!("verification json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist verification: {error}"));
+        let carry = TaskCarryFingerprintV1 {
+            schema_version: super::TASK_CARRY_FINGERPRINT_SCHEMA_VERSION,
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 2,
+            plan_digest: plan_two_digest.clone(),
+            task_id: "A".to_owned(),
+            task_contract_digest: upstream_digest.clone(),
+            implementation_inputs_digest: format!("sha256:{}", "5".repeat(64)),
+            dependency_contract_digest: format!("sha256:{}", "6".repeat(64)),
+            instruction_fingerprint_digest: format!("sha256:{}", "7".repeat(64)),
+            source_fingerprints: BTreeMap::new(),
+            acceptance_contract_digest: verification.acceptance_contract_digest.clone(),
+            verification_id: verification.verification_id.clone(),
+            verification_artifact_digest: artifact.digest.clone(),
+        };
+        state
+            .put_state(
+                "controller.task_carry_fingerprint",
+                &revision_scoped_key("plan.fixture", 2, "A"),
+                &serde_json::to_string(&carry)
+                    .unwrap_or_else(|error| panic!("carry json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist carry: {error}"));
+        for (namespace, kind, binding_id) in [
+            ("controller.artifact_binding", "artifact", "artifact.A"),
+            ("controller.acceptance_binding", "acceptance", "AC.A"),
+        ] {
+            let binding = VerifiedOutputBindingV1 {
+                schema_version: super::VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION,
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 2,
+                plan_digest: plan_two_digest.clone(),
+                task_id: "A".to_owned(),
+                task_contract_digest: upstream_digest.clone(),
+                attempt_id: "attempt.A.1".to_owned(),
+                binding_kind: kind.to_owned(),
+                binding_id: binding_id.to_owned(),
+                verification_id: verification.verification_id.clone(),
+                verification_artifact_digest: artifact.digest.clone(),
+                repository_snapshot_digest: "snapshot.N+1".to_owned(),
+                carried_from_plan_revision: Some(1),
+                carried_from_plan_digest: Some(plan_one_digest.clone()),
+            };
+            state
+                .put_state(
+                    namespace,
+                    &revision_scoped_key("plan.fixture", 2, &output_binding_key("A", binding_id)),
+                    &serde_json::to_string(&binding)
+                        .unwrap_or_else(|error| panic!("binding json: {error}")),
+                )
+                .unwrap_or_else(|error| panic!("persist binding: {error}"));
+        }
+        let mut active = active_fixture(&base, 2, &plan_two_digest);
+        active.tasks.insert(
+            "A".to_owned(),
+            TaskRuntime {
+                state: TaskState::Succeeded,
+                attempts_started: 1,
+                model_calls_used: 1,
+                failure_counts: BTreeMap::new(),
+                retry_exhausted: false,
+                resource_deferrals_used: 0,
+                resource_retry_exhausted: false,
+                resource_deferred_from: None,
+                task_contract_digest: upstream_digest,
+                task: upstream_task,
+            },
+        );
+        let downstream_digest = digest_json(&downstream_task)
+            .unwrap_or_else(|error| panic!("downstream digest: {error}"));
+        active.tasks.insert(
+            "B".to_owned(),
+            TaskRuntime {
+                state: TaskState::Planned,
+                attempts_started: 0,
+                model_calls_used: 0,
+                failure_counts: BTreeMap::new(),
+                retry_exhausted: false,
+                resource_deferrals_used: 0,
+                resource_retry_exhausted: false,
+                resource_deferred_from: None,
+                task_contract_digest: downstream_digest,
+                task: downstream_task.clone(),
+            },
+        );
+        let mut controller = Controller::new(state);
+        controller.active = Some(active);
+        let resolved =
+            controller.resolve_dependency_binding_digests(&downstream_task, "snapshot.N+1");
+        assert!(
+            resolved.is_ok(),
+            "carried N output must be consumable in N+1: {resolved:?}"
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn dependent_carry_requires_upstream_to_actually_carry_into_n_plus_one() {
+        let (base, mut state) = temp_state("dependency-closed-carry");
+        let artifact_store = ArtifactStore::open(base.join("cas"))
+            .unwrap_or_else(|error| panic!("artifact store: {error}"));
+        let verification_artifact = artifact_store
+            .put(&mut state, b"verification")
+            .unwrap_or_else(|error| panic!("verification artifact: {error}"));
+        let plan_one_digest = format!("sha256:{}", "1".repeat(64));
+        let plan_two_digest = format!("sha256:{}", "2".repeat(64));
+        let task = |task_id: &str, dependency: Option<&str>| {
+            json!({
+                "task_id": task_id,
+                "dependencies": dependency.into_iter().collect::<Vec<_>>(),
+                "dependency_bindings": dependency.into_iter().map(|upstream| json!({
+                    "upstream_task_id": upstream,
+                    "required_artifact_ids": [format!("artifact.{upstream}")],
+                    "required_acceptance_criterion_ids": [format!("AC.{upstream}")],
+                    "freshness": "carry_forward_if_inputs_unchanged"
+                })).collect::<Vec<_>>(),
+                "implementation_contract": {"inputs": []},
+                "acceptance_criteria": [{
+                    "criterion_id": format!("AC.{task_id}"),
+                    "evidence_freshness": "carry_forward_if_inputs_unchanged",
+                    "required": true
+                }],
+                "expected_artifacts": [{
+                    "artifact_id": format!("artifact.{task_id}"),
+                    "required": true
+                }]
+            })
+        };
+        let task_a = task("A", None);
+        let task_b = task("B", Some("A"));
+        let digest_a = digest_json(&task_a).unwrap_or_else(|error| panic!("digest A: {error}"));
+        let digest_b = digest_json(&task_b).unwrap_or_else(|error| panic!("digest B: {error}"));
+        let next_plan = json!({
+            "repositories": [{"instructions": []}],
+            "tasks": [task_a.clone(), task_b.clone()]
+        });
+        let instruction_digest = plan_instruction_fingerprint_digest(&next_plan)
+            .unwrap_or_else(|error| panic!("instruction digest: {error}"));
+        state
+            .put_state(
+                "controller.compilation_evidence",
+                &revision_record_key("plan.fixture", 1),
+                &json!({"exact_evidence": []}).to_string(),
+            )
+            .unwrap_or_else(|error| panic!("persist compilation evidence: {error}"));
+
+        let mut previous = active_fixture(&base, 1, &plan_one_digest);
+        for (task_id, task_value, task_digest, source_fingerprints) in [
+            (
+                "A",
+                &task_a,
+                &digest_a,
+                BTreeMap::from([(
+                    "missing-upstream-input.rs".to_owned(),
+                    format!("sha256:{}", "9".repeat(64)),
+                )]),
+            ),
+            ("B", &task_b, &digest_b, BTreeMap::new()),
+        ] {
+            previous.tasks.insert(
+                task_id.to_owned(),
+                TaskRuntime {
+                    state: TaskState::Succeeded,
+                    attempts_started: 1,
+                    model_calls_used: 1,
+                    failure_counts: BTreeMap::new(),
+                    retry_exhausted: false,
+                    resource_deferrals_used: 0,
+                    resource_retry_exhausted: false,
+                    resource_deferred_from: None,
+                    task_contract_digest: task_digest.clone(),
+                    task: task_value.clone(),
+                },
+            );
+            let verification_id = format!("verification.{task_id}");
+            let verification = VerificationResultV1 {
+                schema_version: super::VERIFICATION_RESULT_SCHEMA_VERSION,
+                verification_id: verification_id.clone(),
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 1,
+                plan_digest: plan_one_digest.clone(),
+                task_id: task_id.to_owned(),
+                task_contract_digest: task_digest.clone(),
+                attempt_id: format!("attempt.{task_id}.1"),
+                execution_epoch: 1,
+                evaluator: "builtin.diff.scoped_change.v1".to_owned(),
+                acceptance_contract_digest: format!("sha256:{}", "3".repeat(64)),
+                diff_digest: format!("sha256:{}", "4".repeat(64)),
+                post_snapshot_digest: "snapshot.N".to_owned(),
+                expected_target_mode: 0o644,
+                observed_target_mode: 0o644,
+                evidence_ids: vec!["ev.N".to_owned()],
+                passed: true,
+                failure_code: None,
+            };
+            state
+                .put_state(
+                    "controller.verification",
+                    &revision_scoped_key("plan.fixture", 1, &verification_id),
+                    &serde_json::to_string(&verification)
+                        .unwrap_or_else(|error| panic!("verification json: {error}")),
+                )
+                .unwrap_or_else(|error| panic!("persist verification: {error}"));
+            let proof = TaskCarryFingerprintV1 {
+                schema_version: super::TASK_CARRY_FINGERPRINT_SCHEMA_VERSION,
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 1,
+                plan_digest: plan_one_digest.clone(),
+                task_id: task_id.to_owned(),
+                task_contract_digest: task_digest.clone(),
+                implementation_inputs_digest: digest_json(&json!([]))
+                    .unwrap_or_else(|error| panic!("inputs digest: {error}")),
+                dependency_contract_digest: digest_json(&task_value["dependency_bindings"])
+                    .unwrap_or_else(|error| panic!("dependency digest: {error}")),
+                instruction_fingerprint_digest: instruction_digest.clone(),
+                source_fingerprints,
+                acceptance_contract_digest: verification.acceptance_contract_digest.clone(),
+                verification_id: verification_id.clone(),
+                verification_artifact_digest: verification_artifact.digest.clone(),
+            };
+            state
+                .put_state(
+                    "controller.task_carry_fingerprint",
+                    &revision_scoped_key("plan.fixture", 1, task_id),
+                    &serde_json::to_string(&proof)
+                        .unwrap_or_else(|error| panic!("carry proof json: {error}")),
+                )
+                .unwrap_or_else(|error| panic!("persist carry proof: {error}"));
+            for (namespace, kind, binding_id) in [
+                (
+                    "controller.artifact_binding",
+                    "artifact",
+                    format!("artifact.{task_id}"),
+                ),
+                (
+                    "controller.acceptance_binding",
+                    "acceptance",
+                    format!("AC.{task_id}"),
+                ),
+            ] {
+                let binding = VerifiedOutputBindingV1 {
+                    schema_version: super::VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION,
+                    plan_id: "plan.fixture".to_owned(),
+                    plan_revision: 1,
+                    plan_digest: plan_one_digest.clone(),
+                    task_id: task_id.to_owned(),
+                    task_contract_digest: task_digest.clone(),
+                    attempt_id: format!("attempt.{task_id}.1"),
+                    binding_kind: kind.to_owned(),
+                    binding_id: binding_id.clone(),
+                    verification_id: verification_id.clone(),
+                    verification_artifact_digest: verification_artifact.digest.clone(),
+                    repository_snapshot_digest: "snapshot.N".to_owned(),
+                    carried_from_plan_revision: None,
+                    carried_from_plan_digest: None,
+                };
+                state
+                    .put_state(
+                        namespace,
+                        &revision_scoped_key(
+                            "plan.fixture",
+                            1,
+                            &output_binding_key(task_id, &binding_id),
+                        ),
+                        &serde_json::to_string(&binding)
+                            .unwrap_or_else(|error| panic!("binding json: {error}")),
+                    )
+                    .unwrap_or_else(|error| panic!("persist binding: {error}"));
+            }
+        }
+
+        let diff = PlanRevisionDiff {
+            plan_id: "plan.fixture".to_owned(),
+            from_revision: 1,
+            to_revision: 2,
+            from_plan_digest: plan_one_digest,
+            to_plan_digest: plan_two_digest.clone(),
+            scope: ReplanScope::Task,
+            invalidated_contract_ids: vec!["ASSUME.unrelated".to_owned()],
+            affected_task_ids: vec!["X".to_owned()],
+            unchanged_task_ids: vec!["A".to_owned(), "B".to_owned()],
+            changed_task_ids: vec!["X".to_owned()],
+            added_task_ids: Vec::new(),
+            removed_task_ids: Vec::new(),
+        };
+        let build = build_superseding_runtime(
+            &state,
+            &ProjectRegistry::new(),
+            &previous,
+            &next_plan,
+            &plan_two_digest,
+            &json!({"exact_evidence": []}),
+            &diff,
+            "snapshot.N+1",
+        )
+        .unwrap_or_else(|error| panic!("superseding runtime: {error}"));
+        assert_eq!(build.tasks["A"].state, TaskState::Planned);
+        assert_eq!(build.tasks["B"].state, TaskState::Planned);
+        assert!(build.carry_records.is_empty());
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn scope_lineage_survives_unrelated_replan_and_reopen_and_split_inherits_it() {
+        let (base, mut state) = temp_state("scope-lineage");
+        let plan_digest = format!("sha256:{}", "a".repeat(64));
+        let active_r2 = active_fixture(&base, 2, &plan_digest);
+        let classification_a = FailureClassification {
+            kind: FailureClassificationKind::PlanFailure,
+            scope: Some(ReplanScope::DependencyBranch),
+            affected_task_ids: vec!["A".to_owned()],
+            affected_contract_ids: vec!["ASSUME.first".to_owned()],
+            evidence_refs: vec!["ev.first".to_owned()],
+        };
+        let lineage_a = scope_lineage_id(&state, &active_r2, &classification_a)
+            .unwrap_or_else(|error| panic!("lineage A: {error}"));
+        state
+            .put_state(
+                "controller.replan_task_lineage",
+                &revision_scoped_key("plan.fixture", 2, "A"),
+                &json!({
+                    "plan_id":"plan.fixture","revision":2,"task_id":"A","lineage_id":lineage_a
+                })
+                .to_string(),
+            )
+            .unwrap_or_else(|error| panic!("persist lineage A: {error}"));
+        let diff_b = PlanRevisionDiff {
+            plan_id: "plan.fixture".to_owned(),
+            from_revision: 2,
+            to_revision: 3,
+            from_plan_digest: plan_digest.clone(),
+            to_plan_digest: format!("sha256:{}", "b".repeat(64)),
+            scope: ReplanScope::Task,
+            invalidated_contract_ids: vec!["ASSUME.B".to_owned()],
+            affected_task_ids: vec!["B".to_owned()],
+            unchanged_task_ids: vec!["A".to_owned()],
+            changed_task_ids: vec!["B".to_owned()],
+            added_task_ids: Vec::new(),
+            removed_task_ids: Vec::new(),
+        };
+        let records = lineage_records_for_supersession(&state, &active_r2, &diff_b, "lineage.B")
+            .unwrap_or_else(|error| panic!("lineage records B: {error}"));
+        for (namespace, key, value) in records {
+            state
+                .put_state(&namespace, &key, &value)
+                .unwrap_or_else(|error| panic!("persist copied lineage: {error}"));
+        }
+        drop(state);
+        let state = StateStore::open(base.join("state.sqlite3"))
+            .unwrap_or_else(|error| panic!("reopen state: {error}"));
+        let active_r3 = active_fixture(&base, 3, &diff_b.to_plan_digest);
+        let classification_a_different_clause = FailureClassification {
+            affected_contract_ids: vec!["ASSUME.second".to_owned()],
+            evidence_refs: vec!["ev.second".to_owned()],
+            ..classification_a
+        };
+        assert_eq!(
+            scope_lineage_id(&state, &active_r3, &classification_a_different_clause)
+                .unwrap_or_else(|error| panic!("reused lineage A: {error}")),
+            lineage_a
+        );
+        let split = PlanRevisionDiff {
+            plan_id: "plan.fixture".to_owned(),
+            from_revision: 3,
+            to_revision: 4,
+            from_plan_digest: diff_b.to_plan_digest.clone(),
+            to_plan_digest: format!("sha256:{}", "c".repeat(64)),
+            scope: ReplanScope::DependencyBranch,
+            invalidated_contract_ids: vec!["ASSUME.second".to_owned()],
+            affected_task_ids: vec!["A".to_owned()],
+            unchanged_task_ids: vec!["B".to_owned()],
+            changed_task_ids: vec!["A".to_owned()],
+            added_task_ids: vec!["A2".to_owned()],
+            removed_task_ids: Vec::new(),
+        };
+        let split_records =
+            lineage_records_for_supersession(&state, &active_r3, &split, &lineage_a)
+                .unwrap_or_else(|error| panic!("split lineage records: {error}"));
+        let a2 = split_records
+            .iter()
+            .find(|(_, key, _)| key.ends_with(":A2"))
+            .unwrap_or_else(|| panic!("split task lineage missing"));
+        assert!(a2.2.contains(&lineage_a));
+        drop(state);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ambiguous_scope_lineage_and_nonterminal_process_leases_fail_closed() {
+        let (base, mut state) = temp_state("ambiguous-lineage-lease");
+        let active = active_fixture(&base, 2, &format!("sha256:{}", "d".repeat(64)));
+        for (task, lineage) in [("A", "lineage.A"), ("B", "lineage.B")] {
+            state
+                .put_state(
+                    "controller.replan_task_lineage",
+                    &revision_scoped_key("plan.fixture", 2, task),
+                    &json!({
+                        "plan_id":"plan.fixture","revision":2,"task_id":task,"lineage_id":lineage
+                    })
+                    .to_string(),
+                )
+                .unwrap_or_else(|error| panic!("persist lineage: {error}"));
+        }
+        let classification = FailureClassification {
+            kind: FailureClassificationKind::PlanFailure,
+            scope: Some(ReplanScope::DependencyBranch),
+            affected_task_ids: vec!["A".to_owned(), "B".to_owned()],
+            affected_contract_ids: vec!["binding:B:A".to_owned()],
+            evidence_refs: vec!["ev".to_owned()],
+        };
+        let Err(error) = scope_lineage_id(&state, &active, &classification) else {
+            panic!("ambiguous inherited lineages must fail closed");
+        };
+        assert!(error.to_string().contains("ambiguous inherited lineages"));
+        let lease = |schema_version, state: &str| RecoveryProcessLease {
+            schema_version,
+            lease_id: format!("lease.{state}"),
+            task_id: "A".to_owned(),
+            attempt_id: "attempt.A".to_owned(),
+            action_id: "action.A".to_owned(),
+            process_group_id: None,
+            leader_identity: None,
+            state: state.to_owned(),
+        };
+        assert!(process_lease_is_terminal(&lease(
+            super::RECOVERY_PROCESS_LEASE_SCHEMA_VERSION,
+            "reaped"
+        )));
+        assert!(process_lease_is_terminal(&lease(
+            super::RECOVERY_PROCESS_LEASE_SCHEMA_VERSION,
+            "reaped_recovery"
+        )));
+        assert!(!process_lease_is_terminal(&lease(
+            super::RECOVERY_PROCESS_LEASE_SCHEMA_VERSION,
+            "pending_spawn"
+        )));
+        assert!(!process_lease_is_terminal(&lease(
+            super::RECOVERY_PROCESS_LEASE_SCHEMA_VERSION,
+            "active"
+        )));
+        assert!(!process_lease_is_terminal(&lease(
+            super::RECOVERY_PROCESS_LEASE_SCHEMA_VERSION,
+            "future_unknown"
+        )));
+        assert!(!process_lease_is_terminal(&lease(999, "reaped")));
+        let pending = lease(
+            super::RECOVERY_PROCESS_LEASE_SCHEMA_VERSION,
+            "pending_spawn",
+        );
+        state
+            .put_state(
+                "controller.process_lease",
+                "action.A",
+                &serde_json::to_string(&pending)
+                    .unwrap_or_else(|error| panic!("pending lease json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist pending lease: {error}"));
+        assert!(
+            has_unresolved_process_lease(&state)
+                .unwrap_or_else(|error| panic!("pending unresolved check: {error}"))
+        );
+        let reaped = lease(super::RECOVERY_PROCESS_LEASE_SCHEMA_VERSION, "reaped");
+        state
+            .put_state(
+                "controller.process_lease",
+                "action.A",
+                &serde_json::to_string(&reaped)
+                    .unwrap_or_else(|error| panic!("reaped lease json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist reaped lease: {error}"));
+        assert!(
+            !has_unresolved_process_lease(&state)
+                .unwrap_or_else(|error| panic!("reaped unresolved check: {error}"))
+        );
+        let unknown = lease(
+            super::RECOVERY_PROCESS_LEASE_SCHEMA_VERSION,
+            "future_unknown",
+        );
+        state
+            .put_state(
+                "controller.process_lease",
+                "action.A",
+                &serde_json::to_string(&unknown)
+                    .unwrap_or_else(|error| panic!("unknown lease json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist unknown lease: {error}"));
+        assert!(
+            has_unresolved_process_lease(&state)
+                .unwrap_or_else(|error| panic!("unknown unresolved check: {error}"))
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(base);
     }
 }

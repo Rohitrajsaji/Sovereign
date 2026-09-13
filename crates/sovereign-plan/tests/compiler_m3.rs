@@ -10,8 +10,9 @@ use sovereign_model::{
 use sovereign_plan::{
     DepthClassifier, DepthFeatureInput, ExecutionDepth, GovernedEvaluatorRef, M3PlanningInput,
     PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationError, PlanCompilationInput,
-    PlanCompilationRepository, PlanCompiler, PlanValidator, PreauthorizedManualGate,
-    SuppliedPlanningSourceKind, SuppliedPlanningSourceRef, ValidationEnvironment,
+    PlanCompilationRepository, PlanCompiler, PlanReplanInput, PlanValidator,
+    PreauthorizedManualGate, ReplanScope, SuppliedPlanningSourceKind, SuppliedPlanningSourceRef,
+    ValidationEnvironment, smallest_replan_scope_tasks,
 };
 use sovereign_policy::ModelCallBudget;
 use std::collections::VecDeque;
@@ -158,6 +159,7 @@ fn extension(packet: &ContextPacket, depth: ExecutionDepth) -> M3PlanningInput {
             version: "1.0.0".to_owned(),
             digest: sha('c'),
         }),
+        replan: None,
     }
 }
 
@@ -346,6 +348,48 @@ fn compiler_m3_multimodule_dag_is_topological_and_bindings_are_one_for_one() {
     }
     assert_eq!(plan["edges"].as_array().map(Vec::len), Some(2));
     assert!(validator.is_valid(result.plan()));
+}
+
+#[test]
+fn compiler_m3_emits_guarded_cross_revision_freshness_for_machine_acceptance_and_dependencies() {
+    let proposal = json!({
+        "tasks": [
+            task("root", "repo.app", "src/api.rs", &[]),
+            task("consumer", "repo.app", "src/api.rs", &["root"])
+        ]
+    })
+    .to_string();
+    let backend = RecordingBackend::new(vec![response(proposal)]);
+    let validator = validator();
+    let input = compilation_input();
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let result = compiler(&backend, &validator)
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile: {error}"));
+    let tasks = result.plan().as_value()["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tasks"));
+    for compiled_task in tasks {
+        assert!(
+            compiled_task["acceptance_criteria"]
+                .as_array()
+                .unwrap_or_else(|| panic!("acceptance"))
+                .iter()
+                .all(|criterion| criterion["evidence_freshness"]
+                    == json!("carry_forward_if_inputs_unchanged"))
+        );
+    }
+    let consumer = tasks
+        .iter()
+        .find(|compiled_task| compiled_task["title"] == json!("Implement consumer"))
+        .unwrap_or_else(|| panic!("consumer"));
+    assert!(
+        consumer["dependency_bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("bindings"))
+            .iter()
+            .all(|binding| binding["freshness"] == json!("carry_forward_if_inputs_unchanged"))
+    );
 }
 
 #[test]
@@ -680,4 +724,133 @@ fn compiler_m3_manual_acceptance_requires_preauthorized_gate() {
         compiler(&backend, &validator).compile(&rejected_input, &mut budget),
         Err(PlanCompilationError::ProposalRejected { .. })
     ));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn compiler_m3_replan_preserves_plan_identity_and_unaffected_task_verbatim() {
+    let initial_proposal = json!({
+        "tasks": [
+            {
+                "local_id": "root",
+                "repository_id": "repo.app",
+                "title": "Implement root",
+                "objective": "Use the observed API contract.",
+                "rationale": "The current bounded source shows the API entry point.",
+                "files": ["src/api.rs"],
+                "symbols": ["api"],
+                "dependencies": [],
+                "evidence_needs": [],
+                "assumptions": [{
+                    "text": "The API entry point remains the observed implementation.",
+                    "invalidation_scope": "dependency_branch",
+                    "evidence_ids": ["ev.app.api"],
+                    "fingerprints": [sha('1')]
+                }],
+                "expected_change": "Root API change",
+                "acceptance": [{"kind":"diff","description":"Root diff passes.","manual_gate_id":Value::Null}]
+            },
+            task("consumer", "repo.app", "src/api.rs", &["root"]),
+            task("unrelated", "repo.app", "src/api.rs", &[])
+        ]
+    })
+    .to_string();
+    let initial_backend = RecordingBackend::new(vec![response(initial_proposal)]);
+    let validator = validator();
+    let initial_input = compilation_input();
+    let mut initial_budget = ModelCallBudget::new(1, 1_000);
+    let initial = compiler(&initial_backend, &validator)
+        .compile(&initial_input, &mut initial_budget)
+        .unwrap_or_else(|error| panic!("initial compile: {error}"));
+    let previous = initial.plan().as_value().clone();
+    let previous_digest = initial.plan_digest().to_owned();
+    let previous_tasks = previous["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("initial tasks"));
+    let root = previous_tasks
+        .iter()
+        .find(|task| task["title"] == json!("Implement root"))
+        .unwrap_or_else(|| panic!("root task"));
+    let root_id = root["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("root id"))
+        .to_owned();
+    let assumption_id = root["implementation_contract"]["assumptions"][0]["assumption_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("assumption id"))
+        .to_owned();
+    let affected = smallest_replan_scope_tasks(&previous, &root_id, ReplanScope::DependencyBranch)
+        .unwrap_or_else(|error| panic!("affected: {error}"));
+    let consumer_id = affected
+        .iter()
+        .find(|task_id| *task_id != &root_id)
+        .unwrap_or_else(|| panic!("consumer id"))
+        .clone();
+    let unrelated_before = previous_tasks
+        .iter()
+        .find(|task| task["title"] == json!("Implement unrelated"))
+        .unwrap_or_else(|| panic!("unrelated task"))
+        .clone();
+
+    let replan_proposal = json!({
+        "tasks": [
+            {
+                "local_id": root_id,
+                "repository_id": "repo.app",
+                "title": "Implement corrected root",
+                "objective": "Use the corrected API topology.",
+                "rationale": "Fresh exact evidence falsified the prior API assumption.",
+                "files": ["src/api.rs"],
+                "symbols": ["api"],
+                "dependencies": [],
+                "evidence_needs": [],
+                "expected_change": "Corrected root API change",
+                "acceptance": [{"kind":"diff","description":"Corrected root diff passes.","manual_gate_id":Value::Null}]
+            },
+            {
+                "local_id": consumer_id,
+                "repository_id": "repo.app",
+                "title": "Implement corrected consumer",
+                "objective": "Consume the corrected root contract.",
+                "rationale": "The producer contract changed.",
+                "files": ["src/api.rs"],
+                "symbols": ["consumer"],
+                "dependencies": [root_id],
+                "evidence_needs": [],
+                "expected_change": "Corrected consumer change",
+                "acceptance": [{"kind":"diff","description":"Corrected consumer diff passes.","manual_gate_id":Value::Null}]
+            }
+        ]
+    })
+    .to_string();
+    let replan_backend = RecordingBackend::new(vec![response(replan_proposal)]);
+    let mut replan_input = compilation_input();
+    replan_input.compilation_id = "compile.m3.replan".to_owned();
+    replan_input
+        .m3
+        .as_mut()
+        .unwrap_or_else(|| panic!("M3 extension"))
+        .replan = Some(PlanReplanInput {
+        previous_plan: previous.clone(),
+        previous_plan_digest: previous_digest,
+        scope: ReplanScope::DependencyBranch,
+        invalidated_contract_ids: vec![assumption_id],
+        affected_task_ids: affected,
+    });
+    let mut replan_budget = ModelCallBudget::new(1, 1_000);
+    let revised = compiler(&replan_backend, &validator)
+        .compile(&replan_input, &mut replan_budget)
+        .unwrap_or_else(|error| panic!("replan compile: {error}"));
+    let revised_plan = revised.plan().as_value();
+
+    assert_eq!(revised_plan["plan_id"], previous["plan_id"]);
+    assert_eq!(revised_plan["revision"], json!(2));
+    assert_eq!(revised_plan["supersedes_revision"], json!(1));
+    let unrelated_after = revised_plan["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("revised tasks"))
+        .iter()
+        .find(|task| task["task_id"] == unrelated_before["task_id"])
+        .unwrap_or_else(|| panic!("carried unrelated task"));
+    assert_eq!(unrelated_after, &unrelated_before);
 }
