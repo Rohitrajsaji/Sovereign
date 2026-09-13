@@ -13,8 +13,8 @@ pub use lexical::{
 };
 pub use structural::{
     DependencyEdge, DependencyGraph, StructuralConfig, StructuralIndex, StructuralLookup,
-    StructuralRefreshReport, StructuralRetriever, StructuralSnapshot, StructuralTelemetry,
-    SymbolIndex, SymbolRecord,
+    StructuralPathQueryResult, StructuralQueryResult, StructuralRefreshReport, StructuralRetriever,
+    StructuralSnapshot, StructuralTelemetry, SymbolIndex, SymbolRecord,
 };
 
 use serde::{Deserialize, Serialize};

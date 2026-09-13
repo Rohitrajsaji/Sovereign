@@ -1,0 +1,204 @@
+{
+  "schema_version": 1,
+  "task_id": "M2-T03",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "75e8aca",
+  "status": "completed",
+  "completed_at": "2026-09-13T07:50:23Z",
+  "scope": [
+    "crates/sovereign-context deterministic retrieval routing and C0-C3 packet projection",
+    "minimal crates/sovereign-repo structural query extensions required for bounded symbol/dependency routing and reverse dependent neighborhoods"
+  ],
+  "interfaces": [
+    "RetrievalRouter",
+    "ContextLevelPolicy",
+    "RetrievalBackend",
+    "RepositoryRetrievalBackend",
+    "RetrievalTrace",
+    "RouteStep",
+    "RouteBoundFact",
+    "HistoryProvider",
+    "StructuralQueryResult",
+    "StructuralPathQueryResult",
+    "DependencyGraph::dependent_neighborhood",
+    "StructuralIndex bounded symbol/path/import/dependent query methods"
+  ],
+  "routing_contract": {
+    "typed_intents": [
+      "known_path",
+      "literal_error",
+      "known_symbol",
+      "behavior",
+      "impact",
+      "diff",
+      "failure_history",
+      "fuzzy"
+    ],
+    "typed_channels": [
+      "diff",
+      "exact",
+      "lexical",
+      "symbol",
+      "structural",
+      "history",
+      "semantic"
+    ],
+    "known_path": "exact current path only; insufficient exact evidence never reports Satisfied",
+    "literal_error": "bounded exact literal search, then bounded lexical fallback only after exact insufficiency",
+    "known_symbol": "bounded exact symbol-name lookup plus bounded symbol index; no broad FTS/graph fanout",
+    "behavior": "bounded lexical retrieval followed by at most one bounded structural anchor expansion after an explicit gap",
+    "impact": "bounded outgoing plus reverse dependent/importer structural neighborhood as primary topology channel",
+    "diff": "authoritative current Git diff -> exact current touched paths -> bounded touched-path symbols -> bounded outgoing/reverse dependency neighborhood",
+    "failure_history": "optional normalized signature/repository/tool/symbol lookup before text fallback; no provider required until M4",
+    "fuzzy": "bounded lexical first, at most one structural expansion, then typed semantic-unavailable marker in M2",
+    "no_all_retriever_fanout": true,
+    "semantic_retrieval_available_in_m2": false,
+    "persistent_memory_required_in_m2": false
+  },
+  "production_adapter": {
+    "type": "RepositoryRetrievalBackend",
+    "exact": "ExactRetriever",
+    "lexical": "LexicalRetriever",
+    "structural": "StructuralIndex / SymbolIndex / DependencyGraph",
+    "source_authority": "Repository truth remains in sovereign-repo. Context consumes current-source/fresh derived results and does not create a second repository authority.",
+    "freshness": "Exact operations are direct current-source operations. Lexical/structural operations retain sovereign-repo preflight freshness, returned-row digest validation, complete post-query source-manifest revalidation, bounded refresh/retry, and fail-closed race behavior.",
+    "stale_rejected_semantics": "RouteStep/trace use Option<usize>. Exact routes report known Some(0). Production lexical/symbol/structural report None because internal rejected-row counts are not exposed; telemetry must not reinterpret unknown as zero or re-query repository state."
+  },
+  "bounded_structural_queries": {
+    "symbol_limit": 8,
+    "structural_selected_limit": 12,
+    "query_side_bounding": true,
+    "definitions": "COUNT plus SQL LIMIT; total candidate count remains truthful while at most 8 rows materialize",
+    "symbols_for_path": "bounded current-path structural symbol query; total plus at most 8 rows materialized",
+    "outgoing_dependencies": "COUNT plus SQL LIMIT; at most 12 rows materialized",
+    "dependent_importers": "ordered scan counts all matching candidates but retains at most 12 matching rows; exact freshness validation remains in StructuralIndex",
+    "combined_neighborhood": "bounded outgoing and inbound rows are deterministically sorted/deduplicated; final selected evidence capped at 12 with RouteBoundFact observed/limit/truncated"
+  },
+  "diff_route": {
+    "authority": "RepositoryRetrievalBackend::current_diff calls ExactRetriever::current_diff; caller supplies only repository_id.",
+    "touched_paths": "derived only from authoritative exact Git diff; parses --- a/ and +++ b/ patch headers plus rename from/to and copy from/to metadata, ignores /dev/null, then sorts/deduplicates before the deterministic cap",
+    "max_touched_paths": 16,
+    "bound_fact": "Diff RouteStep records observed/limit/truncated for touched paths",
+    "priority_order": [
+      "diff",
+      "exact_current_touched_path",
+      "touched_path_symbols",
+      "structural_neighbors"
+    ],
+    "expansion_bound": "At most 16 touched paths are admitted for exact/symbol/structural routing; symbol and structural rows are independently bounded.",
+    "rename_copy_support": "Pure tracked rename/copy metadata is treated as authoritative touched-path evidence even when Git emits no ---/+++ file headers; regression covers git mv to a path containing spaces."
+  },
+  "trace_contract": {
+    "per_route_step": [
+      "channel",
+      "reason",
+      "candidate_count",
+      "selected_count",
+      "candidate_ids",
+      "selected_ids",
+      "freshness_checked",
+      "stale_rejected_option",
+      "source_refresh_count",
+      "source_snapshot",
+      "source_fingerprint",
+      "bound"
+    ],
+    "aggregate": [
+      "candidate_count",
+      "selected_count",
+      "evidence_channels",
+      "freshness_checked",
+      "stale_rejected_option",
+      "source_refresh_count",
+      "source_snapshot",
+      "source_fingerprint",
+      "expansion_count",
+      "stop_reason",
+      "semantic_available",
+      "semantic_unavailable_reason"
+    ],
+    "identity_binding": "trace_id binds intent, ordered route/outcome diagnostics, candidate/selected IDs, evidence-channel links, and every selected evidence source_digest/content_digest.",
+    "m2_t04_consumption": "Per-route trace facts are sufficient for later telemetry without reconstructing repository/index state; unknown stale-rejection counts remain explicit."
+  },
+  "context_packet": {
+    "levels": [
+      "c0",
+      "c1",
+      "c2",
+      "c3"
+    ],
+    "default_max_input_tokens": 8000,
+    "dedupe": "ContextPlanner deduplicates by content_digest before bounded section selection.",
+    "bounds": "C0 remains mandatory; direct C1, routed C2/C3, tool evidence, tool schemas, and final serialization retain existing weak-model ceilings.",
+    "history_default": "no persistent history provider in M2",
+    "semantic_default": "semantic channel is an unavailable trace note only; no semantic retrieval occurs in M2"
+  },
+  "regression_evidence": {
+    "routing_tests": 18,
+    "routing_filter": "18/18 pass",
+    "context_full": "27/27 integration tests pass (9 packet + 18 routing); doc tests pass",
+    "structural_filter": "1 structural unit + 10 structural integration tests pass",
+    "repo_full": "2 unit + 5 baseline + 3 exact + 9 lexical + 10 structural integration tests pass; doc tests pass",
+    "notable_regressions": [
+      "authoritative production current Git diff source",
+      "known-path insufficient does not report satisfied",
+      "diff touched-path cap/truncation",
+      "trace id binds source/content digests",
+      "pure tracked rename metadata routes authoritative old/new touched paths, including paths with spaces",
+      "real touched-symbol evidence appears before dependency expansion",
+      "impact returns reverse importer/dependent evidence",
+      "query-side symbol/structural row materialization is bounded with truthful observed-vs-selected RouteBoundFact",
+      "derived stale-rejection count is explicit unknown rather than fabricated zero",
+      "C0-C3 packet remains bounded without required history/semantic channel"
+    ]
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-context --offline -- routing",
+      "result": "passed",
+      "detail": "18/18 routing integration tests"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-context --offline",
+      "result": "passed",
+      "detail": "9 packet + 18 routing = 27/27 integration tests; doc tests pass"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-repo --offline -- structural",
+      "result": "passed",
+      "detail": "1 unit + 10 structural integration tests"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-repo --offline",
+      "result": "passed",
+      "detail": "all sovereign-repo tests and doc tests pass"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-context -p sovereign-repo --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "independent_audit": {
+    "result": "CLOSABLE",
+    "blockers": [],
+    "notes": "Worker-13 completed a fresh independent read-only final audit of this exact tree/evidence and reported CLOSABLE with no blockers. The audit reverified authoritative current-diff routing, deterministic touched-path bounds, truthful per-route freshness/stale/bound facts, KnownPath insufficiency, trace source/content digest binding, bounded symbol/structural cardinality, reverse-dependent impact evidence, no default retriever fanout, optional history, semantic unavailability in M2, bounded C0-C3 packets, and pure rename/copy parsing including a real git mv path with spaces. Independent routing/context/repository tests, strict clippy, fmt, and git diff checks all passed."
+  },
+  "source_hashes": {
+    "crates/sovereign-context/Cargo.toml": "sha256:4f6b9bb5d12c7f97f61d40d4113cc54c5000f7a81c176e9721c746dacd852745",
+    "crates/sovereign-context/src/lib.rs": "sha256:5f85a7afe961779f8f799c194c2593a378125cc88d8d0d68b559dc99a5ea3e7f",
+    "crates/sovereign-context/src/routing.rs": "sha256:ae46003a38dfda3734d05918c6676f8557ecc8eadff4a2ae359189774106dc3f",
+    "crates/sovereign-context/tests/routing.rs": "sha256:077ac512f7bcdfe3ae9b2ddb389f65c1c21a0982f1eee9ef05c765536818b7c7",
+    "crates/sovereign-repo/src/lib.rs": "sha256:ee5cada1bc51c5ee60c894423cdb52b7abbaddb4ba302c4a9651684cbb83fb11",
+    "crates/sovereign-repo/src/structural.rs": "sha256:0e49db5b203830acec642af047f8dee46b6e6fa8c0b5644bbf29083bb3e4a810",
+    "crates/sovereign-repo/tests/structural.rs": "sha256:bea0c5a5b736170e5a5d7902497c236454f66cb6b5bb45751d2d49cd0d515c41",
+    "Cargo.lock": "sha256:4f601cb449b1d109a592730652b2ba6ed77fc3253b5b23319e7ffc3132c39688"
+  }
+}

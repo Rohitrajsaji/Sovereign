@@ -116,12 +116,25 @@ pub enum StructuralLookup<T> {
     UnsupportedLanguage { path: PathBuf },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralQueryResult<T> {
+    pub total: usize,
+    pub rows: Vec<T>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuralPathQueryResult {
+    pub total: usize,
+    pub lookup: StructuralLookup<SymbolRecord>,
+}
+
 pub trait SymbolIndex {
     fn definitions(&mut self, name: &str) -> Result<Vec<SymbolRecord>, RepoError>;
 }
 
 pub trait DependencyGraph {
     fn import_neighborhood(&mut self, path: &Path) -> Result<Vec<DependencyEdge>, RepoError>;
+    fn dependent_neighborhood(&mut self, path: &Path) -> Result<Vec<DependencyEdge>, RepoError>;
 }
 
 pub trait StructuralRetriever: SymbolIndex + DependencyGraph {
@@ -339,6 +352,151 @@ impl<'a> StructuralIndex<'a> {
             .map_err(sqlite_error)?
             .map(|raw| serde_json::from_str(&raw).map_err(RepoError::Serialization))
             .transpose()
+    }
+
+    pub fn definitions_bounded(
+        &mut self,
+        name: &str,
+        max_results: usize,
+    ) -> Result<StructuralQueryResult<SymbolRecord>, RepoError> {
+        if name.trim().is_empty() || max_results == 0 {
+            return Err(RepoError::InvalidSearch(
+                "symbol name and result bound must be non-empty/positive".to_owned(),
+            ));
+        }
+        for attempt in 0..=MAX_SOURCE_RACE_RETRIES {
+            self.ensure_fresh()?;
+            let result = query_symbols_bounded(
+                &self.connection,
+                &self.repository_id,
+                Some(name),
+                None,
+                max_results,
+            )?;
+            let rows_current = self
+                .validate_records_fresh(result.rows.iter().map(|row| row.relative_path.clone()))?;
+            let manifest_current = self.source_manifest_is_current()?;
+            if rows_current && manifest_current {
+                return Ok(result);
+            }
+            if attempt == MAX_SOURCE_RACE_RETRIES {
+                break;
+            }
+            self.refresh()?;
+        }
+        Err(RepoError::InvalidSearch(
+            "bounded symbol query source changed repeatedly during validation".to_owned(),
+        ))
+    }
+
+    pub fn structural_for_path_bounded(
+        &mut self,
+        path: &Path,
+        max_results: usize,
+    ) -> Result<StructuralPathQueryResult, RepoError> {
+        if max_results == 0 {
+            return Err(RepoError::InvalidSearch(
+                "structural result bound must be positive".to_owned(),
+            ));
+        }
+        if language_for_path(path).is_none() {
+            return Ok(StructuralPathQueryResult {
+                total: 0,
+                lookup: StructuralLookup::UnsupportedLanguage {
+                    path: path.to_path_buf(),
+                },
+            });
+        }
+        for attempt in 0..=MAX_SOURCE_RACE_RETRIES {
+            self.ensure_fresh()?;
+            let result = query_symbols_bounded(
+                &self.connection,
+                &self.repository_id,
+                None,
+                Some(path),
+                max_results,
+            )?;
+            let rows_current = self
+                .validate_records_fresh(result.rows.iter().map(|row| row.relative_path.clone()))?;
+            let manifest_current = self.source_manifest_is_current()?;
+            if rows_current && manifest_current {
+                return Ok(StructuralPathQueryResult {
+                    total: result.total,
+                    lookup: StructuralLookup::Indexed(result.rows),
+                });
+            }
+            if attempt == MAX_SOURCE_RACE_RETRIES {
+                break;
+            }
+            self.refresh()?;
+        }
+        Err(RepoError::InvalidSearch(
+            "bounded structural path query source changed repeatedly during validation".to_owned(),
+        ))
+    }
+
+    pub fn import_neighborhood_bounded(
+        &mut self,
+        path: &Path,
+        max_results: usize,
+    ) -> Result<StructuralQueryResult<DependencyEdge>, RepoError> {
+        if max_results == 0 {
+            return Err(RepoError::InvalidSearch(
+                "dependency result bound must be positive".to_owned(),
+            ));
+        }
+        for attempt in 0..=MAX_SOURCE_RACE_RETRIES {
+            self.ensure_fresh()?;
+            let result =
+                query_edges_bounded(&self.connection, &self.repository_id, path, max_results)?;
+            let rows_current =
+                self.validate_records_fresh(result.rows.iter().map(|row| row.source_path.clone()))?;
+            let manifest_current = self.source_manifest_is_current()?;
+            if rows_current && manifest_current {
+                return Ok(result);
+            }
+            if attempt == MAX_SOURCE_RACE_RETRIES {
+                break;
+            }
+            self.refresh()?;
+        }
+        Err(RepoError::InvalidSearch(
+            "bounded dependency query source changed repeatedly during validation".to_owned(),
+        ))
+    }
+
+    pub fn dependent_neighborhood_bounded(
+        &mut self,
+        path: &Path,
+        max_results: usize,
+    ) -> Result<StructuralQueryResult<DependencyEdge>, RepoError> {
+        if max_results == 0 {
+            return Err(RepoError::InvalidSearch(
+                "dependent result bound must be positive".to_owned(),
+            ));
+        }
+        for attempt in 0..=MAX_SOURCE_RACE_RETRIES {
+            self.ensure_fresh()?;
+            let result = query_dependent_edges_bounded(
+                &self.connection,
+                &self.repository_id,
+                path,
+                max_results,
+            )?;
+            let rows_current =
+                self.validate_records_fresh(result.rows.iter().map(|row| row.source_path.clone()))?;
+            let manifest_current = self.source_manifest_is_current()?;
+            if rows_current && manifest_current {
+                return Ok(result);
+            }
+            if attempt == MAX_SOURCE_RACE_RETRIES {
+                break;
+            }
+            self.refresh()?;
+        }
+        Err(RepoError::InvalidSearch(
+            "bounded dependent query source changed repeatedly during validation".to_owned(),
+        ))
     }
 
     fn ensure_fresh(&mut self) -> Result<(), RepoError> {
@@ -563,6 +721,27 @@ impl DependencyGraph for StructuralIndex<'_> {
         }
         Err(RepoError::InvalidSearch(
             "dependency query source changed repeatedly during bounded validation".to_owned(),
+        ))
+    }
+
+    fn dependent_neighborhood(&mut self, path: &Path) -> Result<Vec<DependencyEdge>, RepoError> {
+        for attempt in 0..=MAX_SOURCE_RACE_RETRIES {
+            self.ensure_fresh()?;
+            let rows = query_dependent_edges(&self.connection, &self.repository_id, path)?;
+            let rows_current =
+                self.validate_records_fresh(rows.iter().map(|row| row.source_path.clone()))?;
+            let manifest_current = self.source_manifest_is_current()?;
+            if rows_current && manifest_current {
+                return Ok(rows);
+            }
+            if attempt == MAX_SOURCE_RACE_RETRIES {
+                break;
+            }
+            self.refresh()?;
+        }
+        Err(RepoError::InvalidSearch(
+            "dependent dependency query source changed repeatedly during bounded validation"
+                .to_owned(),
         ))
     }
 }
@@ -1016,6 +1195,60 @@ fn query_symbols(
     rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
 }
 
+fn query_symbols_bounded(
+    connection: &Connection,
+    repository_id: &str,
+    name: Option<&str>,
+    path: Option<&Path>,
+    max_results: usize,
+) -> Result<StructuralQueryResult<SymbolRecord>, RepoError> {
+    let (count_sql, rows_sql, value) = if let Some(name) = name {
+        (
+            "SELECT count(*) FROM structural_symbols WHERE name=?1",
+            "SELECT path,source_digest,language,kind,name,start_byte,end_byte,start_line,end_line FROM structural_symbols WHERE name=?1 ORDER BY path,start_byte LIMIT ?2",
+            name.to_owned(),
+        )
+    } else if let Some(path) = path {
+        (
+            "SELECT count(*) FROM structural_symbols WHERE path=?1",
+            "SELECT path,source_digest,language,kind,name,start_byte,end_byte,start_line,end_line FROM structural_symbols WHERE path=?1 ORDER BY start_byte LIMIT ?2",
+            path.to_string_lossy().into_owned(),
+        )
+    } else {
+        return Ok(StructuralQueryResult {
+            total: 0,
+            rows: Vec::new(),
+        });
+    };
+    let total: i64 = connection
+        .query_row(count_sql, [value.as_str()], |row| row.get(0))
+        .map_err(sqlite_error)?;
+    let limit = i64::try_from(max_results).unwrap_or(i64::MAX);
+    let mut statement = connection.prepare(rows_sql).map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![value, limit], |row| {
+            Ok(SymbolRecord {
+                repository_id: repository_id.to_owned(),
+                relative_path: PathBuf::from(row.get::<_, String>(0)?),
+                source_digest: row.get(1)?,
+                parser_fingerprint: parser_fingerprint(),
+                schema_fingerprint: STRUCTURAL_SCHEMA_FINGERPRINT.to_owned(),
+                language: row.get(2)?,
+                kind: row.get(3)?,
+                name: row.get(4)?,
+                start_byte: row.get(5)?,
+                end_byte: row.get(6)?,
+                start_line: row.get(7)?,
+                end_line: row.get(8)?,
+            })
+        })
+        .map_err(sqlite_error)?;
+    Ok(StructuralQueryResult {
+        total: usize::try_from(total).unwrap_or(usize::MAX),
+        rows: rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?,
+    })
+}
+
 fn query_edges(
     connection: &Connection,
     repository_id: &str,
@@ -1039,6 +1272,129 @@ fn query_edges(
         })
         .map_err(sqlite_error)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)
+}
+
+fn query_edges_bounded(
+    connection: &Connection,
+    repository_id: &str,
+    path: &Path,
+    max_results: usize,
+) -> Result<StructuralQueryResult<DependencyEdge>, RepoError> {
+    let path_text = path.to_string_lossy();
+    let total: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM structural_edges WHERE source_path=?1",
+            [path_text.as_ref()],
+            |row| row.get(0),
+        )
+        .map_err(sqlite_error)?;
+    let limit = i64::try_from(max_results).unwrap_or(i64::MAX);
+    let mut statement = connection
+        .prepare("SELECT source_path,source_digest,language,relation,target FROM structural_edges WHERE source_path=?1 ORDER BY relation,target LIMIT ?2")
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map(params![path_text.as_ref(), limit], |row| {
+            Ok(DependencyEdge {
+                repository_id: repository_id.to_owned(),
+                source_path: PathBuf::from(row.get::<_, String>(0)?),
+                source_digest: row.get(1)?,
+                parser_fingerprint: parser_fingerprint(),
+                schema_fingerprint: STRUCTURAL_SCHEMA_FINGERPRINT.to_owned(),
+                language: row.get(2)?,
+                relation: row.get(3)?,
+                target: row.get(4)?,
+            })
+        })
+        .map_err(sqlite_error)?;
+    Ok(StructuralQueryResult {
+        total: usize::try_from(total).unwrap_or(usize::MAX),
+        rows: rows.collect::<Result<Vec<_>, _>>().map_err(sqlite_error)?,
+    })
+}
+
+fn query_dependent_edges(
+    connection: &Connection,
+    repository_id: &str,
+    path: &Path,
+) -> Result<Vec<DependencyEdge>, RepoError> {
+    let module_keys = module_keys_for_path(path);
+    let mut statement = connection
+        .prepare(
+            "SELECT source_path,source_digest,language,relation,target FROM structural_edges ORDER BY source_path,relation,target",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(DependencyEdge {
+                repository_id: repository_id.to_owned(),
+                source_path: PathBuf::from(row.get::<_, String>(0)?),
+                source_digest: row.get(1)?,
+                parser_fingerprint: parser_fingerprint(),
+                schema_fingerprint: STRUCTURAL_SCHEMA_FINGERPRINT.to_owned(),
+                language: row.get(2)?,
+                relation: row.get(3)?,
+                target: row.get(4)?,
+            })
+        })
+        .map_err(sqlite_error)?;
+    let mut output = Vec::new();
+    for row in rows {
+        let edge = row.map_err(sqlite_error)?;
+        if module_keys
+            .iter()
+            .any(|key| target_matches(&edge.target, key))
+        {
+            output.push(edge);
+        }
+    }
+    Ok(output)
+}
+
+fn query_dependent_edges_bounded(
+    connection: &Connection,
+    repository_id: &str,
+    path: &Path,
+    max_results: usize,
+) -> Result<StructuralQueryResult<DependencyEdge>, RepoError> {
+    let module_keys = module_keys_for_path(path);
+    let mut statement = connection
+        .prepare(
+            "SELECT source_path,source_digest,language,relation,target FROM structural_edges ORDER BY source_path,relation,target",
+        )
+        .map_err(sqlite_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(DependencyEdge {
+                repository_id: repository_id.to_owned(),
+                source_path: PathBuf::from(row.get::<_, String>(0)?),
+                source_digest: row.get(1)?,
+                parser_fingerprint: parser_fingerprint(),
+                schema_fingerprint: STRUCTURAL_SCHEMA_FINGERPRINT.to_owned(),
+                language: row.get(2)?,
+                relation: row.get(3)?,
+                target: row.get(4)?,
+            })
+        })
+        .map_err(sqlite_error)?;
+    let mut total = 0_usize;
+    let mut output = Vec::new();
+    for row in rows {
+        let edge = row.map_err(sqlite_error)?;
+        if !module_keys
+            .iter()
+            .any(|key| target_matches(&edge.target, key))
+        {
+            continue;
+        }
+        total = total.saturating_add(1);
+        if output.len() < max_results {
+            output.push(edge);
+        }
+    }
+    Ok(StructuralQueryResult {
+        total,
+        rows: output,
+    })
 }
 
 fn count_rows(connection: &Connection, table: &str) -> Result<usize, RepoError> {

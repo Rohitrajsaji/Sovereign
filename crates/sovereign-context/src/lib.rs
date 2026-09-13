@@ -1,7 +1,7 @@
-//! Bounded, deterministic M1 context packets over exact current evidence.
+//! Bounded, deterministic context packets over exact current and routed evidence.
 //!
 //! This crate deliberately does not own repository truth, model state, or
-//! semantic retrieval. It projects already-governed C0/C1 facts into a small,
+//! semantic retrieval. It projects already-governed C0-C3 facts into a small,
 //! stable weak-model packet and records reproducible token accounting.
 
 use serde::{Deserialize, Serialize};
@@ -12,12 +12,23 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-/// M1 context levels. Richer levels are introduced by later milestones.
+mod routing;
+
+pub use routing::{
+    Channel, ChannelResult, ContextLevelPolicy, DiffResult, EvidenceChannelLink, FailureHistoryKey,
+    HistoryProvider, RepositoryRetrievalBackend, RetrievalBackend, RetrievalIntent,
+    RetrievalOutcome, RetrievalRouter, RetrievalTrace, RouteBoundFact, RouteStep, StopCondition,
+};
+
+/// Progressive context levels implemented through M2; broader semantic/project-plan levels remain
+/// outside this crate's current routing surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextLevel {
     C0,
     C1,
+    C2,
+    C3,
 }
 
 /// Stable packet section order for weak local models.
@@ -317,7 +328,7 @@ impl EvidenceItem {
     }
 }
 
-/// Token ceilings for one M1 packet. Ceilings are not fill targets.
+/// Token ceilings for one bounded weak-model packet. Ceilings are not fill targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextBudget {
     pub max_input_tokens: u32,
@@ -330,7 +341,7 @@ pub struct ContextBudget {
 }
 
 impl ContextBudget {
-    /// Default 8k M1 profile from the frozen architecture.
+    /// Default 8k weak-model profile from the frozen architecture.
     #[must_use]
     pub const fn m1_8k() -> Self {
         Self {

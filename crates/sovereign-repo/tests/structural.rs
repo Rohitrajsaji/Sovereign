@@ -2,6 +2,7 @@ use sovereign_repo::{
     DependencyGraph, ProjectRegistry, StructuralConfig, StructuralIndex, StructuralLookup,
     StructuralRetriever, SymbolIndex,
 };
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -129,6 +130,54 @@ fn structural_import_neighborhood_extracts_language_aware_relations() {
         root.iter()
             .any(|e| e.relation == "module" && e.target == "service")
     );
+}
+
+#[test]
+fn structural_dependent_neighborhood_returns_importers() {
+    let repo = TestRepo::new("dependents");
+    let r = registry(&repo);
+    let mut idx = index(&r, &repo);
+    idx.rebuild().unwrap_or_else(|e| panic!("rebuild: {e}"));
+
+    let dependents = idx
+        .dependent_neighborhood(Path::new("src/service.rs"))
+        .unwrap_or_else(|e| panic!("dependents: {e}"));
+    assert!(dependents.iter().any(|edge| {
+        edge.source_path == PathBuf::from("src/lib.rs")
+            && edge.relation == "module"
+            && edge.target == "service"
+    }));
+}
+
+#[test]
+fn structural_bounded_queries_report_total_and_limit_materialized_rows() {
+    let repo = TestRepo::new("bounded-query-results");
+    let repeated = (0..12)
+        .map(|_| "pub fn repeated() {}\n")
+        .collect::<String>();
+    fs::write(repo.path().join("src/many.rs"), repeated)
+        .unwrap_or_else(|e| panic!("write symbols: {e}"));
+    let mut modules = String::new();
+    for index in 0..20 {
+        writeln!(&mut modules, "mod dep_{index:02};")
+            .unwrap_or_else(|e| panic!("format edges: {e}"));
+    }
+    fs::write(repo.path().join("src/lib.rs"), modules)
+        .unwrap_or_else(|e| panic!("write edges: {e}"));
+
+    let r = registry(&repo);
+    let mut idx = index(&r, &repo);
+    let symbols = idx
+        .definitions_bounded("repeated", 8)
+        .unwrap_or_else(|e| panic!("bounded definitions: {e}"));
+    assert_eq!(symbols.total, 12);
+    assert_eq!(symbols.rows.len(), 8);
+
+    let edges = idx
+        .import_neighborhood_bounded(Path::new("src/lib.rs"), 12)
+        .unwrap_or_else(|e| panic!("bounded edges: {e}"));
+    assert_eq!(edges.total, 20);
+    assert_eq!(edges.rows.len(), 12);
 }
 
 #[test]
