@@ -1,12 +1,14 @@
 //! Normative Plan IR v1.2 representation and deterministic validation.
 
 mod compiler;
+mod depth;
 
 pub use compiler::{
     CompilationEvidence, CompilationEvidenceHandle, ModelAttemptEvidence,
     PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationError, PlanCompilationInput,
     PlanCompilationRepository, PlanCompilationResult, PlanCompiler,
 };
+pub use depth::{DepthClassifier, DepthDecision, DepthFeatureInput, DepthFeatures, ExecutionDepth};
 
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};

@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "task_id": "M3-T01",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "1cf42ff",
+  "status": "completed",
+  "completed_at": "2026-09-13T08:42:06Z",
+  "verified_at": "2026-09-13T08:38:05Z",
+  "scope": [
+    "crates/sovereign-plan standalone deterministic depth feature extraction/classification only",
+    "no PlanCompiler, PlanCompilationInput, Controller, BUILD_STATE, or compiler-integration changes"
+  ],
+  "interfaces": [
+    "ExecutionDepth",
+    "DepthFeatureInput",
+    "DepthFeatures",
+    "DepthDecision",
+    "DepthClassifier"
+  ],
+  "classifier_contract": {
+    "modes": ["D0", "D1", "D2", "D3", "D4"],
+    "persisted_output": ["chosen depth", "deterministic reason", "scalar normalized feature vector", "aggregate score"],
+    "feature_categories": [
+      "repository count",
+      "language count",
+      "expected files/modules/symbols",
+      "security/authentication/authorization/secrets sensitivity",
+      "schema/data migration and irreversibility",
+      "public API/protocol compatibility and coordinated multi-repository protocol",
+      "unknown technology/dependency",
+      "verification availability and coverage",
+      "architecture uncertainty",
+      "blast radius and dependency centrality",
+      "prior similar failures",
+      "destructive/external effects and rollback availability"
+    ],
+    "normalization": "repository/language counts are at least 1; percentage inputs are clamped to 0..=100 before scoring/persistence",
+    "hard_overrides_to_d4": [
+      "irreversible_migration",
+      "authentication_or_authorization",
+      "secrets_sensitive",
+      "coordinated multi-repository protocol change",
+      "multi-repository schema/data migration",
+      "destructive or external effect without rollback"
+    ],
+    "minimum_floors": [
+      "security-sensitive, migration, public API/protocol, high blast/dependency centrality, or architectural/multi-module scope => at least D3",
+      "multi-file single-subsystem scope => at least D2"
+    ],
+    "score_bands": {
+      "D0": "aggregate 0..=1 only when direct-scope predicate is true",
+      "D1": "aggregate 0..=5 absent a higher floor/override",
+      "D2": "aggregate 6..=12 absent a higher floor/override",
+      "D3": "aggregate 13..=23 absent a D4 override",
+      "D4": "aggregate >=24 or a hard override"
+    },
+    "plan_ir_compatibility": "DepthFeatures serializes as a flat JSON object of scalar booleans/numbers and DepthDecision serializes mode/reason/features compatible with Plan IR v1.2 depth shape."
+  },
+  "fixture_matrix": [
+    {
+      "fixture": "default tiny one-repository one-language one-file scope",
+      "expected": "D0",
+      "test": "depth_trivial_and_focused_inputs_classify_d0_d1"
+    },
+    {
+      "fixture": "focused bounded symbol change with 70% verification coverage",
+      "expected": "D1",
+      "test": "depth_trivial_and_focused_inputs_classify_d0_d1"
+    },
+    {
+      "fixture": "four-file one-subsystem change",
+      "expected": "D2",
+      "test": "depth_multi_file_single_subsystem_classifies_d2"
+    },
+    {
+      "fixture": "authentication/authorization change",
+      "expected": "D4 hard override: authentication_or_authorization",
+      "test": "depth_authentication_change_is_hard_override_d4"
+    },
+    {
+      "fixture": "two-repository schema/data migration",
+      "expected": "D4 hard override: multi_repo_migration",
+      "test": "depth_multi_repo_migration_is_hard_override_d4"
+    },
+    {
+      "fixture": "destructive or external effect without rollback",
+      "expected": "D4 regardless of aggregate score",
+      "test": "depth_destructive_or_external_without_rollback_is_d4_regardless_of_score"
+    },
+    {
+      "fixture": "security/migration/public API/high blast/multi-module/high architecture uncertainty",
+      "expected": "at least D3",
+      "test": "depth_security_migration_public_api_and_high_blast_have_d3_floor"
+    },
+    {
+      "fixture": "repeated classification plus serde serialization",
+      "expected": "identical decisions and scalar persisted features",
+      "test": "depth_decision_reason_and_scalar_features_are_deterministic_and_serializable"
+    }
+  ],
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-plan --offline -- depth",
+      "result": "passed",
+      "detail": "7/7 depth integration tests; compiler/validator tests filtered by the frozen depth filter"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-plan --offline",
+      "result": "passed",
+      "detail": "36/36 integration tests: 7 depth + 10 minimal_compiler + 19 validator; doc tests pass"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-plan --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test --workspace --offline",
+      "result": "passed",
+      "detail": "full current-tree offline workspace regression passed after M3-T01 implementation; only the two explicitly local-Qwen-gated tests remain ignored"
+    }
+  ],
+  "implementation_worker_report": {
+    "worker": "worker-14",
+    "result": "implemented; no blockers",
+    "ownership": "author report only, not the independent closure audit",
+    "reported_dirty_scope": [
+      "crates/sovereign-plan/src/lib.rs",
+      "crates/sovereign-plan/src/depth.rs",
+      "crates/sovereign-plan/tests/depth.rs"
+    ]
+  },
+  "independent_audit": {
+    "worker": "worker-15",
+    "result": "CLOSABLE",
+    "blockers": [],
+    "notes": "Fresh independent read-only audit of the exact current dirty tree/evidence found no M3-T01 blocker. It re-read the frozen task and architecture section 7, independently verified every classifier feature category, deterministic normalization/scoring, Plan IR-compatible scalar persistence, D0-D4 fixtures, all hard overrides and floors, exact evidence hashes/test counts, and confirmed compiler.rs is byte-identical to HEAD so PlanCompiler/PlanCompilationInput behavior is untouched. Targeted depth tests 7/7, full sovereign-plan 36/36, strict clippy, fmt check, and git diff check all passed independently."
+  },
+  "source_hashes": {
+    "crates/sovereign-plan/src/lib.rs": "sha256:c317f0778474068d19dd183d6012217409eb4ea7b1c94025fde8efc120aa9792",
+    "crates/sovereign-plan/src/depth.rs": "sha256:b548f867a3e34e5881bd973a6caefc2337f563bdf8cddffe086d9af198804a53",
+    "crates/sovereign-plan/tests/depth.rs": "sha256:43286a9cf7fc590d66b7ef95d8251658db28c0fecc45b311a8da538d742af2d1"
+  }
+}
