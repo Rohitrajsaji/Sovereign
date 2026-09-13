@@ -22,15 +22,19 @@ use sovereign_policy::{
 use sovereign_repo::{
     ExactRetriever, ProjectRegistry, RepoError, RepositoryIntelligence, RepositorySnapshot,
 };
-use sovereign_state::{NewCheckpointIntegrityRecord, NewJournalEvent, StateError, StateStore};
+use sovereign_state::{
+    CheckpointIntegrityRecord, JournalEvent, NewCheckpointIntegrityRecord, NewJournalEvent,
+    StateError, StateRecordUpdate, StateStore,
+};
 use sovereign_tools::{
     ActionJournal, AuthorizedAction, PermissionClass, ProcessRunner, RawToolResult,
-    ReconciliationMode, ToolError, ToolManifest,
+    ReconciliationMode, ToolError, ToolManifest, reap_owned_process_group,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +44,9 @@ const M1_MODEL_OUTPUT_TOKENS: u32 = 512;
 const MAX_LITERAL_BYTES: usize = 4_096;
 const EVIDENCE_SATISFACTION_SCHEMA_VERSION: u32 = 1;
 const VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION: u32 = 1;
+pub const CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const RECOVERY_PROCESS_LEASE_SCHEMA_VERSION: u32 = 1;
+const ACTION_INTENT_SCHEMA_VERSION: u32 = 2;
 const MAX_PROPOSAL_EVIDENCE_IDS: usize = 16;
 const MAX_PROPOSAL_EVIDENCE_ID_BYTES: usize = 512;
 const ATOMIC_REPLACE_HELPER: &str = r"import hashlib, os, pathlib, sys
@@ -382,6 +389,81 @@ pub struct ExecutionSuccess {
     pub verification: VerificationResultV1,
 }
 
+/// Durable checkpoint body published to the Controller checkpoint CAS. The immutable
+/// checkpoint-integrity row stores this manifest's CAS digest and journal sequence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointManifest {
+    pub schema_version: u32,
+    pub plan_document: Value,
+    pub plan_id: String,
+    pub goal_id: String,
+    pub plan_revision: u32,
+    pub plan_digest: String,
+    pub compiler_plan_digest: String,
+    pub compilation_evidence_digest: String,
+    pub policy_digest: String,
+    pub repository_id: String,
+    pub repository_root: PathBuf,
+    pub repository_snapshot: RepositorySnapshot,
+    pub repository_snapshot_digest: String,
+    pub baseline_diff_digest: String,
+    pub baseline_diff_content: String,
+    pub plan_validity: PlanValidity,
+    pub task_records: BTreeMap<String, Value>,
+    pub attempt_records: BTreeMap<String, Value>,
+    pub evidence_binding_digests: BTreeMap<String, String>,
+    pub action_records: Vec<CheckpointActionRecord>,
+    pub process_leases: Vec<RecoveryProcessLease>,
+    pub action_journal_sequence: i64,
+    pub execution_epoch: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CheckpointActionRecord {
+    pub action_id: String,
+    pub state: String,
+    pub payload_digest: String,
+    pub policy_digest: String,
+    pub execution_epoch: i64,
+    pub result_digest: Option<String>,
+    pub last_event_sequence: i64,
+}
+
+/// Recovery ownership record for a locally spawned process group. A lease without a
+/// PID/identity proof is unresolved and blocks mutation rather than guessing process state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryProcessLease {
+    pub schema_version: u32,
+    pub lease_id: String,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub action_id: String,
+    pub process_group_id: Option<u32>,
+    pub leader_identity: Option<String>,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverySummary {
+    pub plan_id: String,
+    pub plan_digest: String,
+    pub checkpoint_generation: i64,
+    pub checkpoint_action_sequence: i64,
+    pub replayed_events: usize,
+    pub execution_epoch_before: i64,
+    pub execution_epoch_after: i64,
+    pub interrupted_attempt_ids: Vec<String>,
+    pub unknown_action_ids: Vec<String>,
+    pub pending_recovery_action_ids: Vec<String>,
+    pub unresolved_process_lease_ids: Vec<String>,
+    pub fallback_checkpoint_used: bool,
+    pub mutation_blocked: bool,
+}
+
+/// Controller-owned restart authority. Recovery reconstructs only from durable
+/// SQLite/CAS/Git truth and never from chat/model memory.
+pub struct RecoveryManager;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvidenceSatisfactionV1 {
     pub schema_version: u32,
@@ -440,8 +522,16 @@ struct AttemptRuntime {
     pre_changed_fingerprints: BTreeMap<PathBuf, String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedRepositoryBaseline {
+    snapshot: RepositorySnapshot,
+    diff_digest: String,
+    diff_content: String,
+}
+
 struct ActivePlan {
-    compilation: PlanCompilationResult,
+    plan_document: Value,
+    compiler_plan_digest: String,
     plan_id: String,
     goal_id: String,
     revision: u32,
@@ -463,6 +553,7 @@ pub struct Controller {
     active: Option<ActivePlan>,
     resource_governor: M1ResourceGovernor,
     permission_context: PermissionContext,
+    trusted_recovery_intent_digests: BTreeMap<String, String>,
 }
 
 impl Controller {
@@ -473,6 +564,7 @@ impl Controller {
             active: None,
             resource_governor: M1ResourceGovernor::default(),
             permission_context: PermissionContext::m1_local_autonomous(),
+            trusted_recovery_intent_digests: BTreeMap::new(),
         }
     }
 
@@ -486,6 +578,7 @@ impl Controller {
             active: None,
             resource_governor: M1ResourceGovernor::default(),
             permission_context,
+            trusted_recovery_intent_digests: BTreeMap::new(),
         }
     }
 
@@ -653,7 +746,7 @@ impl Controller {
     ///
     /// # Errors
     /// Returns a fail-closed validation/state error when the compiler result or baseline is stale.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     pub fn activate(
         &mut self,
         compilation: PlanCompilationResult,
@@ -677,7 +770,8 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        let plan = compilation.plan().as_value();
+        let plan_document = compilation.plan().as_value().clone();
+        let plan = &plan_document;
         let plan_id = required_str(plan, "/plan_id")?.to_owned();
         let goal_id = required_str(plan, "/goal/goal_id")?.to_owned();
         let revision = required_u32(plan, "/revision")?;
@@ -744,11 +838,13 @@ impl Controller {
                 .ok_or_else(|| ControllerError::InvalidPlan("missing policy".to_owned()))?,
         )?;
         let plan_digest = compilation.plan_digest().to_owned();
+        let compiler_plan_digest = plan_digest.clone();
         let compilation_evidence_digest = compilation.compilation_evidence_digest().to_owned();
         let epoch = self.state.advance_execution_epoch()?;
         let task_ids = tasks.keys().cloned().collect::<Vec<_>>();
         self.active = Some(ActivePlan {
-            compilation,
+            plan_document,
+            compiler_plan_digest,
             plan_id: plan_id.clone(),
             goal_id,
             revision,
@@ -893,6 +989,114 @@ impl Controller {
         }
     }
 
+    /// Resumes a crash-interrupted, not-yet-mutated replacement from the exact durable
+    /// Controller action intent without another model call. Recovery creates a new attempt
+    /// under the current epoch and revalidates the repository preimage and compiled contract.
+    ///
+    /// # Errors
+    /// Returns a fail-closed recovery/readiness error when the intent, baseline, retry budget,
+    /// authority, or current repository content no longer matches.
+    pub fn resume_recovered_replace<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        prior_action_id: &str,
+        runtime: &ExecutionRuntime<'_, I>,
+        readiness: ReadinessInputs<'_>,
+    ) -> Result<ExecutionSuccess, ControllerError> {
+        let raw = self
+            .state
+            .get_state("controller.action_intent", prior_action_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "recovery action intent {prior_action_id} is missing"
+                ))
+            })?;
+        let trusted_intent_digest = self
+            .trusted_recovery_intent_digests
+            .get(prior_action_id)
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "recovery action intent {prior_action_id} has no trusted checkpoint binding"
+                ))
+            })?;
+        if sha256_prefixed(raw.as_bytes()) != *trusted_intent_digest {
+            return Err(ControllerError::NotReady(
+                "recovery action intent differs from its trusted recovery checkpoint binding"
+                    .to_owned(),
+            ));
+        }
+        let intent: PersistedActionIntent = serde_json::from_str(&raw)?;
+        if intent.schema_version != ACTION_INTENT_SCHEMA_VERSION {
+            return Err(ControllerError::NotReady(
+                "recovery action intent schema is unsupported".to_owned(),
+            ));
+        }
+        let prior = self.state.action_record(prior_action_id)?.ok_or_else(|| {
+            ControllerError::NotReady("recovery action record missing".to_owned())
+        })?;
+        if !matches!(prior.state.as_str(), "prepared" | "authorized" | "failed") {
+            return Err(ControllerError::NotReady(format!(
+                "action {} is not eligible for pre-mutation recovery from state {}",
+                prior.action_id, prior.state
+            )));
+        }
+        if intent.action_id != prior.action_id
+            || intent.payload_digest != prior.payload_digest
+            || intent.policy_digest != prior.policy_digest
+            || intent.execution_epoch != prior.execution_epoch
+        {
+            return Err(ControllerError::NotReady(
+                "recovery action intent does not match durable prior action authority".to_owned(),
+            ));
+        }
+        let action_seed = persisted_intent_action_seed(&intent)?;
+        if intent.action_id != format!("action.{}", &action_seed[7..27])
+            || intent.action_nonce != format!("nonce.{}", &action_seed[27..47])
+        {
+            return Err(ControllerError::NotReady(
+                "recovery action intent semantics do not re-derive the prior action identity"
+                    .to_owned(),
+            ));
+        }
+        let validated = self.validate_recovered_action_intent(&intent, runtime.registry)?;
+        let (attempts_started, max_attempts) = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&intent.task_id).ok_or_else(|| {
+                ControllerError::NotReady("recovery task no longer exists".to_owned())
+            })?;
+            let original_attempt = active.attempts.get(&intent.attempt_id).ok_or_else(|| {
+                ControllerError::NotReady("recovery origin attempt no longer exists".to_owned())
+            })?;
+            if original_attempt.task_id != intent.task_id
+                || original_attempt.task_contract_digest != intent.task_contract_digest
+            {
+                return Err(ControllerError::NotReady(
+                    "recovery action intent is misbound to its origin attempt".to_owned(),
+                ));
+            }
+            (
+                task.attempts_started,
+                required_u32(&task.task, "/failure_policy/max_attempts")?,
+            )
+        };
+        if attempts_started >= max_attempts {
+            return Err(ControllerError::NotReady(
+                "recovery attempt budget is exhausted".to_owned(),
+            ));
+        }
+        let mut lease = self.derive_ready_lease(runtime.registry, &intent.task_id, readiness)?;
+        let result = (|| {
+            self.validate_ready_lease(&lease, runtime.registry)?;
+            let attempt_id = self.start_attempt(&lease, runtime.registry)?;
+            self.execute_validated_replace(&mut lease, runtime, &attempt_id, &validated)
+        })();
+        let release = self.resource_governor.release(&lease.resource_lease);
+        match (result, release) {
+            (Ok(success), Ok(())) => Ok(success),
+            (Ok(_), Err(error)) => Err(ControllerError::Policy(error)),
+            (Err(error), _) => Err(error),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn execute_replace_inner<I: sovereign_policy::ExecutionIsolationBackend>(
         &mut self,
@@ -938,7 +1142,19 @@ impl Controller {
                     return Err(error);
                 }
             };
-        let action = self.lower_replace_action(lease, &attempt_id, &validated, runtime)?;
+        self.execute_validated_replace(lease, runtime, &attempt_id, &validated)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_validated_replace<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        lease: &mut ReadyLease,
+        runtime: &ExecutionRuntime<'_, I>,
+        attempt_id: &str,
+        validated: &ValidatedReplace,
+    ) -> Result<ExecutionSuccess, ControllerError> {
+        let action = self.lower_replace_action(lease, attempt_id, validated, runtime)?;
+        self.persist_action_intent(&action, validated, runtime.artifacts.root())?;
         {
             let mut journal = ActionJournal::new(&mut self.state);
             journal.authorize(&action, runtime.tool_manifest)?;
@@ -964,30 +1180,34 @@ impl Controller {
                     .as_ref()
                     .is_some_and(|record| record.state == "unknown")
                 {
-                    self.mark_unknown(&attempt_id, &lease.task_id, &action.action_id)?;
+                    self.mark_unknown(attempt_id, &lease.task_id, &action.action_id)?;
                     return Err(ControllerError::UnknownAction(action.action_id));
                 }
                 let signature = sha256_prefixed(format!("runner\0{error}").as_bytes());
-                self.fail_attempt_and_route(&attempt_id, &lease.task_id, &signature)?;
+                self.fail_attempt_and_route(attempt_id, &lease.task_id, &signature)?;
                 return Err(ControllerError::Tool(error));
             }
         };
         self.checkpoint_now()?;
+        recovery_test_hook("after_mutation_checkpoint");
         if result.exit_code != Some(0) || result.terminated_for_limit.is_some() {
-            let failure = self.execution_failure(lease, &attempt_id, &action, &result)?;
-            self.fail_attempt_and_route(&attempt_id, &lease.task_id, &failure.signature)?;
+            let failure = self.execution_failure(lease, attempt_id, &action, &result)?;
+            self.fail_attempt_and_route(attempt_id, &lease.task_id, &failure.signature)?;
             return Err(ControllerError::ExecutionFailed(Box::new(failure)));
         }
-        self.transition_attempt(&attempt_id, AttemptState::Verifying, "attempt_verifying")?;
+        self.transition_attempt(attempt_id, AttemptState::Verifying, "attempt_verifying")?;
         self.transition_task(&lease.task_id, TaskState::Verifying, "task_verifying")?;
+        recovery_test_hook("verification_started");
+        let verification_binding = VerificationLeaseBinding::from(&*lease);
         let verification = DeterministicVerifier::verify(
             &self.state,
             self.active_ref()?,
             runtime.registry,
-            lease,
-            &attempt_id,
-            &action,
-            &validated,
+            &verification_binding,
+            attempt_id,
+            &action.action_id,
+            action.destination_digest.as_deref(),
+            validated,
         )?;
         let verification_bytes = serde_json::to_vec(&verification)?;
         let artifact = runtime
@@ -1018,7 +1238,7 @@ impl Controller {
                 )
                 .as_bytes(),
             );
-            self.fail_attempt_and_route(&attempt_id, &lease.task_id, &signature)?;
+            self.fail_attempt_and_route(attempt_id, &lease.task_id, &signature)?;
             return Err(ControllerError::VerificationFailed(Box::new(verification)));
         }
         self.record_verified_output_bindings(&verification, &artifact.digest)?;
@@ -1035,7 +1255,7 @@ impl Controller {
         })?;
         Ok(ExecutionSuccess {
             task_id: lease.task_id.clone(),
-            attempt_id,
+            attempt_id: attempt_id.to_owned(),
             action_id: action.action_id,
             action_result_digest,
             verification_evidence_id,
@@ -1107,7 +1327,7 @@ impl Controller {
             ));
         }
         let active = self.active_ref()?;
-        let plan = active.compilation.plan().as_value();
+        let plan = &active.plan_document;
         let global_permissions = required_array(plan, "/policy/capability_ceiling")?;
         let task_permissions = required_array(task, "/permissions")?;
         let global_repo_write = global_permissions
@@ -1462,11 +1682,19 @@ impl Controller {
                 .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?;
             task.model_calls_used = task.model_calls_used.saturating_add(1);
         }
-        self.persist_task(task_id)?;
-        self.append_controller_event(
-            "task_model_call_consumed",
-            task_id,
-            &json!({"used": used.saturating_add(1), "limit": limit}),
+        let task_json = serde_json::to_string(
+            self.active_ref()?
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?,
+        )?;
+        self.persist_runtime_records_with_events(
+            &[("controller.task".to_owned(), task_id.to_owned(), task_json)],
+            &[(
+                "task_model_call_consumed".to_owned(),
+                task_id.to_owned(),
+                json!({"used": used.saturating_add(1), "limit": limit}),
+            )],
         )?;
         self.checkpoint_now()?;
         Ok(())
@@ -1536,11 +1764,23 @@ impl Controller {
                 active.validity = PlanValidity::StaleEvidence;
             }
             let epoch = self.state.advance_execution_epoch()?;
-            self.persist_all_runtime()?;
-            self.append_controller_event(
+            let (repository_snapshot_digest, baseline_diff_digest, plan_validity) = {
+                let active = self.active_ref()?;
+                (
+                    snapshot_digest(&active.baseline)?,
+                    active.baseline_diff_digest.clone(),
+                    active.validity,
+                )
+            };
+            self.persist_plan_baseline_with_event(
                 "plan_stale_evidence",
                 &repository_id,
-                &json!({"execution_epoch": epoch}),
+                &json!({
+                    "execution_epoch": epoch,
+                    "repository_snapshot_digest": repository_snapshot_digest,
+                    "baseline_diff_digest": baseline_diff_digest,
+                    "plan_validity": plan_validity,
+                }),
             )?;
             self.checkpoint_now()?;
             return Err(ControllerError::NotReady(
@@ -1675,11 +1915,7 @@ impl Controller {
                 "replace_literal would modify a pre-existing user-owned target hunk".to_owned(),
             ));
         }
-        if !compiled_literal_contract_allows(
-            active.compilation.plan().as_value(),
-            &task.task,
-            &action,
-        )? {
+        if !compiled_literal_contract_allows(&active.plan_document, &task.task, &action)? {
             return Err(ControllerError::ProposalRejected(
                 "replace_literal is not entailed by the immutable compiled literal contract"
                     .to_owned(),
@@ -1806,6 +2042,245 @@ impl Controller {
         })
     }
 
+    fn persist_action_intent(
+        &mut self,
+        action: &AuthorizedAction,
+        validated: &ValidatedReplace,
+        artifact_store_root: &Path,
+    ) -> Result<(), ControllerError> {
+        let (plan_digest, task_contract_digest) = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&action.task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("action intent task disappeared".to_owned())
+            })?;
+            (
+                active.plan_digest.clone(),
+                task.task_contract_digest.clone(),
+            )
+        };
+        let intent = PersistedActionIntent {
+            schema_version: ACTION_INTENT_SCHEMA_VERSION,
+            action_id: action.action_id.clone(),
+            plan_id: action.plan_id.clone(),
+            plan_revision: action.plan_revision,
+            plan_digest,
+            task_id: action.task_id.clone(),
+            task_contract_digest,
+            attempt_id: action.attempt_id.clone(),
+            execution_epoch: action.execution_epoch,
+            payload_digest: action.payload_digest(),
+            action_nonce: action.nonce.clone(),
+            policy_digest: action.policy_digest.clone(),
+            repository_id: action.repository_id.clone(),
+            path: validated.proposal.path.clone(),
+            expected_source_digest: validated.proposal.expected_source_digest.clone(),
+            old_literal: validated.proposal.old_literal.clone(),
+            new_literal: validated.proposal.new_literal.clone(),
+            expected_post_digest: validated.expected_post_digest.clone(),
+            expected_target_mode: validated.expected_target_mode,
+            artifact_store_root: artifact_store_root.to_path_buf(),
+        };
+        self.state.put_state(
+            "controller.action_intent",
+            &action.action_id,
+            &serde_json::to_string(&intent)?,
+        )?;
+        Ok(())
+    }
+
+    fn validate_recovered_action_intent(
+        &self,
+        intent: &PersistedActionIntent,
+        registry: &ProjectRegistry,
+    ) -> Result<ValidatedReplace, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active.tasks.get(&intent.task_id).ok_or_else(|| {
+            ControllerError::NotReady("recovery action task disappeared".to_owned())
+        })?;
+        if intent.schema_version != ACTION_INTENT_SCHEMA_VERSION
+            || intent.plan_id != active.plan_id
+            || intent.plan_revision != active.revision
+            || intent.plan_digest != active.plan_digest
+            || intent.repository_id != active.repository_id
+            || intent.policy_digest != active.policy_digest
+            || intent.task_contract_digest != task.task_contract_digest
+        {
+            return Err(ControllerError::NotReady(
+                "recovery action intent is stale or misbound".to_owned(),
+            ));
+        }
+        let proposal = ReplaceLiteral {
+            kind: ReplaceLiteralKind::ReplaceLiteral,
+            repository_id: intent.repository_id.clone(),
+            path: intent.path.clone(),
+            expected_source_digest: intent.expected_source_digest.clone(),
+            old_literal: intent.old_literal.clone(),
+            new_literal: intent.new_literal.clone(),
+            expected_occurrences: 1,
+        };
+        if !compiled_literal_contract_allows(&active.plan_document, &task.task, &proposal)? {
+            return Err(ControllerError::NotReady(
+                "recovery action no longer matches compiled acceptance contract".to_owned(),
+            ));
+        }
+        let scoped_files = required_array(&task.task, "/scope/files")?;
+        if !scoped_files
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|path| path == proposal.path)
+        {
+            return Err(ControllerError::NotReady(
+                "recovery action target is outside active task scope".to_owned(),
+            ));
+        }
+        let source = ExactRetriever::new(registry).read_path(
+            &intent.repository_id,
+            Path::new(&intent.path),
+            Some(&intent.expected_source_digest),
+        )?;
+        if source.content.matches(&intent.old_literal).count() != 1 {
+            return Err(ControllerError::NotReady(
+                "recovery preimage no longer contains exactly one old literal".to_owned(),
+            ));
+        }
+        let expected_post = source
+            .content
+            .replacen(&intent.old_literal, &intent.new_literal, 1);
+        let expected_post_digest = sha256_prefixed(expected_post.as_bytes());
+        let current_mode = permission_mode(&fs::symlink_metadata(
+            active.repository_root.join(&intent.path),
+        )?);
+        if expected_post_digest != intent.expected_post_digest
+            || current_mode != intent.expected_target_mode
+        {
+            return Err(ControllerError::NotReady(
+                "recovery action postimage/mode contract no longer matches durable intent"
+                    .to_owned(),
+            ));
+        }
+        Ok(ValidatedReplace {
+            proposal,
+            expected_post_digest,
+            expected_target_mode: intent.expected_target_mode,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn resume_recovery_verification(
+        &mut self,
+        registry: &ProjectRegistry,
+        action_id: &str,
+    ) -> Result<(), ControllerError> {
+        let raw = self
+            .state
+            .get_state("controller.action_intent", action_id)?
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "recovery verification intent {action_id} is missing"
+                ))
+            })?;
+        let intent: PersistedActionIntent = serde_json::from_str(&raw)?;
+        let record = self
+            .state
+            .action_record(action_id)?
+            .ok_or_else(|| ControllerError::InvalidPlan("recovery action missing".to_owned()))?;
+        if record.state != "committed"
+            || record.result_digest.is_none()
+            || record.payload_digest != intent.payload_digest
+        {
+            return Err(ControllerError::NotReady(format!(
+                "recovery action {action_id} is not durably committed"
+            )));
+        }
+        let (task_contract_digest, baseline_digest) = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&intent.task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("recovery verification task missing".to_owned())
+            })?;
+            let attempt = active.attempts.get(&intent.attempt_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("recovery verification attempt missing".to_owned())
+            })?;
+            if task.state != TaskState::Verifying || attempt.state != AttemptState::Verifying {
+                return Err(ControllerError::NotReady(
+                    "recovery verification state is not Verifying".to_owned(),
+                ));
+            }
+            (
+                task.task_contract_digest.clone(),
+                attempt.baseline_digest.clone(),
+            )
+        };
+        let proposal = ReplaceLiteral {
+            kind: ReplaceLiteralKind::ReplaceLiteral,
+            repository_id: intent.repository_id.clone(),
+            path: intent.path.clone(),
+            expected_source_digest: intent.expected_source_digest.clone(),
+            old_literal: intent.old_literal.clone(),
+            new_literal: intent.new_literal.clone(),
+            expected_occurrences: 1,
+        };
+        let validated = ValidatedReplace {
+            proposal,
+            expected_post_digest: intent.expected_post_digest.clone(),
+            expected_target_mode: intent.expected_target_mode,
+        };
+        let active = self.active_ref()?;
+        let binding = VerificationLeaseBinding {
+            plan_id: active.plan_id.clone(),
+            plan_revision: active.revision,
+            plan_digest: active.plan_digest.clone(),
+            task_id: intent.task_id.clone(),
+            task_contract_digest,
+            baseline_digest,
+            execution_epoch: self.state.current_execution_epoch()?,
+        };
+        let verification = DeterministicVerifier::verify(
+            &self.state,
+            self.active_ref()?,
+            registry,
+            &binding,
+            &intent.attempt_id,
+            action_id,
+            Some(&intent.expected_source_digest),
+            &validated,
+        )?;
+        let artifacts = ArtifactStore::open(&intent.artifact_store_root)?;
+        let verification_bytes = serde_json::to_vec(&verification)?;
+        let artifact = artifacts.put(&mut self.state, &verification_bytes)?;
+        let verification_evidence_id = format!(
+            "evidence.verification.{}",
+            digest_fragment(&artifact.digest, 16)
+        );
+        self.state
+            .add_artifact_reference(&verification_evidence_id, &artifact.digest)?;
+        self.state.put_state(
+            "controller.verification",
+            &verification.verification_id,
+            &serde_json::to_string(&verification)?,
+        )?;
+        self.append_controller_event(
+            "recovery_verification_recorded",
+            &verification.verification_id,
+            &json!({"passed": verification.passed, "artifact_digest": artifact.digest}),
+        )?;
+        self.checkpoint_now()?;
+        if !verification.passed {
+            let signature = sha256_prefixed(
+                format!(
+                    "recovery-verification\0{}",
+                    verification.failure_code.as_deref().unwrap_or("unknown")
+                )
+                .as_bytes(),
+            );
+            self.fail_attempt_and_route(&intent.attempt_id, &intent.task_id, &signature)?;
+            return Err(ControllerError::VerificationFailed(Box::new(verification)));
+        }
+        self.record_verified_output_bindings(&verification, &artifact.digest)?;
+        self.apply_verified_success(&verification)?;
+        self.refresh_baseline_after_verified_success(registry)?;
+        Ok(())
+    }
+
     fn execution_failure(
         &self,
         lease: &ReadyLease,
@@ -1909,12 +2384,36 @@ impl Controller {
         self.active_mut()?
             .attempts
             .insert(attempt_id.clone(), attempt);
-        self.persist_task(&lease.task_id)?;
-        self.persist_attempt(&attempt_id)?;
-        self.append_controller_event(
-            "attempt_started",
-            &attempt_id,
-            &json!({"task_id": lease.task_id, "attempt_number": attempt_number}),
+        let task_json = serde_json::to_string(
+            self.active_ref()?
+                .tasks
+                .get(&lease.task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?,
+        )?;
+        let attempt_json = serde_json::to_string(
+            self.active_ref()?
+                .attempts
+                .get(&attempt_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("attempt disappeared".to_owned()))?,
+        )?;
+        self.persist_runtime_records_with_events(
+            &[
+                (
+                    "controller.task".to_owned(),
+                    lease.task_id.clone(),
+                    task_json,
+                ),
+                (
+                    "controller.attempt".to_owned(),
+                    attempt_id.clone(),
+                    attempt_json,
+                ),
+            ],
+            &[(
+                "attempt_started".to_owned(),
+                attempt_id.clone(),
+                json!({"task_id": lease.task_id, "attempt_number": attempt_number}),
+            )],
         )?;
         self.checkpoint_now()?;
         Ok(attempt_id)
@@ -1938,8 +2437,24 @@ impl Controller {
             )));
         }
         attempt.state = next;
-        self.persist_attempt(attempt_id)?;
-        self.append_controller_event(event, attempt_id, &json!({"state": next}))?;
+        let value = serde_json::to_string(
+            self.active_ref()?
+                .attempts
+                .get(attempt_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("attempt disappeared".to_owned()))?,
+        )?;
+        self.persist_runtime_records_with_events(
+            &[(
+                "controller.attempt".to_owned(),
+                attempt_id.to_owned(),
+                value,
+            )],
+            &[(
+                event.to_owned(),
+                attempt_id.to_owned(),
+                json!({"state": next}),
+            )],
+        )?;
         self.checkpoint_now()?;
         Ok(())
     }
@@ -1962,8 +2477,16 @@ impl Controller {
             )));
         }
         task.state = next;
-        self.persist_task(task_id)?;
-        self.append_controller_event(event, task_id, &json!({"state": next}))?;
+        let value = serde_json::to_string(
+            self.active_ref()?
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?,
+        )?;
+        self.persist_runtime_records_with_events(
+            &[("controller.task".to_owned(), task_id.to_owned(), value)],
+            &[(event.to_owned(), task_id.to_owned(), json!({"state": next}))],
+        )?;
         self.checkpoint_now()?;
         Ok(())
     }
@@ -1974,17 +2497,23 @@ impl Controller {
         task_id: &str,
         signature: &str,
     ) -> Result<(), ControllerError> {
-        let attempt_state = self
-            .active_ref()?
-            .attempts
-            .get(attempt_id)
-            .ok_or_else(|| ControllerError::InvalidPlan("attempt disappeared".to_owned()))?
-            .state;
-        if attempt_state != AttemptState::Failed {
-            self.transition_attempt(attempt_id, AttemptState::Failed, "attempt_failed")?;
-        }
-        let (max_attempts, same_failure_limit, attempts_started, same_count) = {
+        let (attempt_was_failed, max_attempts, same_failure_limit, attempts_started, same_count) = {
             let active = self.active_mut()?;
+            let attempt = active
+                .attempts
+                .get_mut(attempt_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("attempt disappeared".to_owned()))?;
+            let attempt_was_failed = attempt.state == AttemptState::Failed;
+            if !attempt_was_failed {
+                if !legal_attempt_transition(attempt.state, AttemptState::Failed) {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "illegal attempt transition {:?}->{:?}",
+                        attempt.state,
+                        AttemptState::Failed
+                    )));
+                }
+                attempt.state = AttemptState::Failed;
+            }
             let task = active
                 .tasks
                 .get_mut(task_id)
@@ -1993,7 +2522,13 @@ impl Controller {
             *count = count.saturating_add(1);
             let max_attempts = required_u32(&task.task, "/failure_policy/max_attempts")?;
             let same_limit = required_u32(&task.task, "/failure_policy/same_failure_limit")?;
-            (max_attempts, same_limit, task.attempts_started, *count)
+            (
+                attempt_was_failed,
+                max_attempts,
+                same_limit,
+                task.attempts_started,
+                *count,
+            )
         };
         let retry_allowed = repair_allowed(
             attempts_started,
@@ -2010,16 +2545,46 @@ impl Controller {
             task.state = TaskState::RepairPending;
             task.retry_exhausted = !retry_allowed;
         }
-        self.persist_task(task_id)?;
-        self.append_controller_event(
-            "task_repair_pending",
-            task_id,
-            &json!({
+        let attempt_json = serde_json::to_string(
+            self.active_ref()?
+                .attempts
+                .get(attempt_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("attempt disappeared".to_owned()))?,
+        )?;
+        let task_json = serde_json::to_string(
+            self.active_ref()?
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?,
+        )?;
+        let mut events = Vec::new();
+        if !attempt_was_failed {
+            events.push((
+                "attempt_failed".to_owned(),
+                attempt_id.to_owned(),
+                json!({"state": AttemptState::Failed}),
+            ));
+        }
+        events.push((
+            "task_repair_pending".to_owned(),
+            task_id.to_owned(),
+            json!({
                 "failure_signature": signature,
                 "attempts_started": attempts_started,
                 "same_failure_count": same_count,
                 "retry_allowed": retry_allowed
             }),
+        ));
+        self.persist_runtime_records_with_events(
+            &[
+                (
+                    "controller.attempt".to_owned(),
+                    attempt_id.to_owned(),
+                    attempt_json,
+                ),
+                ("controller.task".to_owned(), task_id.to_owned(), task_json),
+            ],
+            &events,
         )?;
         self.checkpoint_now()?;
         Ok(())
@@ -2172,16 +2737,58 @@ impl Controller {
                 verification.clone(),
             )));
         }
-        self.transition_attempt(
-            &verification.attempt_id,
-            AttemptState::Succeeded,
-            "attempt_succeeded",
+        {
+            let active = self.active_mut()?;
+            active
+                .attempts
+                .get_mut(&verification.attempt_id)
+                .ok_or_else(|| ControllerError::VerificationFailed(Box::new(verification.clone())))?
+                .state = AttemptState::Succeeded;
+            active
+                .tasks
+                .get_mut(&verification.task_id)
+                .ok_or_else(|| ControllerError::VerificationFailed(Box::new(verification.clone())))?
+                .state = TaskState::Succeeded;
+        }
+        let attempt_json = serde_json::to_string(
+            self.active_ref()?
+                .attempts
+                .get(&verification.attempt_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("attempt disappeared".to_owned()))?,
         )?;
-        self.transition_task(
-            &verification.task_id,
-            TaskState::Succeeded,
-            "task_succeeded",
+        let task_json = serde_json::to_string(
+            self.active_ref()?
+                .tasks
+                .get(&verification.task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?,
         )?;
+        self.persist_runtime_records_with_events(
+            &[
+                (
+                    "controller.attempt".to_owned(),
+                    verification.attempt_id.clone(),
+                    attempt_json,
+                ),
+                (
+                    "controller.task".to_owned(),
+                    verification.task_id.clone(),
+                    task_json,
+                ),
+            ],
+            &[
+                (
+                    "attempt_succeeded".to_owned(),
+                    verification.attempt_id.clone(),
+                    json!({"state": AttemptState::Succeeded}),
+                ),
+                (
+                    "task_succeeded".to_owned(),
+                    verification.task_id.clone(),
+                    json!({"state": TaskState::Succeeded}),
+                ),
+            ],
+        )?;
+        self.checkpoint_now()?;
         Ok(())
     }
 
@@ -2214,11 +2821,23 @@ impl Controller {
             active.validity = PlanValidity::Current;
         }
         let epoch = self.state.advance_execution_epoch()?;
-        self.persist_all_runtime()?;
-        self.append_controller_event(
+        let (repository_snapshot_digest, baseline_diff_digest, plan_validity) = {
+            let active = self.active_ref()?;
+            (
+                snapshot_digest(&active.baseline)?,
+                active.baseline_diff_digest.clone(),
+                active.validity,
+            )
+        };
+        self.persist_plan_baseline_with_event(
             "verified_baseline_advanced",
             &repository_id,
-            &json!({"execution_epoch": epoch}),
+            &json!({
+                "execution_epoch": epoch,
+                "repository_snapshot_digest": repository_snapshot_digest,
+                "baseline_diff_digest": baseline_diff_digest,
+                "plan_validity": plan_validity,
+            }),
         )?;
         self.checkpoint_now()?;
         Ok(())
@@ -2240,69 +2859,168 @@ impl Controller {
     }
 
     fn checkpoint_now(&mut self) -> Result<(), ControllerError> {
-        let sequence = self.state.latest_journal_sequence()?;
-        let payload = self.runtime_snapshot_digest()?;
-        self.state
+        let manifest = self.checkpoint_manifest()?;
+        let bytes = serde_json::to_vec(&canonicalize(&serde_json::to_value(&manifest)?))?;
+        let store = checkpoint_artifact_store(self.state.path())?;
+        let artifact = store.put(&mut self.state, &bytes)?;
+        let checkpoint = self
+            .state
             .append_checkpoint_integrity(NewCheckpointIntegrityRecord {
-                payload_digest: &payload,
-                action_sequence: sequence,
+                payload_digest: &artifact.digest,
+                action_sequence: manifest.action_journal_sequence,
             })?;
+        self.state.add_artifact_reference(
+            &format!("checkpoint.manifest.{}", checkpoint.generation),
+            &artifact.digest,
+        )?;
         Ok(())
     }
 
-    fn runtime_snapshot_digest(&self) -> Result<String, ControllerError> {
+    fn checkpoint_recovery_reanchor(
+        &mut self,
+        trusted: &CheckpointIntegrityRecord,
+    ) -> Result<(), ControllerError> {
+        let manifest = self.checkpoint_manifest()?;
+        let bytes = serde_json::to_vec(&canonicalize(&serde_json::to_value(&manifest)?))?;
+        let store = checkpoint_artifact_store(self.state.path())?;
+        let artifact = store.put(&mut self.state, &bytes)?;
+        let checkpoint = self.state.append_recovery_checkpoint_integrity(
+            NewCheckpointIntegrityRecord {
+                payload_digest: &artifact.digest,
+                action_sequence: manifest.action_journal_sequence,
+            },
+            trusted.generation,
+            &trusted.checkpoint_hash,
+        )?;
+        self.state.add_artifact_reference(
+            &format!("checkpoint.manifest.{}", checkpoint.generation),
+            &artifact.digest,
+        )?;
+        Ok(())
+    }
+
+    fn checkpoint_manifest(&self) -> Result<CheckpointManifest, ControllerError> {
         let active = self.active_ref()?;
-        let tasks = active
+        let task_records = active
             .tasks
             .iter()
-            .map(|(id, task)| {
-                (
-                    id.clone(),
-                    json!({
-                        "state": task.state,
-                        "attempts_started": task.attempts_started,
-                        "model_calls_used": task.model_calls_used,
-                        "failure_counts": task.failure_counts,
-                        "retry_exhausted": task.retry_exhausted,
-                        "task_contract_digest": task.task_contract_digest,
-                    }),
-                )
+            .map(|(id, task)| Ok((id.clone(), serde_json::to_value(task)?)))
+            .collect::<Result<BTreeMap<_, _>, serde_json::Error>>()?;
+        let attempt_records = active
+            .attempts
+            .iter()
+            .map(|(id, attempt)| Ok((id.clone(), serde_json::to_value(attempt)?)))
+            .collect::<Result<BTreeMap<_, _>, serde_json::Error>>()?;
+        let mut evidence_binding_digests = BTreeMap::new();
+        for namespace in [
+            "controller.evidence_satisfaction",
+            "controller.evidence_item",
+            "controller.artifact_binding",
+            "controller.acceptance_binding",
+            "controller.verification",
+            "controller.action_intent",
+        ] {
+            for record in self.state.state_records(namespace)? {
+                evidence_binding_digests.insert(
+                    format!("{}:{}", record.namespace, record.key),
+                    sha256_prefixed(record.value_json.as_bytes()),
+                );
+            }
+        }
+        let action_records = self
+            .state
+            .action_records()?
+            .into_iter()
+            .map(|record| CheckpointActionRecord {
+                action_id: record.action_id,
+                state: record.state,
+                payload_digest: record.payload_digest,
+                policy_digest: record.policy_digest,
+                execution_epoch: record.execution_epoch,
+                result_digest: record.result_digest,
+                last_event_sequence: record.last_event_sequence,
             })
-            .collect::<BTreeMap<_, _>>();
-        digest_json(&json!({
-            "plan_id": active.plan_id,
-            "goal_id": active.goal_id,
-            "revision": active.revision,
-            "plan_digest": active.plan_digest,
-            "compilation_evidence_digest": active.compilation_evidence_digest,
-            "compiler_plan_digest": active.compilation.plan_digest(),
-            "validity": active.validity,
-            "execution_epoch": self.state.current_execution_epoch()?,
-            "tasks": tasks,
-        }))
-        .map_err(Into::into)
+            .collect();
+        let process_leases = self
+            .state
+            .state_records("controller.process_lease")?
+            .into_iter()
+            .map(|record| serde_json::from_str::<RecoveryProcessLease>(&record.value_json))
+            .collect::<Result<Vec<_>, _>>()?;
+        let repository_snapshot_digest = snapshot_digest(&active.baseline)?;
+        Ok(CheckpointManifest {
+            schema_version: CHECKPOINT_MANIFEST_SCHEMA_VERSION,
+            plan_document: active.plan_document.clone(),
+            plan_id: active.plan_id.clone(),
+            goal_id: active.goal_id.clone(),
+            plan_revision: active.revision,
+            plan_digest: active.plan_digest.clone(),
+            compiler_plan_digest: active.compiler_plan_digest.clone(),
+            compilation_evidence_digest: active.compilation_evidence_digest.clone(),
+            policy_digest: active.policy_digest.clone(),
+            repository_id: active.repository_id.clone(),
+            repository_root: active.repository_root.clone(),
+            repository_snapshot: active.baseline.clone(),
+            repository_snapshot_digest,
+            baseline_diff_digest: active.baseline_diff_digest.clone(),
+            baseline_diff_content: active.baseline_diff_content.clone(),
+            plan_validity: active.validity,
+            task_records,
+            attempt_records,
+            evidence_binding_digests,
+            action_records,
+            process_leases,
+            action_journal_sequence: self.state.latest_journal_sequence()?,
+            execution_epoch: self.state.current_execution_epoch()?,
+        })
     }
 
     fn persist_all_runtime(&mut self) -> Result<(), ControllerError> {
         let task_ids = self.active_ref()?.tasks.keys().cloned().collect::<Vec<_>>();
-        let plan_record = {
+        let attempt_ids = self
+            .active_ref()?
+            .attempts
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let (plan_record, plan_document_json, baseline_json) = {
             let active = self.active_ref()?;
-            json!({
-                "plan_id": active.plan_id,
-                "goal_id": active.goal_id,
-                "revision": active.revision,
-                "plan_digest": active.plan_digest,
-                "compilation_evidence_digest": active.compilation_evidence_digest,
-                "validity": active.validity,
-            })
+            (
+                json!({
+                    "plan_id": active.plan_id,
+                    "goal_id": active.goal_id,
+                    "revision": active.revision,
+                    "plan_digest": active.plan_digest,
+                    "compilation_evidence_digest": active.compilation_evidence_digest,
+                    "validity": active.validity,
+                }),
+                serde_json::to_string(&active.plan_document)?,
+                serde_json::to_string(&PersistedRepositoryBaseline {
+                    snapshot: active.baseline.clone(),
+                    diff_digest: active.baseline_diff_digest.clone(),
+                    diff_content: active.baseline_diff_content.clone(),
+                })?,
+            )
         };
         self.state.put_state(
             "controller.plan",
             "active",
             &serde_json::to_string(&plan_record)?,
         )?;
+        self.state
+            .put_state("controller.plan_document", "active", &plan_document_json)?;
+        self.state
+            .put_state("controller.repository_baseline", "active", &baseline_json)?;
         for task_id in task_ids {
             self.persist_task(&task_id)?;
+        }
+        for attempt_id in attempt_ids {
+            let value =
+                serde_json::to_string(self.active_ref()?.attempts.get(&attempt_id).ok_or_else(
+                    || ControllerError::InvalidPlan("attempt disappeared".to_owned()),
+                )?)?;
+            self.state
+                .put_state("controller.attempt", &attempt_id, &value)?;
         }
         Ok(())
     }
@@ -2317,19 +3035,6 @@ impl Controller {
             serde_json::to_string(task)?
         };
         self.state.put_state("controller.task", task_id, &value)?;
-        Ok(())
-    }
-
-    fn persist_attempt(&mut self, attempt_id: &str) -> Result<(), ControllerError> {
-        let value = {
-            let attempt =
-                self.active_ref()?.attempts.get(attempt_id).ok_or_else(|| {
-                    ControllerError::InvalidPlan("attempt disappeared".to_owned())
-                })?;
-            serde_json::to_string(attempt)?
-        };
-        self.state
-            .put_state("controller.attempt", attempt_id, &value)?;
         Ok(())
     }
 
@@ -2359,12 +3064,191 @@ impl Controller {
         Ok(())
     }
 
+    fn persist_runtime_records_with_events(
+        &mut self,
+        records: &[(String, String, String)],
+        events: &[(String, String, Value)],
+    ) -> Result<(), ControllerError> {
+        let base_sequence = self.state.latest_journal_sequence()?;
+        let bound_events = events
+            .iter()
+            .map(|(event_kind, entity_id, payload)| {
+                Ok((
+                    event_kind.clone(),
+                    entity_id.clone(),
+                    self.runtime_bound_event_payload(entity_id, payload)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ControllerError>>()?;
+        let payloads = bound_events
+            .iter()
+            .map(|(_, _, payload)| serde_json::to_string(payload))
+            .collect::<Result<Vec<_>, _>>()?;
+        let event_ids = bound_events
+            .iter()
+            .zip(&payloads)
+            .enumerate()
+            .map(|(index, ((event_kind, entity_id, _), payload_json))| {
+                let sequence_seed =
+                    base_sequence.saturating_add(i64::try_from(index).unwrap_or(i64::MAX));
+                let seed = sha256_prefixed(
+                    format!("{event_kind}\0{entity_id}\0{sequence_seed}\0{payload_json}")
+                        .as_bytes(),
+                );
+                format!("controller.{}", &seed[7..27])
+            })
+            .collect::<Vec<_>>();
+        let updates = records
+            .iter()
+            .map(|(namespace, key, value_json)| StateRecordUpdate {
+                namespace,
+                key,
+                value_json,
+            })
+            .collect::<Vec<_>>();
+        let journal_events = bound_events
+            .iter()
+            .zip(&payloads)
+            .zip(&event_ids)
+            .map(
+                |(((event_kind, entity_id, _), payload_json), event_id)| NewJournalEvent {
+                    event_id,
+                    entity_type: "controller",
+                    entity_id,
+                    event_kind,
+                    payload_json,
+                },
+            )
+            .collect::<Vec<_>>();
+        self.state
+            .put_state_records_with_events(&updates, &journal_events)?;
+        Ok(())
+    }
+
+    fn runtime_bound_event_payload(
+        &self,
+        entity_id: &str,
+        payload: &Value,
+    ) -> Result<Value, ControllerError> {
+        let mut bound = payload.clone();
+        let object = bound.as_object_mut().ok_or_else(|| {
+            ControllerError::InvalidPlan("controller event payload must be an object".to_owned())
+        })?;
+        let active = self.active_ref()?;
+        if let Some(task) = active.tasks.get(entity_id) {
+            object.insert("task_id".to_owned(), Value::String(entity_id.to_owned()));
+            object.insert("task_runtime".to_owned(), serde_json::to_value(task)?);
+        }
+        if let Some(attempt) = active.attempts.get(entity_id) {
+            object.insert("attempt_runtime".to_owned(), serde_json::to_value(attempt)?);
+            object.insert("task_id".to_owned(), Value::String(attempt.task_id.clone()));
+            if let Some(task) = active.tasks.get(&attempt.task_id) {
+                object.insert("task_runtime".to_owned(), serde_json::to_value(task)?);
+            }
+        }
+        Ok(bound)
+    }
+
+    fn persist_plan_baseline_with_event(
+        &mut self,
+        event_kind: &str,
+        entity_id: &str,
+        payload: &Value,
+    ) -> Result<(), ControllerError> {
+        let (plan_json, baseline_json) = {
+            let active = self.active_ref()?;
+            (
+                serde_json::to_string(&json!({
+                    "plan_id": active.plan_id,
+                    "goal_id": active.goal_id,
+                    "revision": active.revision,
+                    "plan_digest": active.plan_digest,
+                    "compilation_evidence_digest": active.compilation_evidence_digest,
+                    "validity": active.validity,
+                }))?,
+                serde_json::to_string(&PersistedRepositoryBaseline {
+                    snapshot: active.baseline.clone(),
+                    diff_digest: active.baseline_diff_digest.clone(),
+                    diff_content: active.baseline_diff_content.clone(),
+                })?,
+            )
+        };
+        self.persist_runtime_records_with_events(
+            &[
+                ("controller.plan".to_owned(), "active".to_owned(), plan_json),
+                (
+                    "controller.repository_baseline".to_owned(),
+                    "active".to_owned(),
+                    baseline_json,
+                ),
+            ],
+            &[(event_kind.to_owned(), entity_id.to_owned(), payload.clone())],
+        )
+    }
+
+    fn persist_recovery_runtime_with_event(
+        &mut self,
+        plan_id: &str,
+        payload: &Value,
+    ) -> Result<(), ControllerError> {
+        let mut records = Vec::new();
+        let active = self.active_ref()?;
+        records.push((
+            "controller.plan".to_owned(),
+            "active".to_owned(),
+            serde_json::to_string(&json!({
+                "plan_id": active.plan_id,
+                "goal_id": active.goal_id,
+                "revision": active.revision,
+                "plan_digest": active.plan_digest,
+                "compilation_evidence_digest": active.compilation_evidence_digest,
+                "validity": active.validity,
+            }))?,
+        ));
+        records.push((
+            "controller.plan_document".to_owned(),
+            "active".to_owned(),
+            serde_json::to_string(&active.plan_document)?,
+        ));
+        records.push((
+            "controller.repository_baseline".to_owned(),
+            "active".to_owned(),
+            serde_json::to_string(&PersistedRepositoryBaseline {
+                snapshot: active.baseline.clone(),
+                diff_digest: active.baseline_diff_digest.clone(),
+                diff_content: active.baseline_diff_content.clone(),
+            })?,
+        ));
+        for (task_id, runtime) in &active.tasks {
+            records.push((
+                "controller.task".to_owned(),
+                task_id.clone(),
+                serde_json::to_string(runtime)?,
+            ));
+        }
+        for (attempt_id, runtime) in &active.attempts {
+            records.push((
+                "controller.attempt".to_owned(),
+                attempt_id.clone(),
+                serde_json::to_string(runtime)?,
+            ));
+        }
+        self.persist_runtime_records_with_events(
+            &records,
+            &[(
+                "recovery_reconstructed".to_owned(),
+                plan_id.to_owned(),
+                payload.clone(),
+            )],
+        )
+    }
+
     fn any_unknown_action(&self) -> Result<bool, ControllerError> {
         Ok(self
             .state
-            .journal()?
+            .action_records()?
             .iter()
-            .any(|event| event.entity_type == "action" && event.event_kind == "unknown"))
+            .any(|record| record.state == "unknown"))
     }
 
     fn active_ref(&self) -> Result<&ActivePlan, ControllerError> {
@@ -2378,6 +3262,845 @@ impl Controller {
             .as_mut()
             .ok_or_else(|| ControllerError::InvalidPlan("no active compiler plan".to_owned()))
     }
+}
+
+impl RecoveryManager {
+    /// Reconstructs the active Controller exclusively from durable SQLite/CAS/Git state.
+    /// No chat transcript, model call, or raw `PlanIr` activation surface participates.
+    ///
+    /// # Errors
+    /// Returns a fail-closed recovery error when durable authority cannot be reconciled.
+    pub fn recover(
+        state: StateStore,
+        registry: &ProjectRegistry,
+    ) -> Result<(Controller, RecoverySummary), ControllerError> {
+        Self::recover_with_permission_context(
+            state,
+            registry,
+            PermissionContext::m1_local_autonomous(),
+        )
+    }
+
+    /// Same recovery path with an explicitly narrowed Controller permission context.
+    ///
+    /// # Errors
+    /// Returns a fail-closed recovery error when checkpoint, state, process, action, or Git
+    /// authority cannot be reconciled.
+    #[allow(clippy::too_many_lines)]
+    pub fn recover_with_permission_context(
+        state: StateStore,
+        registry: &ProjectRegistry,
+        permission_context: PermissionContext,
+    ) -> Result<(Controller, RecoverySummary), ControllerError> {
+        state.recovery_integrity_check()?;
+        let physical_latest = state.latest_checkpoint_integrity()?.ok_or_else(|| {
+            ControllerError::InvalidPlan("recovery requires at least one checkpoint".to_owned())
+        })?;
+        let latest_valid = state.latest_valid_checkpoint_integrity()?.ok_or_else(|| {
+            ControllerError::InvalidPlan("recovery found no valid checkpoint floor".to_owned())
+        })?;
+        let (trusted_checkpoint, manifest) =
+            load_latest_recoverable_manifest(&state, &latest_valid)?;
+        validate_checkpoint_manifest(&manifest, &trusted_checkpoint)?;
+        validate_checkpoint_immutable_bindings(&state, &manifest)?;
+        let fallback_checkpoint_used = trusted_checkpoint.generation != physical_latest.generation;
+        let replayed_events = validate_post_checkpoint_runtime_correlation(
+            &state,
+            &manifest,
+            trusted_checkpoint.action_sequence,
+        )?;
+        let active = reconstruct_active_plan(&state, registry, &manifest)?;
+        let trusted_recovery_intent_digests = manifest
+            .evidence_binding_digests
+            .iter()
+            .filter_map(|(key, digest)| {
+                key.strip_prefix("controller.action_intent:")
+                    .map(|action_id| (action_id.to_owned(), digest.clone()))
+            })
+            .collect();
+        let execution_epoch_before = state.current_execution_epoch()?;
+        let mut controller = Controller {
+            state,
+            active: Some(active),
+            resource_governor: M1ResourceGovernor::default(),
+            permission_context,
+            trusted_recovery_intent_digests,
+        };
+
+        let (unresolved_process_lease_ids, unresolved_process_actions) =
+            reap_recovery_process_leases(&mut controller.state)?;
+        let mut unknown_action_ids = reconcile_recovery_actions(
+            &mut controller.state,
+            registry,
+            &unresolved_process_actions,
+            &manifest,
+        )?;
+        let (interrupted_attempt_ids, pending_recovery_action_ids, verification_actions) =
+            normalize_recovered_runtime(&mut controller, &unknown_action_ids)?;
+        require_checkpoint_bound_recovery_intents(
+            &controller.state,
+            &manifest,
+            pending_recovery_action_ids
+                .iter()
+                .chain(verification_actions.iter()),
+        )?;
+
+        let execution_epoch_after_reconstruction = controller.state.advance_execution_epoch()?;
+        let task_runtimes = controller
+            .active_ref()?
+            .tasks
+            .iter()
+            .map(|(task_id, runtime)| Ok((task_id.clone(), serde_json::to_value(runtime)?)))
+            .collect::<Result<BTreeMap<_, _>, serde_json::Error>>()?;
+        let attempt_runtimes = controller
+            .active_ref()?
+            .attempts
+            .iter()
+            .map(|(attempt_id, runtime)| Ok((attempt_id.clone(), serde_json::to_value(runtime)?)))
+            .collect::<Result<BTreeMap<_, _>, serde_json::Error>>()?;
+        controller.persist_recovery_runtime_with_event(
+            &manifest.plan_id,
+            &json!({
+                "trusted_checkpoint_generation": trusted_checkpoint.generation,
+                "trusted_checkpoint_sequence": trusted_checkpoint.action_sequence,
+                "fallback_checkpoint_used": fallback_checkpoint_used,
+                "replayed_events": replayed_events,
+                "interrupted_attempt_ids": interrupted_attempt_ids,
+                "unknown_action_ids": unknown_action_ids,
+                "pending_recovery_action_ids": pending_recovery_action_ids,
+                "unresolved_process_lease_ids": unresolved_process_lease_ids,
+                "execution_epoch_before": execution_epoch_before,
+                "execution_epoch_after": execution_epoch_after_reconstruction,
+                "task_runtimes": task_runtimes,
+                "attempt_runtimes": attempt_runtimes,
+            }),
+        )?;
+        if fallback_checkpoint_used {
+            controller.checkpoint_recovery_reanchor(&trusted_checkpoint)?;
+        } else {
+            controller.checkpoint_now()?;
+        }
+
+        for action_id in verification_actions {
+            controller.resume_recovery_verification(registry, &action_id)?;
+        }
+        unknown_action_ids = controller
+            .state
+            .action_records()?
+            .into_iter()
+            .filter(|record| record.state == "unknown")
+            .map(|record| record.action_id)
+            .collect();
+        let execution_epoch_after = controller.state.current_execution_epoch()?;
+        let mutation_blocked = !unknown_action_ids.is_empty()
+            || !unresolved_process_lease_ids.is_empty()
+            || controller
+                .active_ref()?
+                .tasks
+                .values()
+                .any(|task| task.state == TaskState::ReconcilingUnknown);
+        let summary = RecoverySummary {
+            plan_id: manifest.plan_id,
+            plan_digest: manifest.plan_digest,
+            checkpoint_generation: trusted_checkpoint.generation,
+            checkpoint_action_sequence: trusted_checkpoint.action_sequence,
+            replayed_events,
+            execution_epoch_before,
+            execution_epoch_after,
+            interrupted_attempt_ids,
+            unknown_action_ids,
+            pending_recovery_action_ids,
+            unresolved_process_lease_ids,
+            fallback_checkpoint_used,
+            mutation_blocked,
+        };
+        Ok((controller, summary))
+    }
+}
+
+fn load_latest_recoverable_manifest(
+    state: &StateStore,
+    latest_valid: &CheckpointIntegrityRecord,
+) -> Result<(CheckpointIntegrityRecord, CheckpointManifest), ControllerError> {
+    let store = checkpoint_artifact_store(state.path())?;
+    let ancestry = state.latest_valid_checkpoint_ancestry()?;
+    if ancestry.first().is_none_or(|checkpoint| {
+        checkpoint.generation != latest_valid.generation
+            || checkpoint.checkpoint_hash != latest_valid.checkpoint_hash
+    }) {
+        return Err(ControllerError::InvalidPlan(
+            "latest valid checkpoint is not the head of its trusted ancestry".to_owned(),
+        ));
+    }
+    for checkpoint in ancestry {
+        let manifest = (|| -> Result<CheckpointManifest, ControllerError> {
+            let mut file = store.open_artifact(state, &checkpoint.payload_digest)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            let manifest: CheckpointManifest = serde_json::from_slice(&bytes)?;
+            validate_checkpoint_manifest(&manifest, &checkpoint)?;
+            Ok(manifest)
+        })();
+        if let Ok(manifest) = manifest {
+            return Ok((checkpoint, manifest));
+        }
+    }
+    Err(ControllerError::InvalidPlan(
+        "no checkpoint has a verifiable manifest CAS object".to_owned(),
+    ))
+}
+
+fn validate_checkpoint_manifest(
+    manifest: &CheckpointManifest,
+    checkpoint: &CheckpointIntegrityRecord,
+) -> Result<(), ControllerError> {
+    if manifest.schema_version != CHECKPOINT_MANIFEST_SCHEMA_VERSION
+        || manifest.action_journal_sequence != checkpoint.action_sequence
+        || manifest.compiler_plan_digest != manifest.plan_digest
+        || digest_json(&manifest.plan_document)? != manifest.plan_digest
+        || snapshot_digest(&manifest.repository_snapshot)? != manifest.repository_snapshot_digest
+        || manifest.repository_snapshot.repository_id != manifest.repository_id
+        || manifest.repository_snapshot.root != manifest.repository_root
+    {
+        return Err(ControllerError::InvalidPlan(
+            "checkpoint manifest integrity/binding mismatch".to_owned(),
+        ));
+    }
+    let plan_tasks = required_array(&manifest.plan_document, "/tasks")?;
+    if manifest.task_records.len() != plan_tasks.len() {
+        return Err(ControllerError::InvalidPlan(
+            "checkpoint task set does not match canonical plan".to_owned(),
+        ));
+    }
+    for plan_task in plan_tasks {
+        let task_id = required_str(plan_task, "/task_id")?;
+        let record = manifest.task_records.get(task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!("checkpoint is missing task runtime {task_id}"))
+        })?;
+        let runtime: TaskRuntime = serde_json::from_value(record.clone())?;
+        if runtime.task_contract_digest != digest_json(plan_task)? || runtime.task != *plan_task {
+            return Err(ControllerError::InvalidPlan(format!(
+                "checkpoint task contract {task_id} is misbound"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_immutable_bindings(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+) -> Result<(), ControllerError> {
+    for (binding_key, expected_digest) in &manifest.evidence_binding_digests {
+        let Some(action_id) = binding_key.strip_prefix("controller.action_intent:") else {
+            continue;
+        };
+        let current = state
+            .get_state("controller.action_intent", action_id)?
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "checkpoint-bound action intent {action_id} is missing"
+                ))
+            })?;
+        if sha256_prefixed(current.as_bytes()) != *expected_digest {
+            return Err(ControllerError::InvalidPlan(format!(
+                "checkpoint-bound action intent {action_id} changed after checkpoint"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_post_checkpoint_runtime_correlation(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+) -> Result<usize, ControllerError> {
+    let events = state.journal_after(checkpoint_sequence)?;
+    let mut replayed_tasks = manifest.task_records.clone();
+    let mut replayed_attempts = manifest.attempt_records.clone();
+    for event in &events {
+        if event.entity_type != "controller" {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        if let Some(task_runtimes) = payload.get("task_runtimes").and_then(Value::as_object) {
+            for (task_id, runtime) in task_runtimes {
+                replayed_tasks.insert(task_id.clone(), runtime.clone());
+            }
+        }
+        if let Some(attempt_runtimes) = payload.get("attempt_runtimes").and_then(Value::as_object) {
+            for (attempt_id, runtime) in attempt_runtimes {
+                replayed_attempts.insert(attempt_id.clone(), runtime.clone());
+            }
+        }
+        if let Some(runtime) = payload.get("task_runtime") {
+            let task_id = payload
+                .get("task_id")
+                .and_then(Value::as_str)
+                .unwrap_or(event.entity_id.as_str());
+            replayed_tasks.insert(task_id.to_owned(), runtime.clone());
+        }
+        if let Some(runtime) = payload.get("attempt_runtime") {
+            replayed_attempts.insert(event.entity_id.clone(), runtime.clone());
+        }
+    }
+    let current_tasks = state
+        .state_records("controller.task")?
+        .into_iter()
+        .map(|record| {
+            Ok((
+                record.key,
+                serde_json::from_str::<Value>(&record.value_json)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+    if replayed_tasks != current_tasks {
+        return Err(ControllerError::InvalidPlan(
+            "current task state does not equal ordered post-checkpoint journal replay".to_owned(),
+        ));
+    }
+
+    let current_attempts = state
+        .state_records("controller.attempt")?
+        .into_iter()
+        .map(|record| {
+            Ok((
+                record.key,
+                serde_json::from_str::<Value>(&record.value_json)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+    if replayed_attempts != current_attempts {
+        return Err(ControllerError::InvalidPlan(
+            "current attempt state does not equal ordered post-checkpoint journal replay"
+                .to_owned(),
+        ));
+    }
+    validate_post_checkpoint_baseline_correlation(state, manifest, &events)?;
+    Ok(events.len())
+}
+
+fn validate_post_checkpoint_baseline_correlation(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    events: &[JournalEvent],
+) -> Result<(), ControllerError> {
+    let raw_plan = state
+        .get_state("controller.plan", "active")?
+        .ok_or_else(|| ControllerError::InvalidPlan("active plan state is missing".to_owned()))?;
+    let current_plan: Value = serde_json::from_str(&raw_plan)?;
+    let current_validity: PlanValidity =
+        serde_json::from_value(current_plan.get("validity").cloned().ok_or_else(|| {
+            ControllerError::InvalidPlan("active validity is missing".to_owned())
+        })?)?;
+    let raw_baseline = state
+        .get_state("controller.repository_baseline", "active")?
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan("durable repository baseline is missing".to_owned())
+        })?;
+    let current_baseline: PersistedRepositoryBaseline = serde_json::from_str(&raw_baseline)?;
+    let current_snapshot_digest = snapshot_digest(&current_baseline.snapshot)?;
+    let baseline_changed = current_snapshot_digest != manifest.repository_snapshot_digest
+        || current_baseline.diff_digest != manifest.baseline_diff_digest
+        || current_baseline.diff_content != manifest.baseline_diff_content;
+    let validity_changed = current_validity != manifest.plan_validity;
+    if baseline_changed || validity_changed {
+        let exact_transition = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.entity_type == "controller"
+                    && event.entity_id == manifest.repository_id
+                    && matches!(
+                        event.event_kind.as_str(),
+                        "verified_baseline_advanced" | "plan_stale_evidence"
+                    )
+            })
+            .is_some_and(|event| {
+                let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+                    return false;
+                };
+                payload
+                    .get("repository_snapshot_digest")
+                    .and_then(Value::as_str)
+                    == Some(current_snapshot_digest.as_str())
+                    && payload.get("baseline_diff_digest").and_then(Value::as_str)
+                        == Some(current_baseline.diff_digest.as_str())
+                    && payload.get("plan_validity")
+                        == serde_json::to_value(current_validity).ok().as_ref()
+            });
+        if !exact_transition {
+            return Err(ControllerError::InvalidPlan(
+                "current repository baseline/plan validity differs from checkpoint without an exact post-checkpoint transition event"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_checkpoint_bound_recovery_intents<'a>(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    action_ids: impl Iterator<Item = &'a String>,
+) -> Result<(), ControllerError> {
+    for action_id in action_ids {
+        let current = state
+            .get_state("controller.action_intent", action_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!("recovery action intent {action_id} is missing"))
+            })?;
+        let key = format!("controller.action_intent:{action_id}");
+        let Some(expected_digest) = manifest.evidence_binding_digests.get(&key) else {
+            return Err(ControllerError::NotReady(format!(
+                "recovery action intent {action_id} is not bound by the trusted checkpoint"
+            )));
+        };
+        if sha256_prefixed(current.as_bytes()) != *expected_digest {
+            return Err(ControllerError::NotReady(format!(
+                "recovery action intent {action_id} differs from its trusted checkpoint binding"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn reconstruct_active_plan(
+    state: &StateStore,
+    registry: &ProjectRegistry,
+    manifest: &CheckpointManifest,
+) -> Result<ActivePlan, ControllerError> {
+    let raw_plan = state
+        .get_state("controller.plan", "active")?
+        .ok_or_else(|| ControllerError::InvalidPlan("active plan state is missing".to_owned()))?;
+    let plan_record: Value = serde_json::from_str(&raw_plan)?;
+    let active_plan_id = required_str(&plan_record, "/plan_id")?;
+    let active_plan_digest = required_str(&plan_record, "/plan_digest")?;
+    let active_revision = required_u32(&plan_record, "/revision")?;
+    if active_plan_id != manifest.plan_id
+        || active_plan_digest != manifest.plan_digest
+        || active_revision != manifest.plan_revision
+    {
+        return Err(ControllerError::InvalidPlan(
+            "checkpoint belongs to a superseded plan; explicit N+1 carry-forward proof is required"
+                .to_owned(),
+        ));
+    }
+    let raw_document = state
+        .get_state("controller.plan_document", "active")?
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan("durable canonical plan document is missing".to_owned())
+        })?;
+    let plan_document: Value = serde_json::from_str(&raw_document)?;
+    if digest_json(&plan_document)? != active_plan_digest {
+        return Err(ControllerError::InvalidPlan(
+            "durable canonical plan document digest does not match active plan".to_owned(),
+        ));
+    }
+    let raw_baseline = state
+        .get_state("controller.repository_baseline", "active")?
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan("durable repository baseline is missing".to_owned())
+        })?;
+    let baseline: PersistedRepositoryBaseline = serde_json::from_str(&raw_baseline)?;
+    let repository_id = required_str(&plan_document, "/repositories/0/repository_id")?.to_owned();
+    let registered = registry.repository(&repository_id).ok_or_else(|| {
+        ControllerError::InvalidPlan(format!(
+            "recovery repository {repository_id} is not registered"
+        ))
+    })?;
+    let repository_root = registered.root.canonicalize()?;
+    if baseline.snapshot.repository_id != repository_id
+        || baseline.snapshot.root.canonicalize()? != repository_root
+    {
+        return Err(ControllerError::InvalidPlan(
+            "durable repository baseline is bound to another repository".to_owned(),
+        ));
+    }
+    let plan_tasks = required_array(&plan_document, "/tasks")?;
+    let plan_task_map = plan_tasks
+        .iter()
+        .map(|task| Ok((required_str(task, "/task_id")?.to_owned(), task)))
+        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+    let mut tasks = BTreeMap::new();
+    for record in state.state_records("controller.task")? {
+        let runtime: TaskRuntime = serde_json::from_str(&record.value_json)?;
+        let plan_task = plan_task_map.get(&record.key).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "durable task {} is absent from active canonical plan",
+                record.key
+            ))
+        })?;
+        if runtime.task_contract_digest != digest_json(plan_task)? || &runtime.task != *plan_task {
+            return Err(ControllerError::InvalidPlan(format!(
+                "durable task {} contract is stale or altered",
+                record.key
+            )));
+        }
+        tasks.insert(record.key, runtime);
+    }
+    if tasks.len() != plan_task_map.len() {
+        return Err(ControllerError::InvalidPlan(
+            "durable task set is incomplete".to_owned(),
+        ));
+    }
+    let attempts = state
+        .state_records("controller.attempt")?
+        .into_iter()
+        .map(|record| {
+            let attempt: AttemptRuntime = serde_json::from_str(&record.value_json)?;
+            Ok((record.key, attempt))
+        })
+        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+    let validity: PlanValidity =
+        serde_json::from_value(plan_record.get("validity").cloned().ok_or_else(|| {
+            ControllerError::InvalidPlan("active validity is missing".to_owned())
+        })?)?;
+    let compilation_evidence_digest =
+        required_str(&plan_record, "/compilation_evidence_digest")?.to_owned();
+    if compilation_evidence_digest != manifest.compilation_evidence_digest {
+        return Err(ControllerError::InvalidPlan(
+            "active compiler evidence digest differs from checkpoint plan provenance".to_owned(),
+        ));
+    }
+    let policy_digest = digest_json(
+        plan_document
+            .get("policy")
+            .ok_or_else(|| ControllerError::InvalidPlan("plan policy is missing".to_owned()))?,
+    )?;
+    Ok(ActivePlan {
+        plan_document,
+        compiler_plan_digest: active_plan_digest.to_owned(),
+        plan_id: active_plan_id.to_owned(),
+        goal_id: required_str(&plan_record, "/goal_id")?.to_owned(),
+        revision: active_revision,
+        plan_digest: active_plan_digest.to_owned(),
+        compilation_evidence_digest,
+        policy_digest,
+        repository_id,
+        repository_root,
+        baseline: baseline.snapshot,
+        baseline_diff_digest: baseline.diff_digest,
+        baseline_diff_content: baseline.diff_content,
+        validity,
+        tasks,
+        attempts,
+    })
+}
+
+fn reap_recovery_process_leases(
+    state: &mut StateStore,
+) -> Result<(Vec<String>, BTreeSet<String>), ControllerError> {
+    let mut unresolved = Vec::new();
+    let mut unresolved_actions = BTreeSet::new();
+    for record in state.state_records("controller.process_lease")? {
+        let mut lease: RecoveryProcessLease = serde_json::from_str(&record.value_json)?;
+        if lease.schema_version != RECOVERY_PROCESS_LEASE_SCHEMA_VERSION
+            || !matches!(
+                lease.state.as_str(),
+                "active" | "reaped" | "reaped_recovery"
+            )
+        {
+            unresolved.push(lease.lease_id.clone());
+            unresolved_actions.insert(lease.action_id.clone());
+            continue;
+        }
+        if lease.state != "active" {
+            continue;
+        }
+        let reaped = match (lease.process_group_id, lease.leader_identity.as_deref()) {
+            (Some(pgid), Some(identity)) => reap_owned_process_group(pgid, identity).is_ok(),
+            _ => false,
+        };
+        if reaped {
+            "reaped_recovery".clone_into(&mut lease.state);
+            state.put_state(
+                "controller.process_lease",
+                &record.key,
+                &serde_json::to_string(&lease)?,
+            )?;
+        } else {
+            unresolved.push(lease.lease_id.clone());
+            unresolved_actions.insert(lease.action_id.clone());
+        }
+    }
+    Ok((unresolved, unresolved_actions))
+}
+
+#[allow(clippy::too_many_lines)]
+fn reconcile_recovery_actions(
+    state: &mut StateStore,
+    registry: &ProjectRegistry,
+    unresolved_process_actions: &BTreeSet<String>,
+    manifest: &CheckpointManifest,
+) -> Result<Vec<String>, ControllerError> {
+    for record in state.action_records()? {
+        if record.state == "dispatched" {
+            let event_id = recovery_event_id(
+                &record.action_id,
+                "unknown",
+                state.latest_journal_sequence()?,
+            );
+            state.recover_dispatched_action_as_unknown(
+                &record.action_id,
+                &event_id,
+                "{\"reason\":\"restart_after_dispatched_before_observed\"}",
+            )?;
+        }
+    }
+    let mut unknown = Vec::new();
+    for record in state.action_records()? {
+        if record.state != "unknown" {
+            continue;
+        }
+        if unresolved_process_actions.contains(&record.action_id) {
+            unknown.push(record.action_id);
+            continue;
+        }
+        let Some(raw_intent) = state.get_state("controller.action_intent", &record.action_id)?
+        else {
+            unknown.push(record.action_id);
+            continue;
+        };
+        let binding_key = format!("controller.action_intent:{}", record.action_id);
+        if manifest
+            .evidence_binding_digests
+            .get(&binding_key)
+            .is_none_or(|digest| *digest != sha256_prefixed(raw_intent.as_bytes()))
+        {
+            unknown.push(record.action_id);
+            continue;
+        }
+        let intent: PersistedActionIntent = serde_json::from_str(&raw_intent)?;
+        if intent.schema_version != ACTION_INTENT_SCHEMA_VERSION
+            || intent.action_id != record.action_id
+            || intent.payload_digest != record.payload_digest
+            || intent.policy_digest != record.policy_digest
+        {
+            unknown.push(record.action_id);
+            continue;
+        }
+        let Ok(current) = ExactRetriever::new(registry).read_path(
+            &intent.repository_id,
+            Path::new(&intent.path),
+            None,
+        ) else {
+            unknown.push(record.action_id);
+            continue;
+        };
+        let current_mode = permission_mode(&fs::symlink_metadata(
+            registry
+                .repository(&intent.repository_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan("recovery intent repository missing".to_owned())
+                })?
+                .root
+                .join(&intent.path),
+        )?);
+        if current.digest == intent.expected_post_digest
+            && current_mode == intent.expected_target_mode
+        {
+            let store = ArtifactStore::open(&intent.artifact_store_root)?;
+            let receipt = serde_json::to_vec(&json!({
+                "schema": "sovereign-recovery-result-v1",
+                "action_id": record.action_id,
+                "proof": "effect_observed",
+                "target_digest": current.digest,
+                "process_cleanup": "proven_or_absent"
+            }))?;
+            let artifact = store.put(state, &receipt)?;
+            let reconciled_event = recovery_event_id(
+                &record.action_id,
+                "reconciled_effect_observed",
+                state.latest_journal_sequence()?,
+            );
+            state.reconcile_historical_unknown_action(
+                &record.action_id,
+                "reconciled",
+                Some(&artifact.digest),
+                &reconciled_event,
+                "reconciled",
+                "{\"proof\":\"effect_observed\"}",
+            )?;
+            let committed_event = recovery_event_id(
+                &record.action_id,
+                "committed_recovery",
+                state.latest_journal_sequence()?,
+            );
+            state.commit_historical_reconciled_action(
+                &record.action_id,
+                &committed_event,
+                "{\"proof\":\"effect_observed\"}",
+            )?;
+        } else if current.digest == intent.expected_source_digest
+            && current_mode == intent.expected_target_mode
+        {
+            let reconciled_event = recovery_event_id(
+                &record.action_id,
+                "reconciled_effect_absent",
+                state.latest_journal_sequence()?,
+            );
+            state.reconcile_historical_unknown_action(
+                &record.action_id,
+                "reconciled",
+                None,
+                &reconciled_event,
+                "reconciled",
+                "{\"proof\":\"effect_absent\"}",
+            )?;
+            let failed_event = recovery_event_id(
+                &record.action_id,
+                "failed_recovery",
+                state.latest_journal_sequence()?,
+            );
+            state.fail_historical_reconciled_action(
+                &record.action_id,
+                &failed_event,
+                "{\"proof\":\"effect_absent\"}",
+            )?;
+        } else {
+            unknown.push(record.action_id);
+        }
+    }
+    Ok(unknown)
+}
+
+type RecoveryRuntimeNormalization = (Vec<String>, Vec<String>, Vec<String>);
+
+fn normalize_recovered_runtime(
+    controller: &mut Controller,
+    unknown_action_ids: &[String],
+) -> Result<RecoveryRuntimeNormalization, ControllerError> {
+    let unknown = unknown_action_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let intents = controller
+        .state
+        .state_records("controller.action_intent")?
+        .into_iter()
+        .map(|record| {
+            let intent: PersistedActionIntent = serde_json::from_str(&record.value_json)?;
+            Ok((record.key, intent))
+        })
+        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+    let actions = controller
+        .state
+        .action_records()?
+        .into_iter()
+        .map(|record| (record.action_id.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut interrupted = Vec::new();
+    let mut pending = Vec::new();
+    let mut verify = Vec::new();
+    let attempt_ids = controller
+        .active_ref()?
+        .attempts
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for attempt_id in attempt_ids {
+        let (attempt_state, task_id) = {
+            let active = controller.active_ref()?;
+            let attempt = active.attempts.get(&attempt_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("recovery attempt disappeared".to_owned())
+            })?;
+            (attempt.state, attempt.task_id.clone())
+        };
+        if !matches!(
+            attempt_state,
+            AttemptState::Executing | AttemptState::Verifying
+        ) {
+            continue;
+        }
+        let intent = intents
+            .values()
+            .filter(|intent| intent.attempt_id == attempt_id)
+            .max_by(|left, right| left.action_id.cmp(&right.action_id));
+        let next = intent.and_then(|intent| {
+            actions
+                .get(&intent.action_id)
+                .map(|action| (intent.action_id.clone(), action.state.clone()))
+        });
+        let (attempt_next, task_next) = match next.as_ref().map(|(_, state)| state.as_str()) {
+            Some("committed") => {
+                if let Some((action_id, _)) = next {
+                    verify.push(action_id);
+                }
+                (AttemptState::Verifying, TaskState::Verifying)
+            }
+            Some("unknown") => (AttemptState::Interrupted, TaskState::ReconcilingUnknown),
+            Some("prepared" | "authorized" | "failed") => {
+                if let Some((action_id, _)) = next {
+                    pending.push(action_id);
+                }
+                (AttemptState::Interrupted, TaskState::Planned)
+            }
+            _ => (AttemptState::Interrupted, TaskState::Planned),
+        };
+        {
+            let active = controller.active_mut()?;
+            if let Some(attempt) = active.attempts.get_mut(&attempt_id) {
+                attempt.state = attempt_next;
+            }
+            if let Some(task) = active.tasks.get_mut(&task_id) {
+                task.state = task_next;
+            }
+        }
+        if attempt_next == AttemptState::Interrupted {
+            interrupted.push(attempt_id);
+        }
+    }
+    for action_id in &unknown {
+        if let Some(intent) = intents.get(action_id)
+            && let Some(task) = controller.active_mut()?.tasks.get_mut(&intent.task_id)
+        {
+            task.state = TaskState::ReconcilingUnknown;
+        }
+    }
+    extend_pending_recovery_actions(controller, &intents, &actions, &mut pending)?;
+    interrupted.sort();
+    pending.sort();
+    pending.dedup();
+    verify.sort();
+    Ok((interrupted, pending, verify))
+}
+
+fn extend_pending_recovery_actions(
+    controller: &Controller,
+    intents: &BTreeMap<String, PersistedActionIntent>,
+    actions: &BTreeMap<String, sovereign_state::PersistedActionRecord>,
+    pending: &mut Vec<String>,
+) -> Result<(), ControllerError> {
+    let active = controller.active_ref()?;
+    for (action_id, action) in actions {
+        if !matches!(action.state.as_str(), "prepared" | "authorized" | "failed")
+            || pending.contains(action_id)
+        {
+            continue;
+        }
+        let Some(intent) = intents.get(action_id) else {
+            continue;
+        };
+        let origin_interrupted = active
+            .attempts
+            .get(&intent.attempt_id)
+            .is_some_and(|attempt| {
+                attempt.task_id == intent.task_id && attempt.state == AttemptState::Interrupted
+            });
+        let task_planned = active
+            .tasks
+            .get(&intent.task_id)
+            .is_some_and(|task| task.state == TaskState::Planned);
+        if origin_interrupted && task_planned {
+            pending.push(action_id.clone());
+        }
+    }
+    Ok(())
+}
+
+fn recovery_event_id(entity_id: &str, kind: &str, sequence: i64) -> String {
+    let digest = sha256_prefixed(format!("recovery\0{entity_id}\0{kind}\0{sequence}").as_bytes());
+    format!("recovery.{}", &digest[7..27])
 }
 
 pub struct ExecutionRuntime<'a, I: sovereign_policy::ExecutionIsolationBackend> {
@@ -2397,6 +4120,73 @@ struct ValidatedReplace {
     expected_target_mode: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedActionIntent {
+    schema_version: u32,
+    action_id: String,
+    plan_id: String,
+    plan_revision: u32,
+    plan_digest: String,
+    task_id: String,
+    task_contract_digest: String,
+    attempt_id: String,
+    execution_epoch: i64,
+    payload_digest: String,
+    action_nonce: String,
+    policy_digest: String,
+    repository_id: String,
+    path: String,
+    expected_source_digest: String,
+    old_literal: String,
+    new_literal: String,
+    expected_post_digest: String,
+    expected_target_mode: u32,
+    artifact_store_root: PathBuf,
+}
+
+fn persisted_intent_action_seed(intent: &PersistedActionIntent) -> Result<String, ControllerError> {
+    let proposal = ReplaceLiteral {
+        kind: ReplaceLiteralKind::ReplaceLiteral,
+        repository_id: intent.repository_id.clone(),
+        path: intent.path.clone(),
+        expected_source_digest: intent.expected_source_digest.clone(),
+        old_literal: intent.old_literal.clone(),
+        new_literal: intent.new_literal.clone(),
+        expected_occurrences: 1,
+    };
+    Ok(digest_json(&json!({
+        "plan": intent.plan_digest,
+        "task": intent.task_contract_digest,
+        "attempt": intent.attempt_id,
+        "proposal": proposal,
+    }))?)
+}
+
+#[derive(Debug, Clone)]
+struct VerificationLeaseBinding {
+    plan_id: String,
+    plan_revision: u32,
+    plan_digest: String,
+    task_id: String,
+    task_contract_digest: String,
+    baseline_digest: String,
+    execution_epoch: i64,
+}
+
+impl From<&ReadyLease> for VerificationLeaseBinding {
+    fn from(lease: &ReadyLease) -> Self {
+        Self {
+            plan_id: lease.plan_id.clone(),
+            plan_revision: lease.plan_revision,
+            plan_digest: lease.plan_digest.clone(),
+            task_id: lease.task_id.clone(),
+            task_contract_digest: lease.task_contract_digest.clone(),
+            baseline_digest: lease.baseline_digest.clone(),
+            execution_epoch: lease.execution_epoch,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExactRequirementProbe {
     Path { path: String, contains: Vec<String> },
@@ -2405,13 +4195,15 @@ enum ExactRequirementProbe {
 pub struct DeterministicVerifier;
 
 impl DeterministicVerifier {
+    #[allow(clippy::too_many_arguments)]
     fn verify(
         state: &StateStore,
         active: &ActivePlan,
         registry: &ProjectRegistry,
-        lease: &ReadyLease,
+        lease: &VerificationLeaseBinding,
         attempt_id: &str,
-        action: &AuthorizedAction,
+        action_id: &str,
+        destination_digest: Option<&str>,
         validated: &ValidatedReplace,
     ) -> Result<VerificationResultV1, ControllerError> {
         let task = active.tasks.get(&lease.task_id).ok_or_else(|| {
@@ -2434,7 +4226,7 @@ impl DeterministicVerifier {
             active.repository_root.join(&validated.proposal.path),
         )?);
         let diff = retriever.current_diff(&active.repository_id)?;
-        let action_record = state.action_record(&action.action_id)?;
+        let action_record = state.action_record(action_id)?;
         let action_committed = action_record
             .as_ref()
             .is_some_and(|record| record.state == "committed" && record.result_digest.is_some());
@@ -2454,12 +4246,12 @@ impl DeterministicVerifier {
             && task.task_contract_digest == lease.task_contract_digest
             && current_epoch == lease.execution_epoch;
         let postimage_ok = file.digest == validated.expected_post_digest;
-        let accepted_transformation_ok = action.destination_digest.as_deref()
+        let accepted_transformation_ok = destination_digest
             == Some(validated.proposal.expected_source_digest.as_str())
             && postimage_ok
             && observed_target_mode == validated.expected_target_mode;
         let compiled_literal_contract_ok = compiled_literal_contract_allows(
-            active.compilation.plan().as_value(),
+            &active.plan_document,
             &task.task,
             &validated.proposal,
         )?;
@@ -2533,7 +4325,7 @@ fn protected_preexisting_changes_unchanged(
 fn repository_verification_failure(
     active: &ActivePlan,
     attempt: &AttemptRuntime,
-    lease: &ReadyLease,
+    lease: &VerificationLeaseBinding,
     post_snapshot: &RepositorySnapshot,
     expected_path: &Path,
 ) -> Option<String> {
@@ -3153,6 +4945,33 @@ fn validate_required_evidence_types(
 fn snapshot_digest(snapshot: &RepositorySnapshot) -> Result<String, ControllerError> {
     Ok(sha256_prefixed(snapshot.manifest_json()?.as_bytes()))
 }
+
+fn checkpoint_artifact_store(state_path: &Path) -> Result<ArtifactStore, ControllerError> {
+    let parent = state_path.parent().ok_or_else(|| {
+        ControllerError::InvalidPlan("state database has no checkpoint CAS parent".to_owned())
+    })?;
+    Ok(ArtifactStore::open(parent.join("checkpoint-cas"))?)
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+fn recovery_test_hook(point: &str) {
+    if std::env::var("SOVEREIGN_RECOVERY_TEST_PAUSE_AT")
+        .ok()
+        .as_deref()
+        != Some(point)
+    {
+        return;
+    }
+    if let Ok(marker) = std::env::var("SOVEREIGN_RECOVERY_TEST_MARKER") {
+        let _ = fs::write(marker, point.as_bytes());
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+#[cfg(not(feature = "recovery-test-hooks"))]
+fn recovery_test_hook(_point: &str) {}
 
 fn digest_json(value: &Value) -> Result<String, serde_json::Error> {
     let canonical = canonicalize(value);

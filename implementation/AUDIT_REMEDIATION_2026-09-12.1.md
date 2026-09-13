@@ -27,7 +27,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
    - Required tests/evidence: crash during execution, after evidence publication/before action-state commit, and after commit; recovery must never expose a committed action without recoverable result evidence.
 
 3. **Cleanup proof**
-   - Status: resolved for the T04 minimum with fail-closed recovery blocking when descendant death cannot be proven; richer recovery remains M1-T08.
+   - Status: resolved for the T04 minimum with fail-closed recovery blocking when descendant death cannot be proven; richer checkpoint/restart recovery is now closed in M1-T08 with `implementation/evidence/M1-T08.json`.
    - Status: **RESOLVED for M1-T04 minimum.**
    - Source: `crates/sovereign-tools/src/lib.rs`, `crates/sovereign-policy/src/lib.rs`.
    - Tests: `timeout_kills_and_reaps_the_entire_process_group`, `escaped_descendant_holding_output_pipe_is_bounded_and_recovery_blocked`, `output_disk_and_subprocess_ceilings_terminate_bounded_commands`.
@@ -61,7 +61,7 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
    - Required tests/evidence: runtime Seatbelt probe, nested protected-root fixture, PATH-shim fixture, offline network fixture, selective-network request fail-closed fixture.
 
 6. **Representative M1 model qualification**
-   - Status: M1-T10 compiler qualification passed on the target machine with exact rendered/schema/output-reserve accounting and current evidence in `implementation/evidence/M1-T10-model-smoke.json`. M1-T07 Controller/edit/deterministic-verification behavior is now closed with current evidence in `implementation/evidence/M1-T07.json`, using the deterministic local fake model backend plus a real isolated local repository mutation. Real-Qwen repair and restart/resume qualification remain open under M1-T08/M1-T09 and the final M1 engineering packet.
+   - Status: M1-T10 compiler qualification passed on the target machine with exact rendered/schema/output-reserve accounting and current evidence in `implementation/evidence/M1-T10-model-smoke.json`. M1-T07 Controller/edit/deterministic-verification behavior is closed with current evidence in `implementation/evidence/M1-T07.json`, and deterministic checkpoint/restart recovery is closed in `implementation/evidence/M1-T08.json`. Real-Qwen targeted repair plus the combined real-Qwen implementation+repair+restart engineering qualification remain open under M1-T09 and the final M1 engineering packet.
    - Status: **OPEN — required before M1 closure.** Historical M1-T03 short smoke remains valid only for short tool-call viability.
    - Planned proof owners: M1-T10, M1-T07, M1-T08, M1-T09 plus a current real-model full-packet report.
    - Preserve M1-T03 short real tool-call smoke as valid evidence only for short tool-call viability (206 input tokens); do not represent it as an 8k engineering packet.
@@ -93,3 +93,12 @@ Supervisor steering acknowledgment: the interrupted 17:44 UTC audit steering was
 - `BUILD_STATE.json` remains the durable execution pointer.
 - Stop at verified release acceptance; do not expand scope indefinitely.
 - No publishing, spending, remote pushes, or security weakening are authorized.
+
+## M1-T08 closure update
+
+- M1-T08 is durably complete with current-code evidence in `implementation/evidence/M1-T08.json`; `BUILD_STATE.json` advances only to M1-T09.
+- Current verification includes strict workspace Clippy, the state/tools/controller regression suites, the compiler→Controller vertical slice, a 17/17 crash/restart matrix, and the full offline workspace suite. The final independent read-only T08 audit reported no blocker.
+- Recovery now uses CAS-verified manifests and explicit trusted checkpoint/re-anchor ancestry; ordered post-checkpoint runtime replay must exactly reproduce authoritative task/attempt state, and repository baseline/plan-validity changes require the latest exact journal binding.
+- Pre-mutation recovery is checkpoint-bound to the exact persisted action intent and re-derived action identity, committed edits resume verification only, ambiguous dispatch remains mutation-blocking, and process recovery is fenced by a pre-spawn lease plus PID/PGID/birth identity.
+- M1-T08 does not perform a second repair model attempt or recompile a valid plan; that remains M1-T09.
+- Representative real-model gate 6 remains **OPEN**. T08 is deterministic restart/recovery closure, not the final real-Qwen implementation+repair+restart engineering qualification.

@@ -505,6 +505,31 @@ impl<'a> ActionJournal<'a> {
     pub fn record(&self, action_id: &str) -> Result<Option<PersistedActionRecord>, ToolError> {
         Ok(self.store.action_record(action_id)?)
     }
+
+    fn record_process_lease(
+        &mut self,
+        action: &AuthorizedAction,
+        pgid: Option<u32>,
+        leader_identity: Option<&str>,
+        state: &str,
+    ) -> Result<(), ToolError> {
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "lease_id": format!("process.{}", action.action_id),
+            "task_id": action.task_id,
+            "attempt_id": action.attempt_id,
+            "action_id": action.action_id,
+            "process_group_id": pgid,
+            "leader_identity": leader_identity,
+            "state": state,
+        });
+        self.store.put_state(
+            "controller.process_lease",
+            &action.action_id,
+            &value.to_string(),
+        )?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,6 +672,7 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         journal.verify_authorized(action)?;
         let prepared = self.prepare_execution(action, isolation_request)?;
         journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
+        journal.record_process_lease(action, None, None, "pending_spawn")?;
         self.execute_dispatched(journal, action, artifacts, prepared)
     }
 
@@ -730,11 +756,32 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
+                journal.record_process_lease(action, None, None, "reaped")?;
                 Self::reconcile_proven_no_child(journal, action)?;
                 return Err(ToolError::Io(error));
             }
         };
         let pgid = child.id();
+        recovery_test_hook("after_process_spawn_before_identity_lease");
+        let Some(leader_identity) = process_group_leader_identity(pgid)? else {
+            terminate_process_group(&mut child, pgid)?;
+            if wait_group_absent(pgid, Duration::from_millis(500))? {
+                journal.record_process_lease(action, Some(pgid), None, "reaped")?;
+            }
+            journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
+            return Err(ToolError::RecoveryBlocked(
+                "spawned process leader identity could not be proven".to_owned(),
+            ));
+        };
+        if let Err(error) =
+            journal.record_process_lease(action, Some(pgid), Some(&leader_identity), "active")
+        {
+            terminate_process_group(&mut child, pgid)?;
+            if !wait_group_absent(pgid, Duration::from_millis(500))? {
+                let _ = journal.transition(action, ActionState::Dispatched, ActionState::Unknown);
+            }
+            return Err(error);
+        }
         let output_count = Arc::new(AtomicU64::new(0));
         let stdout_handle = spawn_reader(
             child.stdout.take(),
@@ -791,6 +838,7 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         let receipt = durable_result_receipt(action, &result)?;
         journal.observe_with_receipt(action, artifacts, &receipt)?;
         journal.commit_with_bound_result(action, ActionState::Observed)?;
+        journal.record_process_lease(action, Some(pgid), Some(&leader_identity), "reaped")?;
         Ok(result)
     }
 
@@ -840,6 +888,26 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         Ok(())
     }
 }
+
+#[cfg(feature = "recovery-test-hooks")]
+fn recovery_test_hook(point: &str) {
+    if std::env::var("SOVEREIGN_RECOVERY_TEST_PAUSE_AT")
+        .ok()
+        .as_deref()
+        != Some(point)
+    {
+        return;
+    }
+    if let Ok(marker) = std::env::var("SOVEREIGN_RECOVERY_TEST_MARKER") {
+        let _ = fs::write(marker, point.as_bytes());
+    }
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
+
+#[cfg(not(feature = "recovery-test-hooks"))]
+fn recovery_test_hook(_point: &str) {}
 
 fn digest_field(hasher: &mut Sha256, value: &str) {
     let bytes = value.as_bytes();
@@ -1027,6 +1095,92 @@ fn signal_group(pgid: u32, signal: &str) -> Result<(), ToolError> {
         Err(ToolError::RecoveryBlocked(format!(
             "failed to send {signal} to process group {pgid}"
         )))
+    }
+}
+
+/// Returns a PID-reuse-resistant identity string for a process-group leader on macOS/Unix
+/// using the leader PID, process group and OS-reported start time. A missing leader returns
+/// `None`; malformed or contradictory output fails closed.
+///
+/// # Errors
+/// Returns a recovery error when process identity cannot be observed safely.
+pub fn process_group_leader_identity(pgid: u32) -> Result<Option<String>, ToolError> {
+    let output = Command::new("/bin/ps")
+        .args([
+            "-p",
+            &pgid.to_string(),
+            "-o",
+            "pid=",
+            "-o",
+            "pgid=",
+            "-o",
+            "lstart=",
+        ])
+        .env_clear()
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .map(str::to_owned);
+    let Some(line) = line else {
+        return Ok(None);
+    };
+    let mut fields = line.split_whitespace();
+    let observed_pid = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| ToolError::RecoveryBlocked("malformed process leader PID".to_owned()))?;
+    let observed_group = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| ToolError::RecoveryBlocked("malformed process group ID".to_owned()))?;
+    let start = fields.collect::<Vec<_>>().join(" ");
+    if observed_pid != pgid || observed_group != pgid || start.is_empty() {
+        return Err(ToolError::RecoveryBlocked(format!(
+            "process leader identity does not match owned group {pgid}"
+        )));
+    }
+    Ok(Some(format!("{observed_pid}:{observed_group}:{start}")))
+}
+
+/// Reaps one durably-owned process group only when the current leader identity exactly
+/// matches the identity captured at spawn. PID reuse or leaderless surviving groups are
+/// recovery-blocking rather than kill targets.
+///
+/// # Errors
+/// Returns a recovery error when ownership cannot be proven or cleanup cannot be proven.
+pub fn reap_owned_process_group(pgid: u32, expected_identity: &str) -> Result<(), ToolError> {
+    match process_group_leader_identity(pgid)? {
+        Some(current) if current == expected_identity => {
+            signal_group(pgid, "-TERM")?;
+            if wait_group_absent(pgid, Duration::from_millis(200))? {
+                return Ok(());
+            }
+            signal_group(pgid, "-KILL")?;
+            if wait_group_absent(pgid, Duration::from_millis(500))? {
+                Ok(())
+            } else {
+                Err(ToolError::RecoveryBlocked(format!(
+                    "owned process group {pgid} remains after recovery kill"
+                )))
+            }
+        }
+        Some(_) => Err(ToolError::RecoveryBlocked(format!(
+            "process group leader identity changed for {pgid}; refusing PID-reuse kill"
+        ))),
+        None => {
+            if wait_group_absent(pgid, Duration::from_millis(50))? {
+                Ok(())
+            } else {
+                Err(ToolError::RecoveryBlocked(format!(
+                    "process group {pgid} still exists without its recorded leader identity"
+                )))
+            }
+        }
     }
 }
 

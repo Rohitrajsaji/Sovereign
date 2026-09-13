@@ -7,6 +7,7 @@
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 use sovereign_types::UnixMillis;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
@@ -151,6 +152,14 @@ pub struct NewJournalEvent<'a> {
     pub payload_json: &'a str,
 }
 
+/// One normalized current-state write to commit atomically with related journal events.
+#[derive(Debug, Clone, Copy)]
+pub struct StateRecordUpdate<'a> {
+    pub namespace: &'a str,
+    pub key: &'a str,
+    pub value_json: &'a str,
+}
+
 /// Canonical metadata for one published content-addressed artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactMetadata {
@@ -169,6 +178,16 @@ pub struct PersistedActionRecord {
     pub execution_epoch: i64,
     pub result_digest: Option<String>,
     pub last_event_sequence: i64,
+    pub updated_at_ms: i64,
+}
+
+/// One current-state record returned for deterministic checkpoint/recovery scans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedStateRecord {
+    pub namespace: String,
+    pub key: String,
+    pub value_json: String,
+    pub version: i64,
     pub updated_at_ms: i64,
 }
 
@@ -323,6 +342,31 @@ impl StateStore {
             .optional()?)
     }
 
+    /// Lists one namespace in stable key order for checkpoint/recovery reconstruction.
+    ///
+    /// # Errors
+    /// Returns [`StateError`] on `SQLite` failure.
+    pub fn state_records(&self, namespace: &str) -> Result<Vec<PersistedStateRecord>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT namespace, record_key, value_json, version, updated_at_ms \
+             FROM state_records WHERE namespace=?1 ORDER BY record_key ASC",
+        )?;
+        let rows = statement.query_map([namespace], |row| {
+            Ok(PersistedStateRecord {
+                namespace: row.get(0)?,
+                key: row.get(1)?,
+                value_json: row.get(2)?,
+                version: row.get(3)?,
+                updated_at_ms: row.get(4)?,
+            })
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
     /// Appends an immutable event and returns its authoritative sequence.
     ///
     /// # Errors
@@ -348,6 +392,51 @@ impl StateStore {
         })
     }
 
+    /// Atomically upserts current-state records and appends their correlated immutable events.
+    /// This prevents crash recovery from observing a state transition without the journal facts
+    /// that explain it, or vice versa.
+    ///
+    /// # Errors
+    /// Returns [`StateError`] on clock or `SQLite` failure.
+    pub fn put_state_records_with_events(
+        &mut self,
+        updates: &[StateRecordUpdate<'_>],
+        events: &[NewJournalEvent<'_>],
+    ) -> Result<Vec<i64>, StateError> {
+        let now = UnixMillis::now()?.as_millis();
+        self.transaction(|tx| {
+            for update in updates {
+                tx.execute(
+                    "INSERT INTO state_records(namespace, record_key, value_json, version, updated_at_ms) \
+                     VALUES (?1, ?2, ?3, 1, ?4) \
+                     ON CONFLICT(namespace, record_key) DO UPDATE SET \
+                     value_json=excluded.value_json, \
+                     version=state_records.version + 1, \
+                     updated_at_ms=excluded.updated_at_ms",
+                    (update.namespace, update.key, update.value_json, now),
+                )?;
+            }
+            let mut sequences = Vec::with_capacity(events.len());
+            for event in events {
+                tx.execute(
+                    "INSERT INTO event_journal(\
+                        event_id, entity_type, entity_id, event_kind, payload_json, occurred_at_ms\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (
+                        event.event_id,
+                        event.entity_type,
+                        event.entity_id,
+                        event.event_kind,
+                        event.payload_json,
+                        now,
+                    ),
+                )?;
+                sequences.push(tx.last_insert_rowid());
+            }
+            Ok(sequences)
+        })
+    }
+
     /// Returns all events in authoritative sequence order.
     ///
     /// # Errors
@@ -370,6 +459,38 @@ impl StateStore {
             })
         })?;
 
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    /// Returns authoritative journal events after one checkpoint sequence.
+    ///
+    /// # Errors
+    /// Returns [`StateError`] on `SQLite` failure.
+    pub fn journal_after(&self, sequence: i64) -> Result<Vec<JournalEvent>, StateError> {
+        if sequence < 0 {
+            return Err(StateError::Integrity(
+                "negative recovery journal sequence".to_owned(),
+            ));
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, event_id, entity_type, entity_id, event_kind, payload_json, occurred_at_ms \
+             FROM event_journal WHERE sequence>?1 ORDER BY sequence ASC",
+        )?;
+        let rows = statement.query_map([sequence], |row| {
+            Ok(JournalEvent {
+                sequence: row.get(0)?,
+                event_id: row.get(1)?,
+                entity_type: row.get(2)?,
+                entity_id: row.get(3)?,
+                event_kind: row.get(4)?,
+                payload_json: row.get(5)?,
+                occurred_at_ms: row.get(6)?,
+            })
+        })?;
         let mut events = Vec::new();
         for row in rows {
             events.push(row?);
@@ -615,6 +736,232 @@ impl StateStore {
         ).optional()?)
     }
 
+    /// Lists current authoritative action records in stable action-id order.
+    ///
+    /// # Errors
+    /// Returns [`StateError`] on persistence failure.
+    pub fn action_records(&self) -> Result<Vec<PersistedActionRecord>, StateError> {
+        let mut statement = self.connection.prepare(
+            "SELECT action_id, state, payload_digest, policy_digest, execution_epoch, result_digest, last_event_sequence, updated_at_ms \
+             FROM action_records ORDER BY action_id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(PersistedActionRecord {
+                action_id: row.get(0)?,
+                state: row.get(1)?,
+                payload_digest: row.get(2)?,
+                policy_digest: row.get(3)?,
+                execution_epoch: row.get(4)?,
+                result_digest: row.get(5)?,
+                last_event_sequence: row.get(6)?,
+                updated_at_ms: row.get(7)?,
+            })
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row?);
+        }
+        Ok(records)
+    }
+
+    /// Crash-recovery transition for an action whose dispatch was durably recorded but
+    /// whose process outcome was not. This transition intentionally validates the stored
+    /// action epoch against the current Controller epoch before any recovery epoch advance.
+    ///
+    /// # Errors
+    /// Returns an integrity error unless the action is currently `dispatched` in the
+    /// current execution epoch.
+    pub fn recover_dispatched_action_as_unknown(
+        &mut self,
+        action_id: &str,
+        event_id: &str,
+        payload_json: &str,
+    ) -> Result<i64, StateError> {
+        let now = UnixMillis::now()?.as_millis();
+        self.transaction(|tx| {
+            let controller_epoch: i64 = tx.query_row(
+                "SELECT execution_epoch FROM controller_runtime WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )?;
+            let current: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT state, execution_epoch FROM action_records WHERE action_id=?1",
+                    [action_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((state, action_epoch)) = current else {
+                return Err(StateError::Integrity(format!(
+                    "unknown recovery action {action_id}"
+                )));
+            };
+            if state != "dispatched" || action_epoch != controller_epoch {
+                return Err(StateError::Integrity(format!(
+                    "recovery dispatch state mismatch for {action_id}: state={state} action_epoch={action_epoch} controller_epoch={controller_epoch}"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO event_journal(event_id, entity_type, entity_id, event_kind, payload_json, occurred_at_ms) \
+                 VALUES (?1, 'action', ?2, 'unknown', ?3, ?4)",
+                (event_id, action_id, payload_json, now),
+            )?;
+            let sequence = tx.last_insert_rowid();
+            tx.execute(
+                "UPDATE action_records SET state='unknown', last_event_sequence=?2, updated_at_ms=?3 WHERE action_id=?1",
+                (action_id, sequence, now),
+            )?;
+            Ok(sequence)
+        })
+    }
+
+    /// Recovery-only transition for an old-epoch `unknown` action. The original action
+    /// epoch is immutable authority evidence; a later Controller epoch may reconcile the
+    /// record only after deterministic proof has been obtained.
+    ///
+    /// # Errors
+    /// Returns an integrity error unless the current record is `unknown` and the requested
+    /// recovery state is `reconciled`.
+    pub fn reconcile_historical_unknown_action(
+        &mut self,
+        action_id: &str,
+        next_state: &str,
+        result_digest: Option<&str>,
+        event_id: &str,
+        event_kind: &str,
+        payload_json: &str,
+    ) -> Result<i64, StateError> {
+        if next_state != "reconciled" {
+            return Err(StateError::Integrity(format!(
+                "unsupported recovery action state {next_state}"
+            )));
+        }
+        let now = UnixMillis::now()?.as_millis();
+        self.transaction(|tx| {
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM action_records WHERE action_id=?1",
+                    [action_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if state.as_deref() != Some("unknown") {
+                return Err(StateError::Integrity(format!(
+                    "recovery action {action_id} is not currently unknown"
+                )));
+            }
+            if let Some(digest) = result_digest {
+                let known: Option<i64> = tx
+                    .query_row(
+                        "SELECT 1 FROM artifact_metadata WHERE digest=?1",
+                        [digest],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if known.is_none() {
+                    return Err(StateError::Integrity(format!(
+                        "recovery result artifact {digest} is not registered"
+                    )));
+                }
+            }
+            tx.execute(
+                "INSERT INTO event_journal(event_id, entity_type, entity_id, event_kind, payload_json, occurred_at_ms) \
+                 VALUES (?1, 'action', ?2, ?3, ?4, ?5)",
+                (event_id, action_id, event_kind, payload_json, now),
+            )?;
+            let sequence = tx.last_insert_rowid();
+            tx.execute(
+                "UPDATE action_records SET state=?2, result_digest=COALESCE(?3, result_digest), last_event_sequence=?4, updated_at_ms=?5 WHERE action_id=?1",
+                (action_id, next_state, result_digest, sequence, now),
+            )?;
+            Ok(sequence)
+        })
+    }
+
+    /// Commits an already recovery-reconciled historical action with its durable result.
+    /// The action's original execution epoch remains immutable; current Controller epoch
+    /// may be newer because restart invalidates pre-crash leases.
+    ///
+    /// # Errors
+    /// Returns an integrity error unless the action is `reconciled` and has a result digest.
+    pub fn commit_historical_reconciled_action(
+        &mut self,
+        action_id: &str,
+        event_id: &str,
+        payload_json: &str,
+    ) -> Result<i64, StateError> {
+        let now = UnixMillis::now()?.as_millis();
+        self.transaction(|tx| {
+            let current: Option<(String, Option<String>)> = tx
+                .query_row(
+                    "SELECT state, result_digest FROM action_records WHERE action_id=?1",
+                    [action_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((state, result_digest)) = current else {
+                return Err(StateError::Integrity(format!(
+                    "unknown recovery action {action_id}"
+                )));
+            };
+            if state != "reconciled" || result_digest.is_none() {
+                return Err(StateError::Integrity(format!(
+                    "historical recovery action {action_id} is not reconciled with result evidence"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO event_journal(event_id, entity_type, entity_id, event_kind, payload_json, occurred_at_ms) \
+                 VALUES (?1, 'action', ?2, 'committed', ?3, ?4)",
+                (event_id, action_id, payload_json, now),
+            )?;
+            let sequence = tx.last_insert_rowid();
+            tx.execute(
+                "UPDATE action_records SET state='committed', last_event_sequence=?2, updated_at_ms=?3 WHERE action_id=?1",
+                (action_id, sequence, now),
+            )?;
+            Ok(sequence)
+        })
+    }
+
+    /// Marks a historical recovery-reconciled action failed after deterministic proof that
+    /// its side effect is absent. This preserves `unknown -> reconciled -> failed`.
+    ///
+    /// # Errors
+    /// Returns an integrity error unless the action is currently `reconciled`.
+    pub fn fail_historical_reconciled_action(
+        &mut self,
+        action_id: &str,
+        event_id: &str,
+        payload_json: &str,
+    ) -> Result<i64, StateError> {
+        let now = UnixMillis::now()?.as_millis();
+        self.transaction(|tx| {
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM action_records WHERE action_id=?1",
+                    [action_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if state.as_deref() != Some("reconciled") {
+                return Err(StateError::Integrity(format!(
+                    "historical recovery action {action_id} is not reconciled"
+                )));
+            }
+            tx.execute(
+                "INSERT INTO event_journal(event_id, entity_type, entity_id, event_kind, payload_json, occurred_at_ms) \
+                 VALUES (?1, 'action', ?2, 'failed', ?3, ?4)",
+                (event_id, action_id, payload_json, now),
+            )?;
+            let sequence = tx.last_insert_rowid();
+            tx.execute(
+                "UPDATE action_records SET state='failed', last_event_sequence=?2, updated_at_ms=?3 WHERE action_id=?1",
+                (action_id, sequence, now),
+            )?;
+            Ok(sequence)
+        })
+    }
+
     /// Atomically compares the expected action state/epoch, appends an event,
     /// and advances the durable state.
     ///
@@ -747,6 +1094,94 @@ impl StateStore {
         })
     }
 
+    /// Appends a recovery re-anchor after an immutable corrupt/torn checkpoint tail.
+    /// The new generation keeps every prior row for audit but cryptographically names the
+    /// last trusted generation/hash as its recovery parent. Normal checkpoints after this
+    /// row resume a linear chain from the re-anchor.
+    ///
+    /// # Errors
+    /// Returns an integrity error when the trusted checkpoint no longer matches durable state
+    /// or when the requested action sequence is not the authoritative journal tail.
+    pub fn append_recovery_checkpoint_integrity(
+        &mut self,
+        input: NewCheckpointIntegrityRecord<'_>,
+        trusted_generation: i64,
+        trusted_hash: &str,
+    ) -> Result<CheckpointIntegrityRecord, StateError> {
+        if input.action_sequence < 0 || trusted_generation <= 0 || trusted_hash.trim().is_empty() {
+            return Err(StateError::Integrity(
+                "invalid recovery checkpoint re-anchor input".to_owned(),
+            ));
+        }
+        let trusted = self
+            .checkpoint_integrity_by_generation(trusted_generation)?
+            .ok_or_else(|| {
+                StateError::Integrity(format!(
+                    "trusted checkpoint generation {trusted_generation} is missing"
+                ))
+            })?;
+        if trusted.checkpoint_hash != trusted_hash {
+            return Err(StateError::Integrity(
+                "trusted recovery checkpoint hash changed".to_owned(),
+            ));
+        }
+        let ancestry = self.latest_valid_checkpoint_ancestry()?;
+        if !ancestry.iter().any(|record| {
+            record.generation == trusted_generation && record.checkpoint_hash == trusted_hash
+        }) {
+            return Err(StateError::Integrity(
+                "recovery checkpoint parent is not on the current trusted checkpoint ancestry"
+                    .to_owned(),
+            ));
+        }
+        let now = UnixMillis::now()?.as_millis();
+        self.transaction(|tx| {
+            let latest_sequence: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM event_journal",
+                [],
+                |row| row.get(0),
+            )?;
+            if input.action_sequence != latest_sequence {
+                return Err(StateError::Integrity(format!(
+                    "recovery checkpoint action sequence mismatch: requested={}, authoritative={latest_sequence}",
+                    input.action_sequence
+                )));
+            }
+            let physical_generation: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(generation), 0) FROM checkpoint_integrity",
+                [],
+                |row| row.get(0),
+            )?;
+            let generation = physical_generation.saturating_add(1);
+            let previous_hash = recovery_anchor(trusted_generation, trusted_hash);
+            let checkpoint_hash = checkpoint_hash(
+                generation,
+                Some(&previous_hash),
+                input.payload_digest,
+                input.action_sequence,
+            );
+            tx.execute(
+                "INSERT INTO checkpoint_integrity(generation, previous_hash, checkpoint_hash, payload_digest, action_sequence, created_at_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (
+                    generation,
+                    previous_hash.as_str(),
+                    checkpoint_hash.as_str(),
+                    input.payload_digest,
+                    input.action_sequence,
+                    now,
+                ),
+            )?;
+            Ok(CheckpointIntegrityRecord {
+                generation,
+                previous_hash: Some(previous_hash),
+                checkpoint_hash,
+                payload_digest: input.payload_digest.to_owned(),
+                action_sequence: input.action_sequence,
+                created_at_ms: now,
+            })
+        })
+    }
+
     /// Returns one immutable checkpoint generation.
     ///
     /// # Errors
@@ -756,6 +1191,78 @@ impl StateStore {
         generation: i64,
     ) -> Result<Option<CheckpointIntegrityRecord>, StateError> {
         checkpoint_row(&self.connection, generation)
+    }
+
+    /// Returns the cryptographically trusted ancestry of the newest valid checkpoint,
+    /// newest first. Recovery-anchor rows follow their explicit trusted generation/hash
+    /// parent rather than numerically adjacent physical rows.
+    ///
+    /// # Errors
+    /// Returns an integrity error if any parent link, row hash, or generation ordering is
+    /// inconsistent with the trusted chain.
+    pub fn latest_valid_checkpoint_ancestry(
+        &self,
+    ) -> Result<Vec<CheckpointIntegrityRecord>, StateError> {
+        let Some(mut current) = latest_valid_checkpoint(&self.connection)? else {
+            return Ok(Vec::new());
+        };
+        let mut ancestry = Vec::new();
+        loop {
+            let computed = checkpoint_hash(
+                current.generation,
+                current.previous_hash.as_deref(),
+                &current.payload_digest,
+                current.action_sequence,
+            );
+            if computed != current.checkpoint_hash {
+                return Err(StateError::Integrity(format!(
+                    "checkpoint generation {} has an invalid hash",
+                    current.generation
+                )));
+            }
+            let parent = match current.previous_hash.as_deref() {
+                None => {
+                    if current.generation != 1 {
+                        return Err(StateError::Integrity(format!(
+                            "checkpoint generation {} has no trusted parent",
+                            current.generation
+                        )));
+                    }
+                    ancestry.push(current);
+                    break;
+                }
+                Some(previous) => {
+                    let (parent_generation, expected_hash) =
+                        if let Some((generation, hash)) = parse_recovery_anchor(previous) {
+                            (generation, hash.to_owned())
+                        } else {
+                            (current.generation.saturating_sub(1), previous.to_owned())
+                        };
+                    if parent_generation <= 0 || parent_generation >= current.generation {
+                        return Err(StateError::Integrity(format!(
+                            "checkpoint generation {} has invalid parent generation {parent_generation}",
+                            current.generation
+                        )));
+                    }
+                    let parent =
+                        checkpoint_row(&self.connection, parent_generation)?.ok_or_else(|| {
+                            StateError::Integrity(format!(
+                                "checkpoint parent generation {parent_generation} is missing"
+                            ))
+                        })?;
+                    if parent.checkpoint_hash != expected_hash {
+                        return Err(StateError::Integrity(format!(
+                            "checkpoint generation {} parent hash does not match generation {parent_generation}",
+                            current.generation
+                        )));
+                    }
+                    parent
+                }
+            };
+            ancestry.push(current);
+            current = parent;
+        }
+        Ok(ancestry)
     }
 
     /// Returns the newest checkpoint row without asserting its integrity.
@@ -776,6 +1283,44 @@ impl StateStore {
             .map(Option::flatten)
     }
 
+    /// Returns the newest contiguous hash-valid checkpoint generation without requiring
+    /// its journal sequence to equal the current authoritative sequence. Recovery uses
+    /// this as a floor and then replays/reconciles later authoritative journal/state.
+    ///
+    /// # Errors
+    /// Returns an integrity error when checkpoint rows exist but no valid generation does.
+    pub fn latest_valid_checkpoint_integrity(
+        &self,
+    ) -> Result<Option<CheckpointIntegrityRecord>, StateError> {
+        latest_valid_checkpoint(&self.connection)
+    }
+
+    /// Runs bounded `SQLite` integrity and foreign-key checks before recovery enables mutation.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Integrity`] unless both checks report a clean database.
+    pub fn recovery_integrity_check(&self) -> Result<(), StateError> {
+        let quick: String = self
+            .connection
+            .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))?;
+        if quick != "ok" {
+            return Err(StateError::Integrity(format!(
+                "SQLite quick_check failed: {quick}"
+            )));
+        }
+        let foreign_key_failures: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM pragma_foreign_key_check",
+            [],
+            |row| row.get(0),
+        )?;
+        if foreign_key_failures != 0 {
+            return Err(StateError::Integrity(format!(
+                "SQLite foreign_key_check reported {foreign_key_failures} violation(s)"
+            )));
+        }
+        Ok(())
+    }
+
     /// Validates the checkpoint chain and exact action-journal sequence floor.
     /// Corrupt newest generations may fall back only to the last contiguous valid
     /// generation. A sequence mismatch blocks mutation.
@@ -786,39 +1331,7 @@ impl StateStore {
         &self,
         expected_action_sequence: i64,
     ) -> Result<Option<CheckpointIntegrityRecord>, StateError> {
-        let mut statement = self.connection.prepare("SELECT generation, previous_hash, checkpoint_hash, payload_digest, action_sequence, created_at_ms FROM checkpoint_integrity ORDER BY generation ASC")?;
-        let rows = statement.query_map([], checkpoint_from_row)?;
-        let mut previous_hash: Option<String> = None;
-        let mut expected_generation = 1_i64;
-        let mut latest_valid = None;
-        for row in rows {
-            let record = row?;
-            let valid = record.generation == expected_generation
-                && record.previous_hash == previous_hash
-                && record.checkpoint_hash
-                    == checkpoint_hash(
-                        record.generation,
-                        record.previous_hash.as_deref(),
-                        &record.payload_digest,
-                        record.action_sequence,
-                    );
-            if !valid {
-                break;
-            }
-            previous_hash = Some(record.checkpoint_hash.clone());
-            expected_generation += 1;
-            latest_valid = Some(record);
-        }
-        let row_count: i64 =
-            self.connection
-                .query_row("SELECT COUNT(*) FROM checkpoint_integrity", [], |row| {
-                    row.get(0)
-                })?;
-        if row_count > 0 && latest_valid.is_none() {
-            return Err(StateError::Integrity(
-                "checkpoint chain has no valid generation".to_owned(),
-            ));
-        }
+        let latest_valid = latest_valid_checkpoint(&self.connection)?;
         if let Some(record) = latest_valid.as_ref() {
             if record.action_sequence != expected_action_sequence {
                 return Err(StateError::Integrity(format!(
@@ -924,6 +1437,82 @@ fn checkpoint_hash(
     hasher.update(payload_digest.as_bytes());
     hasher.update(action_sequence.to_be_bytes());
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn recovery_anchor(generation: i64, checkpoint_hash: &str) -> String {
+    format!("RECOVERY:{generation}:{checkpoint_hash}")
+}
+
+fn latest_valid_checkpoint(
+    connection: &Connection,
+) -> Result<Option<CheckpointIntegrityRecord>, StateError> {
+    let mut statement = connection.prepare(
+        "SELECT generation, previous_hash, checkpoint_hash, payload_digest, action_sequence, created_at_ms \
+         FROM checkpoint_integrity ORDER BY generation ASC",
+    )?;
+    let rows = statement.query_map([], checkpoint_from_row)?;
+    let mut latest_valid: Option<CheckpointIntegrityRecord> = None;
+    let mut expected_generation = 1_i64;
+    let mut previous_hash: Option<String> = None;
+    let mut broken = false;
+    let mut row_count = 0_i64;
+    let mut trusted_hashes = BTreeMap::new();
+    for row in rows {
+        row_count += 1;
+        let record = row?;
+        let hash_valid = record.checkpoint_hash
+            == checkpoint_hash(
+                record.generation,
+                record.previous_hash.as_deref(),
+                &record.payload_digest,
+                record.action_sequence,
+            );
+        if !broken
+            && record.generation == expected_generation
+            && record.previous_hash == previous_hash
+            && hash_valid
+        {
+            previous_hash = Some(record.checkpoint_hash.clone());
+            expected_generation = record.generation.saturating_add(1);
+            trusted_hashes.insert(record.generation, record.checkpoint_hash.clone());
+            latest_valid = Some(record);
+            continue;
+        }
+        broken = true;
+        let anchor_valid = record
+            .previous_hash
+            .as_deref()
+            .and_then(parse_recovery_anchor)
+            .and_then(|(generation, hash)| {
+                trusted_hashes
+                    .get(&generation)
+                    .map(|trusted_hash| trusted_hash == hash)
+            })
+            .unwrap_or(false);
+        if anchor_valid && hash_valid {
+            previous_hash = Some(record.checkpoint_hash.clone());
+            expected_generation = record.generation.saturating_add(1);
+            trusted_hashes.insert(record.generation, record.checkpoint_hash.clone());
+            latest_valid = Some(record);
+            broken = false;
+        }
+    }
+    if row_count > 0 && latest_valid.is_none() {
+        return Err(StateError::Integrity(
+            "checkpoint chain has no valid generation".to_owned(),
+        ));
+    }
+    Ok(latest_valid)
+}
+
+fn parse_recovery_anchor(value: &str) -> Option<(i64, &str)> {
+    let rest = value.strip_prefix("RECOVERY:")?;
+    let (generation, hash) = rest.split_once(':')?;
+    let generation = generation.parse().ok()?;
+    if generation <= 0 || hash.is_empty() {
+        return None;
+    }
+    Some((generation, hash))
 }
 
 fn checkpoint_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CheckpointIntegrityRecord> {

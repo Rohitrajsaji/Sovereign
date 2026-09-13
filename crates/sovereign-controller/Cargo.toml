@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = []
+recovery-test-hooks = ["sovereign-tools/recovery-test-hooks"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
