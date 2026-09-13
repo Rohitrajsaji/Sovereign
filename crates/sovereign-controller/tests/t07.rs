@@ -7,10 +7,11 @@ use sovereign_context::{
 };
 use sovereign_controller::{
     CheckpointActionRecord, CheckpointManifest, Controller, ControllerError, ExecutionRuntime,
-    ModelProposalV1, PermissionContext, PlanValidity, ReadinessInputs, RecoveryManager,
-    SchedulerView, TaskState,
+    ExecutionSuccess, ModelProposalV1, PermissionContext, PlanValidity, ReadinessInputs,
+    RecoveryManager, SchedulerView, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
+use sovereign_memory::{MemoryKind, MemoryTrust, ProcedurePattern};
 use sovereign_model::{
     DeterministicFakeBackend, MODEL_SCHEMA_VERSION, ModelBackend, ModelCapabilities,
     ModelFinishReason, ModelLoadProfile, ModelResponse, ModelUsage,
@@ -455,6 +456,44 @@ fn compiled_two_task_fixture(label: &str) -> CompiledFixture {
     compiled_fixture_inner(label, false, false, None, None, true, false, None, None)
 }
 
+fn compiled_learning_two_path_fixture(label: &str) -> CompiledFixture {
+    compiled_fixture_inner(
+        label,
+        false,
+        false,
+        None,
+        None,
+        false,
+        false,
+        Some(json!({
+            "tasks": [
+                {
+                    "title": "Apply verified label change",
+                    "objective": "Change Save to Apply in SettingsForm.",
+                    "rationale": "Exact current label evidence gates the mutation.",
+                    "files": ["src/settings/SettingsForm.tsx"],
+                    "symbols": ["SettingsForm"],
+                    "evidence_queries": ["exact:path=src/settings/SettingsForm.tsx;contains=Save"],
+                    "expected_change": "SettingsForm renders Apply."
+                },
+                {
+                    "title": "Update independent baseline text",
+                    "objective": "Change baseline other file to updated other file in src/other.txt.",
+                    "rationale": "A second bounded path provides distinct verified workflow support without overlapping the first Controller-owned hunk.",
+                    "files": ["src/other.txt"],
+                    "symbols": ["other"],
+                    "evidence_queries": [],
+                    "expected_change": "src/other.txt contains updated other file."
+                }
+            ]
+        })),
+        Some(
+            "Change Save to Apply in SettingsForm and change baseline other file to updated other file in src/other.txt."
+                .to_owned(),
+        ),
+    )
+}
+
 fn compiled_worktree_fixture(label: &str) -> CompiledFixture {
     compiled_fixture_inner(label, false, false, None, None, false, true, None, None)
 }
@@ -693,7 +732,10 @@ fn compiled_fixture_inner(
         rollback_diff_evaluator: "builtin.diff.controller_patch_absent.v1".to_owned(),
         context_packet: packet.clone(),
         m3,
-        max_model_calls: 1,
+        max_model_calls: task_model_call_cap
+            .and_then(|cap| u8::try_from(cap).ok())
+            .filter(|cap| *cap > 0)
+            .unwrap_or(1),
         model_input_token_ceiling: 8_000,
         max_output_tokens: 512,
         model_deadline_ms: 1_000,
@@ -731,7 +773,7 @@ fn execution_proposal(
 ) -> String {
     json!({
         "schema_version": 1,
-        "evidence_ids": ["file:repo.app:src/settings/SettingsForm.tsx"],
+        "evidence_ids": [format!("file:repo.app:{path}")],
         "action": {
             "kind": "replace_literal",
             "repository_id": "repo.app",
@@ -761,6 +803,17 @@ fn controller_for(fixture: &mut CompiledFixture) -> (Controller, String) {
 
 fn readiness() -> ReadinessInputs<'static> {
     ReadinessInputs::permissive_m1("sha256:resources")
+}
+
+fn learning_procedure() -> ProcedurePattern {
+    ProcedurePattern {
+        subject: "workflow.settings-repair".to_owned(),
+        summary: "Use exact evidence, apply one bounded replacement, then verify".to_owned(),
+        steps: vec![
+            "inspect exact failure and source evidence".to_owned(),
+            "apply the bounded replacement and rerun deterministic verification".to_owned(),
+        ],
+    }
 }
 
 struct RuntimeParts {
@@ -801,6 +854,113 @@ fn runtime_parts(fixture: &CompiledFixture) -> RuntimeParts {
             declared_risk_floor: CommandRisk::RepositoryMutation,
         },
     }
+}
+
+fn execute_verified_replace(
+    controller: &mut Controller,
+    fixture: &CompiledFixture,
+    task_id: &str,
+    path: &str,
+    source_digest: &str,
+    old_literal: &str,
+    new_literal: &str,
+) -> ExecutionSuccess {
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, task_id, readiness())
+        .unwrap_or_else(|error| panic!("derive {task_id} ready lease: {error}"));
+    let execution = backend(vec![model_response(
+        execution_proposal(path, source_digest, old_literal, new_literal),
+        fixture.packet.metrics.final_serialized_input_tokens,
+    )]);
+    let parts = runtime_parts(fixture);
+    let isolation =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("seatbelt: {error}"));
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut budget = ModelCallBudget::new(1, 30_000);
+    controller
+        .execute_replace(ready, &runtime, &fixture.packet, &mut budget)
+        .unwrap_or_else(|error| {
+            panic!("execute {task_id} {old_literal}->{new_literal} verified edit: {error}")
+        })
+}
+
+fn assert_verification_journal_binding(controller: &Controller, success: &ExecutionSuccess) {
+    let event = controller
+        .state()
+        .journal()
+        .unwrap_or_else(|error| panic!("verification journal: {error}"))
+        .into_iter()
+        .find(|event| {
+            event.event_kind == "verification_recorded"
+                && event.entity_id == success.verification.verification_id
+        })
+        .unwrap_or_else(|| panic!("real verification journal event missing"));
+    let payload: Value = serde_json::from_str(&event.payload_json)
+        .unwrap_or_else(|error| panic!("verification journal payload: {error}"));
+    assert_eq!(
+        payload.get("task_id").and_then(Value::as_str),
+        Some(success.verification.task_id.as_str())
+    );
+    assert_eq!(
+        payload.get("task_contract_digest").and_then(Value::as_str),
+        Some(success.verification.task_contract_digest.as_str())
+    );
+    assert_eq!(
+        payload.get("attempt_id").and_then(Value::as_str),
+        Some(success.verification.attempt_id.as_str())
+    );
+}
+
+fn assert_task_succeeded(controller: &Controller, task_id: &str) {
+    assert_eq!(controller.task_state(task_id), Some(TaskState::Succeeded));
+}
+
+fn assert_repair_learning_origin(
+    controller: &Controller,
+    episode_assertion: &str,
+    prior_attempt_id: &str,
+    failure_record_digest: &str,
+    task_id: &str,
+) {
+    let assertion: Value = serde_json::from_str(episode_assertion)
+        .unwrap_or_else(|error| panic!("decode repaired learning assertion: {error}"));
+    let repair_origin = assertion
+        .pointer("/outcome_proof/repair_origin")
+        .unwrap_or_else(|| panic!("repaired episode origin missing"));
+    assert_eq!(
+        repair_origin["prior_attempt_id"].as_str(),
+        Some(prior_attempt_id)
+    );
+    assert_eq!(
+        repair_origin["failure_record_digest"].as_str(),
+        Some(failure_record_digest)
+    );
+    assert!(
+        repair_origin["repair_packet_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:"))
+    );
+    let repair_event = controller
+        .state()
+        .journal()
+        .unwrap_or_else(|error| panic!("repair journal: {error}"))
+        .into_iter()
+        .find(|event| {
+            event.entity_type == "controller" && event.event_kind == "repair_packet_built"
+        })
+        .unwrap_or_else(|| panic!("repair-packet journal event missing"));
+    let payload: Value = serde_json::from_str(&repair_event.payload_json)
+        .unwrap_or_else(|error| panic!("repair event payload: {error}"));
+    assert_eq!(payload["task_id"].as_str(), Some(task_id));
 }
 
 fn execute_worktree_replace(
@@ -1330,6 +1490,150 @@ fn verified_upstream_bindings_make_dependent_task_ready_and_misbound_record_bloc
 }
 
 #[test]
+fn controller_learning_uses_real_verified_attempts_and_checkpoints_memory_journal() {
+    let mut fixture = compiled_learning_two_path_fixture("controller-learning-success");
+    let contract = two_task_contract(&fixture);
+    let (mut controller, _) = controller_for(&mut fixture);
+    controller
+        .record_exact_evidence_satisfaction(
+            &fixture.registry,
+            &contract.upstream,
+            &contract.requirement,
+            &fixture.packet,
+            &["file:repo.app:src/settings/SettingsForm.tsx".to_owned()],
+        )
+        .unwrap_or_else(|error| panic!("satisfy upstream evidence: {error}"));
+    let first = execute_verified_replace(
+        &mut controller,
+        &fixture,
+        &contract.upstream,
+        "src/settings/SettingsForm.tsx",
+        &fixture.form_digest,
+        "Save",
+        "Apply",
+    );
+    assert_verification_journal_binding(&controller, &first);
+    let sequence_before_learning = controller
+        .state()
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("journal before learning: {error}"));
+    let first_episode = controller
+        .record_attempt_episode(
+            &first.attempt_id,
+            Some(learning_procedure()),
+            1_800_000_000_000,
+        )
+        .unwrap_or_else(|error| panic!("record first verified episode: {error}"));
+    assert_eq!(first_episode.episode.kind, MemoryKind::Episodic);
+    assert_eq!(first_episode.episode.trust, MemoryTrust::Observed);
+    assert!(first_episode.candidate.is_none());
+    assert_task_succeeded(&controller, &contract.upstream);
+
+    let learned_sequence = controller
+        .state()
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("journal after learning: {error}"));
+    assert!(learned_sequence > sequence_before_learning);
+    let floor = controller
+        .state()
+        .validate_checkpoint_integrity_floor(learned_sequence)
+        .unwrap_or_else(|error| panic!("learning checkpoint floor: {error}"))
+        .unwrap_or_else(|| panic!("learning checkpoint missing"));
+    assert_eq!(floor.action_sequence, learned_sequence);
+    assert_eq!(
+        latest_checkpoint_manifest(controller.state()).action_journal_sequence,
+        learned_sequence
+    );
+
+    let replay = controller
+        .record_attempt_episode(
+            &first.attempt_id,
+            Some(learning_procedure()),
+            1_800_000_000_001,
+        )
+        .unwrap_or_else(|error| panic!("replay first verified episode: {error}"));
+    assert_eq!(replay.episode.id, first_episode.episode.id);
+    assert!(replay.candidate.is_none());
+    assert_eq!(
+        controller
+            .state()
+            .latest_journal_sequence()
+            .unwrap_or_else(|error| panic!("journal after replay: {error}")),
+        learned_sequence,
+        "duplicate replay must not append support or checkpoint facts"
+    );
+
+    let current = ExactRetriever::new(&fixture.registry)
+        .read_path("repo.app", Path::new("src/other.txt"), None)
+        .unwrap_or_else(|error| panic!("read downstream source: {error}"));
+    let second = execute_verified_replace(
+        &mut controller,
+        &fixture,
+        &contract.downstream,
+        "src/other.txt",
+        &current.digest,
+        "baseline other file",
+        "updated other file",
+    );
+    let second_episode = controller
+        .record_attempt_episode(
+            &second.attempt_id,
+            Some(learning_procedure()),
+            1_800_000_000_002,
+        )
+        .unwrap_or_else(|error| panic!("record second verified episode: {error}"));
+    let candidate = second_episode
+        .candidate
+        .unwrap_or_else(|| panic!("two distinct verified attempts must create a candidate"));
+    assert_eq!(candidate.supporting_verified_episodes, 2);
+    assert_eq!(candidate.record.kind, MemoryKind::ProceduralCandidate);
+    assert_eq!(candidate.record.trust, MemoryTrust::Observed);
+    assert_task_succeeded(&controller, &contract.downstream);
+}
+
+#[test]
+fn controller_learning_rejects_tampered_real_verification_bytes() {
+    let mut fixture = compiled_fixture("controller-learning-tamper", false);
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let success = execute_verified_replace(
+        &mut controller,
+        &fixture,
+        &task_id,
+        "src/settings/SettingsForm.tsx",
+        &fixture.form_digest,
+        "Save",
+        "Apply",
+    );
+    let mut second = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open verifier tamper state: {error}"));
+    let record = second
+        .state_records("controller.verification")
+        .unwrap_or_else(|error| panic!("verification records: {error}"))
+        .into_iter()
+        .find(|record| record.value_json.contains(&success.attempt_id))
+        .unwrap_or_else(|| panic!("verification row for learned attempt missing"));
+    let mut value: Value = serde_json::from_str(&record.value_json)
+        .unwrap_or_else(|error| panic!("decode verification row: {error}"));
+    value["evidence_ids"] = json!(["tampered-after-controller-verification"]);
+    second
+        .put_state("controller.verification", &record.key, &value.to_string())
+        .unwrap_or_else(|error| panic!("tamper verification row: {error}"));
+    let Err(error) = controller.record_attempt_episode(
+        &success.attempt_id,
+        Some(learning_procedure()),
+        1_800_000_100_000,
+    ) else {
+        panic!("tampered verification bytes must fail closed")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("append-only passed journal evidence")
+    );
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Succeeded));
+}
+
+#[test]
 fn permission_context_is_controller_owned_and_can_deny_repo_write() {
     let mut fixture = compiled_fixture("permission-denied", false);
     let state =
@@ -1812,6 +2116,98 @@ fn committed_nonzero_process_result_is_execution_failure_not_unknown() {
     assert_eq!(
         controller.task_state(&task_id),
         Some(TaskState::RepairPending)
+    );
+}
+
+#[test]
+fn controller_learning_records_real_failure_and_accepts_exact_repair_origin() {
+    let mut fixture = compiled_fixture_with_task_model_call_cap("controller-learning-repair", 2);
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, &task_id, readiness())
+        .unwrap_or_else(|error| panic!("initial repair fixture readiness: {error}"));
+    let execution = backend(vec![
+        model_response(
+            valid_execution_proposal(&fixture.form_digest),
+            fixture.packet.metrics.final_serialized_input_tokens,
+        ),
+        model_response(
+            valid_execution_proposal(&fixture.form_digest),
+            fixture.packet.metrics.final_serialized_input_tokens,
+        ),
+    ]);
+    let parts = runtime_parts(&fixture);
+    let failing_isolation = SwapIsolation {
+        inner: MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("seatbelt: {error}")),
+        executable: PathBuf::from("/usr/bin/false"),
+        advance_epoch_db: None,
+    };
+    let failing_runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &failing_isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut budget = ModelCallBudget::new(2, 30_000);
+    let failure =
+        match controller.execute_replace(ready, &failing_runtime, &fixture.packet, &mut budget) {
+            Err(ControllerError::ExecutionFailed(failure)) => failure,
+            other => panic!("expected real committed failure before repair, got {other:?}"),
+        };
+    let failed_episode = controller
+        .record_attempt_episode(
+            &failure.attempt_id,
+            Some(learning_procedure()),
+            1_800_000_200_000,
+        )
+        .unwrap_or_else(|error| panic!("record real failed episode: {error}"));
+    assert_eq!(failed_episode.episode.kind, MemoryKind::Episodic);
+    assert!(failed_episode.candidate.is_none());
+    assert_eq!(
+        controller.task_state(&task_id),
+        Some(TaskState::RepairPending)
+    );
+
+    let repair_isolation =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("repair seatbelt: {error}"));
+    let repair_runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &repair_isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let (success, repair_packet) = controller
+        .repair_replace(
+            &task_id,
+            &repair_runtime,
+            &fixture.packet,
+            readiness(),
+            &mut budget,
+        )
+        .unwrap_or_else(|error| panic!("real targeted repair: {error}"));
+    let repaired_episode = controller
+        .record_attempt_episode(
+            &success.attempt_id,
+            Some(learning_procedure()),
+            1_800_000_200_001,
+        )
+        .unwrap_or_else(|error| panic!("record repaired verified episode: {error}"));
+    assert!(repaired_episode.candidate.is_none());
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Succeeded));
+    assert_repair_learning_origin(
+        &controller,
+        &repaired_episode.episode.assertion,
+        &failure.attempt_id,
+        &repair_packet.failure_record_digest,
+        &task_id,
     );
 }
 

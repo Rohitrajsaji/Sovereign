@@ -12,6 +12,10 @@ use sovereign_context::{
     RepairPacket, RepairPacketInput, TrustClass,
 };
 use sovereign_evidence::{ArtifactStore, EvidenceError};
+use sovereign_memory::{
+    ControllerEpisodeOutcomeProof, ControllerEpisodeProof, EpisodeCapture, EpisodeCaptureResult,
+    EpisodeRecorder, MemoryError, MemoryScope, MemoryScopeKind, ProcedurePattern,
+};
 use sovereign_model::{
     MODEL_SCHEMA_VERSION, ModelBackend, ModelError, ModelFinishReason, ModelMessage,
     ModelMessageRole, ModelOutputContract, ModelRequest,
@@ -90,6 +94,7 @@ pub enum ControllerError {
     Repo(RepoError),
     Tool(ToolError),
     Evidence(EvidenceError),
+    Memory(MemoryError),
     Json(serde_json::Error),
     Io(std::io::Error),
     InvalidPlan(String),
@@ -109,6 +114,7 @@ impl Display for ControllerError {
             Self::Repo(error) => write!(f, "controller repository error: {error}"),
             Self::Tool(error) => write!(f, "controller tool error: {error}"),
             Self::Evidence(error) => write!(f, "controller evidence error: {error}"),
+            Self::Memory(error) => write!(f, "controller memory error: {error}"),
             Self::Json(error) => write!(f, "controller JSON error: {error}"),
             Self::Io(error) => write!(f, "controller I/O error: {error}"),
             Self::InvalidPlan(message) => write!(f, "invalid active plan: {message}"),
@@ -143,6 +149,7 @@ from_error!(PolicyError, Policy);
 from_error!(RepoError, Repo);
 from_error!(ToolError, Tool);
 from_error!(EvidenceError, Evidence);
+from_error!(MemoryError, Memory);
 from_error!(serde_json::Error, Json);
 from_error!(std::io::Error, Io);
 
@@ -1577,6 +1584,181 @@ impl Controller {
         Ok(self
             .latest_failure_record_with_digest(task_id)?
             .map(|(record, _)| record))
+    }
+
+    /// Captures one Controller-owned durable attempt outcome as episodic memory.
+    ///
+    /// The caller supplies only the attempt identity and an optional reusable
+    /// procedure description. Success/failure eligibility, project scope, task
+    /// contract, durable verification/failure proof, and promotion support are
+    /// derived from Controller-owned state. Learning remains evidence-only and
+    /// cannot mutate Plan IR, permissions, task authority, or completion state.
+    ///
+    /// # Errors
+    /// Fails closed when the attempt is not terminal, durable outcome proof is
+    /// missing/ambiguous, memory validation fails, or the post-learning
+    /// checkpoint cannot cover newly appended journal facts.
+    pub fn record_attempt_episode(
+        &mut self,
+        attempt_id: &str,
+        procedure: Option<ProcedurePattern>,
+        now_ms: i64,
+    ) -> Result<EpisodeCaptureResult, ControllerError> {
+        let (scope, proof) = self.episode_capture_proof(attempt_id)?;
+        let capture = EpisodeCapture {
+            scope,
+            procedure,
+            proof,
+            observed_at_ms: now_ms,
+        };
+        let journal_before = self.state.latest_journal_sequence()?;
+        let result = EpisodeRecorder::new(&mut self.state).record(&capture);
+        let journal_after = self.state.latest_journal_sequence()?;
+        if journal_after > journal_before {
+            self.checkpoint_now()?;
+        }
+        result.map_err(ControllerError::Memory)
+    }
+
+    fn episode_capture_proof(
+        &self,
+        attempt_id: &str,
+    ) -> Result<(MemoryScope, ControllerEpisodeProof), ControllerError> {
+        let active = self.active_ref()?;
+        let attempt = active.attempts.get(attempt_id).ok_or_else(|| {
+            ControllerError::NotReady(format!("unknown attempt {attempt_id} for learning"))
+        })?;
+        let task = active.tasks.get(&attempt.task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan("learning attempt task disappeared".to_owned())
+        })?;
+        if task.task_contract_digest != attempt.task_contract_digest {
+            return Err(ControllerError::InvalidPlan(
+                "learning attempt/task contract binding is inconsistent".to_owned(),
+            ));
+        }
+        let project_id = required_str(&active.plan_document, "/project/project_id")?.to_owned();
+        let scope = MemoryScope {
+            project_id,
+            repository_id: Some(active.repository_id.clone()),
+            kind: MemoryScopeKind::Project,
+            agent_id: None,
+            role_visibility: Vec::new(),
+        };
+        let task_record_key =
+            revision_scoped_key(&active.plan_id, active.revision, &attempt.task_id);
+        let attempt_record_key = revision_scoped_key(&active.plan_id, active.revision, attempt_id);
+        let outcome = match attempt.state {
+            AttemptState::Succeeded => {
+                self.verified_success_episode_outcome(active, attempt, attempt_id)?
+            }
+            AttemptState::Failed => self.failed_episode_outcome(active, attempt, attempt_id)?,
+            state => {
+                return Err(ControllerError::NotReady(format!(
+                    "attempt {attempt_id} in state {state:?} is not eligible for episode learning"
+                )));
+            }
+        };
+        Ok((
+            scope,
+            ControllerEpisodeProof {
+                plan_id: active.plan_id.clone(),
+                plan_revision: active.revision,
+                plan_digest: active.plan_digest.clone(),
+                task_id: attempt.task_id.clone(),
+                task_contract_digest: attempt.task_contract_digest.clone(),
+                attempt_id: attempt_id.to_owned(),
+                task_record_key,
+                attempt_record_key,
+                outcome,
+            },
+        ))
+    }
+
+    fn verified_success_episode_outcome(
+        &self,
+        active: &ActivePlan,
+        attempt: &AttemptRuntime,
+        attempt_id: &str,
+    ) -> Result<ControllerEpisodeOutcomeProof, ControllerError> {
+        let mut matches = Vec::new();
+        for record in self.state.state_records("controller.verification")? {
+            let verification: VerificationResultV1 = serde_json::from_str(&record.value_json)?;
+            if verification.schema_version == VERIFICATION_RESULT_SCHEMA_VERSION
+                && verification.passed
+                && verification.plan_id == active.plan_id
+                && verification.plan_revision == active.revision
+                && verification.plan_digest == active.plan_digest
+                && verification.task_id == attempt.task_id
+                && verification.task_contract_digest == attempt.task_contract_digest
+                && verification.attempt_id == attempt_id
+                && record.key
+                    == revision_scoped_key(
+                        &verification.plan_id,
+                        verification.plan_revision,
+                        &verification.verification_id,
+                    )
+            {
+                matches.push(verification);
+            }
+        }
+        if matches.len() != 1 {
+            return Err(ControllerError::NotReady(format!(
+                "succeeded attempt {attempt_id} requires exactly one durable passed verification; found {}",
+                matches.len()
+            )));
+        }
+        let verification = matches.pop().ok_or_else(|| {
+            ControllerError::NotReady(
+                "succeeded attempt verification disappeared during learning".to_owned(),
+            )
+        })?;
+        Ok(ControllerEpisodeOutcomeProof::VerifiedSuccess {
+            verification_record_key: revision_scoped_key(
+                &verification.plan_id,
+                verification.plan_revision,
+                &verification.verification_id,
+            ),
+            verification_id: verification.verification_id,
+        })
+    }
+
+    fn failed_episode_outcome(
+        &self,
+        active: &ActivePlan,
+        attempt: &AttemptRuntime,
+        attempt_id: &str,
+    ) -> Result<ControllerEpisodeOutcomeProof, ControllerError> {
+        let failure_record_key = revision_scoped_key(
+            &active.plan_id,
+            active.revision,
+            &format!("{}:{attempt_id}", attempt.task_id),
+        );
+        let raw = self
+            .state
+            .get_state("controller.failure_record", &failure_record_key)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "failed attempt {attempt_id} lacks its durable FailureRecord"
+                ))
+            })?;
+        let failure: FailureRecordV1 = serde_json::from_str(&raw)?;
+        if failure.schema_version != FAILURE_RECORD_SCHEMA_VERSION
+            || failure.plan_id != active.plan_id
+            || failure.plan_revision != active.revision
+            || failure.plan_digest != active.plan_digest
+            || failure.task_id != attempt.task_id
+            || failure.task_contract_digest != attempt.task_contract_digest
+            || failure.attempt_id != attempt_id
+            || failure.signature.is_empty()
+        {
+            return Err(ControllerError::InvalidPlan(
+                "durable FailureRecord is misbound to the learned attempt".to_owned(),
+            ));
+        }
+        Ok(ControllerEpisodeOutcomeProof::FailedAttempt {
+            failure_record_key,
+            failure_signature: failure.signature,
+        })
     }
 
     fn latest_failure_record_with_digest(
@@ -3202,6 +3384,9 @@ impl Controller {
                 "repair_packet_built".to_owned(),
                 task_id.to_owned(),
                 json!({
+                    "plan_id": plan_id,
+                    "plan_revision": plan_revision,
+                    "task_id": task_id,
                     "prior_attempt_id": failure.attempt_id,
                     "failure_signature": failure.signature,
                     "failure_record_digest": failure_record_digest,
@@ -3556,7 +3741,16 @@ impl Controller {
         self.append_controller_event(
             "verification_recorded",
             &verification.verification_id,
-            &json!({"passed": verification.passed, "artifact_digest": artifact.digest}),
+            &json!({
+                "passed": verification.passed,
+                "artifact_digest": artifact.digest,
+                "plan_id": verification.plan_id,
+                "plan_revision": verification.plan_revision,
+                "plan_digest": verification.plan_digest,
+                "task_id": verification.task_id,
+                "task_contract_digest": verification.task_contract_digest,
+                "attempt_id": verification.attempt_id,
+            }),
         )?;
         self.checkpoint_now()?;
         if !verification.passed {
@@ -4944,7 +5138,16 @@ impl Controller {
         self.append_controller_event(
             "recovery_verification_recorded",
             &verification.verification_id,
-            &json!({"passed": verification.passed, "artifact_digest": artifact.digest}),
+            &json!({
+                "passed": verification.passed,
+                "artifact_digest": artifact.digest,
+                "plan_id": verification.plan_id,
+                "plan_revision": verification.plan_revision,
+                "plan_digest": verification.plan_digest,
+                "task_id": verification.task_id,
+                "task_contract_digest": verification.task_contract_digest,
+                "attempt_id": verification.attempt_id,
+            }),
         )?;
         self.checkpoint_now()?;
         if !verification.passed {
@@ -8549,6 +8752,7 @@ fn controller_failure_code(error: &ControllerError) -> &'static str {
         ControllerError::Policy(_) => "policy_error",
         ControllerError::Tool(_) => "tool_error",
         ControllerError::Evidence(_) => "evidence_error",
+        ControllerError::Memory(_) => "memory_error",
         ControllerError::Json(_) => "json_error",
         ControllerError::Io(_) => "io_error",
         ControllerError::InvalidPlan(_) => "invalid_plan",

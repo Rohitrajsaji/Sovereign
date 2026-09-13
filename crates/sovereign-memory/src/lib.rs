@@ -17,9 +17,15 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::Path;
 
+mod learning;
 mod projection;
 mod retrieval;
 
+pub use learning::{
+    ControllerEpisodeOutcomeProof, ControllerEpisodeProof, EpisodeCapture, EpisodeCaptureResult,
+    EpisodeRecorder, PROCEDURE_CANDIDATE_SUPPORT_THRESHOLD, ProcedureCandidate, ProcedurePattern,
+    WorkflowPattern,
+};
 pub use projection::{ProjectionOutbox, ProjectionRepair};
 
 pub use retrieval::{
@@ -514,7 +520,7 @@ impl MemoryManager {
     }
 
     fn finish_projection_after_canonical_commit(&mut self) -> Result<(), MemoryError> {
-        self.drain_projection_outbox()
+        projection::drain_projection_outbox_state(&mut self.state)
             .map(|_| ())
             .map_err(|error| MemoryError::ProjectionPending(error.to_string()))
     }
@@ -628,24 +634,10 @@ impl MemoryManager {
 impl MemoryLifecycle for MemoryManager {
     fn capture(
         &mut self,
-        mut record: NewMemoryRecord,
+        record: NewMemoryRecord,
         now_ms: i64,
     ) -> Result<MemoryRecord, MemoryError> {
-        normalize_new_record(&mut record);
-        validate_new_record(&record, now_ms)?;
-        let id = record.id.clone();
-        self.state.transaction(|tx| {
-            insert_record_tx(tx, &record, now_ms, 1, None)?;
-            reconcile_contradictions_tx(tx, &id, now_ms)?;
-            journal_memory_record_tx(tx, &id, "captured", "capture", now_ms)?;
-            Ok(())
-        })?;
-        self.finish_projection_after_canonical_commit()?;
-        self.record(&id)?.ok_or_else(|| {
-            MemoryError::State(StateError::Integrity(format!(
-                "captured memory {id} is missing"
-            )))
-        })
+        capture_record_in_state(&mut self.state, record, now_ms)
     }
 
     fn replace_governed(
@@ -954,6 +946,11 @@ fn validate_new_record(record: &NewMemoryRecord, now_ms: i64) -> Result<(), Memo
             "governed_knowledge requires governed trust".to_owned(),
         ));
     }
+    if record.trust == MemoryTrust::Governed && record.kind != MemoryKind::GovernedKnowledge {
+        return Err(MemoryError::InvalidRecord(
+            "governed trust is reserved for governed_knowledge".to_owned(),
+        ));
+    }
     if record.kind == MemoryKind::ValidatedProjectFact && record.trust != MemoryTrust::Validated {
         return Err(MemoryError::InvalidRecord(
             "validated_project_fact requires validated trust".to_owned(),
@@ -997,6 +994,32 @@ fn validate_new_record(record: &NewMemoryRecord, now_ms: i64) -> Result<(), Memo
         validate_nonempty("invalidation predicate key", &predicate.key)?;
     }
     Ok(())
+}
+
+pub(crate) fn capture_record_in_state(
+    state: &mut StateStore,
+    mut record: NewMemoryRecord,
+    now_ms: i64,
+) -> Result<MemoryRecord, MemoryError> {
+    normalize_new_record(&mut record);
+    validate_new_record(&record, now_ms)?;
+    let id = record.id.clone();
+    state.transaction(|tx| {
+        insert_record_tx(tx, &record, now_ms, 1, None)?;
+        reconcile_contradictions_tx(tx, &id, now_ms)?;
+        journal_memory_record_tx(tx, &id, "captured", "capture", now_ms)?;
+        Ok(())
+    })?;
+    projection::drain_projection_outbox_state(state)
+        .map(|_| ())
+        .map_err(|error| MemoryError::ProjectionPending(error.to_string()))?;
+    state
+        .transaction(|tx| load_record_tx(tx, &id))?
+        .ok_or_else(|| {
+            MemoryError::State(StateError::Integrity(format!(
+                "captured memory {id} is missing"
+            )))
+        })
 }
 
 fn validate_nonempty(field: &str, value: &str) -> Result<(), MemoryError> {

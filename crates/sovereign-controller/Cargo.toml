@@ -15,6 +15,7 @@ serde_json.workspace = true
 sha2.workspace = true
 sovereign-context = { path = "../sovereign-context" }
 sovereign-evidence = { path = "../sovereign-evidence" }
+sovereign-memory = { path = "../sovereign-memory" }
 sovereign-model = { path = "../sovereign-model" }
 sovereign-plan = { path = "../sovereign-plan" }
 sovereign-policy = { path = "../sovereign-policy" }

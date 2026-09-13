@@ -1,0 +1,77 @@
+{
+  "milestone_id": "M4",
+  "title": "Persistent memory and learning",
+  "roadmap_version": "1.4-frozen",
+  "completed_at": "2026-09-13T18:10:27Z",
+  "required_tasks": [
+    "M4-T01",
+    "M4-T02",
+    "M4-T03",
+    "M4-T04"
+  ],
+  "all_required_tasks_completed": true,
+  "task_evidence": {
+    "implementation/evidence/M4-T01.json": "sha256:e42853bc3376188418d87b65500a1976351d5237a60833bf74e0d3f7aa8f7ea3",
+    "implementation/evidence/M4-T02.json": "sha256:054600727010c01a819e5c6f4dc960e7fc0d1a43b6d294347af59f01961b320d",
+    "implementation/evidence/M4-T03.json": "sha256:e78b47eab8a664e3ad7cc615d297093ad6908d56404865236a886fdcf419bb01",
+    "implementation/evidence/M4-T04.json": "sha256:274b0623cc3bf05647038e36a7838b6ae710c6227f1bf77eb02ade4d63df90b4"
+  },
+  "milestone_gates": {
+    "restart_preserves_memory_provenance_and_search_coherence_source_changes_invalidate_only_affected": {
+      "status": "passed",
+      "proofs": [
+        "implementation/evidence/M4-T01.json",
+        "implementation/evidence/M4-T03.json"
+      ],
+      "detail": "Canonical lifecycle provenance and exact old->new fingerprint invalidation are durable; projection outbox/startup replay rebuilds searchable derived FTS from canonical memory after crash/restart without a fallback authority."
+    },
+    "contradictions_are_explicit_and_stale_or_conflicted_records_do_not_enter_ordinary_fact_context_unlabeled": {
+      "status": "passed",
+      "proofs": [
+        "implementation/evidence/M4-T01.json",
+        "implementation/evidence/M4-T02.json"
+      ],
+      "detail": "Lifecycle produces deterministic conflict sets or governed supersession chains; ordinary retrieval excludes stale/superseded/deprecated/expired/conflicted records while explicit history/conflict modes preserve labeled provenance."
+    },
+    "episodic_recall_is_deterministic_filter_lexical_first_compact_first_and_graph_expansion_is_anchored_bounded": {
+      "status": "passed",
+      "proof": "implementation/evidence/M4-T02.json",
+      "detail": "Exact episodic failure-signature/repository/tool/runtime/symbol/task filters precede lexical fallback; compact results and provenance expansion are hard-bounded; graph expansion requires an anchor and bounded neighborhood."
+    },
+    "learning_remains_evidence_not_authority": {
+      "status": "passed",
+      "proof": "implementation/evidence/M4-T04.json",
+      "detail": "Episode/candidate learning derives success/failure from Controller-owned durable state, uses exact verification journal/digest bindings, requires two distinct verified successes, preserves Observed-only candidates and governed precedence, and cannot rewrite permissions/requirements/plan/execution/completion authority."
+    }
+  },
+  "closure_verification": {
+    "memory_learning": "8/8 passed",
+    "controller_real_learning": "3/3 passed",
+    "memory_package": "learning 8/8; lifecycle 25/25; projection 8/8; retrieval 18/18; doc tests passed",
+    "controller_package": "lib 15/15; t07 33/33; doc tests passed",
+    "cargo_check_workspace_all_targets": "passed",
+    "clippy_workspace_all_targets_D_warnings": "passed",
+    "cargo_test_workspace": "passed; only intentional local-model qualification/smoke tests ignored",
+    "cargo_fmt_check": "passed",
+    "git_diff_check": "passed",
+    "source_hash_reconciliation": "worker-28 end hashes and prime recomputation match the frozen eight-file M4-T04 tree exactly"
+  },
+  "independent_read_only_audit": {
+    "worker": "worker-28",
+    "result": "CLOSABLE",
+    "verdict": "M4-T04 frozen task: CLOSABLE",
+    "blockers": [],
+    "scope": "exact frozen M4-T04 tree feeding final M4 closure"
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429"
+  },
+  "network_runtime_dependency": false
+}

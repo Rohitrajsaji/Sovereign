@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "task_id": "M4-T04",
+  "title": "Capture verified episodes and procedural candidates",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "6d43c4fa40e9a739dab2ab0cf9c2c679ba1584e7",
+  "status": "completed",
+  "completed_at": "2026-09-13T18:10:11Z",
+  "verified_at": "2026-09-13T18:10:11Z",
+  "dependencies": [
+    "M4-T03",
+    "M3-T03"
+  ],
+  "interfaces": [
+    "EpisodeRecorder",
+    "ProcedureCandidate"
+  ],
+  "schema_contracts": [
+    "EpisodeRecord v1",
+    "ProcedureCandidate v1"
+  ],
+  "state_schema_version": 6,
+  "authority_contract": {
+    "memory_is_evidence_not_authority": true,
+    "caller_supplied_success_verified_or_promote_flags": false,
+    "controller_owned_outcome_derivation": "record_attempt_episode derives project/task/attempt and outcome proof from the active Controller durable state; callers provide only attempt_id, optional procedure observation, and observation time",
+    "success_requirement": "exact succeeded Controller attempt/task plus exactly matching durable passed VerificationResultV1 and append-only verification journal proof",
+    "failure_requirement": "exact durable FailureRecordV1; failed or failed-verification attempts never count toward candidate support",
+    "learning_cannot_rewrite": [
+      "permissions",
+      "requirements",
+      "Plan IR",
+      "task contract",
+      "action policy",
+      "verification criteria",
+      "execution epoch",
+      "Controller authority",
+      "completion authority"
+    ],
+    "learning_failure_does_not_relabel_task_outcome": true
+  },
+  "verification_binding": {
+    "durable_row_binding": "SHA256 of exact persisted controller.verification JSON bytes must equal the append-only verification journal artifact_digest",
+    "artifact_digest_representation": "bare lowercase 64-character SHA256 hex, matching ArtifactStore::put",
+    "journal_exact_fields": [
+      "passed",
+      "artifact_digest",
+      "plan_id",
+      "plan_revision",
+      "plan_digest",
+      "task_id",
+      "task_contract_digest",
+      "attempt_id"
+    ],
+    "learner_checks_all_exact_bindings": true,
+    "tampered_verification_row_fails_closed": true,
+    "tampered_task_contract_attempt_journal_binding_fails_closed": true
+  },
+  "procedure_candidate_contract": {
+    "threshold_distinct_verified_success_attempts": 2,
+    "same_deterministic_scoped_pattern_required": true,
+    "duplicate_attempt_replay_increases_support": false,
+    "generic_memory_can_spoof_support": false,
+    "scope_bound_identity_and_support": true,
+    "role_visibility_canonicalized": true,
+    "candidate_kind": "procedural_candidate",
+    "candidate_trust": "observed",
+    "governed_trust_inverse_invariant": "MemoryTrust::Governed is legal only for MemoryKind::GovernedKnowledge",
+    "governed_user_precedence_preserved": true,
+    "candidate_identity": "stable workflow signature + canonical scope",
+    "initial_threshold_provenance_immutable": true,
+    "later_support_semantics": "third and later verified supports update returned dynamic support metadata only; persisted threshold provenance remains unchanged after validation",
+    "existing_candidate_reuse_validation": "kind, canonical scope, subject, procedure predicate, workflow conflict key, assertion content, Observed trust, confidence, active status, absence of expiry/invalidation/producer/source fingerprints, and exact threshold source evidence shape are revalidated before reuse"
+  },
+  "state_projection_checkpoint_contract": {
+    "canonical_state_store": "same Controller-owned &mut StateStore",
+    "second_learning_database_or_pool": false,
+    "second_memory_writer": false,
+    "new_schema_v7": false,
+    "projection_is_derived_rebuildable": true,
+    "duplicate_episode_replay_drains_existing_projection_outbox": true,
+    "controller_checkpoints_after_learning_journal_advance": true
+  },
+  "repair_origin_contract": {
+    "exact_fields": [
+      "prior_attempt_id",
+      "failure_record_digest",
+      "repair_packet_digest"
+    ],
+    "validated_against_durable_controller_records_and_journal": true,
+    "repair_packet_built_exact_bindings_include": [
+      "plan_id",
+      "plan_revision",
+      "task_id",
+      "prior_attempt_id",
+      "failure_record_digest",
+      "repair_packet_digest",
+      "plan_digest",
+      "task_contract_digest"
+    ]
+  },
+  "acceptance_tests": [
+    "learning_failed_attempt_never_promotes_as_success",
+    "learning_repeated_verified_pattern_creates_candidate_and_replay_is_idempotent",
+    "learning_generic_memory_cannot_spoof_candidate_support",
+    "learning_governed_decision_precedes_candidate_and_governed_trust_is_restricted",
+    "learning_tampered_verification_row_fails_digest_binding",
+    "learning_verification_journal_must_match_exact_task_contract_and_attempt",
+    "learning_scope_is_canonical_for_duplicate_replay_and_candidate_identity",
+    "learning_existing_episode_replay_drains_projection_outbox",
+    "controller_learning_uses_real_verified_attempts_and_checkpoints_memory_journal",
+    "controller_learning_rejects_tampered_real_verification_bytes",
+    "controller_learning_records_real_failure_and_accepts_exact_repair_origin"
+  ],
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-memory --offline -- learning",
+      "result": "passed",
+      "detail": "8/8 learning integration tests"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-controller --offline --test t07 controller_learning -- --nocapture",
+      "result": "passed",
+      "detail": "3/3 real Controller learning tests"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-memory --offline",
+      "result": "passed",
+      "detail": "learning 8/8; lifecycle 25/25; projection 8/8; retrieval 18/18; doc tests passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-controller --offline",
+      "result": "passed",
+      "detail": "controller lib 15/15; t07 33/33; doc tests passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test --workspace --offline",
+      "result": "passed",
+      "detail": "full workspace passed; only intentional local-model qualification/smoke tests ignored"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "independent_audit": {
+    "worker": "worker-28",
+    "result": "CLOSABLE",
+    "required_verdict": "M4-T04 frozen task: CLOSABLE",
+    "blockers": [],
+    "notes": "Fresh exact-tree read-only audit at HEAD 6d43c4f with the same eight dirty M4-T04 paths and delegated hashes unchanged; both prior worker-23 blockers were confirmed repaired and the full authority/scope/trust/projection/checkpoint/repair-origin checklist found no concrete blocker."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429"
+  },
+  "source_hashes": {
+    "Cargo.lock": "sha256:0afea984e9792eabb60aa6b483824c0e7f3b504e7a32999758f584611c9f6acd",
+    "crates/sovereign-controller/Cargo.toml": "sha256:47b8cfb73f6a9c52a262a500f6ab6f954396a048b14079211adaa862569d9ae4",
+    "crates/sovereign-controller/src/lib.rs": "sha256:7883296d06c0215e171df6fd3f61b4ab724f32611039907e0f8cf43e7b8fcfa7",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:15b3314b7ea57a2f344d9805c45ccf86ac3d518651de0a2e8a98af1903354d13",
+    "crates/sovereign-memory/src/lib.rs": "sha256:8e139b021c0213891a8059cc704c18c4fedff35be729618f51a8acfc98f4bd7d",
+    "crates/sovereign-memory/src/projection.rs": "sha256:91d600da35b21d0768c153e65bf3b15e93b2590389a2ba07f591b06201df1d2a",
+    "crates/sovereign-memory/src/learning.rs": "sha256:5d68622be78c7090a4f10339b364dec5fa1df2a97842ba910f83b8b3b0bbdd6f",
+    "crates/sovereign-memory/tests/learning.rs": "sha256:8a8e88e5a4dff371293661c80701bd6caf06f561eb68a7c1258f020dec87ee0a"
+  },
+  "network_runtime_dependency": false
+}

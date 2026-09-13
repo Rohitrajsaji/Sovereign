@@ -72,19 +72,7 @@ impl MemoryManager {
     /// Returns a durable-state error if any refresh transaction fails. The
     /// uncommitted intent remains durable for retry.
     pub fn drain_projection_outbox(&mut self) -> Result<usize, MemoryError> {
-        let mut refreshed = 0usize;
-        loop {
-            let delivered = self.state.transaction(drain_outbox_batch_tx)?;
-            refreshed = refreshed.checked_add(delivered).ok_or_else(|| {
-                MemoryError::State(StateError::Integrity(
-                    "projection refresh count overflow".to_owned(),
-                ))
-            })?;
-            if delivered < MAX_OUTBOX_BATCH_HARD {
-                break;
-            }
-        }
-        Ok(refreshed)
+        drain_projection_outbox_state(&mut self.state)
     }
 
     /// Detects a derived-projection mismatch, writes durable pending repair
@@ -139,6 +127,24 @@ impl MemoryManager {
             })?;
         Ok(Some(completed))
     }
+}
+
+pub(super) fn drain_projection_outbox_state(
+    state: &mut sovereign_state::StateStore,
+) -> Result<usize, MemoryError> {
+    let mut refreshed = 0usize;
+    loop {
+        let delivered = state.transaction(drain_outbox_batch_tx)?;
+        refreshed = refreshed.checked_add(delivered).ok_or_else(|| {
+            MemoryError::State(StateError::Integrity(
+                "projection refresh count overflow".to_owned(),
+            ))
+        })?;
+        if delivered < MAX_OUTBOX_BATCH_HARD {
+            break;
+        }
+    }
+    Ok(refreshed)
 }
 
 pub(super) fn initialize_projection(manager: &mut MemoryManager) -> Result<(), MemoryError> {
