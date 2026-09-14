@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sovereign://schemas/resource-pressure-event-v1.json",
+  "title": "Sovereign ResourcePressureEvent v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "snapshot",
+    "raw_band",
+    "effective_band",
+    "green_stable_since_ms",
+    "last_non_green_at_ms"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "event_id": { "type": "string", "minLength": 1 },
+    "snapshot": { "$ref": "#/$defs/snapshot" },
+    "raw_band": { "$ref": "#/$defs/pressure_band" },
+    "effective_band": { "$ref": "#/$defs/pressure_band" },
+    "green_stable_since_ms": { "type": ["integer", "null"], "minimum": 0 },
+    "last_non_green_at_ms": { "type": ["integer", "null"], "minimum": 0 }
+  },
+  "$defs": {
+    "pressure_band": { "enum": ["GREEN", "GUARDED", "CONSTRAINED", "EMERGENCY"] },
+    "snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "observed_at_ms",
+        "controlled_working_set_mib",
+        "host_headroom_mib",
+        "swap_used_mib",
+        "swap_out_growth_mib_per_min",
+        "compressor_growth_mib_per_min",
+        "os_memory_pressure",
+        "recent_pressure_event",
+        "thermal_pressure",
+        "allocation_failure",
+        "repeated_resource_kill",
+        "uncontrolled_child_growth",
+        "host_free_disk_mib"
+      ],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "observed_at_ms": { "type": "integer", "minimum": 0 },
+        "controlled_working_set_mib": { "type": "integer", "minimum": 0 },
+        "host_headroom_mib": { "type": "integer", "minimum": 0 },
+        "swap_used_mib": { "type": ["integer", "null"], "minimum": 0 },
+        "swap_out_growth_mib_per_min": { "type": "integer", "minimum": 0 },
+        "compressor_growth_mib_per_min": { "type": "integer", "minimum": 0 },
+        "os_memory_pressure": { "enum": ["NORMAL", "WARNING", "CRITICAL", "UNKNOWN"] },
+        "recent_pressure_event": { "type": "boolean" },
+        "thermal_pressure": { "enum": ["NORMAL", "SERIOUS", "CRITICAL", "UNKNOWN"] },
+        "allocation_failure": { "type": "boolean" },
+        "repeated_resource_kill": { "type": "boolean" },
+        "uncontrolled_child_growth": { "type": "boolean" },
+        "host_free_disk_mib": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    }
+  }
+}

@@ -13,7 +13,7 @@ use sovereign_evidence::ArtifactStore;
 use sovereign_model::{
     BackendHealth, LlamaServerLaunch, LocalOpenAiBackend, LocalOpenAiConfig, MODEL_SCHEMA_VERSION,
     ModelBackend, ModelCapabilities, ModelError, ModelFinishReason, ModelLease, ModelLoadProfile,
-    ModelRequest, ModelResponse, ModelTokenAdmission, ModelUsage,
+    ModelRequest, ModelResidencyProof, ModelResponse, ModelTokenAdmission, ModelUsage,
 };
 use sovereign_plan::{
     PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationInput, PlanCompilationRepository, PlanCompiler,
@@ -435,6 +435,10 @@ impl ModelBackend for QualificationBackend {
     fn unload(&self) -> Result<(), ModelError> {
         self.inner.unload()
     }
+
+    fn residency_proof(&self) -> Result<ModelResidencyProof, ModelError> {
+        self.inner.residency_proof()
+    }
 }
 
 fn capability(id: &str, digest: &str) -> Value {
@@ -797,6 +801,16 @@ fn m1_real_qwen_implementation_repair_restart_qualification() {
         serde_json::to_value(compilation.compilation_evidence().model_attempts())
             .unwrap_or_else(|error| panic!("serialize compiler attempt evidence: {error}"));
     let compiler_calls_used = 2_u32.saturating_sub(compiler_budget.remaining_calls());
+    backend
+        .unload()
+        .unwrap_or_else(|error| panic!("release compiler-only Qwen residency: {error}"));
+    assert_eq!(
+        backend
+            .residency_proof()
+            .unwrap_or_else(|error| panic!("prove compiler-only Qwen absence: {error}")),
+        ModelResidencyProof::Absent,
+        "Controller setup must begin only after compiler-owned model residency is proven absent"
+    );
 
     let state = StateStore::open(fixture.state_path())
         .unwrap_or_else(|error| panic!("open qualification state: {error}"));

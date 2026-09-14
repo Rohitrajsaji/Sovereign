@@ -289,6 +289,19 @@ pub struct BackendHealth {
     pub detail: String,
 }
 
+/// Provider proof about physical model residency after load/unload transitions.
+///
+/// `Unknown` is deliberately distinct from `Absent`: externally managed providers may clear
+/// local lease bookkeeping while the actual model server remains resident. Resource policy must
+/// fail closed when physical absence is required and the backend cannot prove it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ModelResidencyProof {
+    Resident { process_id: Option<u32> },
+    Absent,
+    Unknown,
+}
+
 /// Stable model/backend error classification.
 #[derive(Debug)]
 pub enum ModelError {
@@ -379,6 +392,17 @@ pub trait ModelBackend: Send + Sync {
     ///
     /// Returns [`ModelError`] on deadline, transport, or invalid provider response.
     fn health(&self) -> Result<BackendHealth, ModelError>;
+
+    /// Returns a backend-specific proof of physical residency without mutating provider state.
+    ///
+    /// Backends that cannot distinguish local bookkeeping from real provider residency must
+    /// return [`ModelResidencyProof::Unknown`]. This default is intentionally conservative.
+    ///
+    /// # Errors
+    /// Returns [`ModelError`] when the backend cannot inspect its owned residency state.
+    fn residency_proof(&self) -> Result<ModelResidencyProof, ModelError> {
+        Ok(ModelResidencyProof::Unknown)
+    }
 
     /// Unloads provider residency and releases the physical-model lease.
     ///
@@ -960,6 +984,21 @@ impl ModelBackend for LocalOpenAiBackend {
         self.provider_health(Duration::from_millis(self.config.request_timeout_ms))
     }
 
+    fn residency_proof(&self) -> Result<ModelResidencyProof, ModelError> {
+        if self.config.launch.is_none() {
+            return Ok(ModelResidencyProof::Unknown);
+        }
+        let state = lock(&self.state, "local backend state")?;
+        Ok(state
+            .lease
+            .as_ref()
+            .map_or(ModelResidencyProof::Absent, |lease| {
+                ModelResidencyProof::Resident {
+                    process_id: lease.process_id,
+                }
+            }))
+    }
+
     fn unload(&self) -> Result<(), ModelError> {
         let mut state = lock(&self.state, "local backend state")?;
         Self::cleanup_state(&mut state)
@@ -1067,6 +1106,15 @@ impl ModelBackend for DeterministicFakeBackend {
             reachable: true,
             loaded,
             detail: "deterministic fake backend".to_owned(),
+        })
+    }
+
+    fn residency_proof(&self) -> Result<ModelResidencyProof, ModelError> {
+        let loaded = lock(&self.state, "fake backend state")?.lease.is_some();
+        Ok(if loaded {
+            ModelResidencyProof::Resident { process_id: None }
+        } else {
+            ModelResidencyProof::Absent
         })
     }
 

@@ -9,13 +9,13 @@ use sovereign_context::{
 use sovereign_controller::{
     CheckpointActionRecord, CheckpointManifest, Controller, ControllerError, ExecutionRuntime,
     ExecutionSuccess, ModelProposalV1, PermissionContext, PlanValidity, ReadinessInputs,
-    RecoveryManager, RoleId, RoleRegistry, SchedulerView, TaskState,
+    RecoveryManager, ResourcePressureProbe, RoleId, RoleRegistry, SchedulerView, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_memory::{MemoryKind, MemoryTrust, ProcedurePattern};
 use sovereign_model::{
     DeterministicFakeBackend, MODEL_SCHEMA_VERSION, ModelBackend, ModelCapabilities,
-    ModelFinishReason, ModelLoadProfile, ModelResponse, ModelUsage,
+    ModelFinishReason, ModelLoadProfile, ModelResidencyProof, ModelResponse, ModelUsage,
 };
 use sovereign_plan::{
     DepthClassifier, DepthFeatureInput, ExecutionDepth, M3PlanningInput,
@@ -24,8 +24,9 @@ use sovereign_plan::{
 };
 use sovereign_policy::{
     CapabilitySet, CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend,
-    HostPressureSnapshot, IsolatedCommand, IsolationCapabilities, IsolationRequest,
-    MacSandboxExecBackend, ModelCallBudget, PinnedExecutable, PolicyError,
+    IsolatedCommand, IsolationCapabilities, IsolationRequest, MacSandboxExecBackend,
+    ModelCallBudget, OsMemoryPressure, PinnedExecutable, PolicyError,
+    RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ResourcePressureSnapshotV1, ThermalPressure,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence};
 use sovereign_state::{
@@ -34,7 +35,7 @@ use sovereign_state::{
 use sovereign_tools::{PermissionClass, ToolManifest, ToolSchemaV1};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,6 +48,37 @@ const OTHER_SOURCE: &str = "baseline other file\n";
 const WRITE_TOOL_DIGEST: &str =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct FixedResourcePressureProbe(ResourcePressureSnapshotV1);
+
+impl ResourcePressureProbe for FixedResourcePressureProbe {
+    fn sample(&mut self) -> io::Result<ResourcePressureSnapshotV1> {
+        Ok(self.0)
+    }
+}
+
+fn green_pressure_snapshot(observed_at_ms: i64) -> ResourcePressureSnapshotV1 {
+    ResourcePressureSnapshotV1 {
+        schema_version: RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
+        observed_at_ms,
+        controlled_working_set_mib: 512,
+        host_headroom_mib: 6_144,
+        // Absolute swap is diagnostic context only. Keeping this deliberately high also makes
+        // the legacy Controller regressions exercise the M6 rule that swap-used alone is not an
+        // admission blocker.
+        swap_used_mib: Some(4_096),
+        swap_out_growth_mib_per_min: 0,
+        compressor_growth_mib_per_min: 0,
+        os_memory_pressure: OsMemoryPressure::Normal,
+        recent_pressure_event: false,
+        thermal_pressure: ThermalPressure::Normal,
+        allocation_failure: false,
+        repeated_resource_kill: false,
+        uncontrolled_child_growth: false,
+        host_free_disk_mib: Some(8_192),
+    }
+}
 
 struct TestRepo {
     base: PathBuf,
@@ -423,12 +455,15 @@ fn compiled_fixture(label: &str, evidence_query: bool) -> CompiledFixture {
         false,
         None,
         None,
+        None,
     )
 }
 
 #[allow(clippy::too_many_lines)]
 fn compiled_fixture_with_dirty_target(label: &str) -> CompiledFixture {
-    compiled_fixture_inner(label, false, true, None, None, false, false, None, None)
+    compiled_fixture_inner(
+        label, false, true, None, None, false, false, None, None, None,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -443,6 +478,30 @@ fn compiled_fixture_with_task_model_call_cap(label: &str, cap: u64) -> CompiledF
         false,
         None,
         None,
+        None,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ResourceFixtureOverride {
+    NoBuildHeavyAuthority,
+}
+
+fn compiled_fixture_with_resource_override(
+    label: &str,
+    resource_override: ResourceFixtureOverride,
+) -> CompiledFixture {
+    compiled_fixture_inner(
+        label,
+        false,
+        false,
+        None,
+        None,
+        false,
+        false,
+        None,
+        None,
+        Some(resource_override),
     )
 }
 
@@ -457,11 +516,14 @@ fn compiled_fixture_with_target_mode(label: &str, mode: u32) -> CompiledFixture 
         false,
         None,
         None,
+        None,
     )
 }
 
 fn compiled_two_task_fixture(label: &str) -> CompiledFixture {
-    compiled_fixture_inner(label, false, false, None, None, true, false, None, None)
+    compiled_fixture_inner(
+        label, false, false, None, None, true, false, None, None, None,
+    )
 }
 
 fn compiled_learning_two_path_fixture(label: &str) -> CompiledFixture {
@@ -499,11 +561,14 @@ fn compiled_learning_two_path_fixture(label: &str) -> CompiledFixture {
             "Change Save to Apply in SettingsForm and change baseline other file to updated other file in src/other.txt."
                 .to_owned(),
         ),
+        None,
     )
 }
 
 fn compiled_worktree_fixture(label: &str) -> CompiledFixture {
-    compiled_fixture_inner(label, false, false, None, None, false, true, None, None)
+    compiled_fixture_inner(
+        label, false, false, None, None, false, true, None, None, None,
+    )
 }
 
 fn compiled_worktree_graph_fixture(label: &str, tasks: &[Value]) -> CompiledFixture {
@@ -520,6 +585,7 @@ fn compiled_worktree_graph_fixture(label: &str, tasks: &[Value]) -> CompiledFixt
             "Change Save to Apply, Apply to Applied, Apply to Approved, baseline to branchthree, imported to finalized."
                 .to_owned(),
         ),
+        None,
     )
 }
 
@@ -538,6 +604,7 @@ fn compiled_fixture_inner(
     worktree_depth: bool,
     planning_override: Option<Value>,
     goal_statement_override: Option<String>,
+    resource_override: Option<ResourceFixtureOverride>,
 ) -> CompiledFixture {
     let repo = TestRepo::create(label);
     if let Some(mode) = target_mode {
@@ -678,6 +745,13 @@ fn compiled_fixture_inner(
             .unwrap_or_else(|| panic!("policy max_model_calls missing"));
         *resource_cap = json!(cap);
     }
+    if let Some(resource_override) = resource_override {
+        match resource_override {
+            ResourceFixtureOverride::NoBuildHeavyAuthority => {
+                policy["resources"]["heavy_leases"] = json!(["MODEL"]);
+            }
+        }
+    }
     let m3 = worktree_depth.then(|| {
         let mut decision = DepthClassifier.classify(&DepthFeatureInput {
             repository_count: 1,
@@ -797,6 +871,9 @@ fn controller_for(fixture: &mut CompiledFixture) -> (Controller, String) {
     let state =
         StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
     let mut controller = Controller::new(state);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
     let compilation = fixture
         .compilation
         .take()
@@ -1451,6 +1528,9 @@ fn verified_upstream_bindings_make_dependent_task_ready_and_misbound_record_bloc
     let state =
         StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
     let mut controller = Controller::new(state);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
     let compilation = fixture
         .compilation
         .take()
@@ -1855,19 +1935,32 @@ fn m5_t03_only_exact_pinned_authorized_tool_schema_enters_context_packet() {
 fn constrained_pressure_defers_before_ready_lease_is_issued() {
     let mut fixture = compiled_fixture("pressure", false);
     let (mut controller, task_id) = controller_for(&mut fixture);
-    let mut inputs = readiness();
-    inputs.host_pressure = HostPressureSnapshot {
-        controlled_working_set_mib: 6_000,
-        host_headroom_mib: 512,
-        swap_out_growth_mib_per_min: 300,
-        compressor_growth_mib_per_min: 300,
-        os_pressure_warning: true,
-        recent_pressure_event: true,
-        thermal_serious: false,
-    };
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        ResourcePressureSnapshotV1 {
+            schema_version: RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
+            observed_at_ms: 1_000,
+            controlled_working_set_mib: 6_000,
+            host_headroom_mib: 512,
+            swap_used_mib: Some(4_096),
+            swap_out_growth_mib_per_min: 300,
+            compressor_growth_mib_per_min: 300,
+            os_memory_pressure: OsMemoryPressure::Warning,
+            recent_pressure_event: true,
+            thermal_pressure: ThermalPressure::Normal,
+            allocation_failure: false,
+            repeated_resource_kill: false,
+            uncontrolled_child_growth: false,
+            host_free_disk_mib: Some(8_192),
+        },
+    )));
     assert!(
         controller
-            .derive_ready_lease(&fixture.registry, &task_id, inputs, &write_tool_manifest())
+            .derive_ready_lease(
+                &fixture.registry,
+                &task_id,
+                readiness(),
+                &write_tool_manifest(),
+            )
             .is_err()
     );
     assert_eq!(
@@ -2520,7 +2613,7 @@ fn epoch_change_after_authorization_blocks_dispatch_before_mutation() {
 }
 
 #[test]
-fn exhausted_model_budget_defers_cleanly_before_backend_dispatch() {
+fn exhausted_outer_model_budget_is_not_a_resource_pressure_deferral() {
     let mut fixture = compiled_fixture("budget", false);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
@@ -2553,17 +2646,17 @@ fn exhausted_model_budget_defers_cleanly_before_backend_dispatch() {
         controller.execute_replace(ready, &runtime, &fixture.packet, &mut budget),
         Err(ControllerError::Policy(_))
     ));
-    assert_eq!(
-        controller.task_state(&task_id),
-        Some(TaskState::DeferredResource)
-    );
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Planned));
+    assert_eq!(controller.task_resource_deferrals_used(&task_id), Some(0));
+    assert_eq!(controller.task_model_calls_used(&task_id), Some(0));
+    assert_eq!(budget.remaining_calls(), 0);
     let source = fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
         .unwrap_or_else(|error| panic!("read source: {error}"));
     assert!(source.contains("Save"));
 }
 
 #[test]
-fn compiled_task_model_call_ceiling_cannot_be_refilled_by_caller_budget() {
+fn compiled_task_model_call_ceiling_is_permanent_and_not_a_resource_pressure_deferral() {
     let mut fixture = compiled_fixture_with_task_model_call_cap("task-budget", 0);
     let (mut controller, task_id) = controller_for(&mut fixture);
     let ready = controller
@@ -2604,13 +2697,66 @@ fn compiled_task_model_call_ceiling_cannot_be_refilled_by_caller_budget() {
     );
     assert_eq!(caller_budget.remaining_calls(), 4);
     assert_eq!(controller.task_model_calls_used(&task_id), Some(0));
-    assert_eq!(
-        controller.task_state(&task_id),
-        Some(TaskState::DeferredResource)
-    );
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Planned));
+    assert_eq!(controller.task_resource_deferrals_used(&task_id), Some(0));
     let source = fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
         .unwrap_or_else(|error| panic!("read source: {error}"));
     assert!(source.contains("Save"));
+}
+
+#[test]
+fn permanent_build_heavy_authority_denial_does_not_evict_model_reservation() {
+    let mut fixture = compiled_fixture_with_resource_override(
+        "build-heavy-no-authority",
+        ResourceFixtureOverride::NoBuildHeavyAuthority,
+    );
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
+        .unwrap_or_else(|error| panic!("MODEL ready lease: {error}"));
+    let execution = backend(Vec::new());
+    execution
+        .unload()
+        .unwrap_or_else(|error| panic!("execution backend must start absent: {error}"));
+    assert_eq!(
+        execution
+            .residency_proof()
+            .unwrap_or_else(|error| panic!("backend residency before BUILD_HEAVY: {error}")),
+        ModelResidencyProof::Absent
+    );
+    let before = controller
+        .resource_snapshot()
+        .unwrap_or_else(|error| panic!("resource snapshot before BUILD_HEAVY denial: {error}"));
+
+    let Err(error) = controller.acquire_build_heavy(
+        ready,
+        &fixture.registry,
+        &write_tool_manifest(),
+        &execution,
+    ) else {
+        panic!("BUILD_HEAVY without task authority must be denied")
+    };
+    assert!(error.to_string().contains("does not authorize BUILD_HEAVY"));
+    let after = controller
+        .resource_snapshot()
+        .unwrap_or_else(|error| panic!("resource snapshot after BUILD_HEAVY denial: {error}"));
+    assert_eq!(
+        after, before,
+        "permanent preflight denial must be side-effect free"
+    );
+    assert_eq!(controller.task_resource_deferrals_used(&task_id), Some(0));
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Planned));
+    assert_eq!(
+        execution
+            .residency_proof()
+            .unwrap_or_else(|error| panic!("backend residency after BUILD_HEAVY denial: {error}")),
+        ModelResidencyProof::Absent
+    );
 }
 
 #[test]

@@ -20,7 +20,7 @@ use sovereign_model::{
     ModelFinishReason, ModelMessage, ModelMessageRole, ModelOutputContract, ModelRequest,
     ModelResponse,
 };
-use sovereign_policy::{ModelCallBudget, PolicyError};
+use sovereign_policy::{ModelCallBudget, PlanHeavyLeaseClass, PolicyError};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -3008,17 +3008,34 @@ fn narrowed_resource_budget(
             json!(global_calls.min(u64::from(compiler_model_calls).max(1))),
         );
     }
-    let model_allowed = object
+    let heavy_leases = object
         .get("heavy_leases")
         .and_then(Value::as_array)
-        .is_some_and(|leases| leases.iter().any(|lease| lease.as_str() == Some("MODEL")));
+        .ok_or_else(|| {
+            PlanCompilationError::InvalidInput(
+                "policy.resources.heavy_leases must be an array".to_owned(),
+            )
+        })?;
+    let mut narrowed_heavy_leases = Vec::with_capacity(heavy_leases.len());
+    let mut seen = BTreeSet::new();
+    for lease in heavy_leases {
+        let raw = lease.as_str().ok_or_else(|| {
+            PlanCompilationError::InvalidInput(
+                "policy.resources.heavy_leases entries must be strings".to_owned(),
+            )
+        })?;
+        let class = PlanHeavyLeaseClass::from_plan_ir_str(raw).ok_or_else(|| {
+            PlanCompilationError::InvalidInput(format!(
+                "unknown policy.resources.heavy_leases class {raw:?}"
+            ))
+        })?;
+        if seen.insert(class) {
+            narrowed_heavy_leases.push(Value::String(class.as_plan_ir_str().to_owned()));
+        }
+    }
     object.insert(
         "heavy_leases".to_owned(),
-        if model_allowed {
-            json!(["MODEL"])
-        } else {
-            json!([])
-        },
+        Value::Array(narrowed_heavy_leases),
     );
     Ok(resources)
 }

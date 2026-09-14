@@ -1,0 +1,237 @@
+{
+  "schema_version": 1,
+  "task_id": "M6-T01",
+  "title": "Implement resource leases and memory-pressure governor",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "61439071621eebe767c2853844f297825092d9a5",
+  "status": "completed",
+  "completed_at": "2026-09-14T06:25:55Z",
+  "verified_at": "2026-09-14T06:25:55Z",
+  "dependencies": [
+    "M1-T03",
+    "M1-T04"
+  ],
+  "interfaces": [
+    "ResourceGovernor",
+    "ResourceLease",
+    "HardwareProfile"
+  ],
+  "schemas": [
+    {
+      "name": "HardwareProfile",
+      "version": 1,
+      "path": "schemas/hardware-profile-v1.json"
+    },
+    {
+      "name": "ResourceLease",
+      "version": 1,
+      "path": "schemas/resource-lease-v1.json"
+    },
+    {
+      "name": "resource pressure event",
+      "version": 1,
+      "path": "schemas/resource-pressure-event-v1.json"
+    }
+  ],
+  "hardware_profile": {
+    "target": "MacBook Air M1 8GB",
+    "digest": "sha256:21d7deb7354809400df510dd2b55a50f9b28af8069e2fd490e880c934967aadd",
+    "physical_memory_mb": 8192,
+    "logical_cpus": 8,
+    "single_model_slots": 1,
+    "unknown_heavy_first_run_max_jobs": 2,
+    "unknown_heavy_first_run_max_subprocesses": 2,
+    "calibrated_build_max_jobs": 4,
+    "green_recovery_seconds": 120,
+    "model_reload_cooldown_seconds": 30,
+    "oscillation_window_seconds": 300,
+    "max_completed_eviction_cycles_per_window": 1,
+    "unknown_heavy_rss_mb": 3072,
+    "authority_digest_binds_calibrated_build_max_jobs": true
+  },
+  "resource_governor": {
+    "controller_owned": true,
+    "one_model_invariant": true,
+    "pairwise_heavy_capability_matrix_enforced": true,
+    "absolute_swap_used_alone_is_not_permanent_denial": true,
+    "swapout_or_compressor_growth_tightens_admission": true,
+    "first_pressure_sample_conservative_warmup_non_green": true,
+    "healthy_recovery_hysteresis_seconds": 120,
+    "reload_cooldown_seconds": 30,
+    "anti_oscillation_checkpoint_or_defer": true,
+    "governor_snapshot_restore_preserves_hysteresis_cooldown_and_cycles": true,
+    "conditional_pair_restore_fails_closed": true,
+    "canonical_sqlite_or_cas_never_evicted": true
+  },
+  "build_heavy_authority": {
+    "independent_parallel_job_cap": true,
+    "independent_subprocess_cap": true,
+    "uncalibrated_parallel_jobs_max": 2,
+    "uncalibrated_subprocesses_max": 2,
+    "calibrated_parallel_jobs_max": 4,
+    "adapter_source": "exact verified pinned executable path",
+    "normalized_argv_reauthorized_before_action_digest": true,
+    "unsupported_capped_executable_fails_closed": true,
+    "caller_supplied_worker_overrides_rejected": true,
+    "supported_adapters": [
+      "make",
+      "gmake",
+      "ninja",
+      "cargo",
+      "cmake --build",
+      "gradle",
+      "gradlew",
+      "mvn",
+      "mvnw",
+      "xcodebuild"
+    ],
+    "process_runner_bound_execution": true,
+    "process_group_ownership_required": true,
+    "terminal_reap_proof_required_before_release": true,
+    "predispatch_safe_cancellation_requires_no_dispatch_proof": true
+  },
+  "model_to_build_heavy_ordering": {
+    "immutable_build_authority_checks_before_model_eviction": true,
+    "logical_model_lease_retained_until_physical_absence_proven": true,
+    "backend_unload_requires_absence_proof": true,
+    "durable_absence_persisted_before_logical_model_release": true,
+    "fresh_pressure_probe_before_build_admission": true,
+    "physical_resident_model_regression": "physically_resident_model_is_proven_absent_before_build_heavy_admission",
+    "no_model_build_heavy_overlap_proven": true
+  },
+  "denial_semantics": {
+    "transient_resource_conditions_become_deferred_resource": true,
+    "transient_deferral_consumes_task_attempts": 0,
+    "transient_deferral_consumes_model_calls": 0,
+    "permanent_authority_or_config_denial_is_not_retried": true,
+    "compiled_model_call_ceiling_exhaustion_is_permanent": true,
+    "outer_model_call_budget_exhaustion_is_permanent": true,
+    "permanent_build_heavy_denial_does_not_evict_model": true
+  },
+  "recovery_integrity": {
+    "checkpoint_resource_digests_are_replay_seed_not_mutable_row_equality": true,
+    "resource_mutations_journal_exact_post_image_digests": true,
+    "post_checkpoint_resource_replay_correlated_to_current_rows": true,
+    "unjournaled_or_tampered_resource_mutation_rejected": true,
+    "valid_post_checkpoint_resource_mutation_replays": true,
+    "stale_build_heavy_never_becomes_new_epoch_authority": true,
+    "pending_spawn_blocks_epoch_advance": true,
+    "active_owned_process_reaped_by_exact_pgid_and_leader_identity": true,
+    "terminal_reaped_or_reaped_recovery_required_for_release": true,
+    "post_heavy_empty_active_resource_set_recovers_successfully": true,
+    "ambiguous_stale_model_residency_blocks_fail_closed": true
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-policy --offline -- resources",
+      "result": "passed",
+      "detail": "14/14"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --test m1_8gb_resource_sim --offline",
+      "result": "passed",
+      "detail": "6/6"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --lib --offline",
+      "result": "passed",
+      "detail": "32/32"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --test t07 --offline",
+      "result": "passed",
+      "detail": "36/36"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --test crash_resume --offline",
+      "result": "passed",
+      "detail": "30/30"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --test repair_loop --offline",
+      "result": "passed",
+      "detail": "2/2"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --test vertical_slice --offline",
+      "result": "passed",
+      "detail": "2/2; deterministic pressure injection is test-only"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test --workspace --all-targets --offline",
+      "result": "passed",
+      "detail": "all non-ignored tests passed; only two explicit real-Qwen runtime tests ignored"
+    }
+  ],
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "real_qwen_runtime_on_current_tree": "deferred to target-machine/final release acceptance; runtime not claimed here",
+  "independent_audit": {
+    "worker": "worker-41",
+    "final_result": "CLOSABLE",
+    "final_verdict": "M6-T01 frozen task: CLOSABLE",
+    "final_blockers": [],
+    "notes": "Fresh read-only exact-tree audit matched supplied hashes before/after and independently reran policy resources 14/14, controller lib 32/32, m1_8gb_resource_sim 6/6, and focused BUILD_HEAVY crash-recovery tests 3/3."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "source_hashes": {
+    "Cargo.lock": "sha256:a14433218f0db25c015971981599b5980f39bece7239ad5dc89cde4556d984b0",
+    "crates/sovereign-controller/src/lib.rs": "sha256:a542b03f0c96611b2c49789d8f12d00a9120488ee800a5c519ac16e200ea94d1",
+    "crates/sovereign-controller/src/resources.rs": "sha256:69b4d9959df8003476516d490c4aad236153a1f61948b3a7bd1cd566fe7bb703",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:d25c398cac1fc5482dd4a0801e100724aa35a64cf1867b3ee515f9e367dc92db",
+    "crates/sovereign-eval/tests/crash_resume.rs": "sha256:7add841d475cd3f2fb755c9ba9efaa2befa9fc6a8273736ac310ea936ec57ee8",
+    "crates/sovereign-eval/tests/m1_8gb_resource_sim.rs": "sha256:f92acfc5c91c9208b89bf00a4d6e3eba26670e2bd70f55ae0ca843331b7956f7",
+    "crates/sovereign-eval/tests/m1_real_qualification.rs": "sha256:ebc573ea25c30a687d6377b9fb0898ac5cbdf582ba3b5aea2aa08e3325ca6a6f",
+    "crates/sovereign-eval/tests/repair_loop.rs": "sha256:a31953bf101bdd150db7061dded0eaba6d02116b5b950b7a707271692a29e331",
+    "crates/sovereign-eval/tests/vertical_slice.rs": "sha256:31cc98aa18dcea1c6af257a4064bcd286797318274917adfb51b6a77f376668a",
+    "crates/sovereign-model/src/lib.rs": "sha256:429bfbb0f24816cdeca3cfc1a2f3da284f3f45b577c4dfc9b800cab9998f2580",
+    "crates/sovereign-plan/src/compiler.rs": "sha256:af07f84d76837f98bbaff87ad8bb17cdc5b6f0e8a5dcc84538e4dc76bf980072",
+    "crates/sovereign-plan/tests/minimal_compiler.rs": "sha256:1ceed98a8e6d7b2c869f993eb974c73cb0811a5a70969fda45e6eaa88936fe96",
+    "crates/sovereign-policy/Cargo.toml": "sha256:b1db6a840c735ce1d7fca6cc218be88b822c4a0aea390bed3e045ab643eeadda",
+    "crates/sovereign-policy/src/lib.rs": "sha256:7bcb87a75a065c4ebee6d72a3c604b73b0b35286a3700855dd25e761deebfa53",
+    "crates/sovereign-policy/src/resources.rs": "sha256:61c6d588e92699d301f249fdbeb5e282630f33411a10272aadd2063dc9e7722a",
+    "crates/sovereign-policy/tests/resources.rs": "sha256:da009555f464119ad8f352d614d1d129a8cac36b06e85ad77f87f4a973265462",
+    "schemas/hardware-profile-v1.json": "sha256:e99458ae12bc392ad0acd1fbe41c9ced2764fb0e527f985eed215344bb60739d",
+    "schemas/resource-lease-v1.json": "sha256:aa3a95bb02db518aa2f26fd3597d44a4f8a1e3813b66181d90430943eefa5e05",
+    "schemas/resource-pressure-event-v1.json": "sha256:84dfcd475fb17c67f84b53a121042a81d0b6b95c6b85cf5d1cec6cdf1c7ef029"
+  },
+  "frozen_tree": {
+    "head": "61439071621eebe767c2853844f297825092d9a5",
+    "tracked_modified_files": 12,
+    "untracked_files": 7
+  },
+  "state_authority": {
+    "new_database": false,
+    "new_resource_database": false,
+    "controller_remains_sole_execution_authority": true
+  },
+  "network_runtime_dependency": false
+}

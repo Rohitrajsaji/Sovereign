@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sovereign://schemas/resource-lease-v1.json",
+  "title": "Sovereign ResourceLease v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "lease_id",
+    "owner",
+    "class",
+    "plan_ir_class",
+    "profile_id",
+    "profile_digest",
+    "admitted_pressure_event_id",
+    "admitted_at_ms",
+    "last_used_at_ms",
+    "idle_since_ms",
+    "idle_ttl_seconds",
+    "state",
+    "calibrated",
+    "admission_rss_mib",
+    "projected_controlled_rss_mib",
+    "projected_host_headroom_mib",
+    "task_max_peak_rss_mib"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "lease_id": { "type": "string", "minLength": 1 },
+    "owner": { "$ref": "#/$defs/owner" },
+    "class": { "$ref": "#/$defs/heavy_class" },
+    "plan_ir_class": { "$ref": "#/$defs/plan_ir_class" },
+    "profile_id": { "type": "string", "minLength": 1 },
+    "profile_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "admitted_pressure_event_id": { "type": "string", "minLength": 1 },
+    "admitted_at_ms": { "type": "integer", "minimum": 0 },
+    "last_used_at_ms": { "type": "integer", "minimum": 0 },
+    "idle_since_ms": { "type": ["integer", "null"], "minimum": 0 },
+    "idle_ttl_seconds": { "type": "integer", "minimum": 0 },
+    "state": { "enum": ["ACTIVE", "IDLE", "EVICTED", "RELEASED"] },
+    "calibrated": { "type": "boolean" },
+    "admission_rss_mib": { "type": "integer", "minimum": 0 },
+    "projected_controlled_rss_mib": { "type": "integer", "minimum": 0 },
+    "projected_host_headroom_mib": { "type": "integer", "minimum": 0 },
+    "task_max_peak_rss_mib": { "type": "integer", "minimum": 1 }
+  },
+  "$defs": {
+    "owner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["plan_id", "plan_revision", "task_id"],
+      "properties": {
+        "plan_id": { "type": "string", "minLength": 1 },
+        "plan_revision": { "type": "integer", "minimum": 0 },
+        "task_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "heavy_class": {
+      "enum": [
+        "MODEL",
+        "EMBEDDER",
+        "CDP_BROWSER",
+        "ADAPTIVE_BROWSER",
+        "BUILD_HEAVY",
+        "INDEXER",
+        "CODEGRAPH_WIKI",
+        "LSP",
+        "UNKNOWN"
+      ]
+    },
+    "plan_ir_class": {
+      "enum": ["MODEL", "EMBEDDER", "BROWSER", "INDEXER", "LANGUAGE_SERVER", "BUILD_HEAVY"]
+    }
+  }
+}

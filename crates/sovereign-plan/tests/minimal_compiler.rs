@@ -304,6 +304,11 @@ fn minimal_compiler_simple_edit_is_one_valid_bounded_task_and_calls_only_complet
                 .iter()
                 .any(|value| value == &json!(input.goal_statement)))
     );
+    assert_eq!(
+        result.plan().as_value()["tasks"][0]["resource_budget"]["heavy_leases"],
+        input.policy["resources"]["heavy_leases"],
+        "compiler task budgets must preserve the caller-authorized heavy-lease set rather than silently stripping later deterministic phases"
+    );
     assert!(validator.is_valid(result.plan()));
     assert_eq!(backend.complete_calls(), 1);
     assert_eq!(backend.forbidden_calls.load(Ordering::Relaxed), 0);
@@ -313,6 +318,26 @@ fn minimal_compiler_simple_edit_is_one_valid_bounded_task_and_calls_only_complet
         result.compilation_evidence().plan_digest(),
         result.plan_digest()
     );
+}
+
+#[test]
+fn minimal_compiler_rejects_unknown_authorized_heavy_lease_class() {
+    let backend = RecordingBackend::new(vec![response(one_task_proposal())]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    input.policy["resources"]["heavy_leases"] = json!(["MODEL", "BUILD_HEAVY", "GPU"]);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+
+    let Err(error) = compiler.compile(&input, &mut budget) else {
+        panic!("unknown heavy lease class must fail closed");
+    };
+    assert!(matches!(
+        error,
+        PlanCompilationError::InvalidInput(message)
+            if message.contains("unknown policy.resources.heavy_leases class")
+                && message.contains("GPU")
+    ));
 }
 
 #[test]

@@ -6,27 +6,30 @@ use sovereign_context::{
     EvidenceItem, EvidenceKind, PacketSection, TrustClass,
 };
 use sovereign_controller::{
-    Controller, ExecutionRuntime, ReadinessInputs, RecoveryManager, RoleId, RoleRegistry, TaskState,
+    Controller, ExecutionRuntime, ReadinessInputs, RecoveryManager, ResourcePressureProbe, RoleId,
+    RoleRegistry, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_model::{
     BackendHealth, DeterministicFakeBackend, MODEL_SCHEMA_VERSION, ModelBackend, ModelCapabilities,
-    ModelError, ModelFinishReason, ModelLease, ModelLoadProfile, ModelRequest, ModelResponse,
-    ModelUsage,
+    ModelError, ModelFinishReason, ModelLease, ModelLoadProfile, ModelRequest, ModelResidencyProof,
+    ModelResponse, ModelUsage,
 };
 use sovereign_plan::{
     PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationInput, PlanCompilationRepository, PlanCompiler,
     PlanValidator, ValidationEnvironment,
 };
 use sovereign_policy::{
-    CapabilitySet, CommandPolicy, CommandRisk, HostPressureSnapshot, IsolationRequest,
-    MacSandboxExecBackend, ModelCallBudget, PinnedExecutable,
+    CapabilitySet, CommandPolicy, CommandRisk, IsolationRequest, MacSandboxExecBackend,
+    ModelCallBudget, OsMemoryPressure, PinnedExecutable, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
+    ResourcePressureSnapshotV1, ThermalPressure,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot};
 use sovereign_state::StateStore;
 use sovereign_tools::{PermissionClass, ToolManifest, ToolSchemaV1};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +41,38 @@ const SETTINGS_FORM_TEST: &[u8] =
 const WRITE_TOOL_DIGEST: &str =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct FixedResourcePressureProbe(ResourcePressureSnapshotV1);
+
+impl ResourcePressureProbe for FixedResourcePressureProbe {
+    fn sample(&mut self) -> io::Result<ResourcePressureSnapshotV1> {
+        Ok(self.0)
+    }
+}
+
+fn pressure_snapshot(observed_at_ms: i64, constrained: bool) -> ResourcePressureSnapshotV1 {
+    ResourcePressureSnapshotV1 {
+        schema_version: RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
+        observed_at_ms,
+        controlled_working_set_mib: if constrained { 6_000 } else { 512 },
+        host_headroom_mib: if constrained { 512 } else { 6_144 },
+        swap_used_mib: Some(4_096),
+        swap_out_growth_mib_per_min: if constrained { 512 } else { 0 },
+        compressor_growth_mib_per_min: if constrained { 512 } else { 0 },
+        os_memory_pressure: if constrained {
+            OsMemoryPressure::Warning
+        } else {
+            OsMemoryPressure::Normal
+        },
+        recent_pressure_event: constrained,
+        thermal_pressure: ThermalPressure::Normal,
+        allocation_failure: false,
+        repeated_resource_kill: false,
+        uncontrolled_child_growth: false,
+        host_free_disk_mib: Some(8_192),
+    }
+}
 
 struct Fixture {
     base: PathBuf,
@@ -163,6 +198,10 @@ impl ModelBackend for RepairAwareFakeBackend {
 
     fn unload(&self) -> Result<(), ModelError> {
         self.inner.unload()
+    }
+
+    fn residency_proof(&self) -> Result<ModelResidencyProof, ModelError> {
+        self.inner.residency_proof()
     }
 }
 
@@ -497,10 +536,16 @@ fn compile_and_activate(
         .unwrap_or_else(|error| panic!("compile repair goal: {error}"));
     assert!(validator.validate(compilation.plan()).is_empty());
     assert_eq!(compiler_budget.remaining_calls(), 1);
+    backend
+        .unload()
+        .unwrap_or_else(|error| panic!("release compiler-only model residency: {error}"));
 
     let state = StateStore::open(fixture.state_path())
         .unwrap_or_else(|error| panic!("open repair state: {error}"));
     let mut controller = Controller::new(state);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        pressure_snapshot(1_000, false),
+    )));
     let activation = controller
         .activate(compilation, &prepared.registry)
         .unwrap_or_else(|error| panic!("activate compiler result: {error}"));
@@ -508,21 +553,6 @@ fn compile_and_activate(
     let task_id = activation.task_ids[0].clone();
     let plan_digest = activation.plan_digest;
     (controller, task_id, plan_digest)
-}
-
-fn constrained_readiness(resource_digest: &str) -> ReadinessInputs<'_> {
-    ReadinessInputs {
-        resource_digest,
-        host_pressure: HostPressureSnapshot {
-            controlled_working_set_mib: 6_000,
-            host_headroom_mib: 512,
-            swap_out_growth_mib_per_min: 512,
-            compressor_growth_mib_per_min: 512,
-            os_pressure_warning: true,
-            recent_pressure_event: true,
-            thermal_serious: false,
-        },
-    }
 }
 
 fn task_contract_and_acceptance(controller: &Controller, task_id: &str) -> (String, Value) {
@@ -647,12 +677,15 @@ fn failed_attempt_recovers_resource_defers_then_targeted_repair_succeeds() {
 
     // One constrained-host denial occurs before a repair attempt starts. It consumes the
     // resource retry allowance, but it must not fabricate attempt/model-call counters.
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        pressure_snapshot(2_000, true),
+    )));
     let denied = controller.repair_replace(
         &task_id,
         &runtime,
         &repair_context,
         std::slice::from_ref(&repair_schema),
-        constrained_readiness("sha256:repair-resource-constrained"),
+        ReadinessInputs::permissive_m1("sha256:repair-resource-constrained"),
         &mut execution_budget,
     );
     let Err(denied_error) = denied else {
@@ -672,6 +705,9 @@ fn failed_attempt_recovers_resource_defers_then_targeted_repair_succeeds() {
     assert_eq!(execution_budget.remaining_calls(), 1);
 
     // resource_retry_limit=1 permits re-entry; attempt 2 gets the remaining model call.
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        pressure_snapshot(130_000, false),
+    )));
     let (success, repair_packet) = controller
         .repair_replace(
             &task_id,

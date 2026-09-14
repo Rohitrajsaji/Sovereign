@@ -17,17 +17,20 @@ use sovereign_memory::{
     EpisodeRecorder, MemoryError, MemoryScope, MemoryScopeKind, ProcedurePattern,
 };
 use sovereign_model::{
-    MODEL_SCHEMA_VERSION, ModelBackend, ModelError, ModelFinishReason, ModelMessage,
-    ModelMessageRole, ModelOutputContract, ModelRequest,
+    MODEL_SCHEMA_VERSION, ModelBackend, ModelError, ModelFinishReason, ModelLoadProfile,
+    ModelMessage, ModelMessageRole, ModelOutputContract, ModelRequest, ModelResidencyProof,
 };
 use sovereign_plan::{
     PlanCompilationResult, PlanReplanInput, PlanRevisionDiff, ReplanScope,
     smallest_replan_scope_tasks,
 };
 use sovereign_policy::{
-    Capability, CapabilityLayers, CapabilitySet, CommandMode, CommandPolicy, CommandRisk,
-    HeavyLeaseClass, HostPressureSnapshot, IsolationRequest, M1ResourceGovernor, ModelCallBudget,
-    PermissionDecision, PolicyError, ResourceGovernor, ResourceLease, TaskCapabilityGrant,
+    AdmissionStatus, Capability, CapabilityLayers, CapabilitySet, CommandMode, CommandPolicy,
+    CommandRisk, CommandSpec, ConditionalLeaseContextV1, HeavyLeaseClass, IsolationRequest,
+    LeaseStateV1, M6ResourceGovernorSnapshotV1, ModelCallBudget, PermissionDecision,
+    PlanHeavyLeaseClass, PolicyError, ResourceLeaseOwnerV1, ResourceLeaseRequestV1,
+    ResourceLeaseV1, ResourcePolicyEventV1, ResourcePressureEventV1, TaskCapabilityGrant,
+    TaskResourceBudgetV1,
 };
 use sovereign_repo::{
     ChangeSet, ChangeSetCompositionInput, ComposeChangeSetsOutcome, CompositionConflictEvidence,
@@ -51,9 +54,18 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod resources;
 mod roles;
 mod skills;
 
+use resources::{
+    ControllerResourceCoordinator, MODEL_RESIDENCY_KEY, RESOURCE_GOVERNOR_KEY,
+    RESOURCE_GOVERNOR_NAMESPACE, RESOURCE_LEASE_NAMESPACE, RESOURCE_PRESSURE_NAMESPACE,
+    RESOURCE_RESIDENCY_NAMESPACE, resource_event_payload,
+};
+pub use resources::{
+    MacOsResourceProbe, ResourcePressureProbe, ResourceResidencyStateV1, ResourceResidencyV1,
+};
 pub use roles::{
     ROLE_OUTPUT_SCHEMA_VERSION, ROLE_PROFILE_SCHEMA_VERSION, ROLE_PROFILE_VERSION, RoleDisposition,
     RoleId, RoleOutputV1, RolePin, RoleProfile, RoleRegistry, RoleToolClass,
@@ -72,6 +84,7 @@ pub const MODEL_PROPOSAL_SCHEMA_VERSION: u32 = 1;
 pub const VERIFICATION_RESULT_SCHEMA_VERSION: u32 = 1;
 pub const FAILURE_RECORD_SCHEMA_VERSION: u32 = 1;
 const M1_MODEL_OUTPUT_TOKENS: u32 = 512;
+const M1_MODEL_UNCALIBRATED_ADMISSION_MIB: u64 = 4_096;
 const MAX_LITERAL_BYTES: usize = 4_096;
 const EVIDENCE_SATISFACTION_SCHEMA_VERSION: u32 = 1;
 const VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION: u32 = 1;
@@ -281,24 +294,12 @@ pub struct ActivationSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadinessInputs<'a> {
     pub resource_digest: &'a str,
-    pub host_pressure: HostPressureSnapshot,
 }
 
 impl<'a> ReadinessInputs<'a> {
     #[must_use]
     pub const fn permissive_m1(resource_digest: &'a str) -> Self {
-        Self {
-            resource_digest,
-            host_pressure: HostPressureSnapshot {
-                controlled_working_set_mib: 512,
-                host_headroom_mib: 4_096,
-                swap_out_growth_mib_per_min: 0,
-                compressor_growth_mib_per_min: 0,
-                os_pressure_warning: false,
-                recent_pressure_event: false,
-                thermal_serious: false,
-            },
-        }
+        Self { resource_digest }
     }
 }
 
@@ -317,8 +318,60 @@ pub struct ReadyLease {
     permission_decision: PermissionDecision,
     resource_digest: String,
     execution_epoch: i64,
-    resource_lease: ResourceLease,
+    resource_lease: ResourceLeaseV1,
+    release_resource_on_finish: bool,
     lease_digest: String,
+}
+
+/// Controller-owned lease for one deterministic heavy phase after MODEL has been proven absent.
+#[derive(Debug)]
+pub struct HeavyPhaseLease {
+    plan_id: String,
+    plan_revision: u32,
+    task_id: String,
+    task_contract_digest: String,
+    execution_epoch: i64,
+    resource_lease: ResourceLeaseV1,
+    parallel_job_cap: Option<u32>,
+    subprocess_cap: u32,
+    permission_decision: PermissionDecision,
+    completion: Option<HeavyPhaseCompletion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HeavyPhaseCompletion {
+    action_id: String,
+    result_digest: String,
+}
+
+impl HeavyPhaseLease {
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    #[must_use]
+    pub const fn class(&self) -> HeavyLeaseClass {
+        self.resource_lease.class
+    }
+
+    #[must_use]
+    pub const fn parallel_job_cap(&self) -> Option<u32> {
+        self.parallel_job_cap
+    }
+
+    #[must_use]
+    pub const fn subprocess_cap(&self) -> u32 {
+        self.subprocess_cap
+    }
+}
+
+/// Read-only durable resource view used by recovery/evaluation without granting authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerResourceSnapshotV1 {
+    pub execution_epoch: i64,
+    pub governor: M6ResourceGovernorSnapshotV1,
+    pub model_residency: Option<ResourceResidencyV1>,
 }
 
 impl ReadyLease {
@@ -940,7 +993,8 @@ struct ActivePlan {
 pub struct Controller {
     state: StateStore,
     active: Option<ActivePlan>,
-    resource_governor: M1ResourceGovernor,
+    resources: ControllerResourceCoordinator,
+    resource_probe: Box<dyn ResourcePressureProbe>,
     permission_context: PermissionContext,
     trusted_recovery_intent_digests: BTreeMap<String, String>,
 }
@@ -951,7 +1005,8 @@ impl Controller {
         Self {
             state,
             active: None,
-            resource_governor: M1ResourceGovernor::default(),
+            resources: ControllerResourceCoordinator::default(),
+            resource_probe: Box::<MacOsResourceProbe>::default(),
             permission_context: PermissionContext::m1_local_autonomous(),
             trusted_recovery_intent_digests: BTreeMap::new(),
         }
@@ -965,15 +1020,39 @@ impl Controller {
         Self {
             state,
             active: None,
-            resource_governor: M1ResourceGovernor::default(),
+            resources: ControllerResourceCoordinator::default(),
+            resource_probe: Box::<MacOsResourceProbe>::default(),
             permission_context,
             trusted_recovery_intent_digests: BTreeMap::new(),
         }
     }
 
+    /// Replaces the Controller-owned read-only pressure source.
+    ///
+    /// Production constructors install [`MacOsResourceProbe`]. Deterministic integration tests
+    /// may inject a scripted probe here; readiness callers themselves never supply pressure
+    /// values and therefore cannot manufacture launch headroom.
+    pub fn set_resource_pressure_probe(&mut self, probe: Box<dyn ResourcePressureProbe>) {
+        self.resource_probe = probe;
+    }
+
     #[must_use]
     pub const fn state(&self) -> &StateStore {
         &self.state
+    }
+
+    /// Returns a read-only snapshot of Controller-owned resource state.
+    ///
+    /// This exposes no admission or mutation surface; callers cannot alter governor authority.
+    ///
+    /// # Errors
+    /// Returns a state error when the current execution epoch cannot be read.
+    pub fn resource_snapshot(&self) -> Result<ControllerResourceSnapshotV1, ControllerError> {
+        Ok(ControllerResourceSnapshotV1 {
+            execution_epoch: self.state.current_execution_epoch()?,
+            governor: self.resources.snapshot(),
+            model_residency: self.resources.model_residency().cloned(),
+        })
     }
 
     /// Replaces the exact persisted user-grant layer for one active task.
@@ -3168,9 +3247,11 @@ impl Controller {
             inputs,
             TaskState::Planned,
             tool_manifest,
+            false,
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn derive_ready_lease_for_state(
         &mut self,
         registry: &ProjectRegistry,
@@ -3178,6 +3259,7 @@ impl Controller {
         inputs: ReadinessInputs<'_>,
         eligible_state: TaskState,
         tool_manifest: &ToolManifest,
+        automatic_reload: bool,
     ) -> Result<ReadyLease, ControllerError> {
         let epoch = self.state.current_execution_epoch()?;
         let (plan_id, revision, plan_digest, task_digest, task_value, validity) = {
@@ -3201,8 +3283,6 @@ impl Controller {
             ));
         }
         self.check_task_readiness(task_id, &task_value, inputs, eligible_state)?;
-        let (checkpoint_generation, checkpoint_action_sequence, checkpoint_hash) =
-            self.current_checkpoint_binding()?;
         let baseline_digest = snapshot_digest(&self.task_execution_snapshot(registry, task_id)?)?;
         let evidence_binding_digest =
             self.resolve_readiness_evidence_digest(registry, task_id, &task_value)?;
@@ -3219,22 +3299,105 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        let resource_lease = match self.resource_governor.acquire(
-            format!("ready:{plan_id}:{task_id}:{epoch}"),
-            HeavyLeaseClass::Model,
-            inputs.host_pressure,
-        ) {
-            Ok(lease) => lease,
-            Err(error @ PolicyError::ResourceDenied(_)) => {
-                self.record_pre_attempt_resource_deferral(task_id, eligible_state)?;
-                return Err(ControllerError::Policy(error));
-            }
-            Err(error) => return Err(ControllerError::Policy(error)),
+        let task_budget = self.task_resource_budget(task_id)?;
+        if !task_budget.permits(HeavyLeaseClass::Model) {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                "task resource contract does not authorize MODEL".to_owned(),
+            )));
+        }
+        if task_budget.max_subprocesses == 0 {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                "task resource contract has zero subprocess capacity".to_owned(),
+            )));
+        }
+        if task_budget.max_peak_rss_mib < M1_MODEL_UNCALIBRATED_ADMISSION_MIB {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                format!(
+                    "task max-RSS contract {} MiB is below conservative MODEL admission {} MiB",
+                    task_budget.max_peak_rss_mib, M1_MODEL_UNCALIBRATED_ADMISSION_MIB
+                ),
+            )));
+        }
+        let snapshot = self.resource_probe.sample().map_err(|error| {
+            ControllerError::Policy(PolicyError::ResourceDenied(format!(
+                "live resource pressure probe failed: {error}"
+            )))
+        })?;
+        let pressure = self.resources.observe_pressure(snapshot);
+        let request = ResourceLeaseRequestV1 {
+            lease_id: format!("ready:{plan_id}:r{revision}:{task_id}:{epoch}"),
+            owner: ResourceLeaseOwnerV1 {
+                plan_id: plan_id.clone(),
+                plan_revision: revision,
+                task_id: task_id.to_owned(),
+            },
+            class: HeavyLeaseClass::Model,
+            // M6-T01 has no durable named-model calibration store yet. This is therefore a
+            // conservative admission estimate, explicitly *not* measured calibration evidence.
+            calibrated: false,
+            calibrated_p95_rss_mib: M1_MODEL_UNCALIBRATED_ADMISSION_MIB,
+            evictable_idle_rss_mib: 0,
+            task_budget,
+            conditional: ConditionalLeaseContextV1::default(),
+            automatic_reload,
+            disk_expanding: false,
         };
+        let admission = self.resources.admit(&request, &pressure);
+        let Some(resource_lease) = admission.lease.clone() else {
+            self.persist_resource_policy_decision(&pressure, &admission.event, None, None)?;
+            if matches!(
+                admission.status,
+                AdmissionStatus::Serialize | AdmissionStatus::Cooldown | AdmissionStatus::Deferred
+            ) {
+                self.record_pre_attempt_resource_deferral(task_id, eligible_state)?;
+            }
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                format!(
+                    "MODEL resource admission {:?}: {:?}",
+                    admission.status, admission.event
+                ),
+            )));
+        };
+        if admission.status != AdmissionStatus::Admitted {
+            let _ = self.resources.release(&resource_lease.lease_id);
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                format!(
+                    "MODEL resource admission returned inconsistent status {:?}",
+                    admission.status
+                ),
+            )));
+        }
+        let residency = ResourceResidencyV1 {
+            schema_version: resources::RESOURCE_RESIDENCY_SCHEMA_VERSION,
+            plan_id: plan_id.clone(),
+            plan_revision: revision,
+            task_id: task_id.to_owned(),
+            task_contract_digest: task_digest.clone(),
+            execution_epoch: epoch,
+            policy_lease: resource_lease.clone(),
+            model_lease: None,
+            state: ResourceResidencyStateV1::Reserved,
+            updated_at_ms: pressure.snapshot.observed_at_ms,
+        };
+        if let Err(error) = self.persist_resource_policy_decision(
+            &pressure,
+            &admission.event,
+            Some(&resource_lease),
+            Some(&residency),
+        ) {
+            let _ = self.resources.release(&resource_lease.lease_id);
+            return Err(error);
+        }
+        self.resources.set_model_residency(residency);
+        self.checkpoint_now()?;
+        let (checkpoint_generation, checkpoint_action_sequence, checkpoint_hash) =
+            self.current_checkpoint_binding()?;
         let resource_digest = sha256_prefixed(
             format!(
-                "{}\0{:?}\0{}",
-                resource_lease.lease_id, resource_lease.class, inputs.resource_digest
+                "{}\0{}\0{}",
+                resource_lease.lease_id,
+                serde_json::to_string(&resource_lease)?,
+                inputs.resource_digest
             )
             .as_bytes(),
         );
@@ -3253,6 +3416,7 @@ impl Controller {
             resource_digest,
             execution_epoch: epoch,
             resource_lease,
+            release_resource_on_finish: true,
             lease_digest: String::new(),
         };
         lease.lease_digest = ready_lease_digest(&lease);
@@ -3303,6 +3467,7 @@ impl Controller {
             inputs,
             TaskState::RepairPending,
             tool_manifest,
+            false,
         )
     }
 
@@ -3402,13 +3567,1067 @@ impl Controller {
         Ok(())
     }
 
+    fn task_resource_budget(&self, task_id: &str) -> Result<TaskResourceBudgetV1, ControllerError> {
+        let task =
+            self.active_ref()?.tasks.get(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("resource task disappeared".to_owned())
+            })?;
+        task_resource_budget_from_value(&task.task)
+    }
+
+    fn persist_resource_policy_decision(
+        &mut self,
+        pressure: &ResourcePressureEventV1,
+        policy_event: &ResourcePolicyEventV1,
+        lease: Option<&ResourceLeaseV1>,
+        residency: Option<&ResourceResidencyV1>,
+    ) -> Result<(), ControllerError> {
+        let (pressure_key, lease_key, residency_key) = {
+            let active = self.active_ref()?;
+            (
+                active_scoped_key(active, &pressure.event_id),
+                lease.map(|lease| active_scoped_key(active, &lease.lease_id)),
+                residency.map(|_| active_scoped_key(active, MODEL_RESIDENCY_KEY)),
+            )
+        };
+        let mut records = vec![
+            (
+                RESOURCE_PRESSURE_NAMESPACE.to_owned(),
+                pressure_key,
+                serde_json::to_string(pressure)?,
+            ),
+            (
+                RESOURCE_GOVERNOR_NAMESPACE.to_owned(),
+                {
+                    let active = self.active_ref()?;
+                    active_scoped_key(active, RESOURCE_GOVERNOR_KEY)
+                },
+                serde_json::to_string(&self.resources.snapshot())?,
+            ),
+        ];
+        if let (Some(lease), Some(key)) = (lease, lease_key) {
+            records.push((
+                RESOURCE_LEASE_NAMESPACE.to_owned(),
+                key,
+                serde_json::to_string(lease)?,
+            ));
+        }
+        if let (Some(residency), Some(key)) = (residency, residency_key) {
+            records.push((
+                RESOURCE_RESIDENCY_NAMESPACE.to_owned(),
+                key,
+                serde_json::to_string(residency)?,
+            ));
+        }
+        let post_image_digests = records
+            .iter()
+            .map(|(namespace, key, value_json)| {
+                (
+                    format!("{namespace}:{key}"),
+                    sha256_prefixed(value_json.as_bytes()),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut event_payload = resource_event_payload(pressure, policy_event);
+        event_payload
+            .as_object_mut()
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "resource policy event payload is not an object".to_owned(),
+                )
+            })?
+            .insert(
+                "post_image_digests".to_owned(),
+                serde_json::to_value(post_image_digests)?,
+            );
+        self.persist_runtime_records_with_events(
+            &records,
+            &[(
+                "resource_policy_decision".to_owned(),
+                pressure.event_id.clone(),
+                event_payload,
+            )],
+        )?;
+        Ok(())
+    }
+
+    fn persist_resource_pressure_observation(
+        &mut self,
+        pressure: &ResourcePressureEventV1,
+        event_kind: &str,
+        entity_id: &str,
+    ) -> Result<(), ControllerError> {
+        let (pressure_key, governor_key) = {
+            let active = self.active_ref()?;
+            (
+                active_scoped_key(active, &pressure.event_id),
+                active_scoped_key(active, RESOURCE_GOVERNOR_KEY),
+            )
+        };
+        let pressure_json = serde_json::to_string(pressure)?;
+        let governor_json = serde_json::to_string(&self.resources.snapshot())?;
+        let post_image_digests = BTreeMap::from([
+            (
+                format!("{RESOURCE_PRESSURE_NAMESPACE}:{pressure_key}"),
+                sha256_prefixed(pressure_json.as_bytes()),
+            ),
+            (
+                format!("{RESOURCE_GOVERNOR_NAMESPACE}:{governor_key}"),
+                sha256_prefixed(governor_json.as_bytes()),
+            ),
+        ]);
+        self.persist_runtime_records_with_events(
+            &[
+                (
+                    RESOURCE_PRESSURE_NAMESPACE.to_owned(),
+                    pressure_key,
+                    pressure_json,
+                ),
+                (
+                    RESOURCE_GOVERNOR_NAMESPACE.to_owned(),
+                    governor_key,
+                    governor_json,
+                ),
+            ],
+            &[(
+                event_kind.to_owned(),
+                entity_id.to_owned(),
+                json!({
+                    "pressure_event": pressure,
+                    "post_image_digests": post_image_digests,
+                }),
+            )],
+        )?;
+        Ok(())
+    }
+
+    fn persist_resource_residency(
+        &mut self,
+        residency: &ResourceResidencyV1,
+        event_kind: &str,
+    ) -> Result<(), ControllerError> {
+        let key = {
+            let active = self.active_ref()?;
+            active_scoped_key(active, MODEL_RESIDENCY_KEY)
+        };
+        let value_json = serde_json::to_string(residency)?;
+        let binding_key = format!("{RESOURCE_RESIDENCY_NAMESPACE}:{key}");
+        let post_image_digests =
+            BTreeMap::from([(binding_key, sha256_prefixed(value_json.as_bytes()))]);
+        self.persist_runtime_records_with_events(
+            &[(
+                RESOURCE_RESIDENCY_NAMESPACE.to_owned(),
+                key,
+                value_json.clone(),
+            )],
+            &[(
+                event_kind.to_owned(),
+                residency.task_id.clone(),
+                json!({
+                    "residency": residency,
+                    "post_image_digests": post_image_digests
+                }),
+            )],
+        )?;
+        Ok(())
+    }
+
+    fn release_logical_resource_lease(
+        &mut self,
+        lease: &mut ReadyLease,
+    ) -> Result<(), ControllerError> {
+        if !lease.release_resource_on_finish {
+            return Ok(());
+        }
+        let event = self
+            .resources
+            .release(&lease.resource_lease.lease_id)
+            .ok_or_else(|| {
+                ControllerError::NotReady(
+                    "logical resource lease disappeared before release".to_owned(),
+                )
+            })?;
+        let key = {
+            let active = self.active_ref()?;
+            active_scoped_key(active, &lease.resource_lease.lease_id)
+        };
+        let mut released = lease.resource_lease.clone();
+        released.state = LeaseStateV1::Released;
+        let governor_key = {
+            let active = self.active_ref()?;
+            active_scoped_key(active, RESOURCE_GOVERNOR_KEY)
+        };
+        let lease_json = serde_json::to_string(&released)?;
+        let governor_json = serde_json::to_string(&self.resources.snapshot())?;
+        let lease_binding_key = format!("{RESOURCE_LEASE_NAMESPACE}:{key}");
+        let governor_binding_key = format!("{RESOURCE_GOVERNOR_NAMESPACE}:{governor_key}");
+        let post_image_digests = BTreeMap::from([
+            (lease_binding_key, sha256_prefixed(lease_json.as_bytes())),
+            (
+                governor_binding_key,
+                sha256_prefixed(governor_json.as_bytes()),
+            ),
+        ]);
+        self.persist_runtime_records_with_events(
+            &[
+                (RESOURCE_LEASE_NAMESPACE.to_owned(), key, lease_json.clone()),
+                (
+                    RESOURCE_GOVERNOR_NAMESPACE.to_owned(),
+                    governor_key,
+                    governor_json.clone(),
+                ),
+            ],
+            &[(
+                "resource_lease_released".to_owned(),
+                lease.task_id.clone(),
+                json!({
+                    "policy_event": event,
+                    "post_image_digests": post_image_digests
+                }),
+            )],
+        )?;
+        lease.release_resource_on_finish = false;
+        Ok(())
+    }
+
+    fn ensure_model_resident(
+        &mut self,
+        lease: &mut ReadyLease,
+        backend: &dyn ModelBackend,
+        input_token_ceiling: u32,
+        model_deadline_ms: u64,
+    ) -> Result<(), ControllerError> {
+        let residency = self.resources.model_residency().cloned().ok_or_else(|| {
+            ControllerError::NotReady("MODEL reservation is missing from resource state".to_owned())
+        })?;
+        if residency.policy_lease.lease_id != lease.resource_lease.lease_id
+            || residency.plan_id != lease.plan_id
+            || residency.plan_revision != lease.plan_revision
+            || residency.task_id != lease.task_id
+            || residency.execution_epoch != lease.execution_epoch
+        {
+            return Err(ControllerError::NotReady(
+                "MODEL reservation does not match the exact readiness lease".to_owned(),
+            ));
+        }
+        if residency.state == ResourceResidencyStateV1::Resident {
+            return Ok(());
+        }
+        if residency.state != ResourceResidencyStateV1::Reserved {
+            return Err(ControllerError::NotReady(format!(
+                "MODEL residency state {:?} cannot be loaded",
+                residency.state
+            )));
+        }
+
+        if matches!(
+            backend.residency_proof()?,
+            ModelResidencyProof::Resident { .. }
+        ) {
+            backend.unload()?;
+            if backend.residency_proof()? != ModelResidencyProof::Absent {
+                return Err(ControllerError::NotReady(
+                    "pre-existing model residency could not be proven absent before Controller load"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let profile = self.resources.profile();
+        let load_profile = ModelLoadProfile {
+            context_tokens: input_token_ceiling.min(profile.default_model_input_tokens),
+            output_reserve_tokens: profile
+                .default_model_output_reserve_tokens
+                .max(M1_MODEL_OUTPUT_TOKENS),
+            startup_timeout_ms: model_deadline_ms.max(30_000),
+            provider_call_timeout_ms: model_deadline_ms.max(1),
+        };
+        let model_lease = backend.load(load_profile)?;
+        if model_lease.context_tokens < input_token_ceiling {
+            let _ = backend.unload();
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                "loaded model context is below the admitted request ceiling".to_owned(),
+            )));
+        }
+        // Recovery-test hook for the only ambiguous load window: the backend is physically
+        // resident, while durable Controller state still says `Reserved`. A crash here must be
+        // treated as Unknown on restart; a fresh backend reporting Absent is not proof that this
+        // pre-crash process disappeared.
+        recovery_test_hook("after_model_load_before_resident_persist");
+        let measured_peak_mib = model_lease
+            .startup_peak_rss_kb
+            .into_iter()
+            .chain(model_lease.post_load_rss_kb)
+            .max()
+            .map(|kib| kib.div_ceil(1_024));
+        let mut resident = residency;
+        resident.model_lease = Some(model_lease);
+        resident.state = ResourceResidencyStateV1::Resident;
+        resident.updated_at_ms = unix_millis()?;
+        self.persist_resource_residency(&resident, "resource_model_resident")?;
+        self.resources.set_model_residency(resident.clone());
+        self.checkpoint_now()?;
+        self.rebind_ready_checkpoint(lease)?;
+
+        if measured_peak_mib.is_some_and(|mib| mib > lease.resource_lease.task_max_peak_rss_mib) {
+            self.unload_model_for_ready_lease(lease, backend)?;
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                format!(
+                    "measured model RSS exceeds task max-RSS budget: measured={} MiB limit={} MiB",
+                    measured_peak_mib.unwrap_or_default(),
+                    lease.resource_lease.task_max_peak_rss_mib
+                ),
+            )));
+        }
+        Ok(())
+    }
+
+    fn unload_model_for_ready_lease(
+        &mut self,
+        lease: &mut ReadyLease,
+        backend: &dyn ModelBackend,
+    ) -> Result<(), ControllerError> {
+        if !lease.release_resource_on_finish {
+            return Ok(());
+        }
+        let Some(mut residency) = self.resources.model_residency().cloned() else {
+            return self.release_logical_resource_lease(lease);
+        };
+        if residency.policy_lease.lease_id != lease.resource_lease.lease_id {
+            return Err(ControllerError::NotReady(
+                "physical residency is bound to a different logical MODEL lease".to_owned(),
+            ));
+        }
+        if residency.state == ResourceResidencyStateV1::Reserved {
+            // No backend load has been attempted on this path, so Controller can durably prove
+            // physical absence before releasing the logical MODEL lease. Leaving the last durable
+            // record as `Reserved` would make a clean cancellation indistinguishable from the
+            // crash window between backend load and resident-state persistence.
+            residency.state = ResourceResidencyStateV1::Absent;
+            residency.updated_at_ms = unix_millis()?;
+            self.persist_resource_residency(&residency, "resource_model_absent")?;
+            self.resources.clear_model_residency();
+            self.release_logical_resource_lease(lease)?;
+            self.checkpoint_now()?;
+            return Ok(());
+        }
+        residency.state = ResourceResidencyStateV1::Unloading;
+        residency.updated_at_ms = unix_millis()?;
+        self.persist_resource_residency(&residency, "resource_model_unloading")?;
+        self.resources.set_model_residency(residency.clone());
+        self.checkpoint_now()?;
+
+        if let Err(error) = backend.unload() {
+            residency.state = ResourceResidencyStateV1::Unknown;
+            residency.updated_at_ms = unix_millis()?;
+            self.persist_resource_residency(&residency, "resource_model_unload_unknown")?;
+            self.resources.set_model_residency(residency);
+            self.checkpoint_now()?;
+            return Err(ControllerError::Model(error));
+        }
+        if backend.residency_proof()? != ModelResidencyProof::Absent {
+            residency.state = ResourceResidencyStateV1::Unknown;
+            residency.updated_at_ms = unix_millis()?;
+            self.persist_resource_residency(&residency, "resource_model_unload_unproven")?;
+            self.resources.set_model_residency(residency);
+            self.checkpoint_now()?;
+            return Err(ControllerError::NotReady(
+                "model backend could not prove physical absence after unload; logical MODEL lease remains held"
+                    .to_owned(),
+            ));
+        }
+        residency.state = ResourceResidencyStateV1::Absent;
+        residency.updated_at_ms = unix_millis()?;
+        self.persist_resource_residency(&residency, "resource_model_absent")?;
+        self.resources.clear_model_residency();
+        self.release_logical_resource_lease(lease)?;
+        self.checkpoint_now()?;
+        Ok(())
+    }
+
+    fn persist_resource_lease_transition(
+        &mut self,
+        lease: &ResourceLeaseV1,
+        policy_event: &ResourcePolicyEventV1,
+        event_kind: &str,
+        entity_id: &str,
+    ) -> Result<(), ControllerError> {
+        let (lease_key, governor_key) = {
+            let active = self.active_ref()?;
+            (
+                active_scoped_key(active, &lease.lease_id),
+                active_scoped_key(active, RESOURCE_GOVERNOR_KEY),
+            )
+        };
+        let lease_json = serde_json::to_string(lease)?;
+        let governor_json = serde_json::to_string(&self.resources.snapshot())?;
+        let post_image_digests = BTreeMap::from([
+            (
+                format!("{RESOURCE_LEASE_NAMESPACE}:{lease_key}"),
+                sha256_prefixed(lease_json.as_bytes()),
+            ),
+            (
+                format!("{RESOURCE_GOVERNOR_NAMESPACE}:{governor_key}"),
+                sha256_prefixed(governor_json.as_bytes()),
+            ),
+        ]);
+        self.persist_runtime_records_with_events(
+            &[
+                (RESOURCE_LEASE_NAMESPACE.to_owned(), lease_key, lease_json),
+                (
+                    RESOURCE_GOVERNOR_NAMESPACE.to_owned(),
+                    governor_key,
+                    governor_json,
+                ),
+            ],
+            &[(
+                event_kind.to_owned(),
+                entity_id.to_owned(),
+                json!({
+                    "policy_event": policy_event,
+                    "resource_lease": lease,
+                    "post_image_digests": post_image_digests,
+                }),
+            )],
+        )?;
+        Ok(())
+    }
+
+    fn evict_model_for_heavy_phase(
+        &mut self,
+        lease: &mut ReadyLease,
+        backend: &dyn ModelBackend,
+    ) -> Result<ResourcePolicyEventV1, ControllerError> {
+        if !lease.release_resource_on_finish {
+            return Err(ControllerError::NotReady(
+                "MODEL readiness lease was already released before heavy-phase handoff".to_owned(),
+            ));
+        }
+        let mut residency = self.resources.model_residency().cloned().ok_or_else(|| {
+            ControllerError::NotReady(
+                "MODEL heavy-phase handoff requires exact durable residency state".to_owned(),
+            )
+        })?;
+        if residency.policy_lease.lease_id != lease.resource_lease.lease_id
+            || residency.execution_epoch != lease.execution_epoch
+        {
+            return Err(ControllerError::NotReady(
+                "MODEL heavy-phase handoff residency is stale or misbound".to_owned(),
+            ));
+        }
+
+        if residency.state == ResourceResidencyStateV1::Reserved {
+            residency.state = ResourceResidencyStateV1::Absent;
+            residency.updated_at_ms = unix_millis()?;
+            self.persist_resource_residency(&residency, "resource_model_absent")?;
+            recovery_test_hook("after_model_absent_before_heavy_eviction");
+        } else {
+            residency.state = ResourceResidencyStateV1::Unloading;
+            residency.updated_at_ms = unix_millis()?;
+            self.persist_resource_residency(&residency, "resource_model_unloading")?;
+            self.resources.set_model_residency(residency.clone());
+            self.checkpoint_now()?;
+
+            if let Err(error) = backend.unload() {
+                residency.state = ResourceResidencyStateV1::Unknown;
+                residency.updated_at_ms = unix_millis()?;
+                self.persist_resource_residency(&residency, "resource_model_unload_unknown")?;
+                self.resources.set_model_residency(residency);
+                self.checkpoint_now()?;
+                return Err(ControllerError::Model(error));
+            }
+            if backend.residency_proof()? != ModelResidencyProof::Absent {
+                residency.state = ResourceResidencyStateV1::Unknown;
+                residency.updated_at_ms = unix_millis()?;
+                self.persist_resource_residency(&residency, "resource_model_unload_unproven")?;
+                self.resources.set_model_residency(residency);
+                self.checkpoint_now()?;
+                return Err(ControllerError::NotReady(
+                    "MODEL absence is unproven; BUILD_HEAVY admission remains blocked".to_owned(),
+                ));
+            }
+            residency.state = ResourceResidencyStateV1::Absent;
+            residency.updated_at_ms = unix_millis()?;
+            self.persist_resource_residency(&residency, "resource_model_absent")?;
+        }
+
+        self.resources.clear_model_residency();
+        let now_ms = unix_millis()?;
+        let policy_event = self
+            .resources
+            .record_eviction(&lease.resource_lease.lease_id, now_ms)
+            .ok_or_else(|| {
+                ControllerError::NotReady(
+                    "logical MODEL lease disappeared before confirmed eviction".to_owned(),
+                )
+            })?;
+        let mut evicted = lease.resource_lease.clone();
+        evicted.state = LeaseStateV1::Evicted;
+        evicted.last_used_at_ms = now_ms;
+        self.persist_resource_lease_transition(
+            &evicted,
+            &policy_event,
+            "resource_model_evicted",
+            &lease.task_id,
+        )?;
+        lease.release_resource_on_finish = false;
+        self.checkpoint_now()?;
+        Ok(policy_event)
+    }
+
+    /// Proves MODEL physically absent, records its logical eviction, then admits one `BUILD_HEAVY`
+    /// phase under the same exact task resource contract. This method performs no build/process
+    /// side effect itself; the returned caps must fence the caller's deterministic executor.
+    ///
+    /// # Errors
+    /// Fails closed for stale authority, unproven MODEL absence, permanent task-budget denial,
+    /// pressure/cooldown deferral, or inconsistent governor state.
+    #[allow(clippy::too_many_lines)]
+    pub fn acquire_build_heavy(
+        &mut self,
+        mut model_lease: ReadyLease,
+        registry: &ProjectRegistry,
+        tool_manifest: &ToolManifest,
+        backend: &dyn ModelBackend,
+    ) -> Result<HeavyPhaseLease, ControllerError> {
+        self.validate_ready_lease(&model_lease, registry, tool_manifest)?;
+        // Immutable task authority/budget must be proven before mutating MODEL residency. A
+        // permanently impossible BUILD_HEAVY request must not evict a healthy model and create an
+        // avoidable unload/reload cycle.
+        let task_budget = self.task_resource_budget(&model_lease.task_id)?;
+        if !task_budget.permits(HeavyLeaseClass::BuildHeavy) {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                "task resource contract does not authorize BUILD_HEAVY".to_owned(),
+            )));
+        }
+        if task_budget.max_subprocesses == 0 {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                "task resource contract has zero subprocess capacity for BUILD_HEAVY".to_owned(),
+            )));
+        }
+        let heavy_admission_mib = self.resources.profile().unknown_heavy_admission_mib;
+        if task_budget.max_peak_rss_mib < heavy_admission_mib {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                format!(
+                    "task max-RSS contract {} MiB is below conservative BUILD_HEAVY admission {} MiB",
+                    task_budget.max_peak_rss_mib, heavy_admission_mib
+                ),
+            )));
+        }
+        self.checkpoint_now()?;
+        self.rebind_ready_checkpoint(&mut model_lease)?;
+        let eviction = self.evict_model_for_heavy_phase(&mut model_lease, backend)?;
+        if matches!(eviction, ResourcePolicyEventV1::Defer { .. }) {
+            let state = self.task_state(&model_lease.task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("heavy-phase task disappeared".to_owned())
+            })?;
+            self.record_pre_attempt_resource_deferral(&model_lease.task_id, state)?;
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                "MODEL eviction hit the anti-oscillation ceiling; heavy phase deferred".to_owned(),
+            )));
+        }
+
+        let snapshot = self.resource_probe.sample().map_err(|error| {
+            ControllerError::Policy(PolicyError::ResourceDenied(format!(
+                "live resource pressure probe failed before BUILD_HEAVY: {error}"
+            )))
+        })?;
+        let pressure = self.resources.observe_pressure(snapshot);
+        let request = ResourceLeaseRequestV1 {
+            lease_id: format!(
+                "build:{}:r{}:{}:{}",
+                model_lease.plan_id,
+                model_lease.plan_revision,
+                model_lease.task_id,
+                model_lease.execution_epoch
+            ),
+            owner: ResourceLeaseOwnerV1 {
+                plan_id: model_lease.plan_id.clone(),
+                plan_revision: model_lease.plan_revision,
+                task_id: model_lease.task_id.clone(),
+            },
+            class: HeavyLeaseClass::BuildHeavy,
+            calibrated: false,
+            calibrated_p95_rss_mib: heavy_admission_mib,
+            evictable_idle_rss_mib: 0,
+            task_budget,
+            conditional: ConditionalLeaseContextV1::default(),
+            automatic_reload: false,
+            disk_expanding: false,
+        };
+        let admission = self.resources.admit(&request, &pressure);
+        let Some(resource_lease) = admission.lease.clone() else {
+            self.persist_resource_policy_decision(&pressure, &admission.event, None, None)?;
+            if matches!(
+                admission.status,
+                AdmissionStatus::Serialize | AdmissionStatus::Cooldown | AdmissionStatus::Deferred
+            ) {
+                let state = self.task_state(&model_lease.task_id).ok_or_else(|| {
+                    ControllerError::InvalidPlan("heavy-phase task disappeared".to_owned())
+                })?;
+                self.record_pre_attempt_resource_deferral(&model_lease.task_id, state)?;
+            }
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                format!(
+                    "BUILD_HEAVY resource admission {:?}: {:?}",
+                    admission.status, admission.event
+                ),
+            )));
+        };
+        if !ControllerResourceCoordinator::admission_is_success(&admission) {
+            let _ = self.resources.release(&resource_lease.lease_id);
+            return Err(ControllerError::InvalidPlan(
+                "BUILD_HEAVY admission returned a lease without admitted status".to_owned(),
+            ));
+        }
+        self.persist_resource_policy_decision(
+            &pressure,
+            &admission.event,
+            Some(&resource_lease),
+            None,
+        )?;
+        self.checkpoint_now()?;
+        Ok(HeavyPhaseLease {
+            plan_id: model_lease.plan_id,
+            plan_revision: model_lease.plan_revision,
+            task_id: model_lease.task_id,
+            task_contract_digest: model_lease.task_contract_digest,
+            execution_epoch: model_lease.execution_epoch,
+            resource_lease,
+            parallel_job_cap: admission.parallel_job_cap,
+            subprocess_cap: admission.subprocess_cap,
+            permission_decision: model_lease.permission_decision,
+            completion: None,
+        })
+    }
+
+    fn validate_heavy_phase_lease(&self, lease: &HeavyPhaseLease) -> Result<(), ControllerError> {
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(&lease.task_id)
+            .ok_or_else(|| ControllerError::NotReady("BUILD_HEAVY task disappeared".to_owned()))?;
+        if lease.resource_lease.class != HeavyLeaseClass::BuildHeavy
+            || active.plan_id != lease.plan_id
+            || active.revision != lease.plan_revision
+            || task.task_contract_digest != lease.task_contract_digest
+            || self.state.current_execution_epoch()? != lease.execution_epoch
+            || self.resources.active_lease(&lease.resource_lease.lease_id)
+                != Some(lease.resource_lease.clone())
+        {
+            return Err(ControllerError::NotReady(
+                "BUILD_HEAVY lease authority is stale or misbound".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn authorize_build_heavy_action(
+        &mut self,
+        lease: &HeavyPhaseLease,
+        mut command: CommandSpec,
+        command_policy: &CommandPolicy,
+        isolation_request: &IsolationRequest,
+        tool_manifest: &ToolManifest,
+    ) -> Result<AuthorizedAction, ControllerError> {
+        let permission_decision =
+            self.permission_decision_for_task(&lease.task_id, tool_manifest)?;
+        if permission_decision != lease.permission_decision {
+            return Err(ControllerError::NotReady(
+                "BUILD_HEAVY tool permission decision changed after resource admission".to_owned(),
+            ));
+        }
+        if !permission_decision
+            .effective
+            .contains(Capability::ProcessExec)
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "BUILD_HEAVY requires process_exec capability".to_owned(),
+            )));
+        }
+        if command.mode != CommandMode::Direct {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "BUILD_HEAVY v1 requires a direct structured command; shell mode is forbidden"
+                    .to_owned(),
+            )));
+        }
+        if !command.environment.is_empty() {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "BUILD_HEAVY v1 does not accept caller-supplied environment variables".to_owned(),
+            )));
+        }
+        if command.subprocess_limit > lease.subprocess_cap {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                format!(
+                    "BUILD_HEAVY subprocess ceiling {} exceeds governor cap {}",
+                    command.subprocess_limit, lease.subprocess_cap
+                ),
+            )));
+        }
+
+        let execution_root = self.task_execution_root(&lease.task_id)?;
+        if command.working_directory.canonicalize()? != execution_root.canonicalize()? {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "BUILD_HEAVY working directory must equal the exact task execution root".to_owned(),
+            )));
+        }
+        if !isolation_request.network_offline
+            || isolation_request.repository_root.canonicalize()? != execution_root.canonicalize()?
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "BUILD_HEAVY requires exact offline task-root isolation".to_owned(),
+            )));
+        }
+        let permission_class = if isolation_request.allow_repository_write {
+            if !permission_decision
+                .effective
+                .contains(Capability::RepositoryWrite)
+            {
+                return Err(ControllerError::Policy(PolicyError::Denied(
+                    "BUILD_HEAVY write isolation requires repository_write capability".to_owned(),
+                )));
+            }
+            PermissionClass::RepositoryWrite
+        } else {
+            PermissionClass::ProcessExec
+        };
+        let effective_risk = command_policy.authorize(&command)?;
+        if matches!(
+            effective_risk,
+            CommandRisk::PackageInstall | CommandRisk::Destructive | CommandRisk::Shell
+        ) {
+            return Err(ControllerError::Policy(PolicyError::Denied(format!(
+                "BUILD_HEAVY v1 forbids {effective_risk:?} commands"
+            ))));
+        }
+        let pinned = command_policy.pinned_executable(&command.executable)?;
+        inject_build_parallel_job_cap(&mut command, &pinned.path, lease.parallel_job_cap)?;
+        let effective_risk_after_injection = command_policy.authorize(&command)?;
+        if effective_risk_after_injection != effective_risk {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "BUILD_HEAVY job-cap injection changed the command risk classification".to_owned(),
+            )));
+        }
+        let isolation_policy_digest = isolation_request.digest()?;
+        let (repository_id, policy_digest) = {
+            let active = self.active_ref()?;
+            (active.repository_id.clone(), active.policy_digest.clone())
+        };
+        let action_id = heavy_build_action_id(&lease.resource_lease.lease_id);
+        let now_ms = unix_millis()?;
+        let timeout_i64 = i64::try_from(command.timeout_ms).unwrap_or(i64::MAX);
+        let action = AuthorizedAction {
+            action_id: action_id.clone(),
+            plan_id: lease.plan_id.clone(),
+            plan_revision: lease.plan_revision,
+            task_id: lease.task_id.clone(),
+            attempt_id: heavy_build_attempt_id(&lease.resource_lease.lease_id),
+            tool_id: tool_manifest.tool_id.clone(),
+            tool_version: tool_manifest.version.clone(),
+            tool_digest: tool_manifest.content_digest.clone(),
+            executable_digest: pinned.sha256.clone(),
+            repository_id,
+            destination_digest: None,
+            permission_class,
+            execution_epoch: lease.execution_epoch,
+            policy_digest,
+            permission_decision_digest: permission_decision.digest(),
+            isolation_policy_digest,
+            nonce: format!("nonce.{action_id}"),
+            expires_at_ms: now_ms.saturating_add(timeout_i64).saturating_add(60_000),
+            command,
+            individually_authorized_environment: BTreeSet::new(),
+            reconciliation_mode: ReconciliationMode::UnsafeSideEffect,
+        };
+        {
+            let mut journal = ActionJournal::new(&mut self.state);
+            journal.authorize(&action, tool_manifest, &permission_decision)?;
+        }
+        self.checkpoint_now()?;
+        Ok(action)
+    }
+
+    /// Executes the exact `BUILD_HEAVY` phase through the existing durable [`ProcessRunner`].
+    /// The candidate command is not authority: Controller revalidates the exact task/tool
+    /// permission decision, pinned executable, offline isolation, execution root, and the
+    /// governor-returned job/subprocess caps before durable authorization or dispatch.
+    ///
+    /// A successful return means the action is durably committed and its owned process group is
+    /// durably `reaped`. Failed executions release the logical `BUILD_HEAVY` lease only when durable
+    /// process state proves no heavy child can remain; ambiguous cleanup deliberately retains the
+    /// lease so recovery blocks rather than guessing.
+    ///
+    /// # Errors
+    /// Returns a fail-closed authority/resource/tool error for stale leases, widened caps,
+    /// unpinned or unsafe commands, isolation drift, failed execution, or unproven child cleanup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_build_heavy<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        lease: &mut HeavyPhaseLease,
+        command: CommandSpec,
+        command_policy: &CommandPolicy,
+        isolation_backend: &I,
+        isolation_request: &IsolationRequest,
+        artifacts: &ArtifactStore,
+        tool_manifest: &ToolManifest,
+    ) -> Result<RawToolResult, ControllerError> {
+        self.validate_heavy_phase_lease(lease)?;
+        if lease.completion.is_some() {
+            return Err(ControllerError::NotReady(
+                "BUILD_HEAVY lease already has a committed execution completion".to_owned(),
+            ));
+        }
+        let action = match self.authorize_build_heavy_action(
+            lease,
+            command,
+            command_policy,
+            isolation_request,
+            tool_manifest,
+        ) {
+            Ok(action) => action,
+            Err(error) => {
+                // No ProcessRunner dispatch has happened yet. Retire the exact logical heavy lease
+                // so a malformed/permanently denied command cannot strand BUILD_HEAVY in-session.
+                self.release_build_heavy_proven_absent(
+                    lease,
+                    "resource_build_heavy_predispatch_cancelled",
+                )?;
+                return Err(error);
+            }
+        };
+        let action_id = action.action_id.clone();
+
+        let runner = ProcessRunner::new(command_policy, isolation_backend);
+        let raw = {
+            let mut journal = ActionJournal::new(&mut self.state);
+            runner.run(&mut journal, &action, isolation_request, artifacts)
+        };
+        match raw {
+            Ok(result) => {
+                let completion = self.heavy_phase_completion(lease, &action_id)?;
+                lease.completion = Some(completion);
+                let snapshot = self.resource_probe.sample().map_err(|error| {
+                    ControllerError::Policy(PolicyError::ResourceDenied(format!(
+                        "live resource pressure probe failed after BUILD_HEAVY execution: {error}"
+                    )))
+                })?;
+                let pressure = self.resources.observe_pressure(snapshot);
+                self.persist_resource_pressure_observation(
+                    &pressure,
+                    "resource_build_heavy_post_execution_pressure",
+                    &lease.task_id,
+                )?;
+                self.checkpoint_now()?;
+                Ok(result)
+            }
+            Err(error) => {
+                if self.heavy_process_absence_is_proven(lease, &action_id)? {
+                    self.release_build_heavy_proven_absent(
+                        lease,
+                        "resource_build_heavy_failed_reaped",
+                    )?;
+                }
+                Err(ControllerError::Tool(error))
+            }
+        }
+    }
+
+    fn heavy_phase_completion(
+        &self,
+        lease: &HeavyPhaseLease,
+        action_id: &str,
+    ) -> Result<HeavyPhaseCompletion, ControllerError> {
+        if action_id != heavy_build_action_id(&lease.resource_lease.lease_id) {
+            return Err(ControllerError::NotReady(
+                "BUILD_HEAVY action identity is not bound to the exact resource lease".to_owned(),
+            ));
+        }
+        let record = self.state.action_record(action_id)?.ok_or_else(|| {
+            ControllerError::NotReady("BUILD_HEAVY durable action record is missing".to_owned())
+        })?;
+        let result_digest = record.result_digest.clone().ok_or_else(|| {
+            ControllerError::NotReady("BUILD_HEAVY committed result digest is missing".to_owned())
+        })?;
+        if record.state != "committed" || record.execution_epoch != lease.execution_epoch {
+            return Err(ControllerError::NotReady(
+                "BUILD_HEAVY action is not durably committed under the lease epoch".to_owned(),
+            ));
+        }
+        let process = self
+            .state
+            .get_state("controller.process_lease", action_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(
+                    "BUILD_HEAVY committed action has no durable process lease".to_owned(),
+                )
+            })?;
+        let process: RecoveryProcessLease = serde_json::from_str(&process)?;
+        if process.action_id != action_id
+            || process.task_id != lease.task_id
+            || process.attempt_id != heavy_build_attempt_id(&lease.resource_lease.lease_id)
+            || !process_lease_is_terminal(&process)
+        {
+            return Err(ControllerError::NotReady(
+                "BUILD_HEAVY process-group reap proof is missing or misbound".to_owned(),
+            ));
+        }
+        Ok(HeavyPhaseCompletion {
+            action_id: action_id.to_owned(),
+            result_digest,
+        })
+    }
+
+    fn heavy_process_absence_is_proven(
+        &self,
+        lease: &HeavyPhaseLease,
+        action_id: &str,
+    ) -> Result<bool, ControllerError> {
+        let Some(raw) = self
+            .state
+            .get_state("controller.process_lease", action_id)?
+        else {
+            // ProcessRunner writes `pending_spawn` before spawn. Therefore an absent process row
+            // proves this failed path never reached a physical spawn.
+            return Ok(true);
+        };
+        let process: RecoveryProcessLease = serde_json::from_str(&raw)?;
+        Ok(process.action_id == action_id
+            && process.task_id == lease.task_id
+            && process.attempt_id == heavy_build_attempt_id(&lease.resource_lease.lease_id)
+            && process_lease_is_terminal(&process))
+    }
+
+    fn release_build_heavy_proven_absent(
+        &mut self,
+        lease: &HeavyPhaseLease,
+        event_kind: &str,
+    ) -> Result<(), ControllerError> {
+        self.validate_heavy_phase_lease(lease)?;
+        let policy_event = self
+            .resources
+            .release(&lease.resource_lease.lease_id)
+            .ok_or_else(|| {
+                ControllerError::NotReady(
+                    "BUILD_HEAVY logical lease disappeared before release".to_owned(),
+                )
+            })?;
+        let mut released = lease.resource_lease.clone();
+        released.state = LeaseStateV1::Released;
+        released.last_used_at_ms = unix_millis()?;
+        self.persist_resource_lease_transition(
+            &released,
+            &policy_event,
+            event_kind,
+            &lease.task_id,
+        )?;
+        let snapshot = self.resource_probe.sample().map_err(|error| {
+            ControllerError::Policy(PolicyError::ResourceDenied(format!(
+                "live resource pressure probe failed after BUILD_HEAVY release: {error}"
+            )))
+        })?;
+        let pressure = self.resources.observe_pressure(snapshot);
+        self.persist_resource_pressure_observation(
+            &pressure,
+            "resource_build_heavy_post_release_pressure",
+            &lease.task_id,
+        )?;
+        self.checkpoint_now()?;
+        Ok(())
+    }
+
+    /// Releases one exact `BUILD_HEAVY` lease only after Controller-owned durable action/result and
+    /// process-group state prove that the heavy phase completed and every owned child was reaped.
+    /// Consuming the lease prevents accidental double release.
+    ///
+    /// # Errors
+    /// Fails closed if active plan/task/epoch/resource authority changed, execution was skipped,
+    /// the committed result is misbound, or process-group absence is not durably proven.
+    pub fn release_build_heavy(&mut self, lease: &HeavyPhaseLease) -> Result<(), ControllerError> {
+        self.validate_heavy_phase_lease(lease)?;
+        let completion = lease.completion.as_ref().ok_or_else(|| {
+            ControllerError::NotReady(
+                "BUILD_HEAVY cannot be released before Controller-owned execution/reap proof"
+                    .to_owned(),
+            )
+        })?;
+        let current = self.heavy_phase_completion(lease, &completion.action_id)?;
+        if current != *completion {
+            return Err(ControllerError::NotReady(
+                "BUILD_HEAVY completion token no longer matches durable action/result proof"
+                    .to_owned(),
+            ));
+        }
+        self.release_build_heavy_proven_absent(lease, "resource_build_heavy_released")
+    }
+
+    /// Re-admits MODEL after a completed `BUILD_HEAVY` phase through the governor's automatic-reload
+    /// cooldown/hysteresis rules. No model process is loaded until normal execution consumes the
+    /// returned [`ReadyLease`].
+    ///
+    /// # Errors
+    /// Returns a fail-closed readiness/resource error when the task is not eligible or cooldown,
+    /// pressure, budget, evidence, permission, or epoch authority does not permit MODEL reload.
+    pub fn reacquire_model_after_build(
+        &mut self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+        inputs: ReadinessInputs<'_>,
+        tool_manifest: &ToolManifest,
+    ) -> Result<ReadyLease, ControllerError> {
+        self.require_execution_not_paused()?;
+        self.require_current_baseline(registry)?;
+        self.ensure_task_worktree(registry, task_id)?;
+        let mut state = self
+            .task_state(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        if state == TaskState::DeferredResource {
+            let deferred_from = self
+                .active_ref()?
+                .tasks
+                .get(task_id)
+                .and_then(|task| task.resource_deferred_from)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "resource-deferred task is missing its source state".to_owned(),
+                    )
+                })?;
+            self.restore_resource_deferred_task(task_id, deferred_from)?;
+            state = deferred_from;
+        }
+        if !matches!(state, TaskState::Planned | TaskState::RepairPending) {
+            return Err(ControllerError::NotReady(format!(
+                "task state {state:?} cannot reacquire MODEL after BUILD_HEAVY"
+            )));
+        }
+        self.derive_ready_lease_for_state(registry, task_id, inputs, state, tool_manifest, true)
+    }
+
     /// Releases an unused derived readiness lease.
     ///
     /// # Errors
     /// Returns a policy error when the exact resource lease is no longer active.
     pub fn cancel_ready_lease(&mut self, lease: ReadyLease) -> Result<(), ControllerError> {
-        let ReadyLease { resource_lease, .. } = lease;
-        self.resource_governor.release(&resource_lease)?;
+        let mut lease = lease;
+        if self.resources.model_residency().is_some_and(|residency| {
+            residency.policy_lease.lease_id == lease.resource_lease.lease_id
+                && residency.state != ResourceResidencyStateV1::Reserved
+        }) {
+            return Err(ControllerError::NotReady(
+                "cannot cancel a readiness lease while physical model residency may exist"
+                    .to_owned(),
+            ));
+        }
+        if let Some(mut residency) = self.resources.model_residency().cloned()
+            && residency.policy_lease.lease_id == lease.resource_lease.lease_id
+        {
+            residency.state = ResourceResidencyStateV1::Absent;
+            residency.updated_at_ms = unix_millis()?;
+            self.persist_resource_residency(&residency, "resource_model_absent")?;
+        }
+        self.resources.clear_model_residency();
+        self.release_logical_resource_lease(&mut lease)?;
+        self.checkpoint_now()?;
         Ok(())
     }
 
@@ -3425,11 +4644,10 @@ impl Controller {
         model_budget: &mut ModelCallBudget,
     ) -> Result<ExecutionSuccess, ControllerError> {
         let result = self.execute_replace_inner(&mut lease, runtime, context, model_budget, None);
-        let release = self.resource_governor.release(&lease.resource_lease);
-        match (result, release) {
+        let cleanup = self.unload_model_for_ready_lease(&mut lease, runtime.backend);
+        match (result, cleanup) {
             (Ok(success), Ok(())) => Ok(success),
-            (Ok(_), Err(error)) => Err(ControllerError::Policy(error)),
-            (Err(error), _) => Err(error),
+            (_, Err(error)) | (Err(error), Ok(())) => Err(error),
         }
     }
 
@@ -3711,11 +4929,10 @@ impl Controller {
             model_budget,
             Some(&repair_origin),
         );
-        let release = self.resource_governor.release(&lease.resource_lease);
-        let success = match (result, release) {
+        let cleanup = self.unload_model_for_ready_lease(&mut lease, runtime.backend);
+        let success = match (result, cleanup) {
             (Ok(success), Ok(())) => success,
-            (Ok(_), Err(error)) => return Err(ControllerError::Policy(error)),
-            (Err(error), _) => return Err(error),
+            (_, Err(error)) | (Err(error), Ok(())) => return Err(error),
         };
         let active = self.active_ref()?;
         let task = active
@@ -3848,11 +5065,10 @@ impl Controller {
             let attempt_id = self.start_attempt(&lease, runtime.registry)?;
             self.execute_validated_replace(&mut lease, runtime, &attempt_id, &validated)
         })();
-        let release = self.resource_governor.release(&lease.resource_lease);
-        match (result, release) {
+        let cleanup = self.unload_model_for_ready_lease(&mut lease, runtime.backend);
+        match (result, cleanup) {
             (Ok(success), Ok(())) => Ok(success),
-            (Ok(_), Err(error)) => Err(ControllerError::Policy(error)),
-            (Err(error), _) => Err(error),
+            (_, Err(error)) | (Err(error), Ok(())) => Err(error),
         }
     }
 
@@ -3867,6 +5083,12 @@ impl Controller {
     ) -> Result<ExecutionSuccess, ControllerError> {
         self.validate_ready_lease(lease, runtime.registry, runtime.tool_manifest)?;
         let model_deadline_ms = self.task_model_deadline_ms(&lease.task_id)?;
+        self.ensure_model_resident(
+            lease,
+            runtime.backend,
+            context.budget.max_input_tokens,
+            model_deadline_ms,
+        )?;
         match self.consume_task_model_call(&lease.task_id, model_budget, model_deadline_ms) {
             Ok(()) => {}
             Err(ControllerError::Policy(error @ PolicyError::ResourceDenied(_))) => {
@@ -3881,12 +5103,14 @@ impl Controller {
             Err(error) => return Err(error),
         }
         let attempt_id = self.start_attempt_with_origin(lease, runtime.registry, repair_origin)?;
-        let proposal = match Self::request_model_proposal(
+        let proposal_result = Self::request_model_proposal(
             runtime.backend,
             context,
             &lease.task_id,
             model_deadline_ms,
-        ) {
+        );
+        self.unload_model_for_ready_lease(lease, runtime.backend)?;
+        let proposal = match proposal_result {
             Ok(value) => value,
             Err(error) => {
                 let failure = self.build_failure_record(FailureRecordInput {
@@ -4872,11 +6096,21 @@ impl Controller {
             )
         };
         if used >= limit {
-            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
-                format!("task model-call budget exhausted: used={used}, limit={limit}"),
-            )));
+            return Err(ControllerError::Policy(PolicyError::Denied(format!(
+                "task model-call budget exhausted: used={used}, limit={limit}"
+            ))));
         }
-        model_budget.consume_call(requested_deadline_ms)?;
+        model_budget
+            .consume_call(requested_deadline_ms)
+            .map_err(|error| match error {
+                PolicyError::ResourceDenied(message) => {
+                    // Outer model-call/deadline ceilings are immutable execution authority, not
+                    // transient host pressure. They must not enter DeferredResource or consume a
+                    // resource retry.
+                    ControllerError::Policy(PolicyError::Denied(message))
+                }
+                other => ControllerError::Policy(other),
+            })?;
         {
             let active = self.active_mut()?;
             let task = active
@@ -6741,6 +7975,10 @@ impl Controller {
             "controller.change_set",
             "controller.worktree_conflict",
             TASK_CAPABILITY_GRANT_NAMESPACE,
+            RESOURCE_PRESSURE_NAMESPACE,
+            RESOURCE_LEASE_NAMESPACE,
+            RESOURCE_RESIDENCY_NAMESPACE,
+            RESOURCE_GOVERNOR_NAMESPACE,
         ] {
             for record in self.state.state_records(namespace)? {
                 if namespace != "controller.action_intent"
@@ -7332,6 +8570,334 @@ fn task_carry_execution_provenance(
     }))
 }
 
+fn task_resource_budget_from_value(task: &Value) -> Result<TaskResourceBudgetV1, ControllerError> {
+    let max_peak_rss_mib = task
+        .pointer("/resource_budget/max_peak_rss_mb")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "missing integer /resource_budget/max_peak_rss_mb".to_owned(),
+            )
+        })?;
+    let max_subprocesses = required_u32(task, "/resource_budget/max_subprocesses")?;
+    let mut heavy_leases = BTreeSet::new();
+    for value in required_array(task, "/resource_budget/heavy_leases")? {
+        let raw = value.as_str().ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "resource_budget.heavy_leases contains a non-string value".to_owned(),
+            )
+        })?;
+        let class = PlanHeavyLeaseClass::from_plan_ir_str(raw).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!("unknown Plan IR heavy lease class {raw:?}"))
+        })?;
+        heavy_leases.insert(class);
+    }
+    Ok(TaskResourceBudgetV1::new(
+        max_peak_rss_mib,
+        max_subprocesses,
+        heavy_leases,
+    ))
+}
+
+#[allow(clippy::too_many_lines)]
+fn restore_controller_resources(
+    state: &StateStore,
+    active: &ActivePlan,
+) -> Result<ControllerResourceCoordinator, ControllerError> {
+    let governor_key = revision_scoped_key(&active.plan_id, active.revision, RESOURCE_GOVERNOR_KEY);
+    let residency_key = revision_scoped_key(&active.plan_id, active.revision, MODEL_RESIDENCY_KEY);
+    let governor_raw = state.get_state(RESOURCE_GOVERNOR_NAMESPACE, &governor_key)?;
+    let residency_raw = state.get_state(RESOURCE_RESIDENCY_NAMESPACE, &residency_key)?;
+    let current_epoch = state.current_execution_epoch()?;
+    let mut durable_active_leases = BTreeMap::new();
+    for record in state.state_records(RESOURCE_LEASE_NAMESPACE)? {
+        let Some(logical_key) =
+            logical_key_for_revision(&record.key, &active.plan_id, active.revision)
+        else {
+            continue;
+        };
+        let lease: ResourceLeaseV1 = serde_json::from_str(&record.value_json)?;
+        if logical_key != lease.lease_id {
+            return Err(ControllerError::InvalidPlan(
+                "durable resource lease row key does not match lease identity".to_owned(),
+            ));
+        }
+        if lease.owner.plan_id != active.plan_id || lease.owner.plan_revision != active.revision {
+            return Err(ControllerError::InvalidPlan(
+                "durable resource lease owner is scoped to a different active plan revision"
+                    .to_owned(),
+            ));
+        }
+        let task = active.tasks.get(&lease.owner.task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "durable resource lease {} targets missing task {}",
+                lease.lease_id, lease.owner.task_id
+            ))
+        })?;
+        let budget = task_resource_budget_from_value(&task.task)?;
+        if !budget.permits(lease.class) {
+            return Err(ControllerError::InvalidPlan(format!(
+                "durable resource lease {} class {:?} is no longer authorized by task {}",
+                lease.lease_id, lease.class, lease.owner.task_id
+            )));
+        }
+        if lease.task_max_peak_rss_mib != budget.max_peak_rss_mib {
+            return Err(ControllerError::InvalidPlan(format!(
+                "durable resource lease {} max-RSS binding differs from the active task contract",
+                lease.lease_id
+            )));
+        }
+        if matches!(lease.state, LeaseStateV1::Active | LeaseStateV1::Idle) {
+            durable_active_leases.insert(lease.lease_id.clone(), lease);
+        }
+    }
+
+    let Some(governor_raw) = governor_raw else {
+        if residency_raw.is_some() || !durable_active_leases.is_empty() {
+            return Err(ControllerError::InvalidPlan(
+                "durable active resource state exists without a resource-governor snapshot"
+                    .to_owned(),
+            ));
+        }
+        return Ok(ControllerResourceCoordinator::default());
+    };
+    let snapshot: sovereign_policy::M6ResourceGovernorSnapshotV1 =
+        serde_json::from_str(&governor_raw)?;
+    let snapshot_active_leases = snapshot
+        .active_leases
+        .iter()
+        .cloned()
+        .map(|lease| (lease.lease_id.clone(), lease))
+        .collect::<BTreeMap<_, _>>();
+    if snapshot_active_leases != durable_active_leases {
+        return Err(ControllerError::InvalidPlan(
+            "resource-governor active leases do not exactly match durable nonterminal lease rows"
+                .to_owned(),
+        ));
+    }
+    let residency = residency_raw
+        .as_deref()
+        .map(serde_json::from_str::<ResourceResidencyV1>)
+        .transpose()?;
+    if let Some(residency) = residency.as_ref() {
+        if residency.plan_id != active.plan_id || residency.plan_revision != active.revision {
+            return Err(ControllerError::InvalidPlan(
+                "durable MODEL residency is scoped to a different active plan revision".to_owned(),
+            ));
+        }
+        if residency.execution_epoch > current_epoch {
+            return Err(ControllerError::InvalidPlan(format!(
+                "durable MODEL residency epoch {} is ahead of current execution epoch {current_epoch}",
+                residency.execution_epoch
+            )));
+        }
+        let task = active.tasks.get(&residency.task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "durable MODEL residency targets missing task {}",
+                residency.task_id
+            ))
+        })?;
+        if task.task_contract_digest != residency.task_contract_digest {
+            return Err(ControllerError::InvalidPlan(
+                "durable MODEL residency task-contract digest is stale".to_owned(),
+            ));
+        }
+        let budget = task_resource_budget_from_value(&task.task)?;
+        if !budget.permits(HeavyLeaseClass::Model) {
+            return Err(ControllerError::InvalidPlan(
+                "durable MODEL residency is no longer authorized by the active task contract"
+                    .to_owned(),
+            ));
+        }
+        if residency.policy_lease.task_max_peak_rss_mib != budget.max_peak_rss_mib {
+            return Err(ControllerError::InvalidPlan(
+                "durable MODEL residency max-RSS binding differs from the active task contract"
+                    .to_owned(),
+            ));
+        }
+    }
+    ControllerResourceCoordinator::restore(&snapshot, residency).map_err(|error| {
+        ControllerError::InvalidPlan(format!(
+            "durable resource-governor state cannot be restored safely: {error}"
+        ))
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn reconcile_recovered_resources_before_epoch(
+    controller: &mut Controller,
+    recovery_epoch: i64,
+) -> Result<(), ControllerError> {
+    let active_leases = controller.resources.snapshot().active_leases;
+    if active_leases.is_empty() {
+        // A durable Absent marker is historical evidence only; it grants no current physical or
+        // logical authority and need not remain in the in-memory coordinator after restart.
+        if controller
+            .resources
+            .model_residency()
+            .is_some_and(|residency| residency.state == ResourceResidencyStateV1::Absent)
+        {
+            controller.resources.clear_model_residency();
+        }
+        return Ok(());
+    }
+
+    // BUILD_HEAVY is Controller-owned through ProcessRunner. Recovery may retire an old-epoch
+    // logical build lease only after the exact deterministic action's process row proves there is
+    // no surviving owned process group. Active process groups are reaped before this function.
+    // Pending-spawn or otherwise ambiguous rows remain nonterminal and therefore block the epoch.
+    for lease in active_leases
+        .iter()
+        .filter(|lease| lease.class == HeavyLeaseClass::BuildHeavy)
+    {
+        if !recovered_build_heavy_absence_is_proven(&controller.state, lease)? {
+            return Err(ControllerError::NotReady(format!(
+                "recovery cannot prove physical cleanup for stale active BUILD_HEAVY lease {}; execution epoch was not advanced",
+                lease.lease_id
+            )));
+        }
+        let policy_event = controller
+            .resources
+            .release(&lease.lease_id)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "recovered BUILD_HEAVY logical lease disappeared before cleanup".to_owned(),
+                )
+            })?;
+        let mut released = lease.clone();
+        released.state = LeaseStateV1::Released;
+        released.last_used_at_ms = unix_millis()?;
+        controller.persist_resource_lease_transition(
+            &released,
+            &policy_event,
+            "resource_recovery_build_heavy_released",
+            &lease.owner.task_id,
+        )?;
+    }
+
+    let active_leases = controller.resources.snapshot().active_leases;
+    if let Some(lease) = active_leases
+        .iter()
+        .find(|lease| lease.class != HeavyLeaseClass::Model)
+    {
+        return Err(ControllerError::NotReady(format!(
+            "recovery cannot prove physical cleanup for stale active {:?} lease {}; execution epoch was not advanced",
+            lease.class, lease.lease_id
+        )));
+    }
+
+    if active_leases.is_empty() {
+        if controller
+            .resources
+            .model_residency()
+            .is_some_and(|residency| residency.state == ResourceResidencyStateV1::Absent)
+        {
+            controller.resources.clear_model_residency();
+        }
+        return Ok(());
+    }
+
+    let lease = active_leases.first().ok_or_else(|| {
+        ControllerError::InvalidPlan(
+            "active resource lease set disappeared during recovery".to_owned(),
+        )
+    })?;
+    let Some(mut residency) = controller.resources.model_residency().cloned() else {
+        return Err(ControllerError::InvalidPlan(
+            "active recovered MODEL lease has no durable residency record".to_owned(),
+        ));
+    };
+    if residency.policy_lease != *lease {
+        return Err(ControllerError::InvalidPlan(
+            "recovered MODEL residency does not bind the exact active logical lease".to_owned(),
+        ));
+    }
+    if residency.execution_epoch > recovery_epoch {
+        return Err(ControllerError::InvalidPlan(
+            "recovered MODEL residency is from a future execution epoch".to_owned(),
+        ));
+    }
+
+    if residency.state != ResourceResidencyStateV1::Absent {
+        // Reserved is also ambiguous after a crash: the process may have loaded after the last
+        // durable write but before Resident persistence. Fresh-backend Absent and PID-only probes
+        // are intentionally not accepted as proof for a pre-crash process.
+        if residency.state != ResourceResidencyStateV1::Unknown {
+            residency.state = ResourceResidencyStateV1::Unknown;
+            residency.updated_at_ms = unix_millis()?;
+            controller.persist_resource_residency(
+                &residency,
+                "resource_recovery_model_presence_unknown",
+            )?;
+            controller.resources.set_model_residency(residency);
+        }
+        return Err(ControllerError::NotReady(
+            "recovery cannot prove pre-crash MODEL absence; logical MODEL authority remains held and execution epoch was not advanced"
+                .to_owned(),
+        ));
+    }
+
+    // Absent was durably established before the crash, so only the logical release was
+    // interrupted. This is the one old-epoch MODEL state that can be safely completed without a
+    // live backend. Release it before advancing the execution epoch.
+    let policy_event = controller
+        .resources
+        .release(&lease.lease_id)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "recovered absent MODEL logical lease disappeared before cleanup".to_owned(),
+            )
+        })?;
+    let mut released = lease.clone();
+    released.state = LeaseStateV1::Released;
+    released.last_used_at_ms = unix_millis()?;
+    controller.persist_resource_lease_transition(
+        &released,
+        &policy_event,
+        "resource_recovery_absent_model_released",
+        &residency.task_id,
+    )?;
+    controller.resources.clear_model_residency();
+    Ok(())
+}
+
+fn recovered_build_heavy_absence_is_proven(
+    state: &StateStore,
+    lease: &ResourceLeaseV1,
+) -> Result<bool, ControllerError> {
+    if lease.class != HeavyLeaseClass::BuildHeavy {
+        return Err(ControllerError::InvalidPlan(
+            "BUILD_HEAVY recovery proof requested for a different lease class".to_owned(),
+        ));
+    }
+    let action_id = heavy_build_action_id(&lease.lease_id);
+    let Some(raw) = state.get_state("controller.process_lease", &action_id)? else {
+        // ProcessRunner writes pending_spawn before the OS spawn. Therefore no process row means
+        // the exact heavy action never crossed the physical-spawn boundary. A committed action
+        // without the mandatory process row is inconsistent and must fail closed instead.
+        if state
+            .action_record(&action_id)?
+            .is_some_and(|record| record.state == "committed")
+        {
+            return Err(ControllerError::InvalidPlan(
+                "committed BUILD_HEAVY action is missing its durable process-group lease"
+                    .to_owned(),
+            ));
+        }
+        return Ok(true);
+    };
+    let process: RecoveryProcessLease = serde_json::from_str(&raw)?;
+    if process.action_id != action_id
+        || process.task_id != lease.owner.task_id
+        || process.attempt_id != heavy_build_attempt_id(&lease.lease_id)
+    {
+        return Err(ControllerError::InvalidPlan(
+            "BUILD_HEAVY recovery process proof is misbound to the resource lease".to_owned(),
+        ));
+    }
+    Ok(process_lease_is_terminal(&process))
+}
+
 impl RecoveryManager {
     /// Reconstructs the active Controller exclusively from durable SQLite/CAS/Git state.
     /// No chat transcript, model call, or raw `PlanIr` activation surface participates.
@@ -7378,9 +8944,15 @@ impl RecoveryManager {
             trusted_checkpoint.action_sequence,
         )?;
         let replayed_events = if supersession.is_some() {
-            state
+            let replayed = state
                 .journal_after(trusted_checkpoint.action_sequence)?
-                .len()
+                .len();
+            validate_post_checkpoint_resource_correlation(
+                &state,
+                &manifest,
+                trusted_checkpoint.action_sequence,
+            )?;
+            replayed
         } else {
             let replayed = validate_post_checkpoint_runtime_correlation(
                 &state,
@@ -7388,6 +8960,11 @@ impl RecoveryManager {
                 trusted_checkpoint.action_sequence,
             )?;
             validate_post_checkpoint_task_grant_correlation(
+                &state,
+                &manifest,
+                trusted_checkpoint.action_sequence,
+            )?;
+            validate_post_checkpoint_resource_correlation(
                 &state,
                 &manifest,
                 trusted_checkpoint.action_sequence,
@@ -7416,17 +8993,21 @@ impl RecoveryManager {
                     .map(|action_id| (action_id.to_owned(), digest.clone()))
             })
             .collect();
+        let resources = restore_controller_resources(&state, &active)?;
         let mut controller = Controller {
             state,
             active: Some(active),
-            resource_governor: M1ResourceGovernor::default(),
+            resources,
+            resource_probe: Box::<MacOsResourceProbe>::default(),
             permission_context,
             trusted_recovery_intent_digests,
         };
 
-        let recovery_worktrees = reconcile_recovered_worktrees(&mut controller, registry)?;
         let (unresolved_process_lease_ids, unresolved_process_actions) =
             reap_recovery_process_leases(&mut controller.state)?;
+        reconcile_recovered_resources_before_epoch(&mut controller, execution_epoch_before)?;
+
+        let recovery_worktrees = reconcile_recovered_worktrees(&mut controller, registry)?;
         let mut unknown_action_ids = reconcile_recovery_actions(
             &mut controller.state,
             registry,
@@ -8015,6 +9596,106 @@ fn validate_post_checkpoint_task_grant_correlation(
     if replayed != current {
         return Err(ControllerError::InvalidPlan(
             "current task capability grants do not equal checkpoint plus journal replay".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_post_checkpoint_resource_correlation(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+) -> Result<(), ControllerError> {
+    let namespaces = [
+        RESOURCE_PRESSURE_NAMESPACE,
+        RESOURCE_LEASE_NAMESPACE,
+        RESOURCE_RESIDENCY_NAMESPACE,
+        RESOURCE_GOVERNOR_NAMESPACE,
+    ];
+    let mut replayed = BTreeMap::new();
+    for (binding_key, digest) in &manifest.evidence_binding_digests {
+        for namespace in namespaces {
+            let prefix = format!("{namespace}:");
+            let Some(key) = binding_key.strip_prefix(&prefix) else {
+                continue;
+            };
+            if key_belongs_to_revision(key, &manifest.plan_id, manifest.plan_revision) {
+                replayed.insert(binding_key.clone(), digest.clone());
+            }
+        }
+    }
+
+    for event in state.journal_after(checkpoint_sequence)? {
+        if event.entity_type != "controller" || !event.event_kind.starts_with("resource_") {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        if required_str(&payload, "/plan_id")? != manifest.plan_id
+            || required_u32(&payload, "/plan_revision")? != manifest.plan_revision
+        {
+            return Err(ControllerError::InvalidPlan(
+                "post-checkpoint resource event targets a different plan revision".to_owned(),
+            ));
+        }
+        let post_images = payload
+            .get("post_image_digests")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "post-checkpoint resource event is missing exact post-image digests".to_owned(),
+                )
+            })?;
+        if post_images.is_empty() {
+            return Err(ControllerError::InvalidPlan(
+                "post-checkpoint resource event has an empty post-image digest map".to_owned(),
+            ));
+        }
+        for (binding_key, digest_value) in post_images {
+            let mut matched_namespace = false;
+            for namespace in namespaces {
+                let prefix = format!("{namespace}:");
+                let Some(key) = binding_key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                matched_namespace = true;
+                if !key_belongs_to_revision(key, &manifest.plan_id, manifest.plan_revision) {
+                    return Err(ControllerError::InvalidPlan(
+                        "post-checkpoint resource event contains a stale resource-row binding"
+                            .to_owned(),
+                    ));
+                }
+            }
+            if !matched_namespace {
+                return Err(ControllerError::InvalidPlan(
+                    "post-checkpoint resource event contains a non-resource post-image binding"
+                        .to_owned(),
+                ));
+            }
+            let digest = digest_value.as_str().ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "post-checkpoint resource post-image digest is not a string".to_owned(),
+                )
+            })?;
+            replayed.insert(binding_key.clone(), digest.to_owned());
+        }
+    }
+
+    let mut current = BTreeMap::new();
+    for namespace in namespaces {
+        for record in state.state_records(namespace)? {
+            if !key_belongs_to_revision(&record.key, &manifest.plan_id, manifest.plan_revision) {
+                continue;
+            }
+            current.insert(
+                format!("{namespace}:{}", record.key),
+                sha256_prefixed(record.value_json.as_bytes()),
+            );
+        }
+    }
+    if replayed != current {
+        return Err(ControllerError::InvalidPlan(
+            "current resource state does not equal checkpoint plus ordered resource-journal replay"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -11047,6 +12728,111 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+fn heavy_build_action_id(resource_lease_id: &str) -> String {
+    let digest = sha256_prefixed(format!("build-heavy-action\0{resource_lease_id}").as_bytes());
+    format!("resource-build-action.{}", &digest[7..31])
+}
+
+fn heavy_build_attempt_id(resource_lease_id: &str) -> String {
+    let digest = sha256_prefixed(format!("build-heavy-attempt\0{resource_lease_id}").as_bytes());
+    format!("resource-build-attempt.{}", &digest[7..31])
+}
+
+fn inject_build_parallel_job_cap(
+    command: &mut CommandSpec,
+    pinned_executable_path: &Path,
+    parallel_job_cap: Option<u32>,
+) -> Result<(), ControllerError> {
+    let Some(cap) = parallel_job_cap else {
+        return Ok(());
+    };
+    if cap == 0 {
+        return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+            "BUILD_HEAVY governor returned a zero parallel-job cap".to_owned(),
+        )));
+    }
+    let executable = pinned_executable_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            ControllerError::Policy(PolicyError::Denied(
+                "BUILD_HEAVY executable has no stable UTF-8 basename for job-cap injection"
+                    .to_owned(),
+            ))
+        })?;
+    let has_job_flag = command.args.iter().any(|arg| {
+        arg == "-j"
+            || arg.starts_with("-j")
+            || arg == "--jobs"
+            || arg.starts_with("--jobs=")
+            || arg == "--parallel"
+            || arg.starts_with("--parallel=")
+            || arg == "--max-workers"
+            || arg.starts_with("--max-workers=")
+            || arg == "-T"
+            || arg.starts_with("-T")
+            || arg == "-jobs"
+    });
+    if has_job_flag {
+        return Err(ControllerError::Policy(PolicyError::Denied(
+            "BUILD_HEAVY caller may not supply its own build parallelism flag".to_owned(),
+        )));
+    }
+
+    match executable {
+        "make" | "gmake" => command.args.insert(0, format!("-j{cap}")),
+        "ninja" => {
+            command.args.insert(0, cap.to_string());
+            command.args.insert(0, "-j".to_owned());
+        }
+        "cargo" => {
+            let Some(subcommand_index) = command.args.iter().position(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "build" | "check" | "test" | "bench" | "doc" | "clippy" | "run"
+                )
+            }) else {
+                return Err(ControllerError::Policy(PolicyError::Denied(
+                    "BUILD_HEAVY cargo command requires a supported build/test subcommand for deterministic job-cap injection"
+                        .to_owned(),
+                )));
+            };
+            command
+                .args
+                .insert(subcommand_index + 1, "--jobs".to_owned());
+            command.args.insert(subcommand_index + 2, cap.to_string());
+        }
+        "cmake" => {
+            if !command.args.iter().any(|arg| arg == "--build") {
+                return Err(ControllerError::Policy(PolicyError::Denied(
+                    "BUILD_HEAVY cmake command requires --build for deterministic job-cap injection"
+                        .to_owned(),
+                )));
+            }
+            command.args.push("--parallel".to_owned());
+            command.args.push(cap.to_string());
+        }
+        "gradle" | "gradlew" => {
+            command.args.push("--max-workers".to_owned());
+            command.args.push(cap.to_string());
+        }
+        "mvn" | "mvnw" => {
+            command.args.push("-T".to_owned());
+            command.args.push(cap.to_string());
+        }
+        "xcodebuild" => {
+            command.args.push("-jobs".to_owned());
+            command.args.push(cap.to_string());
+        }
+        _ => {
+            return Err(ControllerError::Policy(PolicyError::Denied(format!(
+                "BUILD_HEAVY executable {executable:?} has no deterministic parallel-job cap adapter"
+            ))));
+        }
+    }
+    Ok(())
+}
+
 fn required_str<'a>(value: &'a Value, pointer: &str) -> Result<&'a str, ControllerError> {
     value
         .pointer(pointer)
@@ -11088,26 +12874,37 @@ mod tests {
     use super::{
         ACTION_INTENT_SCHEMA_VERSION, ActivePlan, Controller, ExactRequirementProbe,
         FailureClassification, FailureClassificationKind, LEGACY_ACTION_INTENT_SCHEMA_VERSION,
-        PlanValidity, RecoveryProcessLease, TaskCarryExecutionProvenanceV1, TaskCarryFingerprintV1,
-        TaskRuntime, TaskState, VerificationResultV1, VerifiedOutputBindingV1, WorktreeLifecycle,
+        PlanValidity, ReadyLease, RecoveryProcessLease, ResourceResidencyStateV1,
+        ResourceResidencyV1, TaskCarryExecutionProvenanceV1, TaskCarryFingerprintV1, TaskRuntime,
+        TaskState, VerificationResultV1, VerifiedOutputBindingV1, WorktreeLifecycle,
         acceptance_permits_cross_revision_carry, build_superseding_runtime,
         compilation_inputs_are_fresh_for_carry, compiled_acceptance_contract,
         dependency_bindings_permit_cross_revision_carry, digest_json, exact_requirement_probe,
         explicit_replace_relation, fresh_task_runtime, has_unresolved_process_lease,
-        lineage_records_for_supersession, normalize_persisted_action_intent,
-        normalized_failure_signature, output_binding_key, plan_instruction_fingerprint_digest,
-        process_lease_is_terminal, repair_allowed, revision_record_key, revision_scoped_key,
-        scope_lineage_id,
+        inject_build_parallel_job_cap, lineage_records_for_supersession,
+        normalize_persisted_action_intent, normalized_failure_signature, output_binding_key,
+        plan_instruction_fingerprint_digest, process_lease_is_terminal, ready_lease_digest,
+        repair_allowed, revision_record_key, revision_scoped_key, scope_lineage_id,
     };
     use serde_json::{Value, json};
     use sovereign_evidence::ArtifactStore;
+    use sovereign_model::{
+        DeterministicFakeBackend, MODEL_SCHEMA_VERSION, ModelBackend, ModelCapabilities,
+        ModelResidencyProof,
+    };
     use sovereign_plan::{PlanRevisionDiff, ReplanScope};
+    use sovereign_policy::{
+        AdmissionStatus, CapabilityLayers, CapabilitySet, CommandMode, CommandRisk, CommandSpec,
+        ConditionalLeaseContextV1, HeavyLeaseClass, OsMemoryPressure, PermissionDecision,
+        PlanHeavyLeaseClass, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ResourceLeaseOwnerV1,
+        ResourceLeaseRequestV1, ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
+    };
     use sovereign_repo::{
         ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot, WorktreeLease,
     };
     use sovereign_state::StateStore;
     use std::collections::BTreeMap;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11416,6 +13213,307 @@ mod tests {
         let state = StateStore::open(base.join("state.sqlite3"))
             .unwrap_or_else(|error| panic!("state: {error}"));
         (base, state)
+    }
+
+    #[test]
+    fn build_heavy_parallel_job_cap_is_injected_independently_of_subprocess_cap() {
+        let mut command = CommandSpec {
+            executable: PathBuf::from("/usr/bin/make"),
+            args: vec!["all".to_owned()],
+            working_directory: PathBuf::from("/tmp"),
+            environment: BTreeMap::new(),
+            mode: CommandMode::Direct,
+            declared_risk: CommandRisk::ReadOnly,
+            timeout_ms: 1_000,
+            output_limit_bytes: 1_024,
+            disk_write_limit_bytes: 1_024,
+            subprocess_limit: 7,
+        };
+        inject_build_parallel_job_cap(&mut command, Path::new("/usr/bin/make"), Some(2))
+            .unwrap_or_else(|error| panic!("inject make job cap: {error}"));
+        assert_eq!(command.args, vec!["-j2", "all"]);
+        assert_eq!(command.subprocess_limit, 7);
+
+        let mut caller_widened = command.clone();
+        caller_widened.args = vec!["-j8".to_owned(), "all".to_owned()];
+        let Err(error) =
+            inject_build_parallel_job_cap(&mut caller_widened, Path::new("/usr/bin/make"), Some(2))
+        else {
+            panic!("caller-owned build parallelism must be rejected");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("may not supply its own build parallelism")
+        );
+
+        let mut unsupported = command;
+        unsupported.executable = PathBuf::from("/usr/bin/true");
+        unsupported.args.clear();
+        let Err(error) =
+            inject_build_parallel_job_cap(&mut unsupported, Path::new("/usr/bin/true"), Some(2))
+        else {
+            panic!("unsupported BUILD_HEAVY executable must fail closed");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("no deterministic parallel-job cap adapter")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn physically_resident_model_is_proven_absent_before_build_heavy_admission() {
+        let (base, state) = temp_state("resident-model-build-heavy-handoff");
+        let plan_digest = format!("sha256:{}", "a".repeat(64));
+        let task = json!({
+            "task_id": "task.A",
+            "resource_budget": {
+                "max_peak_rss_mb": 4096,
+                "max_subprocesses": 2,
+                "heavy_leases": ["MODEL", "BUILD_HEAVY"]
+            }
+        });
+        let runtime =
+            fresh_task_runtime(&task).unwrap_or_else(|error| panic!("fresh task runtime: {error}"));
+        let task_contract_digest = runtime.task_contract_digest.clone();
+        let mut active = active_fixture(&base, 1, &plan_digest);
+        active.tasks.insert("task.A".to_owned(), runtime);
+
+        let mut controller = Controller::new(state);
+        controller.active = Some(active);
+        let epoch = controller
+            .state
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("execution epoch: {error}"));
+        let budget = TaskResourceBudgetV1::new(
+            4_096,
+            2,
+            [PlanHeavyLeaseClass::Model, PlanHeavyLeaseClass::BuildHeavy],
+        );
+        let pressure = controller
+            .resources
+            .observe_pressure(ResourcePressureSnapshotV1 {
+                schema_version: RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
+                observed_at_ms: 1_000,
+                controlled_working_set_mib: 512,
+                host_headroom_mib: 6_144,
+                swap_used_mib: Some(4_096),
+                swap_out_growth_mib_per_min: 0,
+                compressor_growth_mib_per_min: 0,
+                os_memory_pressure: OsMemoryPressure::Normal,
+                recent_pressure_event: false,
+                thermal_pressure: ThermalPressure::Normal,
+                allocation_failure: false,
+                repeated_resource_kill: false,
+                uncontrolled_child_growth: false,
+                host_free_disk_mib: Some(32_768),
+            });
+        let model_request = ResourceLeaseRequestV1 {
+            lease_id: "ready:plan.fixture:r1:task.A:1".to_owned(),
+            owner: ResourceLeaseOwnerV1 {
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 1,
+                task_id: "task.A".to_owned(),
+            },
+            class: HeavyLeaseClass::Model,
+            calibrated: false,
+            calibrated_p95_rss_mib: 4_096,
+            evictable_idle_rss_mib: 0,
+            task_budget: budget.clone(),
+            conditional: ConditionalLeaseContextV1::default(),
+            automatic_reload: false,
+            disk_expanding: false,
+        };
+        let model_admission = controller.resources.admit(&model_request, &pressure);
+        assert_eq!(model_admission.status, AdmissionStatus::Admitted);
+        let model_resource_lease = model_admission
+            .lease
+            .clone()
+            .unwrap_or_else(|| panic!("MODEL admission must return a lease"));
+        let residency = ResourceResidencyV1 {
+            schema_version: super::resources::RESOURCE_RESIDENCY_SCHEMA_VERSION,
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            task_id: "task.A".to_owned(),
+            task_contract_digest: task_contract_digest.clone(),
+            execution_epoch: epoch,
+            policy_lease: model_resource_lease.clone(),
+            model_lease: None,
+            state: ResourceResidencyStateV1::Reserved,
+            updated_at_ms: 1_000,
+        };
+        controller
+            .persist_resource_policy_decision(
+                &pressure,
+                &model_admission.event,
+                Some(&model_resource_lease),
+                Some(&residency),
+            )
+            .unwrap_or_else(|error| panic!("persist MODEL admission: {error}"));
+        controller.resources.set_model_residency(residency);
+        controller
+            .checkpoint_now()
+            .unwrap_or_else(|error| panic!("checkpoint MODEL reservation: {error}"));
+        let (checkpoint_generation, checkpoint_action_sequence, checkpoint_hash) = controller
+            .current_checkpoint_binding()
+            .unwrap_or_else(|error| panic!("current checkpoint binding: {error}"));
+        let layers = CapabilityLayers {
+            global: CapabilitySet::all(),
+            project: CapabilitySet::all(),
+            task: CapabilitySet::all(),
+            role: CapabilitySet::all(),
+            tool: CapabilitySet::all(),
+            user: CapabilitySet::all(),
+        };
+        let permission_decision = PermissionDecision::new(
+            "plan.fixture",
+            1,
+            "task.A",
+            task_contract_digest.clone(),
+            format!("sha256:{}", "f".repeat(64)),
+            "tool.fixture",
+            "1",
+            format!("sha256:{}", "b".repeat(64)),
+            layers,
+        )
+        .unwrap_or_else(|error| panic!("permission decision: {error}"));
+        let mut ready = ReadyLease {
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            plan_digest: plan_digest.clone(),
+            task_id: "task.A".to_owned(),
+            task_contract_digest,
+            baseline_digest: "fixture-baseline".to_owned(),
+            evidence_binding_digest: "fixture-evidence".to_owned(),
+            checkpoint_generation,
+            checkpoint_action_sequence,
+            checkpoint_hash,
+            permission_decision,
+            resource_digest: "fixture-resource".to_owned(),
+            execution_epoch: epoch,
+            resource_lease: model_resource_lease,
+            release_resource_on_finish: true,
+            lease_digest: String::new(),
+        };
+        ready.lease_digest = ready_lease_digest(&ready);
+
+        let backend = DeterministicFakeBackend::new(
+            ModelCapabilities {
+                schema_version: MODEL_SCHEMA_VERSION,
+                model_id: "fake-resource-handoff".to_owned(),
+                parameter_class: "fixture".to_owned(),
+                quantization: "fixture".to_owned(),
+                max_context_tokens: 16_384,
+                supports_tools: false,
+                supports_json_schema: true,
+                local: true,
+            },
+            Vec::new(),
+        )
+        .unwrap_or_else(|error| panic!("fake backend: {error}"));
+        controller
+            .ensure_model_resident(&mut ready, &backend, 1_024, 1_000)
+            .unwrap_or_else(|error| panic!("load resident MODEL: {error}"));
+        assert!(matches!(
+            backend
+                .residency_proof()
+                .unwrap_or_else(|error| panic!("resident proof: {error}")),
+            ModelResidencyProof::Resident { .. }
+        ));
+        assert_eq!(
+            controller
+                .resources
+                .model_residency()
+                .map(|value| value.state),
+            Some(ResourceResidencyStateV1::Resident)
+        );
+
+        let eviction = controller
+            .evict_model_for_heavy_phase(&mut ready, &backend)
+            .unwrap_or_else(|error| panic!("evict resident MODEL: {error}"));
+        assert!(
+            !matches!(
+                eviction,
+                sovereign_policy::ResourcePolicyEventV1::Defer { .. }
+            ),
+            "first resident MODEL eviction must not hit anti-oscillation defer"
+        );
+        assert_eq!(
+            backend
+                .residency_proof()
+                .unwrap_or_else(|error| panic!("absence proof after eviction: {error}")),
+            ModelResidencyProof::Absent
+        );
+        assert!(controller.resources.model_residency().is_none());
+        assert!(
+            controller
+                .resources
+                .snapshot()
+                .active_leases
+                .iter()
+                .all(|lease| lease.class != HeavyLeaseClass::Model),
+            "logical MODEL authority must be gone only after physical absence proof"
+        );
+
+        let post_eviction_pressure =
+            controller
+                .resources
+                .observe_pressure(ResourcePressureSnapshotV1 {
+                    schema_version: RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
+                    observed_at_ms: 2_000,
+                    controlled_working_set_mib: 256,
+                    host_headroom_mib: 6_144,
+                    swap_used_mib: Some(4_096),
+                    swap_out_growth_mib_per_min: 0,
+                    compressor_growth_mib_per_min: 0,
+                    os_memory_pressure: OsMemoryPressure::Normal,
+                    recent_pressure_event: false,
+                    thermal_pressure: ThermalPressure::Normal,
+                    allocation_failure: false,
+                    repeated_resource_kill: false,
+                    uncontrolled_child_growth: false,
+                    host_free_disk_mib: Some(32_768),
+                });
+        let build_request = ResourceLeaseRequestV1 {
+            lease_id: "build:plan.fixture:r1:task.A:1".to_owned(),
+            owner: ResourceLeaseOwnerV1 {
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 1,
+                task_id: "task.A".to_owned(),
+            },
+            class: HeavyLeaseClass::BuildHeavy,
+            calibrated: false,
+            calibrated_p95_rss_mib: controller.resources.profile().unknown_heavy_admission_mib,
+            evictable_idle_rss_mib: 0,
+            task_budget: budget,
+            conditional: ConditionalLeaseContextV1::default(),
+            automatic_reload: false,
+            disk_expanding: false,
+        };
+        let build_admission = controller
+            .resources
+            .admit(&build_request, &post_eviction_pressure);
+        assert_eq!(build_admission.status, AdmissionStatus::Admitted);
+        let build_lease = build_admission
+            .lease
+            .unwrap_or_else(|| panic!("BUILD_HEAVY admission must return a lease"));
+        assert_eq!(build_lease.class, HeavyLeaseClass::BuildHeavy);
+        assert!(build_admission.parallel_job_cap.unwrap_or(2) <= 2);
+        assert!(build_admission.subprocess_cap <= 2);
+        let active_classes = controller
+            .resources
+            .snapshot()
+            .active_leases
+            .into_iter()
+            .map(|lease| lease.class)
+            .collect::<Vec<_>>();
+        assert!(active_classes.contains(&HeavyLeaseClass::BuildHeavy));
+        assert!(!active_classes.contains(&HeavyLeaseClass::Model));
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     fn empty_snapshot(root: &std::path::Path) -> RepositorySnapshot {

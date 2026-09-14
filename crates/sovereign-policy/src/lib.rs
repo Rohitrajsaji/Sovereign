@@ -3,6 +3,19 @@
 //! This crate owns admission policy only. It does not execute tools and it does
 //! not grant itself authority from repository/model/tool text.
 
+mod resources;
+
+pub use resources::{
+    AdmissionStatus, ConditionalLeaseContextV1, HARDWARE_PROFILE_SCHEMA_VERSION, HardwareProfileV1,
+    HeavyLeaseClass, HeavyLeasePairPolicyV1, LeasePairRule, LeaseStateV1,
+    M6_RESOURCE_GOVERNOR_SNAPSHOT_SCHEMA_VERSION, M6ResourceGovernor, M6ResourceGovernorSnapshotV1,
+    OsMemoryPressure, PlanHeavyLeaseClass, PressureBand, RESOURCE_LEASE_SCHEMA_VERSION,
+    RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ResourceAdmissionDecisionV1,
+    ResourceCapabilityCycleSnapshotV1, ResourceGovernorRestoreError, ResourceLeaseOwnerV1,
+    ResourceLeaseRequestV1, ResourceLeaseV1, ResourcePolicyEventV1, ResourcePressureEventV1,
+    ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
+};
+
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -1156,19 +1169,6 @@ fn seatbelt_string(path: &Path) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
     format!("\"{value}\"")
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum HeavyLeaseClass {
-    Model,
-    BuildHeavy,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PressureBand {
-    Green,
-    Guarded,
-    Constrained,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

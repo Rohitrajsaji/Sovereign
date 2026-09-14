@@ -7,7 +7,8 @@ use sovereign_context::{
     ContextBudget, ContextMode, ContextPacket, ContextPacketInput, ContextPlanner, EvidenceItem,
 };
 use sovereign_controller::{
-    Controller, ExecutionRuntime, ReadinessInputs, RecoveryManager, RoleId, RoleRegistry, TaskState,
+    Controller, ExecutionRuntime, ReadinessInputs, RecoveryManager, ResourcePressureProbe, RoleId,
+    RoleRegistry, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_model::{
@@ -19,9 +20,10 @@ use sovereign_plan::{
     PlanIr, PlanRevisionDiff, PlanValidator, ReplanScope, ValidationEnvironment,
 };
 use sovereign_policy::{
-    CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, IsolatedCommand,
-    IsolationCapabilities, IsolationRequest, MacSandboxExecBackend, ModelCallBudget,
-    PinnedExecutable, PolicyError,
+    CommandMode, CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend,
+    IsolatedCommand, IsolationCapabilities, IsolationRequest, M6ResourceGovernor,
+    MacSandboxExecBackend, ModelCallBudget, OsMemoryPressure, PinnedExecutable, PolicyError,
+    RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ResourcePressureSnapshotV1, ThermalPressure,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot};
 use sovereign_state::{
@@ -30,6 +32,7 @@ use sovereign_state::{
 use sovereign_tools::{PermissionClass, ToolManifest, process_group_leader_identity};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,6 +49,34 @@ const CHILD_BASE: &str = "SOVEREIGN_CRASH_CHILD_BASE";
 const CHILD_ROOT: &str = "SOVEREIGN_CRASH_CHILD_ROOT";
 const CHILD_MARKER: &str = "SOVEREIGN_CRASH_CHILD_MARKER";
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct FixedResourcePressureProbe(ResourcePressureSnapshotV1);
+
+impl ResourcePressureProbe for FixedResourcePressureProbe {
+    fn sample(&mut self) -> io::Result<ResourcePressureSnapshotV1> {
+        Ok(self.0)
+    }
+}
+
+fn green_pressure_snapshot(observed_at_ms: i64) -> ResourcePressureSnapshotV1 {
+    ResourcePressureSnapshotV1 {
+        schema_version: RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
+        observed_at_ms,
+        controlled_working_set_mib: 512,
+        host_headroom_mib: 6_144,
+        swap_used_mib: Some(4_096),
+        swap_out_growth_mib_per_min: 0,
+        compressor_growth_mib_per_min: 0,
+        os_memory_pressure: OsMemoryPressure::Normal,
+        recent_pressure_event: false,
+        thermal_pressure: ThermalPressure::Normal,
+        allocation_failure: false,
+        repeated_resource_kill: false,
+        uncontrolled_child_growth: false,
+        host_free_disk_mib: Some(8_192),
+    }
+}
 
 fn write_tool_manifest() -> ToolManifest {
     ToolManifest {
@@ -280,6 +311,15 @@ fn compile_and_activate(
     prepared: &Prepared,
     backend: &DeterministicFakeBackend,
 ) -> (Controller, String) {
+    compile_and_activate_with_policy(base, prepared, backend, global_policy())
+}
+
+fn compile_and_activate_with_policy(
+    base: &Path,
+    prepared: &Prepared,
+    backend: &DeterministicFakeBackend,
+    policy: Value,
+) -> (Controller, String) {
     let input = PlanCompilationInput {
         schema_version: PLAN_COMPILATION_SCHEMA_VERSION,
         compilation_id: "compile.t08.crash".to_owned(),
@@ -300,7 +340,7 @@ fn compile_and_activate(
             protected_changes_present: prepared.snapshot.protected_changes_present,
             languages: vec!["typescript".to_owned()],
         },
-        policy: global_policy(),
+        policy,
         role: canonical_implementer_role(),
         skills: vec![capability(
             "skill.focused-edit",
@@ -335,6 +375,9 @@ fn compile_and_activate(
     let state = StateStore::open(base.join("state.sqlite3"))
         .unwrap_or_else(|error| panic!("state: {error}"));
     let mut controller = Controller::new(state);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
     let activation = controller
         .activate(compilation, &prepared.registry)
         .unwrap_or_else(|error| panic!("activate: {error}"));
@@ -351,6 +394,134 @@ fn raw_sha256(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn active_plan_scope(state: &StateStore) -> (String, u32) {
+    let raw = state
+        .get_state("controller.plan", "active")
+        .unwrap_or_else(|error| panic!("read active plan scope: {error}"))
+        .unwrap_or_else(|| panic!("active plan scope missing"));
+    let value: Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|error| panic!("active plan scope json: {error}"));
+    let plan_id = value["plan_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("active plan id missing"))
+        .to_owned();
+    let revision = value["revision"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_else(|| panic!("active plan revision missing"));
+    (plan_id, revision)
+}
+
+fn resource_binding_key(namespace: &str, key: &str) -> String {
+    format!("{namespace}:{key}")
+}
+
+fn scoped_resource_key(plan_id: &str, revision: u32, logical_key: &str) -> String {
+    if revision == 1 {
+        logical_key.to_owned()
+    } else {
+        format!("{plan_id}@r{revision}:{logical_key}")
+    }
+}
+
+fn publish_resource_row_with_event(
+    state: &mut StateStore,
+    namespace: &str,
+    key: &str,
+    value_json: &str,
+    event_kind: &str,
+    entity_id: &str,
+    payload: &Value,
+) {
+    let payload_json = payload.to_string();
+    let sequence = state
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("resource event sequence: {error}"));
+    let event_id = format!(
+        "fixture.resource.{}",
+        &raw_sha256(format!("{event_kind}\0{entity_id}\0{sequence}\0{payload_json}").as_bytes())
+            [7..27]
+    );
+    state
+        .put_state_records_with_events(
+            &[StateRecordUpdate {
+                namespace,
+                key,
+                value_json,
+            }],
+            &[NewJournalEvent {
+                event_id: &event_id,
+                entity_type: "controller",
+                entity_id,
+                event_kind,
+                payload_json: &payload_json,
+            }],
+        )
+        .unwrap_or_else(|error| panic!("publish resource row/event: {error}"));
+}
+
+fn exact_resource_event_payload(
+    plan_id: &str,
+    revision: u32,
+    binding_key: &str,
+    value_json: &str,
+) -> Value {
+    json!({
+        "plan_id": plan_id,
+        "plan_revision": revision,
+        "post_image_digests": BTreeMap::from([(
+            binding_key.to_owned(),
+            raw_sha256(value_json.as_bytes()),
+        )]),
+    })
+}
+
+fn reserved_model_fixture(label: &str) -> (Fixture, String, i64) {
+    let fixture = Fixture::create(label);
+    let prepared = prepare(&fixture.root);
+    let backend = fake_backend(&prepared, false);
+    let (mut controller, task_id) = compile_and_activate(&fixture.base, &prepared, &backend);
+    let _lease = controller
+        .derive_ready_lease(
+            &prepared.registry,
+            &task_id,
+            ReadinessInputs::permissive_m1("sha256:t08-resource-recovery"),
+            &write_tool_manifest(),
+        )
+        .unwrap_or_else(|error| panic!("derive resource recovery lease: {error}"));
+    let epoch = controller
+        .resource_snapshot()
+        .unwrap_or_else(|error| panic!("resource recovery snapshot: {error}"))
+        .execution_epoch;
+    drop(controller);
+    (fixture, task_id, epoch)
+}
+
+fn sole_resource_record(state: &StateStore, namespace: &str) -> (String, String) {
+    let records = state
+        .state_records(namespace)
+        .unwrap_or_else(|error| panic!("read resource records {namespace}: {error}"));
+    assert_eq!(records.len(), 1, "expected one resource row in {namespace}");
+    let record = records
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("resource row disappeared from {namespace}"));
+    (record.key, record.value_json)
+}
+
+fn build_heavy_resource_record(state: &StateStore) -> (String, Value) {
+    state
+        .state_records("controller.resource_lease")
+        .unwrap_or_else(|error| panic!("read BUILD_HEAVY resource leases: {error}"))
+        .into_iter()
+        .find_map(|record| {
+            let value: Value = serde_json::from_str(&record.value_json)
+                .unwrap_or_else(|error| panic!("BUILD_HEAVY resource lease json: {error}"));
+            (value["class"] == "BUILD_HEAVY").then_some((record.key, value))
+        })
+        .unwrap_or_else(|| panic!("BUILD_HEAVY resource lease row missing"))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -620,6 +791,8 @@ struct RuntimeParts {
 fn runtime_parts(base: &Path, root: &Path) -> RuntimeParts {
     let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python")
         .unwrap_or_else(|error| panic!("pin python: {error}"));
+    let make = PinnedExecutable::from_path("/usr/bin/make", "macos-system-make")
+        .unwrap_or_else(|error| panic!("pin make: {error}"));
     let toolchain = python
         .path
         .parent()
@@ -627,7 +800,7 @@ fn runtime_parts(base: &Path, root: &Path) -> RuntimeParts {
         .to_path_buf();
     let home = std::env::var_os("HOME").map_or_else(|| panic!("HOME missing"), PathBuf::from);
     RuntimeParts {
-        command_policy: CommandPolicy::new([python], [toolchain])
+        command_policy: CommandPolicy::new([python, make], [toolchain])
             .unwrap_or_else(|error| panic!("command policy: {error}")),
         isolation_request: IsolationRequest {
             repository_root: root.to_path_buf(),
@@ -705,6 +878,10 @@ impl ExecutionIsolationBackend for CrashIsolation {
 
 fn run_child(case: &str, base: &Path, root: &Path, marker: &Path) {
     let prepared = prepare(root);
+    if matches!(case, "build_pending_spawn" | "build_orphan_sleep") {
+        run_build_heavy_child(case, base, root, &prepared);
+        return;
+    }
     let backend = fake_backend(&prepared, true);
     let (mut controller, task_id) = compile_and_activate(base, &prepared, &backend);
     let ready = controller
@@ -740,6 +917,62 @@ fn run_child(case: &str, base: &Path, root: &Path, marker: &Path) {
     };
     let mut budget = ModelCallBudget::new(4, 30_000);
     let _ = controller.execute_replace(ready, &runtime, &prepared.packet, &mut budget);
+}
+
+fn run_build_heavy_child(case: &str, base: &Path, root: &Path, prepared: &Prepared) {
+    let backend = fake_backend(prepared, false);
+    let mut policy = global_policy();
+    policy["resources"]["heavy_leases"] = json!(["MODEL", "BUILD_HEAVY"]);
+    let (mut controller, task_id) =
+        compile_and_activate_with_policy(base, prepared, &backend, policy);
+    let model_lease = controller
+        .derive_ready_lease(
+            &prepared.registry,
+            &task_id,
+            ReadinessInputs::permissive_m1("sha256:t08-build-heavy-child"),
+            &write_tool_manifest(),
+        )
+        .unwrap_or_else(|error| panic!("derive child MODEL lease: {error}"));
+    let mut build_lease = controller
+        .acquire_build_heavy(
+            model_lease,
+            &prepared.registry,
+            &write_tool_manifest(),
+            &backend,
+        )
+        .unwrap_or_else(|error| panic!("acquire child BUILD_HEAVY lease: {error}"));
+    let parts = runtime_parts(base, root);
+    let detected =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("detect Seatbelt: {error}"));
+    let isolation = match case {
+        "build_pending_spawn" => CrashIsolation::PendingSpawn(detected),
+        "build_orphan_sleep" => CrashIsolation::Orphan(detected),
+        _ => panic!("unsupported BUILD_HEAVY crash child case {case}"),
+    };
+    let command = CommandSpec {
+        // BUILD_HEAVY commands must have a deterministic parallel-job adapter. CrashIsolation
+        // replaces this command before spawn for the two crash windows below, but Controller
+        // authorization still correctly binds/injects the make job cap before dispatch.
+        executable: PathBuf::from("/usr/bin/make"),
+        args: Vec::new(),
+        working_directory: root.to_path_buf(),
+        environment: BTreeMap::default(),
+        mode: CommandMode::Direct,
+        declared_risk: CommandRisk::RepositoryMutation,
+        timeout_ms: 60_000,
+        output_limit_bytes: 16 * 1_024,
+        disk_write_limit_bytes: 16 * 1_024,
+        subprocess_limit: build_lease.subprocess_cap(),
+    };
+    let _ = controller.execute_build_heavy(
+        &mut build_lease,
+        command,
+        &parts.command_policy,
+        &isolation,
+        &parts.isolation_request,
+        &parts.artifacts,
+        &parts.manifest,
+    );
 }
 
 #[test]
@@ -916,8 +1149,11 @@ fn recover(
     let registry = registry_for(&fixture.root);
     let state = StateStore::open(fixture.state_path())
         .unwrap_or_else(|error| panic!("open state for recovery: {error}"));
-    let (controller, summary) = RecoveryManager::recover(state, &registry)
+    let (mut controller, summary) = RecoveryManager::recover(state, &registry)
         .unwrap_or_else(|error| panic!("recover controller: {error}"));
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(2_000),
+    )));
     (controller, summary, registry)
 }
 
@@ -1611,6 +1847,477 @@ fn fallback_rejects_epoch_below_later_authoritative_journal_epoch() {
 }
 
 #[test]
+fn unjournaled_resource_row_mutation_is_rejected_during_recovery() {
+    let fixture = Fixture::create("resource-unjournaled-row");
+    let prepared = prepare(&fixture.root);
+    let backend = fake_backend(&prepared, false);
+    let (controller, _task_id) = compile_and_activate(&fixture.base, &prepared, &backend);
+    drop(controller);
+
+    let mut state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("state for unjournaled resource row: {error}"));
+    let (plan_id, revision) = active_plan_scope(&state);
+    let mut governor = M6ResourceGovernor::default();
+    let pressure = governor.observe_pressure(green_pressure_snapshot(1_500));
+    let key = scoped_resource_key(&plan_id, revision, &pressure.event_id);
+    let value_json = serde_json::to_string(&pressure)
+        .unwrap_or_else(|error| panic!("serialize resource pressure: {error}"));
+    state
+        .put_state("controller.resource_pressure", &key, &value_json)
+        .unwrap_or_else(|error| panic!("write unjournaled resource row: {error}"));
+    drop(state);
+
+    let registry = registry_for(&fixture.root);
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("reopen unjournaled resource state: {error}"));
+    let Err(error) = RecoveryManager::recover(state, &registry) else {
+        panic!("unjournaled resource row must fail closed");
+    };
+    assert!(error.to_string().contains(
+        "current resource state does not equal checkpoint plus ordered resource-journal replay"
+    ));
+}
+
+#[test]
+fn post_checkpoint_resource_event_tamper_is_rejected() {
+    for tamper_revision in [false, true] {
+        let label = if tamper_revision {
+            "resource-event-revision-tamper"
+        } else {
+            "resource-event-digest-tamper"
+        };
+        let fixture = Fixture::create(label);
+        let prepared = prepare(&fixture.root);
+        let backend = fake_backend(&prepared, false);
+        let (controller, _task_id) = compile_and_activate(&fixture.base, &prepared, &backend);
+        drop(controller);
+
+        let mut state = StateStore::open(fixture.state_path())
+            .unwrap_or_else(|error| panic!("state for resource event tamper: {error}"));
+        let (plan_id, revision) = active_plan_scope(&state);
+        let mut governor = M6ResourceGovernor::default();
+        let pressure = governor.observe_pressure(green_pressure_snapshot(1_500));
+        let key = scoped_resource_key(&plan_id, revision, &pressure.event_id);
+        let value_json = serde_json::to_string(&pressure)
+            .unwrap_or_else(|error| panic!("serialize tampered resource pressure: {error}"));
+        let binding_key = resource_binding_key("controller.resource_pressure", &key);
+        let mut payload =
+            exact_resource_event_payload(&plan_id, revision, &binding_key, &value_json);
+        if tamper_revision {
+            payload["plan_revision"] = json!(revision + 1);
+        } else {
+            payload["post_image_digests"][&binding_key] =
+                Value::String(format!("sha256:{}", "0".repeat(64)));
+        }
+        publish_resource_row_with_event(
+            &mut state,
+            "controller.resource_pressure",
+            &key,
+            &value_json,
+            "resource_fixture_pressure",
+            &pressure.event_id,
+            &payload,
+        );
+        drop(state);
+
+        let registry = registry_for(&fixture.root);
+        let state = StateStore::open(fixture.state_path())
+            .unwrap_or_else(|error| panic!("reopen tampered resource state: {error}"));
+        let Err(error) = RecoveryManager::recover(state, &registry) else {
+            panic!("tampered resource event must fail closed");
+        };
+        let message = error.to_string();
+        if tamper_revision {
+            assert!(
+                message
+                    .contains("post-checkpoint resource event targets a different plan revision")
+            );
+        } else {
+            assert!(message.contains(
+                "current resource state does not equal checkpoint plus ordered resource-journal replay"
+            ));
+        }
+    }
+}
+
+#[test]
+fn valid_post_checkpoint_resource_mutation_replays_during_recovery() {
+    let fixture = Fixture::create("resource-valid-replay");
+    let prepared = prepare(&fixture.root);
+    let backend = fake_backend(&prepared, false);
+    let (controller, _task_id) = compile_and_activate(&fixture.base, &prepared, &backend);
+    drop(controller);
+
+    let mut state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("state for valid resource replay: {error}"));
+    let epoch_before = state
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("resource replay epoch: {error}"));
+    let (plan_id, revision) = active_plan_scope(&state);
+    let mut governor = M6ResourceGovernor::default();
+    let pressure = governor.observe_pressure(green_pressure_snapshot(1_500));
+    let key = scoped_resource_key(&plan_id, revision, &pressure.event_id);
+    let value_json = serde_json::to_string(&pressure)
+        .unwrap_or_else(|error| panic!("serialize replay resource pressure: {error}"));
+    let binding_key = resource_binding_key("controller.resource_pressure", &key);
+    let payload = exact_resource_event_payload(&plan_id, revision, &binding_key, &value_json);
+    publish_resource_row_with_event(
+        &mut state,
+        "controller.resource_pressure",
+        &key,
+        &value_json,
+        "resource_fixture_pressure",
+        &pressure.event_id,
+        &payload,
+    );
+    drop(state);
+
+    let registry = registry_for(&fixture.root);
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("reopen valid resource replay state: {error}"));
+    let (controller, summary) = RecoveryManager::recover(state, &registry)
+        .unwrap_or_else(|error| panic!("valid resource replay must recover: {error}"));
+    assert!(summary.replayed_events >= 1);
+    assert_eq!(summary.execution_epoch_before, epoch_before);
+    assert!(summary.execution_epoch_after > epoch_before);
+    drop(controller);
+}
+
+#[test]
+fn stale_model_residency_states_block_before_recovery_epoch_advance() {
+    for (label, state_name) in [
+        ("resource-stale-model-resident", "resident"),
+        ("resource-stale-model-unloading", "unloading"),
+        ("resource-stale-model-unknown", "unknown"),
+    ] {
+        let (fixture, task_id, epoch_before) = reserved_model_fixture(label);
+        let mut state = StateStore::open(fixture.state_path())
+            .unwrap_or_else(|error| panic!("state for stale MODEL residency: {error}"));
+        let (plan_id, revision) = active_plan_scope(&state);
+        let (key, raw) = sole_resource_record(&state, "controller.resource_residency");
+        let mut residency: Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("stale MODEL residency json: {error}"));
+        residency["state"] = Value::String(state_name.to_owned());
+        residency["updated_at_ms"] = json!(1_750);
+        let value_json = residency.to_string();
+        let binding_key = resource_binding_key("controller.resource_residency", &key);
+        let payload = exact_resource_event_payload(&plan_id, revision, &binding_key, &value_json);
+        publish_resource_row_with_event(
+            &mut state,
+            "controller.resource_residency",
+            &key,
+            &value_json,
+            "resource_fixture_model_state",
+            &task_id,
+            &payload,
+        );
+        drop(state);
+
+        let registry = registry_for(&fixture.root);
+        let state = StateStore::open(fixture.state_path())
+            .unwrap_or_else(|error| panic!("reopen stale MODEL residency: {error}"));
+        let Err(error) = RecoveryManager::recover(state, &registry) else {
+            panic!("stale MODEL state {state_name} must block recovery");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("recovery cannot prove pre-crash MODEL absence")
+        );
+        let state = StateStore::open(fixture.state_path())
+            .unwrap_or_else(|error| panic!("inspect stale MODEL recovery epoch: {error}"));
+        assert_eq!(
+            state
+                .current_execution_epoch()
+                .unwrap_or_else(|error| panic!("stale MODEL recovery epoch: {error}")),
+            epoch_before,
+            "MODEL state {state_name} advanced the recovery epoch despite unresolved physical residency"
+        );
+    }
+}
+
+#[test]
+fn admitted_build_heavy_without_process_row_is_released_before_recovery_epoch_advance() {
+    let fixture = Fixture::create("resource-stale-build-heavy");
+    let prepared = prepare(&fixture.root);
+    let backend = fake_backend(&prepared, false);
+    let mut policy = global_policy();
+    policy["resources"]["heavy_leases"] = json!(["MODEL", "BUILD_HEAVY"]);
+    let (mut controller, task_id) =
+        compile_and_activate_with_policy(&fixture.base, &prepared, &backend, policy);
+    let model_lease = controller
+        .derive_ready_lease(
+            &prepared.registry,
+            &task_id,
+            ReadinessInputs::permissive_m1("sha256:t08-build-heavy-recovery"),
+            &write_tool_manifest(),
+        )
+        .unwrap_or_else(|error| panic!("derive MODEL lease before BUILD_HEAVY: {error}"));
+    let _build_lease = controller
+        .acquire_build_heavy(
+            model_lease,
+            &prepared.registry,
+            &write_tool_manifest(),
+            &backend,
+        )
+        .unwrap_or_else(|error| panic!("acquire BUILD_HEAVY recovery fixture lease: {error}"));
+    let epoch_before = controller
+        .resource_snapshot()
+        .unwrap_or_else(|error| panic!("BUILD_HEAVY recovery snapshot: {error}"))
+        .execution_epoch;
+    let (build_row_key, build_row_before) = build_heavy_resource_record(controller.state());
+    assert_eq!(build_row_before["state"], "ACTIVE");
+    assert!(
+        controller
+            .state()
+            .state_records("controller.process_lease")
+            .unwrap_or_else(|error| panic!("BUILD_HEAVY process rows before crash: {error}"))
+            .is_empty(),
+        "admission without execution must not fabricate a process row"
+    );
+    drop(controller);
+
+    let registry = registry_for(&fixture.root);
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("reopen stale BUILD_HEAVY state: {error}"));
+    let (recovered, summary) = RecoveryManager::recover(state, &registry)
+        .unwrap_or_else(|error| panic!("recover never-spawned BUILD_HEAVY lease: {error}"));
+    assert_eq!(summary.execution_epoch_before, epoch_before);
+    assert!(summary.execution_epoch_after > epoch_before);
+    assert!(summary.unresolved_process_lease_ids.is_empty());
+    let snapshot = recovered
+        .resource_snapshot()
+        .unwrap_or_else(|error| panic!("resource snapshot after BUILD_HEAVY recovery: {error}"));
+    assert_eq!(snapshot.execution_epoch, summary.execution_epoch_after);
+    assert!(snapshot.governor.active_leases.is_empty());
+    let released = recovered
+        .state()
+        .get_state("controller.resource_lease", &build_row_key)
+        .unwrap_or_else(|error| panic!("read released BUILD_HEAVY row: {error}"))
+        .unwrap_or_else(|| panic!("released BUILD_HEAVY row disappeared"));
+    let released: Value = serde_json::from_str(&released)
+        .unwrap_or_else(|error| panic!("released BUILD_HEAVY row json: {error}"));
+    assert_eq!(released["class"], "BUILD_HEAVY");
+    assert_eq!(released["state"], "RELEASED");
+}
+
+#[test]
+fn pending_spawn_build_heavy_blocks_before_recovery_epoch_advance() {
+    let fixture = Fixture::create("resource-build-heavy-pending-spawn");
+    let mut child = spawn_child(
+        &fixture,
+        "build_pending_spawn",
+        Some("after_process_spawn_before_identity_lease"),
+    );
+    wait_for_marker(&fixture.marker());
+    let _action_id = wait_for_action_state(&fixture.state_path(), "dispatched");
+    let pending_lease_id = wait_for_pending_process_lease(&fixture.state_path());
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("state before pending BUILD_HEAVY crash: {error}"));
+    let epoch_before = state
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("pending BUILD_HEAVY epoch: {error}"));
+    drop(state);
+    kill_child(&mut child);
+
+    let registry = registry_for(&fixture.root);
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("reopen pending BUILD_HEAVY state: {error}"));
+    let Err(error) = RecoveryManager::recover(state, &registry) else {
+        panic!("pending-spawn BUILD_HEAVY must block recovery before epoch advance");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("recovery cannot prove physical cleanup for stale active BUILD_HEAVY lease"),
+        "unexpected pending BUILD_HEAVY recovery error: {error}"
+    );
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("inspect pending BUILD_HEAVY recovery: {error}"));
+    assert_eq!(
+        state
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("pending BUILD_HEAVY recovery epoch: {error}")),
+        epoch_before
+    );
+    let pending = state
+        .state_records("controller.process_lease")
+        .unwrap_or_else(|error| panic!("pending BUILD_HEAVY process rows: {error}"));
+    assert!(pending.iter().any(|record| {
+        let value: Value = serde_json::from_str(&record.value_json)
+            .unwrap_or_else(|error| panic!("pending BUILD_HEAVY process json: {error}"));
+        value["lease_id"] == pending_lease_id && value["state"] == "pending_spawn"
+    }));
+    thread::sleep(Duration::from_millis(2_100));
+}
+
+#[test]
+fn active_build_heavy_process_is_reaped_then_resource_lease_released_before_epoch_advance() {
+    let fixture = Fixture::create("resource-build-heavy-active-reap");
+    let mut child = spawn_child(&fixture, "build_orphan_sleep", None);
+    let _action_id = wait_for_action_state(&fixture.state_path(), "dispatched");
+    let (pgid, identity) = wait_for_active_process_lease(&fixture.state_path());
+    assert_eq!(
+        process_group_leader_identity(pgid)
+            .unwrap_or_else(|error| panic!("observe BUILD_HEAVY child identity: {error}"))
+            .as_deref(),
+        Some(identity.as_str())
+    );
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("state before active BUILD_HEAVY crash: {error}"));
+    let epoch_before = state
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("active BUILD_HEAVY epoch: {error}"));
+    let (build_row_key, build_before) = build_heavy_resource_record(&state);
+    assert_eq!(build_before["state"], "ACTIVE");
+    drop(state);
+    kill_child(&mut child);
+
+    let (recovered, summary, _registry) = recover(&fixture);
+    assert!(summary.unresolved_process_lease_ids.is_empty());
+    assert!(summary.execution_epoch_after > epoch_before);
+    assert!(
+        process_group_leader_identity(pgid)
+            .unwrap_or_else(|error| panic!("observe reaped BUILD_HEAVY group: {error}"))
+            .is_none()
+    );
+    let process_rows = recovered
+        .state()
+        .state_records("controller.process_lease")
+        .unwrap_or_else(|error| panic!("BUILD_HEAVY process rows after recovery: {error}"));
+    assert!(
+        process_rows
+            .iter()
+            .any(|record| record.value_json.contains("reaped_recovery"))
+    );
+    let snapshot = recovered
+        .resource_snapshot()
+        .unwrap_or_else(|error| panic!("BUILD_HEAVY resource snapshot after reap: {error}"));
+    assert!(snapshot.governor.active_leases.is_empty());
+    let released = recovered
+        .state()
+        .get_state("controller.resource_lease", &build_row_key)
+        .unwrap_or_else(|error| panic!("read reaped BUILD_HEAVY resource row: {error}"))
+        .unwrap_or_else(|| panic!("reaped BUILD_HEAVY resource row disappeared"));
+    let released: Value = serde_json::from_str(&released)
+        .unwrap_or_else(|error| panic!("reaped BUILD_HEAVY resource row json: {error}"));
+    assert_eq!(released["state"], "RELEASED");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn resource_recovery_rejects_future_epoch_task_contract_and_governor_mismatch() {
+    {
+        let (fixture, task_id, epoch_before) = reserved_model_fixture("resource-future-epoch");
+        let mut state = StateStore::open(fixture.state_path())
+            .unwrap_or_else(|error| panic!("state for future resource epoch: {error}"));
+        let (plan_id, revision) = active_plan_scope(&state);
+        let (key, raw) = sole_resource_record(&state, "controller.resource_residency");
+        let mut residency: Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("future resource epoch json: {error}"));
+        residency["execution_epoch"] = json!(epoch_before + 1);
+        let value_json = residency.to_string();
+        let binding_key = resource_binding_key("controller.resource_residency", &key);
+        let payload = exact_resource_event_payload(&plan_id, revision, &binding_key, &value_json);
+        publish_resource_row_with_event(
+            &mut state,
+            "controller.resource_residency",
+            &key,
+            &value_json,
+            "resource_fixture_future_epoch",
+            &task_id,
+            &payload,
+        );
+        drop(state);
+
+        let registry = registry_for(&fixture.root);
+        let state = StateStore::open(fixture.state_path())
+            .unwrap_or_else(|error| panic!("reopen future resource epoch state: {error}"));
+        let Err(error) = RecoveryManager::recover(state, &registry) else {
+            panic!("future resource epoch must fail closed");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("is ahead of current execution epoch")
+        );
+    }
+
+    {
+        let (fixture, task_id, _epoch_before) =
+            reserved_model_fixture("resource-task-contract-mismatch");
+        let mut state = StateStore::open(fixture.state_path())
+            .unwrap_or_else(|error| panic!("state for resource task-contract mismatch: {error}"));
+        let (plan_id, revision) = active_plan_scope(&state);
+        let (key, raw) = sole_resource_record(&state, "controller.resource_residency");
+        let mut residency: Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("resource task-contract json: {error}"));
+        residency["task_contract_digest"] = Value::String(format!("sha256:{}", "f".repeat(64)));
+        let value_json = residency.to_string();
+        let binding_key = resource_binding_key("controller.resource_residency", &key);
+        let payload = exact_resource_event_payload(&plan_id, revision, &binding_key, &value_json);
+        publish_resource_row_with_event(
+            &mut state,
+            "controller.resource_residency",
+            &key,
+            &value_json,
+            "resource_fixture_task_contract",
+            &task_id,
+            &payload,
+        );
+        drop(state);
+
+        let registry = registry_for(&fixture.root);
+        let state = StateStore::open(fixture.state_path()).unwrap_or_else(|error| {
+            panic!("reopen task-contract-mismatched resource state: {error}")
+        });
+        let Err(error) = RecoveryManager::recover(state, &registry) else {
+            panic!("stale resource task-contract binding must fail closed");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("MODEL residency task-contract digest is stale")
+        );
+    }
+
+    {
+        let (fixture, task_id, _epoch_before) =
+            reserved_model_fixture("resource-governor-row-mismatch");
+        let mut state = StateStore::open(fixture.state_path())
+            .unwrap_or_else(|error| panic!("state for resource governor mismatch: {error}"));
+        let (plan_id, revision) = active_plan_scope(&state);
+        let (key, raw) = sole_resource_record(&state, "controller.resource_governor");
+        let mut governor: Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("resource governor json: {error}"));
+        governor["active_leases"] = json!([]);
+        let value_json = governor.to_string();
+        let binding_key = resource_binding_key("controller.resource_governor", &key);
+        let payload = exact_resource_event_payload(&plan_id, revision, &binding_key, &value_json);
+        publish_resource_row_with_event(
+            &mut state,
+            "controller.resource_governor",
+            &key,
+            &value_json,
+            "resource_fixture_governor_mismatch",
+            &task_id,
+            &payload,
+        );
+        drop(state);
+
+        let registry = registry_for(&fixture.root);
+        let state = StateStore::open(fixture.state_path())
+            .unwrap_or_else(|error| panic!("reopen governor-mismatched resource state: {error}"));
+        let Err(error) = RecoveryManager::recover(state, &registry) else {
+            panic!("resource governor/current-row mismatch must fail closed");
+        };
+        assert!(error.to_string().contains(
+            "resource-governor active leases do not exactly match durable nonterminal lease rows"
+        ));
+    }
+}
+
+#[test]
 fn superseded_plan_checkpoint_is_blocked_without_explicit_carry_forward() {
     let fixture = Fixture::create("superseded");
     let prepared = prepare(&fixture.root);
@@ -1768,6 +2475,9 @@ fn historical_unknown_that_is_now_failed_does_not_block_recovered_readiness() {
         .unwrap_or_else(|error| panic!("recovery state: {error}"));
     let (mut controller, summary) = RecoveryManager::recover(state, &registry)
         .unwrap_or_else(|error| panic!("recover historical unknown: {error}"));
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(2_000),
+    )));
     assert!(summary.unknown_action_ids.is_empty());
     let lease = controller
         .derive_ready_lease(

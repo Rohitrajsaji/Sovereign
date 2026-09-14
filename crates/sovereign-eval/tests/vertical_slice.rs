@@ -6,7 +6,8 @@ use sovereign_context::{
     RetrievalTrace,
 };
 use sovereign_controller::{
-    Controller, ExecutionRuntime, ReadinessInputs, RoleId, RoleRegistry, TaskState,
+    Controller, ExecutionRuntime, ReadinessInputs, ResourcePressureProbe, RoleId, RoleRegistry,
+    TaskState,
 };
 use sovereign_eval::{EvaluationAttemptRecord, aggregate_context_metrics};
 use sovereign_evidence::ArtifactStore;
@@ -20,7 +21,8 @@ use sovereign_plan::{
 };
 use sovereign_policy::{
     CommandPolicy, CommandRisk, IsolationRequest, MacSandboxExecBackend, ModelCallBudget,
-    PinnedExecutable,
+    OsMemoryPressure, PinnedExecutable, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
+    ResourcePressureSnapshotV1, ThermalPressure,
 };
 use sovereign_repo::{
     ExactRetriever, IndexConfig, LexicalRetriever, ProjectRegistry, RepositoryIntelligence,
@@ -30,6 +32,7 @@ use sovereign_state::StateStore;
 use sovereign_tools::{PermissionClass, ToolManifest};
 use std::collections::BTreeSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +44,34 @@ const SETTINGS_FORM_TEST: &[u8] =
 const WRITE_TOOL_DIGEST: &str =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct FixedPressureProbe(ResourcePressureSnapshotV1);
+
+impl ResourcePressureProbe for FixedPressureProbe {
+    fn sample(&mut self) -> io::Result<ResourcePressureSnapshotV1> {
+        Ok(self.0)
+    }
+}
+
+fn green_snapshot(observed_at_ms: i64) -> ResourcePressureSnapshotV1 {
+    ResourcePressureSnapshotV1 {
+        schema_version: RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
+        observed_at_ms,
+        controlled_working_set_mib: 512,
+        host_headroom_mib: 6_144,
+        swap_used_mib: Some(9_728),
+        swap_out_growth_mib_per_min: 0,
+        compressor_growth_mib_per_min: 0,
+        os_memory_pressure: OsMemoryPressure::Normal,
+        recent_pressure_event: false,
+        thermal_pressure: ThermalPressure::Normal,
+        allocation_failure: false,
+        repeated_resource_kill: false,
+        uncontrolled_child_growth: false,
+        host_free_disk_mib: Some(64 * 1_024),
+    }
+}
 
 fn write_tool_manifest() -> ToolManifest {
     ToolManifest {
@@ -540,6 +571,7 @@ fn natural_language_goal_compiles_then_controller_edits_and_deterministically_ve
     let artifacts = ArtifactStore::open(fixture.base.join("cas"))
         .unwrap_or_else(|error| panic!("open artifact store: {error}"));
     let mut controller = Controller::new(state);
+    controller.set_resource_pressure_probe(Box::new(FixedPressureProbe(green_snapshot(10_000))));
     let activation = controller
         .activate(compilation, &prepared.registry)
         .unwrap_or_else(|error| panic!("activate compiler result: {error}"));
@@ -758,6 +790,7 @@ fn m2_medium_d2_goal_succeeds_with_real_routing_and_context_token_metrics_withou
     let artifacts = ArtifactStore::open(fixture.base.join("medium-cas"))
         .unwrap_or_else(|error| panic!("open medium artifact store: {error}"));
     let mut controller = Controller::new(state);
+    controller.set_resource_pressure_probe(Box::new(FixedPressureProbe(green_snapshot(20_000))));
     let activation = controller
         .activate(compilation, &prepared.registry)
         .unwrap_or_else(|error| panic!("activate medium plan: {error}"));
