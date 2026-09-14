@@ -4,6 +4,7 @@ use sovereign_repo::{
 };
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,7 +66,7 @@ impl Drop for Fixture {
 }
 
 fn git(root: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = Command::new("/usr/bin/git")
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -85,7 +86,7 @@ fn git(root: &Path, args: &[&str]) -> String {
 }
 
 fn git_input(root: &Path, args: &[&str], input: &str) -> String {
-    let mut child = Command::new("git")
+    let mut child = Command::new("/usr/bin/git")
         .current_dir(root)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -151,14 +152,12 @@ fn worktree_dirty_primary_is_byte_for_byte_protected_and_cleanup_is_owned() {
         lease.worktree_path.parent(),
         Some(lease.controller_root.as_path())
     );
-    assert!(
-        !lease.worktree_path.starts_with(
-            fixture
-                .primary
-                .canonicalize()
-                .unwrap_or_else(|error| { panic!("canonical primary: {error}") })
-        )
-    );
+    assert!(!lease.worktree_path.starts_with(
+        fixture
+            .primary
+            .canonicalize()
+            .unwrap_or_else(|error| { panic!("canonical primary: {error}") })
+    ));
     assert_eq!(
         git(&lease.worktree_path, &["rev-parse", "HEAD"]),
         lease.base_head
@@ -379,6 +378,117 @@ fn worktree_checkout_rejects_filters_lfs_and_promisor_before_side_effects() {
         Err(RepoError::UnsafeGitConfiguration(_))
     ));
     assert!(!promisor.worktree_path.exists());
+}
+
+#[test]
+fn worktree_production_git_ignores_path_shim_and_disables_checkout_hooks() {
+    const CHILD: &str = "SOVEREIGN_REPO_PATH_SHIM_CHILD";
+    const SENTINEL: &str = "SOVEREIGN_REPO_PATH_SHIM_SENTINEL";
+    if std::env::var_os(CHILD).is_some() {
+        let sentinel = PathBuf::from(
+            std::env::var_os(SENTINEL).unwrap_or_else(|| panic!("child sentinel missing")),
+        );
+        let fixture = Fixture::new("path-shim-child");
+        let hook_sentinel = fixture.base.join("hook-ran");
+        let hook = fixture.primary.join(".git/hooks/post-checkout");
+        fs::write(
+            &hook,
+            format!("#!/bin/sh\n: > '{}'\n", hook_sentinel.display()),
+        )
+        .unwrap_or_else(|error| panic!("write checkout hook: {error}"));
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|error| panic!("chmod checkout hook: {error}"));
+
+        let registry = fixture.registry();
+        let lease = registry
+            .prepare_worktree_lease(
+                "repo.fixture",
+                &fixture.worktrees,
+                "plan.fixture",
+                1,
+                "task.path-shim",
+                "sha256:path-shim-contract",
+            )
+            .unwrap_or_else(|error| panic!("prepare child lease: {error}"));
+        registry
+            .materialize_worktree(&lease)
+            .unwrap_or_else(|error| panic!("materialize under hostile PATH: {error}"));
+        assert!(!sentinel.exists(), "PATH git shim executed");
+        assert!(!hook_sentinel.exists(), "checkout hook executed");
+        return;
+    }
+
+    let fixture = Fixture::new("path-shim-parent");
+    let shim_dir = fixture.base.join("shim-bin");
+    fs::create_dir_all(&shim_dir).unwrap_or_else(|error| panic!("create shim dir: {error}"));
+    let sentinel = fixture.base.join("git-shim-ran");
+    let shim = shim_dir.join("git");
+    fs::write(
+        &shim,
+        "#!/bin/sh\n: > \"$SOVEREIGN_REPO_PATH_SHIM_SENTINEL\"\nexit 97\n",
+    )
+    .unwrap_or_else(|error| panic!("write git shim: {error}"));
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))
+        .unwrap_or_else(|error| panic!("chmod git shim: {error}"));
+    let status = Command::new(
+        std::env::current_exe().unwrap_or_else(|error| panic!("current test exe: {error}")),
+    )
+    .arg("--exact")
+    .arg("worktree_production_git_ignores_path_shim_and_disables_checkout_hooks")
+    .arg("--nocapture")
+    .env(CHILD, "1")
+    .env(SENTINEL, &sentinel)
+    .env("PATH", &shim_dir)
+    .status()
+    .unwrap_or_else(|error| panic!("spawn PATH-shim child: {error}"));
+    assert!(status.success(), "PATH-shim child failed: {status:?}");
+    assert!(!sentinel.exists(), "hostile PATH shim was executed");
+}
+
+#[test]
+fn worktree_checkout_rejects_local_execution_and_network_config_surfaces() {
+    let cases = [
+        ("credential.helper", "!false"),
+        ("core.sshCommand", "/usr/bin/false"),
+        ("alias.evil", "!false"),
+        ("diff.external", "/usr/bin/false"),
+        ("diff.evil.command", "/usr/bin/false"),
+        ("diff.evil.textconv", "/usr/bin/false"),
+        ("filter.evil.process", "/usr/bin/false"),
+        ("core.fsmonitor", "/usr/bin/false"),
+        ("core.hooksPath", "/tmp/sovereign-forbidden-hooks"),
+        ("include.path", "/tmp/sovereign-forbidden-gitconfig"),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.partialclonefilter", "blob:none"),
+        ("remote.origin.proxy", "http://127.0.0.1:9"),
+        ("extensions.partialClone", "origin"),
+        ("url.evil.insteadOf", "https://example.invalid/"),
+        ("http.proxy", "http://127.0.0.1:9"),
+        ("submodule.evil.update", "!false"),
+    ];
+    for (index, (key, value)) in cases.into_iter().enumerate() {
+        let fixture = Fixture::new(&format!("unsafe-local-config-{index}"));
+        git(&fixture.primary, &["config", key, value]);
+        let registry = fixture.registry();
+        let lease = registry
+            .prepare_worktree_lease(
+                "repo.fixture",
+                &fixture.worktrees,
+                "plan.fixture",
+                1,
+                "task.unsafe-config",
+                "sha256:unsafe-config-contract",
+            )
+            .unwrap_or_else(|error| panic!("prepare unsafe config {key}: {error}"));
+        assert!(
+            matches!(
+                registry.materialize_worktree(&lease),
+                Err(RepoError::UnsafeGitConfiguration(_))
+            ),
+            "unsafe local Git config key was accepted: {key}"
+        );
+        assert!(!lease.worktree_path.exists());
+    }
 }
 
 #[test]
@@ -632,6 +742,130 @@ fn worktree_composition_preserves_binary_untracked_and_join_deduplicates_shared_
 }
 
 #[test]
+fn worktree_untracked_composition_replaces_hardlink_without_mutating_external_inode() {
+    let fixture = Fixture::new("composition-hardlink");
+    let registry = fixture.registry();
+    let prepare = |task: &str| {
+        registry
+            .prepare_worktree_lease(
+                "repo.fixture",
+                &fixture.worktrees,
+                "plan.fixture",
+                1,
+                task,
+                &format!("sha256:{task}-contract"),
+            )
+            .unwrap_or_else(|error| panic!("prepare {task}: {error}"))
+    };
+
+    let source = prepare("hardlink-source");
+    registry
+        .materialize_worktree(&source)
+        .unwrap_or_else(|error| panic!("materialize source: {error}"));
+    let source_path = source.worktree_path.join("shared.bin");
+    fs::write(&source_path, b"old-bytes\n")
+        .unwrap_or_else(|error| panic!("write source preimage: {error}"));
+    let baseline = registry
+        .capture_worktree_baseline(&source)
+        .unwrap_or_else(|error| panic!("source baseline: {error}"));
+    fs::write(&source_path, b"new-bytes\n")
+        .unwrap_or_else(|error| panic!("write source postimage: {error}"));
+    let change_set = registry
+        .capture_change_set_from_baseline(&source, &baseline)
+        .unwrap_or_else(|error| panic!("capture hardlink changeset: {error}"));
+    assert_eq!(change_set.untracked_deltas.len(), 1);
+    assert!(change_set.untracked_deltas[0].pre_digest.is_some());
+
+    let target = prepare("hardlink-target");
+    registry
+        .materialize_worktree(&target)
+        .unwrap_or_else(|error| panic!("materialize target: {error}"));
+    let external = fixture.base.join("external-hardlink.bin");
+    fs::write(&external, b"old-bytes\n")
+        .unwrap_or_else(|error| panic!("write external inode: {error}"));
+    let target_path = target.worktree_path.join("shared.bin");
+    fs::hard_link(&external, &target_path)
+        .unwrap_or_else(|error| panic!("create hostile hardlink: {error}"));
+    let external_before =
+        fs::metadata(&external).unwrap_or_else(|error| panic!("external metadata: {error}"));
+    let target_before =
+        fs::metadata(&target_path).unwrap_or_else(|error| panic!("target metadata: {error}"));
+    assert_eq!(external_before.ino(), target_before.ino());
+
+    let outcome = registry
+        .compose_change_sets(&target, &[ChangeSetCompositionInput::current(change_set)])
+        .unwrap_or_else(|error| panic!("compose hardlink changeset: {error}"));
+    assert!(matches!(outcome, ComposeChangeSetsOutcome::Ready(_)));
+    assert_eq!(
+        fs::read(&external).unwrap_or_else(|error| panic!("read external after compose: {error}")),
+        b"old-bytes\n"
+    );
+    assert_eq!(
+        fs::read(&target_path).unwrap_or_else(|error| panic!("read target after compose: {error}")),
+        b"new-bytes\n"
+    );
+    assert_ne!(
+        fs::metadata(&external)
+            .unwrap_or_else(|error| panic!("external metadata after: {error}"))
+            .ino(),
+        fs::metadata(&target_path)
+            .unwrap_or_else(|error| panic!("target metadata after: {error}"))
+            .ino()
+    );
+}
+
+#[test]
+fn worktree_untracked_composition_rejects_symlink_parent_without_external_write() {
+    let fixture = Fixture::new("composition-symlink-parent");
+    let registry = fixture.registry();
+    let prepare = |task: &str| {
+        registry
+            .prepare_worktree_lease(
+                "repo.fixture",
+                &fixture.worktrees,
+                "plan.fixture",
+                1,
+                task,
+                &format!("sha256:{task}-contract"),
+            )
+            .unwrap_or_else(|error| panic!("prepare {task}: {error}"))
+    };
+
+    let source = prepare("symlink-source");
+    registry
+        .materialize_worktree(&source)
+        .unwrap_or_else(|error| panic!("materialize source: {error}"));
+    let baseline = registry
+        .capture_worktree_baseline(&source)
+        .unwrap_or_else(|error| panic!("source baseline: {error}"));
+    fs::create_dir_all(source.worktree_path.join("nested"))
+        .unwrap_or_else(|error| panic!("create source nested: {error}"));
+    fs::write(
+        source.worktree_path.join("nested/payload.bin"),
+        b"payload\n",
+    )
+    .unwrap_or_else(|error| panic!("write nested payload: {error}"));
+    let change_set = registry
+        .capture_change_set_from_baseline(&source, &baseline)
+        .unwrap_or_else(|error| panic!("capture symlink changeset: {error}"));
+
+    let target = prepare("symlink-target");
+    registry
+        .materialize_worktree(&target)
+        .unwrap_or_else(|error| panic!("materialize target: {error}"));
+    let external_dir = fixture.base.join("external-dir");
+    fs::create_dir_all(&external_dir)
+        .unwrap_or_else(|error| panic!("create external dir: {error}"));
+    symlink(&external_dir, target.worktree_path.join("nested"))
+        .unwrap_or_else(|error| panic!("create hostile parent symlink: {error}"));
+    assert!(matches!(
+        registry.compose_change_sets(&target, &[ChangeSetCompositionInput::current(change_set)]),
+        Err(RepoError::SymlinkPath(_))
+    ));
+    assert!(!external_dir.join("payload.bin").exists());
+}
+
+#[test]
 fn worktree_join_conflict_is_evidence_and_never_auto_resolved() {
     let fixture = Fixture::new("composition-conflict");
     let registry = fixture.registry();
@@ -704,11 +938,9 @@ fn worktree_join_conflict_is_evidence_and_never_auto_resolved() {
         ComposeChangeSetsOutcome::Ready(_) => panic!("conflicting join unexpectedly composed"),
     };
     assert_eq!(conflict.incoming_task_id, "T3");
-    assert!(
-        conflict
-            .conflict_paths
-            .contains(&PathBuf::from("tracked.txt"))
-    );
+    assert!(conflict
+        .conflict_paths
+        .contains(&PathBuf::from("tracked.txt")));
     assert_eq!(
         fs::read_to_string(join.worktree_path.join("tracked.txt"))
             .unwrap_or_else(|error| panic!("read unresolved join: {error}")),

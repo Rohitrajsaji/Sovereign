@@ -1,13 +1,15 @@
 use sovereign_evidence::ArtifactStore;
 use sovereign_policy::{
-    CommandMode, CommandPolicy, CommandRisk, CommandSpec, IsolationRequest, MacSandboxExecBackend,
-    PinnedExecutable,
+    CommandMode, CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend,
+    IsolatedCommand, IsolationCapabilities, IsolationRequest, MacSandboxExecBackend,
+    PinnedExecutable, PolicyError,
 };
 use sovereign_state::StateStore;
 use sovereign_tools::{
-    ActionJournal, ActionState, AuthorizedAction, CapabilityLayers, CapabilitySet, PermissionClass,
-    PermissionDecision, ProcessRunner, Reconciliation, ReconciliationMode, ResourceLimitKind,
-    ToolManifest, ToolSchemaV1, filter_authorized_tool_schemas,
+    ActionJournal, ActionState, AtomicReplaceGuard, AuthorizedAction, CapabilityLayers,
+    CapabilitySet, PermissionClass, PermissionDecision, ProcessRunner, Reconciliation,
+    ReconciliationMode, ResourceLimitKind, ToolManifest, ToolSchemaV1,
+    filter_authorized_tool_schemas,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -191,6 +193,149 @@ fn bind_isolation(action: &mut AuthorizedAction, request: &IsolationRequest) {
     action.isolation_policy_digest = request
         .digest()
         .unwrap_or_else(|error| panic!("isolation digest: {error}"));
+}
+
+#[test]
+fn atomic_replace_does_not_mutate_external_hard_link_inode() {
+    let temp = TestDir::under(&std::env::temp_dir(), "atomic-hardlink");
+    let repo = temp.0.join("repo");
+    let outside = temp.0.join("outside.txt");
+    fs::create_dir_all(&repo).unwrap_or_else(|error| panic!("repo: {error}"));
+    fs::write(&outside, b"outside-original").unwrap_or_else(|error| panic!("outside: {error}"));
+    fs::hard_link(&outside, repo.join("target.txt"))
+        .unwrap_or_else(|error| panic!("hard link: {error}"));
+
+    let guard = AtomicReplaceGuard::prepare(&repo, "target.txt")
+        .unwrap_or_else(|error| panic!("prepare: {error}"));
+    guard
+        .commit(b"repository-replacement", 0o644)
+        .unwrap_or_else(|error| panic!("commit: {error}"));
+
+    assert_eq!(fs::read(&outside).unwrap_or_default(), b"outside-original");
+    assert_eq!(
+        fs::read(repo.join("target.txt")).unwrap_or_default(),
+        b"repository-replacement"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let outside_meta = fs::metadata(&outside).unwrap_or_else(|error| panic!("meta: {error}"));
+        let target_meta = fs::metadata(repo.join("target.txt"))
+            .unwrap_or_else(|error| panic!("target meta: {error}"));
+        assert_ne!(outside_meta.ino(), target_meta.ino());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_replace_rejects_target_symlink_swap_after_authorization() {
+    let temp = TestDir::under(&std::env::temp_dir(), "atomic-symlink-swap");
+    let repo = temp.0.join("repo");
+    let outside = temp.0.join("outside.txt");
+    fs::create_dir_all(&repo).unwrap_or_else(|error| panic!("repo: {error}"));
+    fs::write(repo.join("target.txt"), b"before").unwrap_or_else(|error| panic!("target: {error}"));
+    fs::write(&outside, b"outside-original").unwrap_or_else(|error| panic!("outside: {error}"));
+
+    let guard = AtomicReplaceGuard::prepare(&repo, "target.txt")
+        .unwrap_or_else(|error| panic!("prepare: {error}"));
+    fs::remove_file(repo.join("target.txt")).unwrap_or_else(|error| panic!("remove: {error}"));
+    std::os::unix::fs::symlink(&outside, repo.join("target.txt"))
+        .unwrap_or_else(|error| panic!("swap symlink: {error}"));
+
+    assert!(guard.commit(b"should-not-land", 0o644).is_err());
+    assert_eq!(fs::read(&outside).unwrap_or_default(), b"outside-original");
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_replace_rejects_parent_symlink_swap_after_authorization() {
+    let temp = TestDir::under(&std::env::temp_dir(), "atomic-parent-swap");
+    let repo = temp.0.join("repo");
+    let outside = temp.0.join("outside");
+    fs::create_dir_all(repo.join("dir")).unwrap_or_else(|error| panic!("repo dir: {error}"));
+    fs::create_dir_all(&outside).unwrap_or_else(|error| panic!("outside dir: {error}"));
+    fs::write(repo.join("dir/target.txt"), b"before")
+        .unwrap_or_else(|error| panic!("target: {error}"));
+    fs::write(outside.join("target.txt"), b"outside-original")
+        .unwrap_or_else(|error| panic!("outside target: {error}"));
+
+    let guard = AtomicReplaceGuard::prepare(&repo, "dir/target.txt")
+        .unwrap_or_else(|error| panic!("prepare: {error}"));
+    fs::rename(repo.join("dir"), repo.join("dir-old"))
+        .unwrap_or_else(|error| panic!("rename parent: {error}"));
+    std::os::unix::fs::symlink(&outside, repo.join("dir"))
+        .unwrap_or_else(|error| panic!("parent symlink: {error}"));
+
+    assert!(guard.commit(b"should-not-land", 0o644).is_err());
+    assert_eq!(
+        fs::read(outside.join("target.txt")).unwrap_or_default(),
+        b"outside-original"
+    );
+}
+
+struct RejectIsolation;
+
+impl ExecutionIsolationBackend for RejectIsolation {
+    fn capabilities(&self) -> IsolationCapabilities {
+        panic!("capabilities must not be queried by ProcessRunner::prepare_execution")
+    }
+
+    fn isolate(
+        &self,
+        _spec: &CommandSpec,
+        _request: &IsolationRequest,
+    ) -> Result<IsolatedCommand, PolicyError> {
+        Err(PolicyError::IsolationUnavailable(
+            "fixture isolation unavailable".to_owned(),
+        ))
+    }
+}
+
+#[test]
+fn unavailable_isolation_backend_blocks_before_dispatch_or_spawn() {
+    let (temp, repo, home, mut store) = fixture("isolation-unavailable");
+    let artifact_store = artifacts(&temp);
+    let mut action = shell_action(
+        "action_isolation_unavailable",
+        &repo,
+        "printf forbidden > marker.txt",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 4 * 1024,
+            disk_bytes: 4 * 1024,
+            subprocesses: 1,
+        },
+        ReconciliationMode::UnsafeSideEffect,
+    );
+    action.permission_class = PermissionClass::RepositoryWrite;
+    let request = isolation(&repo, &home, true);
+    bind_isolation(&mut action, &request);
+    let command_policy = shell_policy();
+    let backend = RejectIsolation;
+    let runner = ProcessRunner::new(&command_policy, &backend);
+    let mut journal = ActionJournal::new(&mut store);
+    authorize(&mut journal, &action, &manifest())
+        .unwrap_or_else(|error| panic!("authorize: {error}"));
+
+    assert!(
+        runner
+            .run(&mut journal, &action, &request, &artifact_store)
+            .is_err()
+    );
+    assert!(!repo.join("marker.txt").exists());
+    assert_eq!(
+        journal
+            .record(&action.action_id)
+            .unwrap_or(None)
+            .map(|record| record.state),
+        Some("authorized".to_owned())
+    );
+    assert!(
+        store
+            .get_state("controller.process_lease", &action.action_id)
+            .unwrap_or(None)
+            .is_none()
+    );
 }
 
 #[test]

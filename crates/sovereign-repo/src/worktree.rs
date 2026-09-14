@@ -1,19 +1,21 @@
 use super::{
-    ExactDiffEvidence, ExactFileEvidence, ProjectRegistry, RegisteredRepository, RepoError,
-    RepositorySnapshot, capture_snapshot, git_output, reject_existing_symlink_components,
-    sha256_prefixed, validate_relative_path,
+    capture_snapshot, git_output, hardened_git_command, reject_existing_symlink_components,
+    sha256_prefixed, validate_relative_path, ExactDiffEvidence, ExactFileEvidence, ProjectRegistry,
+    RegisteredRepository, RepoError, RepositorySnapshot,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const WORKTREE_LEASE_SCHEMA_VERSION: u32 = 1;
 const CHANGE_SET_SCHEMA_VERSION: u32 = 2;
 const COMPOSITION_CONFLICT_SCHEMA_VERSION: u32 = 1;
+static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Controller-owned detached Git worktree authority for one exact plan/task revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -918,6 +920,8 @@ fn detect_untracked_composition_conflict(
 
 fn apply_untracked_deltas(root: &Path, deltas: &[UntrackedFileDelta]) -> Result<(), RepoError> {
     for delta in deltas {
+        validate_relative_path(&delta.path)?;
+        reject_existing_symlink_components(root, &delta.path)?;
         let absolute = root.join(&delta.path);
         match &delta.post {
             Some(post) => {
@@ -926,19 +930,185 @@ fn apply_untracked_deltas(root: &Path, deltas: &[UntrackedFileDelta]) -> Result<
                         "untracked ChangeSet content digest/path is invalid".to_owned(),
                     ));
                 }
-                if let Some(parent) = absolute.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::write(&absolute, &post.content)?;
-                fs::set_permissions(&absolute, fs::Permissions::from_mode(post.mode))?;
+                atomic_replace_untracked(root, delta, post)?;
             }
             None => {
-                if absolute.exists() {
-                    fs::remove_file(&absolute)?;
-                }
+                remove_untracked_atomically(root, delta, &absolute)?;
             }
         }
     }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+fn directory_identity(path: &Path) -> Result<FileIdentity, RepoError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(RepoError::SymlinkPath(path.to_path_buf()));
+    }
+    Ok(identity(&metadata))
+}
+
+fn ensure_secure_parent(
+    root: &Path,
+    relative: &Path,
+) -> Result<(PathBuf, FileIdentity), RepoError> {
+    let parent_relative = relative.parent().unwrap_or_else(|| Path::new(""));
+    let mut current = root.to_path_buf();
+    let canonical_root = root.canonicalize()?;
+    if canonical_root != root {
+        return Err(RepoError::InvalidWorktreeLease(
+            "controller worktree root changed identity during untracked composition".to_owned(),
+        ));
+    }
+    for component in parent_relative.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return Err(RepoError::InvalidRelativePath(relative.to_path_buf()));
+        };
+        let before = directory_identity(&current)?;
+        let next = current.join(segment);
+        match fs::symlink_metadata(&next) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(RepoError::SymlinkPath(next));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&next)?;
+            }
+            Err(error) => return Err(RepoError::Io(error)),
+        }
+        if directory_identity(&current)? != before {
+            return Err(RepoError::InvalidWorktreeLease(
+                "untracked composition parent changed identity while creating path".to_owned(),
+            ));
+        }
+        current = next;
+    }
+    reject_existing_symlink_components(root, parent_relative)?;
+    let canonical_parent = current.canonicalize()?;
+    if !canonical_parent.starts_with(&canonical_root) || canonical_parent != current {
+        return Err(RepoError::InvalidWorktreeLease(
+            "untracked composition parent escaped or changed identity".to_owned(),
+        ));
+    }
+    let parent_identity = directory_identity(&current)?;
+    Ok((current, parent_identity))
+}
+
+fn current_target_state(path: &Path) -> Result<Option<(FileIdentity, String)>, RepoError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(RepoError::NotRegularFile(path.to_path_buf()));
+            }
+            let bytes = fs::read(path)?;
+            Ok(Some((identity(&metadata), sha256_prefixed(&bytes))))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(RepoError::Io(error)),
+    }
+}
+
+fn validate_target_preimage(
+    path: &Path,
+    expected_digest: Option<&str>,
+) -> Result<Option<FileIdentity>, RepoError> {
+    let state = current_target_state(path)?;
+    let actual_digest = state.as_ref().map(|(_, digest)| digest.as_str());
+    if actual_digest != expected_digest {
+        return Err(RepoError::InvalidWorktreeLease(format!(
+            "untracked composition target changed before commit: {}",
+            path.display()
+        )));
+    }
+    Ok(state.map(|(identity, _)| identity))
+}
+
+fn atomic_replace_untracked(
+    root: &Path,
+    delta: &UntrackedFileDelta,
+    post: &WorktreeFileContent,
+) -> Result<(), RepoError> {
+    let (parent, parent_identity) = ensure_secure_parent(root, &delta.path)?;
+    let target = root.join(&delta.path);
+    let target_identity = validate_target_preimage(&target, delta.pre_digest.as_deref())?;
+    let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(
+        ".sovereign-compose-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(&post.content)?;
+        file.set_permissions(fs::Permissions::from_mode(post.mode))?;
+        file.sync_all()?;
+
+        if directory_identity(&parent)? != parent_identity {
+            return Err(RepoError::InvalidWorktreeLease(
+                "untracked composition parent changed identity before atomic rename".to_owned(),
+            ));
+        }
+        reject_existing_symlink_components(root, &delta.path)?;
+        let current_identity = validate_target_preimage(&target, delta.pre_digest.as_deref())?;
+        if current_identity != target_identity {
+            return Err(RepoError::InvalidWorktreeLease(
+                "untracked composition target inode changed before atomic rename".to_owned(),
+            ));
+        }
+        fs::rename(&temp, &target)?;
+        OpenOptions::new().read(true).open(&parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+fn remove_untracked_atomically(
+    root: &Path,
+    delta: &UntrackedFileDelta,
+    target: &Path,
+) -> Result<(), RepoError> {
+    let Some(expected_digest) = delta.pre_digest.as_deref() else {
+        if target.exists() {
+            return Err(RepoError::InvalidWorktreeLease(
+                "untracked delete had no preimage but target exists".to_owned(),
+            ));
+        }
+        return Ok(());
+    };
+    let (parent, parent_identity) = ensure_secure_parent(root, &delta.path)?;
+    let target_identity = validate_target_preimage(target, Some(expected_digest))?;
+    if directory_identity(&parent)? != parent_identity {
+        return Err(RepoError::InvalidWorktreeLease(
+            "untracked composition parent changed identity before delete".to_owned(),
+        ));
+    }
+    reject_existing_symlink_components(root, &delta.path)?;
+    if validate_target_preimage(target, Some(expected_digest))? != target_identity {
+        return Err(RepoError::InvalidWorktreeLease(
+            "untracked composition target inode changed before delete".to_owned(),
+        ));
+    }
+    fs::remove_file(target)?;
+    OpenOptions::new().read(true).open(&parent)?.sync_all()?;
     Ok(())
 }
 
@@ -981,15 +1151,7 @@ fn reject_checkout_side_effects(root: &Path, base_head: &str) -> Result<(), Repo
     }
     for key in String::from_utf8_lossy(&local_keys.stdout).lines() {
         let lower = key.trim().to_ascii_lowercase();
-        let filter_driver = lower.starts_with("filter.")
-            && matches!(
-                lower.rsplit('.').next(),
-                Some("clean" | "smudge" | "process" | "required")
-            );
-        let include = lower.starts_with("include.") || lower.starts_with("includeif.");
-        let promisor = lower.starts_with("remote.") && lower.ends_with(".promisor");
-        let partial_clone = lower == "extensions.partialclone";
-        if filter_driver || include || promisor || partial_clone {
+        if unsafe_local_git_config_key(&lower) {
             return Err(RepoError::UnsafeGitConfiguration(format!(
                 "local Git config key {key} may execute, include, or lazy-fetch during checkout"
             )));
@@ -1008,6 +1170,14 @@ fn reject_checkout_side_effects(root: &Path, base_head: &str) -> Result<(), Repo
     {
         let path =
             std::str::from_utf8(raw).map_err(|_| RepoError::NonUtf8GitOutput("attribute path"))?;
+        if matches!(
+            Path::new(path).file_name().and_then(|name| name.to_str()),
+            Some(".gitmodules" | ".lfsconfig")
+        ) {
+            return Err(RepoError::UnsafeGitConfiguration(format!(
+                "tracked {path} may configure hidden submodule/LFS execution or network access"
+            )));
+        }
         if Path::new(path).file_name().and_then(|name| name.to_str()) != Some(".gitattributes") {
             continue;
         }
@@ -1025,6 +1195,44 @@ fn reject_checkout_side_effects(root: &Path, base_head: &str) -> Result<(), Repo
         reject_filter_attributes(".git/info/attributes", &fs::read(info_attributes)?)?;
     }
     Ok(())
+}
+
+fn unsafe_local_git_config_key(lower: &str) -> bool {
+    let suffix = lower.rsplit('.').next();
+    let credential_helper = lower == "credential.helper" || suffix == Some("helper");
+    let external_diff = lower == "diff.external"
+        || (lower.starts_with("diff.") && matches!(suffix, Some("command" | "textconv")));
+    let include =
+        lower == "include.path" || lower.starts_with("include.") || lower.starts_with("includeif.");
+    let partial_clone = lower == "extensions.partialclone"
+        || (lower.starts_with("remote.")
+            && matches!(
+                suffix,
+                Some(
+                    "promisor"
+                        | "partialclonefilter"
+                        | "proxy"
+                        | "uploadpack"
+                        | "receivepack"
+                        | "vcs"
+                )
+            ));
+    let url_rewrite =
+        lower.starts_with("url.") && matches!(suffix, Some("insteadof" | "pushinsteadof"));
+    let proxy = lower == "core.gitproxy"
+        || lower == "http.proxy"
+        || (lower.starts_with("http.") && suffix == Some("proxy"));
+    credential_helper
+        || lower == "core.sshcommand"
+        || lower.starts_with("alias.")
+        || external_diff
+        || lower.starts_with("filter.")
+        || matches!(lower, "core.fsmonitor" | "core.hookspath")
+        || include
+        || partial_clone
+        || url_rewrite
+        || proxy
+        || lower.starts_with("submodule.")
 }
 
 fn reject_filter_attributes(source: &str, bytes: &[u8]) -> Result<(), RepoError> {
@@ -1133,30 +1341,8 @@ fn git_output_with_input(
     args: &[&str],
     input: &[u8],
 ) -> Result<std::process::Output, RepoError> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut child = Command::new("git")
-        .current_dir(root)
-        .env_clear()
-        .env("PATH", path)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.attributesFile=/dev/null",
-            "-c",
-            "submodule.recurse=false",
-            "-c",
-            "color.ui=false",
-            "-c",
-            "pager.status=false",
-        ])
+    let mut command = hardened_git_command(root)?;
+    let mut child = command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

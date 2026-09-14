@@ -21,8 +21,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter, Write as _};
 use std::fs;
-use std::net::TcpListener;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
 use std::path::{Component, Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 pub const CAPABILITY_SET_SCHEMA_VERSION: u32 = 1;
 pub const PERMISSION_DECISION_SCHEMA_VERSION: u32 = 1;
@@ -484,6 +487,103 @@ pub struct PathPolicy {
     protected_roots: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathCommitMode {
+    AtomicReplace,
+    InPlace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathAuthorizationTicket {
+    repository_root: PathBuf,
+    relative_path: PathBuf,
+    authorized_target: PathBuf,
+    parent_path: PathBuf,
+    parent_identity: FileIdentity,
+    target_identity: Option<FileIdentity>,
+    target_link_count: Option<u64>,
+}
+
+impl PathAuthorizationTicket {
+    #[must_use]
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    #[must_use]
+    pub fn authorized_target(&self) -> &Path {
+        &self.authorized_target
+    }
+
+    #[must_use]
+    pub const fn parent_identity(&self) -> FileIdentity {
+        self.parent_identity
+    }
+
+    #[must_use]
+    pub const fn target_identity(&self) -> Option<FileIdentity> {
+        self.target_identity
+    }
+
+    #[must_use]
+    pub const fn target_link_count(&self) -> Option<u64> {
+        self.target_link_count
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveRepositoryScope {
+    registered_repository_ids: BTreeSet<String>,
+    writable_repository_ids: BTreeSet<String>,
+}
+
+impl ActiveRepositoryScope {
+    /// Builds an exact task repository-write scope from the project registry snapshot.
+    ///
+    /// # Errors
+    /// Returns a denial if task scope names an unregistered repository.
+    pub fn new(
+        registered_repository_ids: impl IntoIterator<Item = String>,
+        writable_repository_ids: impl IntoIterator<Item = String>,
+    ) -> Result<Self, PolicyError> {
+        let registered_repository_ids = registered_repository_ids.into_iter().collect();
+        let writable_repository_ids: BTreeSet<_> = writable_repository_ids.into_iter().collect();
+        if !writable_repository_ids.is_subset(&registered_repository_ids) {
+            return Err(PolicyError::Denied(
+                "active repository scope contains an unregistered repository".to_owned(),
+            ));
+        }
+        Ok(Self {
+            registered_repository_ids,
+            writable_repository_ids,
+        })
+    }
+
+    /// Authorizes one registered repository for mutation under the exact active task scope.
+    ///
+    /// # Errors
+    /// Returns a denial for unknown repositories and registered siblings outside task scope.
+    pub fn authorize_write(&self, repository_id: &str) -> Result<(), PolicyError> {
+        if !self.registered_repository_ids.contains(repository_id) {
+            return Err(PolicyError::Denied(format!(
+                "repository is not registered: {repository_id}"
+            )));
+        }
+        if !self.writable_repository_ids.contains(repository_id) {
+            return Err(PolicyError::Denied(format!(
+                "registered sibling repository is outside exact active task scope: {repository_id}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl PathPolicy {
     /// Builds a canonical repository jail and protected-root set.
     ///
@@ -542,6 +642,148 @@ impl PathPolicy {
         Ok(canonical_parent.join(file_name))
     }
 
+    /// Creates an immutable mutation ticket bound to the authorized parent and target identity.
+    ///
+    /// The ticket is intentionally separate from the eventual write. Call
+    /// [`PathPolicy::revalidate_for_commit`] immediately before the filesystem commit.
+    ///
+    /// # Errors
+    /// Returns a denial for traversal, symlinks, non-regular existing targets, protected roots,
+    /// or targets outside the repository jail.
+    pub fn authorize_mutation(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> Result<PathAuthorizationTicket, PolicyError> {
+        let relative = relative.as_ref();
+        validate_relative(relative)?;
+        let candidate = self.repository_root.join(relative);
+        let parent = candidate.parent().ok_or_else(|| {
+            PolicyError::Denied("mutation path has no authorized parent".to_owned())
+        })?;
+        let canonical_parent = parent.canonicalize()?;
+        self.authorize_canonical(&canonical_parent)?;
+        let parent_metadata = fs::symlink_metadata(&canonical_parent)?;
+        if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+            return Err(PolicyError::Denied(
+                "mutation parent must remain a real directory".to_owned(),
+            ));
+        }
+        let file_name = candidate.file_name().ok_or_else(|| {
+            PolicyError::Denied("mutation path has no final component".to_owned())
+        })?;
+        let authorized_target = canonical_parent.join(file_name);
+        self.authorize_canonical(&authorized_target)?;
+        let (target_identity, target_link_count) = match fs::symlink_metadata(&authorized_target) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(PolicyError::Denied(
+                        "mutation target must be a regular non-symlink file".to_owned(),
+                    ));
+                }
+                (
+                    Some(file_identity(&metadata)),
+                    Some(file_link_count(&metadata)),
+                )
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(PathAuthorizationTicket {
+            repository_root: self.repository_root.clone(),
+            relative_path: relative.to_path_buf(),
+            authorized_target,
+            parent_path: canonical_parent,
+            parent_identity: file_identity(&parent_metadata),
+            target_identity,
+            target_link_count,
+        })
+    }
+
+    /// Revalidates a mutation ticket immediately before commit.
+    ///
+    /// Atomic replacement is permitted for a hard-linked existing target because the operation
+    /// replaces the authorized directory entry rather than mutating the shared inode. In-place
+    /// mutation of a multiply-linked inode is always denied.
+    ///
+    /// # Errors
+    /// Returns a denial if repository, parent, target identity, symlink state, or hard-link safety
+    /// differs from the immutable authorization ticket.
+    pub fn revalidate_for_commit(
+        &self,
+        ticket: &PathAuthorizationTicket,
+        mode: PathCommitMode,
+    ) -> Result<PathBuf, PolicyError> {
+        if ticket.repository_root != self.repository_root {
+            return Err(PolicyError::Denied(
+                "path authorization ticket belongs to another repository root".to_owned(),
+            ));
+        }
+        validate_relative(&ticket.relative_path)?;
+        let candidate = self.repository_root.join(&ticket.relative_path);
+        let parent = candidate.parent().ok_or_else(|| {
+            PolicyError::Denied("mutation path has no authorized parent".to_owned())
+        })?;
+        let canonical_parent = parent.canonicalize()?;
+        self.authorize_canonical(&canonical_parent)?;
+        if canonical_parent != ticket.parent_path {
+            return Err(PolicyError::Denied(
+                "mutation parent path changed after authorization".to_owned(),
+            ));
+        }
+        let parent_metadata = fs::symlink_metadata(&canonical_parent)?;
+        if parent_metadata.file_type().is_symlink()
+            || !parent_metadata.is_dir()
+            || file_identity(&parent_metadata) != ticket.parent_identity
+        {
+            return Err(PolicyError::Denied(
+                "mutation parent identity changed after authorization".to_owned(),
+            ));
+        }
+        let file_name = candidate.file_name().ok_or_else(|| {
+            PolicyError::Denied("mutation path has no final component".to_owned())
+        })?;
+        let target = canonical_parent.join(file_name);
+        if target != ticket.authorized_target {
+            return Err(PolicyError::Denied(
+                "mutation target path changed after authorization".to_owned(),
+            ));
+        }
+        self.authorize_canonical(&target)?;
+        match (ticket.target_identity, fs::symlink_metadata(&target)) {
+            (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            (None, Ok(_)) => {
+                return Err(PolicyError::Denied(
+                    "mutation target appeared after authorization".to_owned(),
+                ));
+            }
+            (Some(_), Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PolicyError::Denied(
+                    "mutation target disappeared after authorization".to_owned(),
+                ));
+            }
+            (None | Some(_), Err(error)) => return Err(error.into()),
+            (Some(expected), Ok(metadata)) => {
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(PolicyError::Denied(
+                        "mutation target changed to a non-regular or symlink entry".to_owned(),
+                    ));
+                }
+                if file_identity(&metadata) != expected {
+                    return Err(PolicyError::Denied(
+                        "mutation target identity changed after authorization".to_owned(),
+                    ));
+                }
+                if mode == PathCommitMode::InPlace && file_link_count(&metadata) > 1 {
+                    return Err(PolicyError::Denied(
+                        "in-place mutation of a multiply-linked inode is forbidden; use atomic replacement"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(target)
+    }
+
     fn authorize_canonical(&self, candidate: &Path) -> Result<(), PolicyError> {
         if !candidate.starts_with(&self.repository_root) {
             return Err(PolicyError::Denied(format!(
@@ -561,6 +803,32 @@ impl PathPolicy {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: 0,
+        inode: metadata.len(),
+    }
+}
+
+#[cfg(unix)]
+fn file_link_count(metadata: &fs::Metadata) -> u64 {
+    metadata.nlink()
+}
+
+#[cfg(not(unix))]
+fn file_link_count(_metadata: &fs::Metadata) -> u64 {
+    1
 }
 
 fn validate_relative(path: &Path) -> Result<(), PolicyError> {
@@ -649,6 +917,126 @@ impl MinimalNetworkPolicy {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkAuthorization {
+    destination: (String, String, u16),
+    resolved_ips: BTreeSet<IpAddr>,
+}
+
+impl NetworkAuthorization {
+    #[must_use]
+    pub fn destination(&self) -> NetworkDestination {
+        NetworkDestination {
+            scheme: self.destination.0.clone(),
+            host: self.destination.1.clone(),
+            port: self.destination.2,
+        }
+    }
+
+    pub fn resolved_ips(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.resolved_ips.iter().copied()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct NetworkPolicy {
+    allowed: BTreeSet<(String, String, u16)>,
+}
+
+impl NetworkPolicy {
+    #[must_use]
+    pub fn offline() -> Self {
+        Self::default()
+    }
+
+    /// Adds one exact normalized destination to the governed network allowlist.
+    ///
+    /// # Errors
+    /// Returns a denial for malformed or directly unsafe IP-literal destinations.
+    pub fn allow(&mut self, scheme: &str, host: &str, port: u16) -> Result<(), PolicyError> {
+        let key = normalize_destination(scheme, host, port)?;
+        reject_unsafe_host_literal(&key.1)?;
+        self.allowed.insert(key);
+        Ok(())
+    }
+
+    /// Authorizes one destination together with caller-supplied DNS resolution results.
+    ///
+    /// This method performs no DNS or network I/O. The caller must supply the complete set it
+    /// intends to connect to, and every address must be public and policy-safe.
+    ///
+    /// # Errors
+    /// Returns a denial for absent allowlist authority, empty resolution, or any unsafe address.
+    pub fn authorize_resolved(
+        &self,
+        destination: &NetworkDestination,
+        resolved_ips: impl IntoIterator<Item = IpAddr>,
+    ) -> Result<NetworkAuthorization, PolicyError> {
+        let key = normalize_destination(&destination.scheme, &destination.host, destination.port)?;
+        reject_unsafe_host_literal(&key.1)?;
+        if !self.allowed.contains(&key) {
+            return Err(PolicyError::Denied(format!(
+                "network destination not task-authorized: {}://{}:{}",
+                destination.scheme, destination.host, destination.port
+            )));
+        }
+        let resolved_ips: BTreeSet<_> = resolved_ips.into_iter().collect();
+        if resolved_ips.is_empty() {
+            return Err(PolicyError::Denied(
+                "network authorization requires caller-supplied resolved IPs".to_owned(),
+            ));
+        }
+        for address in &resolved_ips {
+            reject_unsafe_network_ip(*address)?;
+        }
+        Ok(NetworkAuthorization {
+            destination: key,
+            resolved_ips,
+        })
+    }
+
+    /// Validates the actual connected peer against the exact previously authorized DNS set.
+    ///
+    /// # Errors
+    /// Returns a denial for private/special peers or DNS-rebinding/peer mismatch.
+    pub fn authorize_connected_peer(
+        &self,
+        authorization: &NetworkAuthorization,
+        peer: IpAddr,
+    ) -> Result<(), PolicyError> {
+        if !self.allowed.contains(&authorization.destination) {
+            return Err(PolicyError::Denied(
+                "network authorization no longer matches the active allowlist".to_owned(),
+            ));
+        }
+        reject_unsafe_network_ip(peer)?;
+        if !authorization.resolved_ips.contains(&peer) {
+            return Err(PolicyError::Denied(
+                "connected peer differs from the authorized DNS result".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reauthorizes an HTTP/package/browser redirect as a new exact destination and DNS set.
+    ///
+    /// # Errors
+    /// Returns a denial unless the redirect target is independently allowlisted and resolves
+    /// exclusively to policy-safe addresses.
+    pub fn authorize_redirect(
+        &self,
+        destination: &NetworkDestination,
+        resolved_ips: impl IntoIterator<Item = IpAddr>,
+    ) -> Result<NetworkAuthorization, PolicyError> {
+        self.authorize_resolved(destination, resolved_ips)
+    }
+
+    #[must_use]
+    pub fn is_offline(&self) -> bool {
+        self.allowed.is_empty()
+    }
+}
+
 fn normalize_destination(
     scheme: &str,
     host: &str,
@@ -677,12 +1065,74 @@ fn normalize_destination(
     ))
 }
 
+fn reject_unsafe_host_literal(host: &str) -> Result<(), PolicyError> {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(address) = host.parse::<IpAddr>() {
+        reject_unsafe_network_ip(address)?;
+    }
+    let lower = host.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "metadata.google.internal" | "metadata" | "instance-data"
+    ) {
+        return Err(PolicyError::Denied(
+            "metadata service destination is forbidden".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_unsafe_network_ip(address: IpAddr) -> Result<(), PolicyError> {
+    let unsafe_address = match address {
+        IpAddr::V4(address) => unsafe_ipv4(address),
+        IpAddr::V6(address) => unsafe_ipv6(address),
+    };
+    if unsafe_address {
+        return Err(PolicyError::Denied(format!(
+            "private, loopback, link-local, multicast, unspecified, or metadata network destination is forbidden: {address}"
+        )));
+    }
+    Ok(())
+}
+
+fn unsafe_ipv4(address: Ipv4Addr) -> bool {
+    let octets = address.octets();
+    address.is_private()
+        || address.is_loopback()
+        || address.is_link_local()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || octets[0] == 0
+        || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        || octets == [100, 100, 100, 200]
+        || octets == [169, 254, 169, 254]
+        || octets == [169, 254, 170, 2]
+}
+
+fn unsafe_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return unsafe_ipv4(mapped);
+    }
+    let segments = address.segments();
+    address.is_loopback()
+        || address.is_unspecified()
+        || address.is_multicast()
+        || (segments[0] & 0xfe00) == 0xfc00
+        || (segments[0] & 0xffc0) == 0xfe80
+}
+
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct CommandPolicy {
     pinned: BTreeMap<PathBuf, PinnedExecutable>,
     toolchain_roots: Vec<PathBuf>,
+    package_install_root: Option<PathBuf>,
     pub allow_shell: bool,
     pub allow_package_install: bool,
+    pub allow_package_lifecycle_scripts: bool,
     pub allow_destructive: bool,
 }
 
@@ -707,10 +1157,28 @@ impl CommandPolicy {
         Ok(Self {
             pinned: pinned_map,
             toolchain_roots,
+            package_install_root: None,
             allow_shell: false,
             allow_package_install: false,
+            allow_package_lifecycle_scripts: false,
             allow_destructive: false,
         })
+    }
+
+    /// Grants package installation only into one explicit project-local root.
+    ///
+    /// The root is canonicalized and must already exist. This does not grant lifecycle scripts;
+    /// callers must separately opt into those untrusted execution semantics.
+    ///
+    /// # Errors
+    /// Returns an I/O error when the project-local root cannot be canonicalized.
+    pub fn allow_project_local_package_install(
+        &mut self,
+        root: impl AsRef<Path>,
+    ) -> Result<(), PolicyError> {
+        self.package_install_root = Some(root.as_ref().canonicalize()?);
+        self.allow_package_install = true;
+        Ok(())
     }
 
     /// Validates an exact structured command and returns its deterministic risk floor.
@@ -753,6 +1221,9 @@ impl CommandPolicy {
                 "package installation is not authorized".to_owned(),
             ));
         }
+        if risk == CommandRisk::PackageInstall {
+            self.authorize_package_install(spec)?;
+        }
         if risk == CommandRisk::Destructive && !self.allow_destructive {
             return Err(PolicyError::Denied(
                 "destructive command is not authorized".to_owned(),
@@ -764,6 +1235,46 @@ impl CommandPolicy {
             ));
         }
         Ok(risk.max(spec.declared_risk))
+    }
+
+    fn authorize_package_install(&self, spec: &CommandSpec) -> Result<(), PolicyError> {
+        let root = self.package_install_root.as_ref().ok_or_else(|| {
+            PolicyError::Denied(
+                "package installation requires an explicit project-local install root".to_owned(),
+            )
+        })?;
+        let working_directory = spec.working_directory.canonicalize()?;
+        if !working_directory.starts_with(root) {
+            return Err(PolicyError::Denied(
+                "package installation working directory is outside the explicit project-local root"
+                    .to_owned(),
+            ));
+        }
+
+        let name = spec
+            .executable
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if !is_recognized_package_manager(name) {
+            return Err(PolicyError::Denied(format!(
+                "unrecognized package installer cannot inherit package_install authority: {name}"
+            )));
+        }
+        if package_args_request_global_install(name, &spec.args) {
+            return Err(PolicyError::Denied(
+                "global/system package installation is forbidden".to_owned(),
+            ));
+        }
+        validate_package_target(name, &spec.args, root, &working_directory)?;
+        if !self.allow_package_lifecycle_scripts
+            && !package_scripts_are_suppressed(name, &spec.args)
+        {
+            return Err(PolicyError::Denied(
+                "package lifecycle/build scripts are denied by default".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -811,11 +1322,131 @@ fn deterministic_risk_floor(spec: &CommandSpec, executable: &Path) -> CommandRis
 
 fn is_package_install(name: &str, args: &[String]) -> bool {
     match name {
-        "npm" | "pnpm" | "yarn" | "pip" | "pip3" | "uv" | "cargo" | "gem" | "brew" => args
+        "npm" | "pnpm" | "yarn" => args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "install" | "add" | "update" | "ci" | "up")),
+        "pip" | "pip3" => args.first().is_some_and(|arg| arg == "install"),
+        "uv" => args.first().is_some_and(|arg| {
+            matches!(arg.as_str(), "add" | "sync" | "install")
+                || (arg == "pip" && args.get(1).is_some_and(|next| next == "install"))
+        }),
+        "cargo" => args
             .first()
             .is_some_and(|arg| matches!(arg.as_str(), "install" | "add" | "update")),
+        "gem" | "brew" => args.first().is_some_and(|arg| arg == "install"),
         _ => false,
     }
+}
+
+fn is_recognized_package_manager(name: &str) -> bool {
+    matches!(
+        name,
+        "npm" | "pnpm" | "yarn" | "pip" | "pip3" | "uv" | "cargo" | "gem" | "brew"
+    )
+}
+
+fn package_args_request_global_install(name: &str, args: &[String]) -> bool {
+    if name == "brew" {
+        return true;
+    }
+    args.iter().any(|arg| {
+        matches!(arg.as_str(), "-g" | "--global" | "--user" | "--system")
+            || arg.eq_ignore_ascii_case("--location=global")
+            || arg.starts_with("--global-dir=")
+            || arg.starts_with("--globalconfig=")
+    })
+}
+
+fn validate_package_target(
+    name: &str,
+    args: &[String],
+    root: &Path,
+    working_directory: &Path,
+) -> Result<(), PolicyError> {
+    let (target_flags, required) = match name {
+        "npm" | "pnpm" => (Some(["--prefix", "--dir", "-C"].as_slice()), false),
+        "yarn" => (Some(["--cwd"].as_slice()), false),
+        "pip" | "pip3" => (Some(["--target", "--prefix"].as_slice()), true),
+        "uv" if args.first().is_some_and(|arg| arg == "pip") => {
+            (Some(["--target", "--prefix"].as_slice()), true)
+        }
+        "cargo" if args.first().is_some_and(|arg| arg == "install") => {
+            (Some(["--root"].as_slice()), true)
+        }
+        "gem" => (Some(["--install-dir"].as_slice()), true),
+        _ => (None, false),
+    };
+    let Some(flags) = target_flags else {
+        return Ok(());
+    };
+    let Some(target) = package_target_argument(args, flags) else {
+        if required {
+            return Err(PolicyError::Denied(
+                "package manager requires an explicit project-local target".to_owned(),
+            ));
+        }
+        return Ok(());
+    };
+    let target = canonicalize_future_path(&target, working_directory)?;
+    if !target.starts_with(root) {
+        return Err(PolicyError::Denied(
+            "package manager target escapes the explicit project-local root".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn package_target_argument(args: &[String], flags: &[&str]) -> Option<PathBuf> {
+    for (index, arg) in args.iter().enumerate() {
+        for flag in flags {
+            if arg == flag {
+                return args.get(index + 1).map(PathBuf::from);
+            }
+            if let Some(value) = arg.strip_prefix(&format!("{flag}=")) {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+    None
+}
+
+fn package_scripts_are_suppressed(name: &str, args: &[String]) -> bool {
+    match name {
+        "npm" | "pnpm" | "yarn" => args.iter().any(|arg| arg == "--ignore-scripts"),
+        "pip" | "pip3" => args
+            .iter()
+            .any(|arg| arg == "--only-binary=:all:" || arg == "--only-binary=all"),
+        "uv" if args.first().is_some_and(|arg| arg == "pip") => args
+            .iter()
+            .any(|arg| arg == "--only-binary=:all:" || arg == "--only-binary=all"),
+        "cargo" => args.first().is_none_or(|arg| arg != "install"),
+        "gem" | "brew" => false,
+        _ => true,
+    }
+}
+
+fn canonicalize_future_path(path: &Path, working_directory: &Path) -> Result<PathBuf, PolicyError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        working_directory.join(path)
+    };
+    let mut cursor = absolute.as_path();
+    let mut missing = Vec::new();
+    while !cursor.exists() {
+        let file_name = cursor.file_name().ok_or_else(|| {
+            PolicyError::Denied("package target has no existing ancestor".to_owned())
+        })?;
+        missing.push(file_name.to_os_string());
+        cursor = cursor.parent().ok_or_else(|| {
+            PolicyError::Denied("package target has no existing ancestor".to_owned())
+        })?;
+    }
+    let mut canonical = cursor.canonicalize()?;
+    for component in missing.iter().rev() {
+        canonical.push(component);
+    }
+    Ok(canonical)
 }
 
 fn is_destructive(name: &str, args: &[String]) -> bool {
@@ -839,6 +1470,10 @@ fn is_destructive(name: &str, args: &[String]) -> bool {
 
 const AMBIENT_DENY_NAMES: &[&str] = &[
     "PATH",
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
@@ -846,10 +1481,15 @@ const AMBIENT_DENY_NAMES: &[&str] = &[
     "GIT_CONFIG",
     "GIT_CONFIG_GLOBAL",
     "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_COUNT",
+    "GIT_ASKPASS",
     "GIT_SSH",
     "GIT_SSH_COMMAND",
+    "SSH_ASKPASS",
     "SSH_AUTH_SOCK",
     "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
     "DYLD_INSERT_LIBRARIES",
     "DYLD_LIBRARY_PATH",
     "EDITOR",
@@ -858,9 +1498,20 @@ const AMBIENT_DENY_NAMES: &[&str] = &[
     "GIT_PAGER",
     "NPM_TOKEN",
     "NODE_AUTH_TOKEN",
+    "NPM_CONFIG_USERCONFIG",
+    "NPM_CONFIG_REGISTRY",
+    "YARN_RC_FILENAME",
+    "PNPM_HOME",
+    "PIP_CONFIG_FILE",
     "PIP_INDEX_URL",
+    "PIP_EXTRA_INDEX_URL",
+    "UV_INDEX_URL",
     "TWINE_PASSWORD",
+    "CARGO_HOME",
     "CARGO_REGISTRIES_CRATES_IO_TOKEN",
+    "GEM_HOME",
+    "GEM_PATH",
+    "GRADLE_USER_HOME",
 ];
 
 /// Constructs a cleared child environment from explicitly requested entries only.
@@ -884,6 +1535,23 @@ pub fn sanitized_environment(
             ));
         }
         let forbidden = AMBIENT_DENY_NAMES.iter().any(|entry| upper == *entry)
+            || upper.starts_with("GIT_CONFIG_KEY_")
+            || upper.starts_with("GIT_CONFIG_VALUE_")
+            || upper.starts_with("GIT_")
+            || upper.starts_with("SSH_")
+            || upper.starts_with("XDG_")
+            || upper.starts_with("LD_")
+            || upper.starts_with("DYLD_")
+            || upper.starts_with("NPM_CONFIG_")
+            || upper.starts_with("YARN_")
+            || upper.starts_with("PNPM_")
+            || upper.starts_with("PIP_")
+            || upper.starts_with("UV_")
+            || upper.starts_with("CARGO_")
+            || upper.starts_with("BUNDLE_")
+            || upper.starts_with("GEM_")
+            || upper.starts_with("MAVEN_")
+            || upper.starts_with("GRADLE_")
             || upper.ends_with("_TOKEN")
             || upper.ends_with("_PASSWORD")
             || upper.ends_with("_SECRET")
@@ -897,6 +1565,247 @@ pub fn sanitized_environment(
         result.insert(name.clone(), value.clone());
     }
     Ok(result)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitConfigKeyClass {
+    Safe,
+    HookOrProgram,
+    Credential,
+    RemoteOrTransport,
+    FilterOrDiff,
+    IncludeOrAlias,
+}
+
+#[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct GitPolicy {
+    allow_destructive: bool,
+    allow_remote_read: bool,
+    allow_remote_write: bool,
+    allow_helper_execution: bool,
+    allow_submodule: bool,
+    allow_lfs: bool,
+    allow_filter_execution: bool,
+}
+
+impl GitPolicy {
+    #[must_use]
+    pub fn deny_by_default() -> Self {
+        Self::default()
+    }
+
+    pub fn set_allow_destructive(&mut self, allow: bool) {
+        self.allow_destructive = allow;
+    }
+
+    pub fn set_allow_remote_read(&mut self, allow: bool) {
+        self.allow_remote_read = allow;
+    }
+
+    pub fn set_allow_remote_write(&mut self, allow: bool) {
+        self.allow_remote_write = allow;
+    }
+
+    pub fn set_allow_helper_execution(&mut self, allow: bool) {
+        self.allow_helper_execution = allow;
+    }
+
+    pub fn set_allow_submodule(&mut self, allow: bool) {
+        self.allow_submodule = allow;
+    }
+
+    pub fn set_allow_lfs(&mut self, allow: bool) {
+        self.allow_lfs = allow;
+    }
+
+    pub fn set_allow_filter_execution(&mut self, allow: bool) {
+        self.allow_filter_execution = allow;
+    }
+
+    /// Classifies a repository-local Git config key by hidden authority surface.
+    #[must_use]
+    pub fn classify_local_config_key(key: &str) -> GitConfigKeyClass {
+        let lower = key.trim().to_ascii_lowercase();
+        if lower == "core.hookspath"
+            || lower == "core.fsmonitor"
+            || lower == "core.editor"
+            || lower == "core.pager"
+            || lower == "sequence.editor"
+            || lower == "gpg.program"
+            || lower.starts_with("pager.")
+            || lower.starts_with("mergetool.")
+            || (lower.starts_with("merge.") && lower.ends_with(".driver"))
+        {
+            return GitConfigKeyClass::HookOrProgram;
+        }
+        if lower.starts_with("credential.")
+            || lower == "credential.helper"
+            || lower == "core.askpass"
+        {
+            return GitConfigKeyClass::Credential;
+        }
+        if lower.starts_with("remote.")
+            || lower.starts_with("url.")
+            || lower.starts_with("http.")
+            || lower.starts_with("https.")
+            || lower.starts_with("submodule.")
+            || lower.starts_with("lfs.")
+            || lower == "core.sshcommand"
+        {
+            return GitConfigKeyClass::RemoteOrTransport;
+        }
+        if lower.starts_with("filter.")
+            || lower == "core.attributesfile"
+            || lower == "interactive.difffilter"
+            || (lower.starts_with("diff.")
+                && (lower.ends_with(".external") || lower.ends_with(".textconv")))
+        {
+            return GitConfigKeyClass::FilterOrDiff;
+        }
+        if lower.starts_with("include.")
+            || lower.starts_with("includeif.")
+            || lower.starts_with("alias.")
+        {
+            return GitConfigKeyClass::IncludeOrAlias;
+        }
+        GitConfigKeyClass::Safe
+    }
+
+    /// Denies repository-local config keys that can introduce hidden execution, credentials,
+    /// helpers, filters, aliases/includes, or remote transport behavior.
+    ///
+    /// # Errors
+    /// Returns a denial for any non-safe config class unless a matching explicit policy switch
+    /// permits that governed capability.
+    pub fn authorize_local_config_key(&self, key: &str) -> Result<(), PolicyError> {
+        let class = Self::classify_local_config_key(key);
+        let allowed = match class {
+            GitConfigKeyClass::Safe => true,
+            GitConfigKeyClass::HookOrProgram | GitConfigKeyClass::IncludeOrAlias => {
+                self.allow_helper_execution
+            }
+            GitConfigKeyClass::Credential => false,
+            GitConfigKeyClass::RemoteOrTransport => self.allow_remote_read,
+            GitConfigKeyClass::FilterOrDiff => self.allow_filter_execution,
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(PolicyError::Denied(format!(
+                "Git config key requires explicit governed capability: {key}"
+            )))
+        }
+    }
+
+    /// Authorizes one normalized Git argument vector under deny-by-default local/remote policy.
+    ///
+    /// # Errors
+    /// Returns a denial for destructive operations, remote access, helper execution, submodule,
+    /// LFS, or filter-style execution absent the corresponding explicit policy grant.
+    pub fn authorize_args(&self, args: &[String]) -> Result<(), PolicyError> {
+        let subcommand = git_subcommand(args)?;
+        let destructive = git_args_are_destructive(args);
+        if destructive && !self.allow_destructive {
+            return Err(PolicyError::Denied(
+                "destructive Git operation is denied by default".to_owned(),
+            ));
+        }
+        let remote_write = subcommand == "push";
+        let remote_read = matches!(
+            subcommand,
+            "fetch" | "pull" | "clone" | "ls-remote" | "archive"
+        );
+        if remote_write && !self.allow_remote_write {
+            return Err(PolicyError::Denied(
+                "remote Git mutation requires explicit network/external authority".to_owned(),
+            ));
+        }
+        if remote_read && !self.allow_remote_read {
+            return Err(PolicyError::Denied(
+                "remote Git access requires explicit network authority".to_owned(),
+            ));
+        }
+        if subcommand == "submodule" && !self.allow_submodule {
+            return Err(PolicyError::Denied(
+                "Git submodule execution requires an explicit governed action".to_owned(),
+            ));
+        }
+        if subcommand == "lfs" && !self.allow_lfs {
+            return Err(PolicyError::Denied(
+                "Git LFS execution requires an explicit governed action".to_owned(),
+            ));
+        }
+        if matches!(subcommand, "credential" | "difftool" | "mergetool")
+            && !self.allow_helper_execution
+        {
+            return Err(PolicyError::Denied(
+                "Git helper execution requires an explicit governed action".to_owned(),
+            ));
+        }
+        if git_args_request_filter_execution(args) && !self.allow_filter_execution {
+            return Err(PolicyError::Denied(
+                "Git filter/external-diff execution requires an explicit governed action"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn git_subcommand(args: &[String]) -> Result<&str, PolicyError> {
+    let Some(subcommand) = args.first() else {
+        return Err(PolicyError::Denied(
+            "Git command is missing a normalized subcommand".to_owned(),
+        ));
+    };
+    if subcommand.starts_with('-') || subcommand.contains('=') {
+        return Err(PolicyError::Denied(
+            "Git global/config overrides are forbidden; the governed wrapper supplies them"
+                .to_owned(),
+        ));
+    }
+    Ok(subcommand)
+}
+
+fn git_args_are_destructive(args: &[String]) -> bool {
+    let Some(subcommand) = args.first().map(|value| value.to_ascii_lowercase()) else {
+        return false;
+    };
+    let tail = &args[1..];
+    (subcommand == "reset" && tail.iter().any(|arg| arg.eq_ignore_ascii_case("--hard")))
+        || (subcommand == "clean"
+            && tail.iter().any(|arg| {
+                let lower = arg.to_ascii_lowercase();
+                lower.starts_with('-') && lower.contains('f') && lower.contains('d')
+            }))
+        || (subcommand == "push"
+            && tail.iter().any(|arg| {
+                arg.eq_ignore_ascii_case("--force")
+                    || arg.eq_ignore_ascii_case("-f")
+                    || arg.to_ascii_lowercase().starts_with("--force-with-lease")
+            }))
+        || (subcommand == "branch"
+            && tail
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-d" | "-D" | "--delete")))
+        || (subcommand == "tag"
+            && tail
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "-d" | "--delete")))
+        || subcommand == "rebase"
+        || subcommand == "filter-branch"
+        || (subcommand == "commit" && tail.iter().any(|arg| arg == "--amend"))
+}
+
+fn git_args_request_filter_execution(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        lower.contains("textconv")
+            || lower.contains("ext-diff")
+            || lower.contains("filter.")
+            || lower.contains("fsmonitor")
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

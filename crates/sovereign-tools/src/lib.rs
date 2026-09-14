@@ -18,8 +18,9 @@ use sovereign_state::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
-use std::fs;
-use std::io::Read;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -91,6 +92,206 @@ impl From<std::time::SystemTimeError> for ToolError {
 }
 
 pub type PermissionClass = Capability;
+
+/// Identity snapshot used to bind an authorized filesystem replacement to the exact parent and
+/// target observed before bytes are staged. The replacement is always a same-directory rename;
+/// an existing hard-linked target inode is never modified in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicReplaceGuard {
+    repository_root: std::path::PathBuf,
+    relative_path: std::path::PathBuf,
+    parent: std::path::PathBuf,
+    parent_device: u64,
+    parent_inode: u64,
+    target_identity: Option<FileIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+    file_type: u32,
+    content_digest: String,
+}
+
+impl AtomicReplaceGuard {
+    /// Captures an immutable authorization-to-commit binding for one repository-relative target.
+    ///
+    /// # Errors
+    /// Returns fail-closed for traversal, a non-canonical repository root, symlinked path
+    /// components, a non-directory parent, or a non-regular existing target.
+    pub fn prepare(
+        repository_root: impl AsRef<Path>,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<Self, ToolError> {
+        let repository_root = repository_root.as_ref().canonicalize()?;
+        let relative_path = relative_path.as_ref();
+        validate_commit_relative_path(relative_path)?;
+        let parent_relative = relative_path.parent().unwrap_or_else(|| Path::new(""));
+        let parent = repository_root.join(parent_relative);
+        ensure_no_symlink_components(&repository_root, parent_relative)?;
+        let parent = parent.canonicalize()?;
+        if !parent.starts_with(&repository_root) {
+            return Err(ToolError::Authority(
+                "atomic replacement parent escaped repository root".to_owned(),
+            ));
+        }
+        let parent_metadata = fs::symlink_metadata(&parent)?;
+        if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+            return Err(ToolError::Authority(
+                "atomic replacement parent is not a stable directory".to_owned(),
+            ));
+        }
+        let target = repository_root.join(relative_path);
+        let target_identity = target_identity(&target)?;
+        Ok(Self {
+            repository_root,
+            relative_path: relative_path.to_path_buf(),
+            parent,
+            parent_device: parent_metadata.dev(),
+            parent_inode: parent_metadata.ino(),
+            target_identity,
+        })
+    }
+
+    #[must_use]
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    /// Atomically replaces the exact guarded path after revalidating parent and target identity.
+    /// A temporary regular file is created in the already-authorized parent, synced, and renamed
+    /// over the target only after the authorization snapshot still matches.
+    ///
+    /// # Errors
+    /// Returns fail-closed if any path component, parent identity, or target identity changed
+    /// between authorization and commit, or if staging/sync/rename fails.
+    pub fn commit(&self, bytes: &[u8], mode: u32) -> Result<(), ToolError> {
+        self.revalidate()?;
+        let target = self.repository_root.join(&self.relative_path);
+        let file_name = target.file_name().ok_or_else(|| {
+            ToolError::Authority("atomic replacement target has no file name".to_owned())
+        })?;
+        let nonce = ATOMIC_REPLACE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let temp = self.parent.join(format!(
+            ".{}.sovereign-tmp-{}-{nonce}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+        let result = (|| -> Result<(), ToolError> {
+            let mut staged = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            staged.write_all(bytes)?;
+            staged.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+            staged.sync_all()?;
+
+            // This second check is deliberately immediately before rename. It catches a parent or
+            // target swap after authorization without ever opening the old target for writing.
+            self.revalidate()?;
+            fs::rename(&temp, &target)?;
+            File::open(&self.parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+
+    fn revalidate(&self) -> Result<(), ToolError> {
+        let parent_relative = self.relative_path.parent().unwrap_or_else(|| Path::new(""));
+        ensure_no_symlink_components(&self.repository_root, parent_relative)?;
+        let current_parent = self.repository_root.join(parent_relative).canonicalize()?;
+        if current_parent != self.parent {
+            return Err(ToolError::Authority(
+                "atomic replacement parent path changed after authorization".to_owned(),
+            ));
+        }
+        let metadata = fs::symlink_metadata(&current_parent)?;
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.dev() != self.parent_device
+            || metadata.ino() != self.parent_inode
+        {
+            return Err(ToolError::Authority(
+                "atomic replacement parent identity changed after authorization".to_owned(),
+            ));
+        }
+        let current_target = target_identity(&self.repository_root.join(&self.relative_path))?;
+        if current_target != self.target_identity {
+            return Err(ToolError::Authority(
+                "atomic replacement target identity changed after authorization".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+static ATOMIC_REPLACE_NONCE: AtomicU64 = AtomicU64::new(1);
+
+fn validate_commit_relative_path(path: &Path) -> Result<(), ToolError> {
+    use std::path::Component;
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(ToolError::Authority(
+            "atomic replacement requires a non-empty repository-relative path".to_owned(),
+        ));
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(ToolError::Authority(
+            "atomic replacement path traversal is forbidden".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_no_symlink_components(root: &Path, relative_parent: &Path) -> Result<(), ToolError> {
+    let mut cursor = root.to_path_buf();
+    for component in relative_parent.components() {
+        if matches!(component, std::path::Component::CurDir) {
+            continue;
+        }
+        cursor.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&cursor)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ToolError::Authority(format!(
+                "atomic replacement parent component is not a stable directory: {}",
+                cursor.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn target_identity(path: &Path) -> Result<Option<FileIdentity>, ToolError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(ToolError::Authority(format!(
+                    "atomic replacement target is not a regular file: {}",
+                    path.display()
+                )));
+            }
+            let bytes = fs::read(path)?;
+            let mut hasher = Sha256::new();
+            hasher.update(bytes);
+            Ok(Some(FileIdentity {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                file_type: metadata.mode() & 0o170_000,
+                content_digest: format!("sha256:{:x}", hasher.finalize()),
+            }))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolManifest {

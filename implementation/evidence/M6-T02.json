@@ -1,0 +1,244 @@
+{
+  "schema_version": 1,
+  "task_id": "M6-T02",
+  "title": "Harden filesystem, shell, Git, dependency, and network policy",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "a51346dddd3a656c97007b898c36b2b37fa55ae8",
+  "status": "completed",
+  "completed_at": "2026-09-14T06:58:53Z",
+  "verified_at": "2026-09-14T06:58:53Z",
+  "dependencies": [
+    "M5-T03"
+  ],
+  "interfaces": [
+    "PathPolicy",
+    "CommandPolicy",
+    "GitPolicy",
+    "NetworkPolicy"
+  ],
+  "security_contract": {
+    "controller_remains_sole_execution_authority": true,
+    "process_exec_never_implies_network_secret_filesystem_or_sibling_repo_authority": true,
+    "path_authorization_ticket_revalidated_at_commit": true,
+    "hard_link_in_place_mutation_denied": true,
+    "authoritative_replacement_uses_atomic_same_parent_replace": true,
+    "sibling_registered_repository_write_requires_exact_active_scope": true,
+    "production_git_is_absolute_canonical_and_process_lifetime_digest_pinned": true,
+    "git_hooks_global_config_credentials_external_diff_filters_fsmonitor_remote_helpers_fail_closed": true,
+    "package_global_install_denied": true,
+    "package_install_requires_explicit_project_local_target": true,
+    "package_lifecycle_scripts_default_denied": true,
+    "network_authorization_binds_exact_destination_dns_set_redirect_and_connected_peer": true,
+    "private_loopback_link_local_metadata_destinations_denied": true,
+    "unavailable_isolation_backend_blocks_before_dispatch": true,
+    "ambient_proxy_git_ssh_loader_package_auth_environment_stripped": true
+  },
+  "adversarial_requirement_mapping": [
+    {
+      "requirement": "path traversal and symlink escape denied",
+      "tests": [
+        "sovereign-policy kernel protected/traversal fixtures",
+        "security_path_ticket_detects_swaps_and_hard_link_in_place_hazard"
+      ]
+    },
+    {
+      "requirement": "authorization-to-commit symlink or parent swap invalidates action",
+      "tests": [
+        "security_path_ticket_detects_swaps_and_hard_link_in_place_hazard",
+        "atomic_replace_rejects_target_symlink_swap_after_authorization",
+        "atomic_replace_rejects_parent_symlink_swap_after_authorization"
+      ]
+    },
+    {
+      "requirement": "hard-link fixture cannot mutate out-of-scope inode through in-place write",
+      "tests": [
+        "security_path_ticket_detects_swaps_and_hard_link_in_place_hazard",
+        "atomic_replace_does_not_mutate_external_hard_link_inode",
+        "worktree_untracked_composition_replaces_hardlink_without_mutating_external_inode"
+      ]
+    },
+    {
+      "requirement": "registered sibling repository denied outside active task scope",
+      "tests": [
+        "security_repository_scope_denies_registered_sibling_outside_task_scope"
+      ]
+    },
+    {
+      "requirement": "secret/protected credential roots denied",
+      "tests": [
+        "sovereign-policy protected-path kernel fixture",
+        "mac_sandbox_denies_protected_home_read_and_offline_network"
+      ]
+    },
+    {
+      "requirement": "PATH shim or repository executable cannot replace production Git",
+      "tests": [
+        "worktree_production_git_ignores_path_shim_and_disables_checkout_hooks"
+      ]
+    },
+    {
+      "requirement": "Git reset/clean/force-push/helper/submodule/LFS/filter/remote hidden execution denied by default",
+      "tests": [
+        "security_git_policy_denies_hidden_execution_remote_and_destructive_surfaces",
+        "worktree_checkout_rejects_local_execution_and_network_config_surfaces",
+        "worktree_checkout_rejects_filters_lfs_and_promisor_before_side_effects"
+      ]
+    },
+    {
+      "requirement": "ambient proxy Git/SSH loader/config/package auth stripped",
+      "tests": [
+        "security_environment_strips_git_ssh_loader_config_and_package_ambient_authority"
+      ]
+    },
+    {
+      "requirement": "package global install denied, local target required, lifecycle scripts default off",
+      "tests": [
+        "security_package_policy_requires_local_target_denies_global_and_defaults_scripts_off"
+      ]
+    },
+    {
+      "requirement": "DNS rebinding redirect peer mismatch private loopback link-local metadata denied",
+      "tests": [
+        "security_network_policy_rejects_private_rebinding_redirect_and_peer_mismatch"
+      ]
+    },
+    {
+      "requirement": "offline process and unavailable isolation fail closed before spawn",
+      "tests": [
+        "mac_sandbox_denies_protected_home_read_and_offline_network",
+        "unavailable_isolation_backend_blocks_before_dispatch_or_spawn",
+        "process_exec isolation-binding/no-write fixtures"
+      ]
+    }
+  ],
+  "policy_denial_audit_traces": {
+    "path": [
+      "parent_identity_changed",
+      "target_identity_changed",
+      "symlink_path",
+      "hard_link_in_place_denied"
+    ],
+    "git": [
+      "destructive_denied",
+      "remote_denied",
+      "hidden_execution_config_denied"
+    ],
+    "package": [
+      "global_install_denied",
+      "missing_or_escaping_local_target_denied",
+      "lifecycle_script_denied"
+    ],
+    "network": [
+      "offline_or_not_allowlisted",
+      "unsafe_resolved_ip",
+      "redirect_reauthorization_denied",
+      "connected_peer_mismatch"
+    ],
+    "isolation": [
+      "backend_unavailable_before_dispatch"
+    ],
+    "evidence_form": "deterministic policy/repository/tool error-path assertions in adversarial test fixtures; tamper-evident audit logging is separately owned by M6-T06"
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-policy --offline -- security",
+      "result": "passed",
+      "detail": "6/6 non-vacuous security tests"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-policy --offline",
+      "result": "passed",
+      "detail": "34/34 (14 kernel + 14 resources + 6 security)"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-tools --offline",
+      "result": "passed",
+      "detail": "runner 15/15"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-repo --offline",
+      "result": "passed",
+      "detail": "41 total; worktree 12/12"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test --workspace --all-targets --offline",
+      "result": "passed",
+      "detail": "all non-ignored tests passed; only the two explicit real-Qwen runtime qualifications ignored"
+    }
+  ],
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "real_qwen_runtime_on_current_tree": "deferred to target-machine/final release acceptance; runtime not claimed here",
+  "independent_audit": {
+    "worker": "worker-24",
+    "final_result": "CLOSABLE",
+    "final_verdict": "M6-T02 frozen task: CLOSABLE",
+    "final_blockers": [],
+    "notes": "Fresh read-only exact-tree audit matched all seven supplied hashes before and after focused checks and found no security-contract blocker."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "source_hashes": {
+    "crates/sovereign-policy/src/lib.rs": "sha256:122880eb7378e1da7e9d3af347c57e3f842339ef5a5e2689fbd6db01f504da69",
+    "crates/sovereign-policy/tests/security.rs": "sha256:c5338220e9e10a63a89917c12f506e51c491434ff44b68c31ff5ea9f7d27e484",
+    "crates/sovereign-tools/src/lib.rs": "sha256:17e6672ffe931d4b19c9f6d750dd5cd37ea8774dfc1944f1762ac5a9b17ee384",
+    "crates/sovereign-tools/tests/runner.rs": "sha256:2eb4daf2e98b910dce0d9013196f1cc3c2b51f5b066b75969c9466e05d39c8e6",
+    "crates/sovereign-repo/src/lib.rs": "sha256:d2a632de496f5bf7cea8d82dc992e6b6618778373b3463449470bd9cf5e070ff",
+    "crates/sovereign-repo/src/worktree.rs": "sha256:fb6a300f8242c101e64f37776517996cb8c58852ea3670ac461bf786b82d5ed0",
+    "crates/sovereign-repo/tests/worktree.rs": "sha256:8047cfb4ddb688e76d0aa129aaa51012773b58cf493dea1d37ffe9b28b23b146"
+  },
+  "frozen_tree": {
+    "head": "a51346dddd3a656c97007b898c36b2b37fa55ae8",
+    "tracked_modified_files": 6,
+    "untracked_files": 1,
+    "status_paths": [
+      "crates/sovereign-policy/src/lib.rs",
+      "crates/sovereign-policy/tests/security.rs",
+      "crates/sovereign-tools/src/lib.rs",
+      "crates/sovereign-tools/tests/runner.rs",
+      "crates/sovereign-repo/src/lib.rs",
+      "crates/sovereign-repo/src/worktree.rs",
+      "crates/sovereign-repo/tests/worktree.rs"
+    ]
+  },
+  "state_authority": {
+    "new_database": false,
+    "new_resource_database": false,
+    "new_memory_database": false,
+    "controller_remains_sole_execution_authority": true
+  },
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false
+  }
+}

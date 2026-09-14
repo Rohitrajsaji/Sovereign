@@ -31,8 +31,18 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const SYSTEM_GIT_PATH: &str = "/usr/bin/git";
+
+#[derive(Debug)]
+struct PinnedGitExecutable {
+    path: PathBuf,
+    digest: String,
+}
+
+static PINNED_GIT: OnceLock<PinnedGitExecutable> = OnceLock::new();
 
 /// Deterministic repository-layer failure.
 #[derive(Debug)]
@@ -969,18 +979,50 @@ fn git_optional_text(
     })
 }
 
-fn git_output(root: &Path, args: &[&str]) -> Result<Output, RepoError> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut command = Command::new("git");
+fn pinned_git() -> Result<&'static PinnedGitExecutable, RepoError> {
+    if PINNED_GIT.get().is_none() {
+        let path = fs::canonicalize(SYSTEM_GIT_PATH).map_err(|error| {
+            RepoError::UnsafeGitConfiguration(format!(
+                "canonical system Git {SYSTEM_GIT_PATH} is unavailable: {error}"
+            ))
+        })?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(RepoError::UnsafeGitConfiguration(format!(
+                "canonical system Git path {} is not a regular file",
+                path.display()
+            )));
+        }
+        let digest = sha256_prefixed(&fs::read(&path)?);
+        let _ = PINNED_GIT.set(PinnedGitExecutable { path, digest });
+    }
+    let pinned = PINNED_GIT.get().ok_or_else(|| {
+        RepoError::UnsafeGitConfiguration("system Git pin was not initialized".to_owned())
+    })?;
+    let current_path = fs::canonicalize(SYSTEM_GIT_PATH)?;
+    let current_digest = sha256_prefixed(&fs::read(&current_path)?);
+    if current_path != pinned.path || current_digest != pinned.digest {
+        return Err(RepoError::UnsafeGitConfiguration(
+            "canonical system Git changed after process-lifetime pinning".to_owned(),
+        ));
+    }
+    Ok(pinned)
+}
+
+fn hardened_git_command(root: &Path) -> Result<Command, RepoError> {
+    let pinned = pinned_git()?;
+    let mut command = Command::new(&pinned.path);
     command
         .current_dir(root)
         .env_clear()
-        .env("PATH", path)
+        .env("PATH", "/usr/bin:/bin")
+        .env("LC_ALL", "C")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_ATTR_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_PROTOCOL_FROM_USER", "0")
         .args([
             "-c",
             "core.hooksPath=/dev/null",
@@ -991,11 +1033,26 @@ fn git_output(root: &Path, args: &[&str]) -> Result<Output, RepoError> {
             "-c",
             "submodule.recurse=false",
             "-c",
+            "fetch.recurseSubmodules=false",
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.file.allow=never",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "credential.helper=",
+            "-c",
             "color.ui=false",
             "-c",
             "pager.status=false",
-        ])
-        .args(args);
+        ]);
+    Ok(command)
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Result<Output, RepoError> {
+    let mut command = hardened_git_command(root)?;
+    command.args(args);
     Ok(command.output()?)
 }
 
