@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SHA256_HEX_LEN: usize = 64;
+pub const REDACTION_EVENT_SCHEMA_V1: &str = "sovereign-redaction-event-v1";
+pub const REDACTOR_VERSION_V1: u32 = 1;
 
 /// Public metadata for one immutable CAS artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,8 +125,84 @@ pub struct FailureSignature(pub String);
 /// Metadata describing one mandatory ingress-redaction event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RedactionEvent {
+    pub schema: String,
+    pub redactor_version: u32,
     pub event_id: String,
     pub class: String,
+    pub occurrences: u64,
+}
+
+/// Reusable deterministic ingress redactor. Exact secret values are supplied per invocation and
+/// are never retained in this configuration object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Redactor {
+    version: u32,
+}
+
+impl Default for Redactor {
+    fn default() -> Self {
+        Self::v1()
+    }
+}
+
+impl Redactor {
+    #[must_use]
+    pub const fn v1() -> Self {
+        Self {
+            version: REDACTOR_VERSION_V1,
+        }
+    }
+
+    #[must_use]
+    pub const fn version(self) -> u32 {
+        self.version
+    }
+
+    /// Redacts exact injected values and generic v1 credential shapes without persisting input.
+    ///
+    /// # Errors
+    /// Returns an input error for an unsupported redactor version.
+    pub fn redact(
+        self,
+        bytes: &[u8],
+        exact_secret_values: &[&str],
+    ) -> Result<RedactedIngress, EvidenceError> {
+        let exact_secret_bytes = exact_secret_values
+            .iter()
+            .map(|value| value.as_bytes())
+            .collect::<Vec<_>>();
+        self.redact_bytes(bytes, &exact_secret_bytes)
+    }
+
+    /// Redacts exact byte sequences plus generic v1 credential shapes without UTF-8 conversion.
+    ///
+    /// This byte-exact entry point is intended for broker-resolved secret material that may not be
+    /// valid UTF-8. Exact secret bytes are supplied per invocation and are never retained in the
+    /// redactor configuration or redaction-event metadata.
+    ///
+    /// # Errors
+    /// Returns an input error for an unsupported redactor version.
+    pub fn redact_bytes(
+        self,
+        bytes: &[u8],
+        exact_secret_values: &[&[u8]],
+    ) -> Result<RedactedIngress, EvidenceError> {
+        if self.version != REDACTOR_VERSION_V1 {
+            return Err(EvidenceError::InvalidInput(format!(
+                "unsupported redactor version: {}",
+                self.version
+            )));
+        }
+        Ok(redact_ingress_v1(bytes, exact_secret_values))
+    }
+}
+
+/// Redacted bytes plus safe deterministic audit metadata, suitable for model/audit ingress before
+/// any persistence occurs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactedIngress {
+    pub bytes: Vec<u8>,
+    pub events: Vec<RedactionEvent>,
 }
 
 /// Bounded immutable evidence derived from one retained post-ingress artifact.
@@ -218,7 +296,9 @@ impl EvidenceCompressor {
                     .to_owned(),
             ));
         }
-        let (redacted, redactions) = redact_ingress(input.bytes, input.known_secret_values);
+        let redacted_ingress = Redactor::v1().redact(input.bytes, input.known_secret_values)?;
+        let redacted = redacted_ingress.bytes;
+        let redactions = redacted_ingress.events;
         let effective_raw_limit = input
             .action_raw_spool_limit_bytes
             .min(input.task_raw_spool_remaining_bytes);
@@ -405,38 +485,163 @@ fn range_is_retained(ranges: &[RetainedRange], start: u64, end: u64) -> bool {
             .any(|range| start >= range.offset && end <= range.end())
 }
 
-fn redact_ingress(bytes: &[u8], known_secret_values: &[&str]) -> (Vec<u8>, Vec<RedactionEvent>) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenericCredentialShape {
+    Bearer {
+        class: &'static str,
+        ordinal: usize,
+    },
+    Assignment {
+        key: &'static [u8],
+        class: &'static str,
+        ordinal: usize,
+    },
+    Json {
+        key: &'static [u8],
+        class: &'static str,
+        ordinal: usize,
+    },
+}
+
+impl GenericCredentialShape {
+    const fn class(self) -> &'static str {
+        match self {
+            Self::Bearer { class, .. }
+            | Self::Assignment { class, .. }
+            | Self::Json { class, .. } => class,
+        }
+    }
+
+    const fn ordinal(self) -> usize {
+        match self {
+            Self::Bearer { ordinal, .. }
+            | Self::Assignment { ordinal, .. }
+            | Self::Json { ordinal, .. } => ordinal,
+        }
+    }
+}
+
+const GENERIC_CREDENTIAL_SHAPES_V1: [GenericCredentialShape; 19] = [
+    GenericCredentialShape::Bearer {
+        class: "bearer_token",
+        ordinal: 0,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"npm_auth_token",
+        class: "package_token",
+        ordinal: 1,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"npm_token",
+        class: "package_token",
+        ordinal: 2,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"_authtoken",
+        class: "package_token",
+        ordinal: 3,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"access_token",
+        class: "token",
+        ordinal: 4,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"client_secret",
+        class: "secret",
+        ordinal: 5,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"api_key",
+        class: "api_key",
+        ordinal: 6,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"api-key",
+        class: "api_key",
+        ordinal: 7,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"apikey",
+        class: "api_key",
+        ordinal: 8,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"token",
+        class: "token",
+        ordinal: 9,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"password",
+        class: "password",
+        ordinal: 10,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"passwd",
+        class: "password",
+        ordinal: 11,
+    },
+    GenericCredentialShape::Assignment {
+        key: b"secret",
+        class: "secret",
+        ordinal: 12,
+    },
+    GenericCredentialShape::Json {
+        key: b"_authtoken",
+        class: "json_package_token",
+        ordinal: 13,
+    },
+    GenericCredentialShape::Json {
+        key: b"api_key",
+        class: "json_api_key",
+        ordinal: 14,
+    },
+    GenericCredentialShape::Json {
+        key: b"apikey",
+        class: "json_api_key",
+        ordinal: 15,
+    },
+    GenericCredentialShape::Json {
+        key: b"token",
+        class: "json_token",
+        ordinal: 16,
+    },
+    GenericCredentialShape::Json {
+        key: b"password",
+        class: "json_password",
+        ordinal: 17,
+    },
+    GenericCredentialShape::Json {
+        key: b"secret",
+        class: "json_secret",
+        ordinal: 18,
+    },
+];
+
+fn redact_ingress_v1(bytes: &[u8], known_secret_values: &[&[u8]]) -> RedactedIngress {
     let mut current = bytes.to_vec();
     let mut events = Vec::new();
-    for (index, secret) in known_secret_values.iter().enumerate() {
-        if secret.is_empty() {
-            continue;
-        }
-        let (next, count) = replace_all(&current, secret.as_bytes(), b"[REDACTED]");
+    let mut exact_secrets = known_secret_values
+        .iter()
+        .copied()
+        .filter(|secret| !secret.is_empty())
+        .collect::<Vec<_>>();
+    exact_secrets
+        .sort_unstable_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+    exact_secrets.dedup();
+    for (index, secret) in exact_secrets.into_iter().enumerate() {
+        let (next, count) = replace_all(&current, secret, b"[REDACTED]");
         current = next;
         if count > 0 {
             events.push(redaction_event("known_secret", index, count));
         }
     }
 
-    let generic_prefixes: &[(&[u8], &str)] = &[
-        (b"authorization: bearer ", "bearer_token"),
-        (b"api_key=", "api_key"),
-        (b"apikey=", "api_key"),
-        (b"token=", "token"),
-        (b"password=", "password"),
-        (b"secret=", "secret"),
-        (b"npm_token=", "package_token"),
-        (b"\"api_key\":\"", "json_api_key"),
-        (b"\"token\":\"", "json_token"),
-        (b"\"password\":\"", "json_password"),
-        (b"\"secret\":\"", "json_secret"),
-    ];
-    for (index, (prefix, class)) in generic_prefixes.iter().enumerate() {
-        let (next, count) = redact_value_after_prefix(&current, prefix);
+    for shape in GENERIC_CREDENTIAL_SHAPES_V1 {
+        let (next, count) = redact_generic_shape(&current, shape);
         current = next;
         if count > 0 {
-            events.push(redaction_event(class, index, count));
+            events.push(redaction_event(shape.class(), shape.ordinal(), count));
         }
     }
     let (next, count) = redact_sk_tokens(&current);
@@ -444,7 +649,10 @@ fn redact_ingress(bytes: &[u8], known_secret_values: &[&str]) -> (Vec<u8>, Vec<R
     if count > 0 {
         events.push(redaction_event("api_token_shape", 0, count));
     }
-    (current, events)
+    RedactedIngress {
+        bytes: current,
+        events,
+    }
 }
 
 fn replace_all(source: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec<u8>, usize) {
@@ -467,31 +675,151 @@ fn replace_all(source: &[u8], needle: &[u8], replacement: &[u8]) -> (Vec<u8>, us
     (result, count)
 }
 
-fn redact_value_after_prefix(source: &[u8], prefix: &[u8]) -> (Vec<u8>, usize) {
+fn redact_generic_shape(source: &[u8], shape: GenericCredentialShape) -> (Vec<u8>, usize) {
     let mut result = Vec::with_capacity(source.len());
     let mut cursor = 0;
     let mut count = 0;
     while cursor < source.len() {
-        if ascii_starts_with_ignore_case(&source[cursor..], prefix) {
-            result.extend_from_slice(&source[cursor..cursor + prefix.len()]);
-            cursor += prefix.len();
-            let value_start = cursor;
-            while cursor < source.len()
-                && !source[cursor].is_ascii_whitespace()
-                && !matches!(source[cursor], b'"' | b'\'' | b',' | b';' | b'}' | b']')
-            {
-                cursor += 1;
-            }
-            if cursor > value_start {
+        if let Some(value) = match_generic_value(source, cursor, shape) {
+            result.extend_from_slice(&source[cursor..value.start]);
+            if value.end > value.start {
                 result.extend_from_slice(b"[REDACTED]");
                 count += 1;
             }
+            cursor = value.end;
         } else {
             result.push(source[cursor]);
             cursor += 1;
         }
     }
     (result, count)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ValueSpan {
+    start: usize,
+    end: usize,
+}
+
+fn match_generic_value(
+    source: &[u8],
+    cursor: usize,
+    shape: GenericCredentialShape,
+) -> Option<ValueSpan> {
+    match shape {
+        GenericCredentialShape::Bearer { .. } => match_bearer_value(source, cursor),
+        GenericCredentialShape::Assignment { key, .. } => {
+            match_key_value(source, cursor, key, b'=')
+        }
+        GenericCredentialShape::Json { key, .. } => match_json_value(source, cursor, key),
+    }
+}
+
+fn match_bearer_value(source: &[u8], cursor: usize) -> Option<ValueSpan> {
+    let header = b"authorization";
+    if !key_boundary_before(source, cursor)
+        || !ascii_starts_with_ignore_case(&source[cursor..], header)
+    {
+        return None;
+    }
+    let mut index = cursor + header.len();
+    index = skip_ascii_ows(source, index);
+    if source.get(index) != Some(&b':') {
+        return None;
+    }
+    index = skip_ascii_ows(source, index + 1);
+    let scheme = b"bearer";
+    if !ascii_starts_with_ignore_case(&source[index..], scheme) {
+        return None;
+    }
+    index += scheme.len();
+    let value_start = skip_ascii_ows(source, index);
+    if value_start == index {
+        return None;
+    }
+    quoted_or_bare_value_span(source, value_start)
+}
+
+fn match_key_value(source: &[u8], cursor: usize, key: &[u8], separator: u8) -> Option<ValueSpan> {
+    if !key_boundary_before(source, cursor)
+        || !ascii_starts_with_ignore_case(&source[cursor..], key)
+        || !key_boundary_after(source, cursor + key.len())
+    {
+        return None;
+    }
+    let mut index = skip_ascii_ows(source, cursor + key.len());
+    if source.get(index) != Some(&separator) {
+        return None;
+    }
+    index = skip_ascii_ows(source, index + 1);
+    quoted_or_bare_value_span(source, index)
+}
+
+fn match_json_value(source: &[u8], cursor: usize, key: &[u8]) -> Option<ValueSpan> {
+    let quote = *source.get(cursor)?;
+    if !matches!(quote, b'"' | b'\'') {
+        return None;
+    }
+    let key_start = cursor + 1;
+    if !ascii_starts_with_ignore_case(&source[key_start..], key)
+        || source.get(key_start + key.len()) != Some(&quote)
+    {
+        return None;
+    }
+    let mut index = skip_ascii_ows(source, key_start + key.len() + 1);
+    if source.get(index) != Some(&b':') {
+        return None;
+    }
+    index = skip_ascii_ows(source, index + 1);
+    quoted_or_bare_value_span(source, index)
+}
+
+fn quoted_or_bare_value_span(source: &[u8], start: usize) -> Option<ValueSpan> {
+    let first = *source.get(start)?;
+    if matches!(first, b'"' | b'\'') {
+        let value_start = start + 1;
+        let mut end = value_start;
+        while end < source.len() && source[end] != first {
+            end += 1;
+        }
+        return (end > value_start).then_some(ValueSpan {
+            start: value_start,
+            end,
+        });
+    }
+
+    let mut end = start;
+    while end < source.len()
+        && !source[end].is_ascii_whitespace()
+        && !matches!(source[end], b',' | b';' | b'}' | b']' | b'"' | b'\'')
+    {
+        end += 1;
+    }
+    (end > start).then_some(ValueSpan { start, end })
+}
+
+const fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
+}
+
+fn key_boundary_before(source: &[u8], cursor: usize) -> bool {
+    cursor == 0
+        || source
+            .get(cursor - 1)
+            .is_none_or(|byte| !is_identifier_byte(*byte))
+}
+
+fn key_boundary_after(source: &[u8], cursor: usize) -> bool {
+    source
+        .get(cursor)
+        .is_none_or(|byte| !is_identifier_byte(*byte))
+}
+
+fn skip_ascii_ows(source: &[u8], mut cursor: usize) -> usize {
+    while matches!(source.get(cursor), Some(b' ' | b'\t')) {
+        cursor += 1;
+    }
+    cursor
 }
 
 fn ascii_starts_with_ignore_case(source: &[u8], prefix: &[u8]) -> bool {
@@ -507,7 +835,7 @@ fn redact_sk_tokens(source: &[u8]) -> (Vec<u8>, usize) {
     let mut cursor = 0;
     let mut count = 0;
     while cursor < source.len() {
-        if source[cursor..].starts_with(b"sk-") {
+        if ascii_starts_with_ignore_case(&source[cursor..], b"sk-") {
             let mut end = cursor + 3;
             while end < source.len()
                 && (source[end].is_ascii_alphanumeric() || matches!(source[end], b'_' | b'-'))
@@ -528,10 +856,14 @@ fn redact_sk_tokens(source: &[u8]) -> (Vec<u8>, usize) {
 }
 
 fn redaction_event(class: &str, ordinal: usize, count: usize) -> RedactionEvent {
-    let seed = format!("{class}:{ordinal}:{count}");
+    let seed =
+        format!("{REDACTION_EVENT_SCHEMA_V1}:{REDACTOR_VERSION_V1}:{class}:{ordinal}:{count}");
     RedactionEvent {
+        schema: REDACTION_EVENT_SCHEMA_V1.to_owned(),
+        redactor_version: REDACTOR_VERSION_V1,
         event_id: format!("redact_{}", &sha256_hex(seed.as_bytes())[..16]),
         class: class.to_owned(),
+        occurrences: u64::try_from(count).unwrap_or(u64::MAX),
     }
 }
 

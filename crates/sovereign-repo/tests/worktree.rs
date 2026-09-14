@@ -4,7 +4,7 @@ use sovereign_repo::{
 };
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -152,12 +152,14 @@ fn worktree_dirty_primary_is_byte_for_byte_protected_and_cleanup_is_owned() {
         lease.worktree_path.parent(),
         Some(lease.controller_root.as_path())
     );
-    assert!(!lease.worktree_path.starts_with(
-        fixture
-            .primary
-            .canonicalize()
-            .unwrap_or_else(|error| { panic!("canonical primary: {error}") })
-    ));
+    assert!(
+        !lease.worktree_path.starts_with(
+            fixture
+                .primary
+                .canonicalize()
+                .unwrap_or_else(|error| { panic!("canonical primary: {error}") })
+        )
+    );
     assert_eq!(
         git(&lease.worktree_path, &["rev-parse", "HEAD"]),
         lease.base_head
@@ -938,9 +940,11 @@ fn worktree_join_conflict_is_evidence_and_never_auto_resolved() {
         ComposeChangeSetsOutcome::Ready(_) => panic!("conflicting join unexpectedly composed"),
     };
     assert_eq!(conflict.incoming_task_id, "T3");
-    assert!(conflict
-        .conflict_paths
-        .contains(&PathBuf::from("tracked.txt")));
+    assert!(
+        conflict
+            .conflict_paths
+            .contains(&PathBuf::from("tracked.txt"))
+    );
     assert_eq!(
         fs::read_to_string(join.worktree_path.join("tracked.txt"))
             .unwrap_or_else(|error| panic!("read unresolved join: {error}")),

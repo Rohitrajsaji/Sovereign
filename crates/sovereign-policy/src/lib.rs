@@ -16,16 +16,21 @@ pub use resources::{
     ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter, Write as _};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as IoWrite;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 pub const CAPABILITY_SET_SCHEMA_VERSION: u32 = 1;
 pub const PERMISSION_DECISION_SCHEMA_VERSION: u32 = 1;
@@ -401,6 +406,724 @@ impl From<std::io::Error> for PolicyError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value)
     }
+}
+
+pub const SECRET_REF_SCHEMA_VERSION: u32 = 1;
+
+/// Controller-visible provider class for a durable/model-visible secret handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretProviderKind {
+    MacosKeychain,
+    Environment,
+    ExternalBroker,
+}
+
+/// Narrow injection channel selected by Controller policy. Resolved values are never serialized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretInjection {
+    Environment,
+    Stdin,
+    TemporaryFile,
+    AdapterHandle,
+}
+
+/// Durable/model-visible handle metadata. This type intentionally contains no lookup locator or
+/// secret value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretRef {
+    pub secret_ref_id: String,
+    pub provider: SecretProviderKind,
+    pub purpose: String,
+    pub injection: SecretInjection,
+    pub target: String,
+}
+
+impl SecretRef {
+    /// Validates only the durable handle metadata. Provider lookup locators are Controller-owned
+    /// broker configuration and are deliberately absent from this structure.
+    ///
+    /// # Errors
+    /// Returns a denial for empty handle metadata.
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        if self.secret_ref_id.trim().is_empty()
+            || self.purpose.trim().is_empty()
+            || self.target.trim().is_empty()
+        {
+            return Err(PolicyError::Denied(
+                "invalid SecretRef v1 handle metadata".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Computes the deterministic authority-binding digest of the exact durable five-field
+    /// `SecretRef` metadata. Provider locators and resolved values are deliberately absent.
+    ///
+    /// # Errors
+    /// Returns a denial when the durable handle metadata is malformed.
+    pub fn binding_digest(&self) -> Result<String, PolicyError> {
+        self.validate()?;
+        let provider = match self.provider {
+            SecretProviderKind::MacosKeychain => "macos_keychain",
+            SecretProviderKind::Environment => "environment",
+            SecretProviderKind::ExternalBroker => "external_broker",
+        };
+        let injection = match self.injection {
+            SecretInjection::Environment => "environment",
+            SecretInjection::Stdin => "stdin",
+            SecretInjection::TemporaryFile => "temporary_file",
+            SecretInjection::AdapterHandle => "adapter_handle",
+        };
+        let mut hasher = Sha256::new();
+        digest_policy_field(&mut hasher, "SecretRef:v1");
+        digest_policy_field(&mut hasher, &self.secret_ref_id);
+        digest_policy_field(&mut hasher, provider);
+        digest_policy_field(&mut hasher, &self.purpose);
+        digest_policy_field(&mut hasher, injection);
+        digest_policy_field(&mut hasher, &self.target);
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    }
+}
+
+/// Exact Controller authority scope for one resolved secret lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecretScope {
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub task_id: String,
+    pub task_contract_digest: String,
+    pub action_id: String,
+    pub permission_decision_digest: String,
+    pub execution_epoch: i64,
+}
+
+impl SecretScope {
+    fn validate(&self) -> Result<(), PolicyError> {
+        if self.plan_id.trim().is_empty()
+            || self.task_id.trim().is_empty()
+            || self.action_id.trim().is_empty()
+            || self.execution_epoch < 0
+            || !is_sha256_binding(&self.task_contract_digest)
+            || !is_sha256_binding(&self.permission_decision_digest)
+        {
+            return Err(PolicyError::Denied(
+                "secret scope has incomplete exact authority bindings".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Provider lookup metadata that only Controller configuration supplies to a [`SecretBroker`].
+/// It is intentionally not serializable and never belongs in Plan IR, model context, or durable
+/// action state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControllerSecretLocator {
+    MacosKeychain {
+        service: String,
+        account: Option<String>,
+    },
+    EnvironmentVariable(String),
+    ExternalBrokerKey(String),
+    FakeKey {
+        provider: SecretProviderKind,
+        key: String,
+    },
+}
+
+impl ControllerSecretLocator {
+    fn provider(&self) -> SecretProviderKind {
+        match self {
+            Self::MacosKeychain { .. } => SecretProviderKind::MacosKeychain,
+            Self::EnvironmentVariable(_) => SecretProviderKind::Environment,
+            Self::ExternalBrokerKey(_) => SecretProviderKind::ExternalBroker,
+            Self::FakeKey { provider, .. } => *provider,
+        }
+    }
+
+    fn validate(&self) -> Result<(), PolicyError> {
+        let valid = match self {
+            Self::MacosKeychain { service, account } => {
+                !service.trim().is_empty()
+                    && account
+                        .as_ref()
+                        .is_none_or(|value| !value.trim().is_empty())
+            }
+            Self::EnvironmentVariable(name) | Self::ExternalBrokerKey(name) => {
+                !name.trim().is_empty()
+            }
+            Self::FakeKey { key, .. } => !key.trim().is_empty(),
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(PolicyError::Denied(
+                "Controller secret locator is empty or malformed".to_owned(),
+            ))
+        }
+    }
+}
+
+/// Opaque resolved bytes. The type cannot be serialized or cloned and its `Debug` output never
+/// reveals the underlying value. Bytes are zeroed when the value is dropped.
+pub struct SecretValue(Vec<u8>);
+
+impl SecretValue {
+    /// Creates a provider-owned opaque value. Callers should keep this value inside broker/lease
+    /// scope and expose it only through [`SecretLease::with_value`].
+    #[must_use]
+    pub fn from_provider_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Debug for SecretValue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretValue([REDACTED])")
+    }
+}
+
+impl Drop for SecretValue {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+/// Provider seam owned by the broker. Repository/model text never receives this interface.
+pub trait SecretProviderBackend: Send + Sync {
+    fn kind(&self) -> SecretProviderKind;
+
+    /// Resolves one Controller-configured locator to opaque bytes.
+    ///
+    /// # Errors
+    /// Returns a fail-closed policy/provider error without exposing resolved bytes in the error.
+    fn resolve(&self, locator: &ControllerSecretLocator) -> Result<SecretValue, PolicyError>;
+}
+
+/// Deterministic provider used by policy tests and higher-layer fake-broker tests.
+#[derive(Debug)]
+pub struct FakeSecretProvider {
+    kind: SecretProviderKind,
+    values: BTreeMap<String, Vec<u8>>,
+}
+
+impl FakeSecretProvider {
+    #[must_use]
+    pub fn new(
+        kind: SecretProviderKind,
+        values: impl IntoIterator<Item = (String, Vec<u8>)>,
+    ) -> Self {
+        Self {
+            kind,
+            values: values.into_iter().collect(),
+        }
+    }
+}
+
+impl SecretProviderBackend for FakeSecretProvider {
+    fn kind(&self) -> SecretProviderKind {
+        self.kind
+    }
+
+    fn resolve(&self, locator: &ControllerSecretLocator) -> Result<SecretValue, PolicyError> {
+        let ControllerSecretLocator::FakeKey { provider, key } = locator else {
+            return Err(PolicyError::Denied(
+                "fake secret provider received a locator for another provider".to_owned(),
+            ));
+        };
+        if *provider != self.kind() {
+            return Err(PolicyError::Denied(
+                "fake secret provider kind does not match Controller locator".to_owned(),
+            ));
+        }
+        self.values
+            .get(key)
+            .cloned()
+            .map(SecretValue::from_provider_bytes)
+            .ok_or_else(|| {
+                PolicyError::Denied("configured secret handle is unavailable".to_owned())
+            })
+    }
+}
+
+/// macOS Keychain provider seam. It is reachable only through a Controller-configured broker
+/// registration; repository/model strings cannot supply service/account lookup fields at resolve
+/// time. Tests must not invoke this provider against real credentials.
+#[derive(Debug, Default)]
+pub struct MacOsKeychainProvider;
+
+impl SecretProviderBackend for MacOsKeychainProvider {
+    fn kind(&self) -> SecretProviderKind {
+        SecretProviderKind::MacosKeychain
+    }
+
+    fn resolve(&self, locator: &ControllerSecretLocator) -> Result<SecretValue, PolicyError> {
+        let ControllerSecretLocator::MacosKeychain { service, account } = locator else {
+            return Err(PolicyError::Denied(
+                "macOS Keychain provider received a locator for another provider".to_owned(),
+            ));
+        };
+        if !cfg!(target_os = "macos") || !Path::new("/usr/bin/security").is_file() {
+            return Err(PolicyError::IsolationUnavailable(
+                "macOS Keychain provider is unavailable on this host".to_owned(),
+            ));
+        }
+        let mut command = Command::new("/usr/bin/security");
+        command
+            .args(["find-generic-password", "-w", "-s", service])
+            .env_clear()
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some(account) = account {
+            command.args(["-a", account]);
+        }
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(PolicyError::Denied(
+                "Controller-configured Keychain secret could not be resolved".to_owned(),
+            ));
+        }
+        let mut bytes = output.stdout;
+        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+            bytes.pop();
+        }
+        if bytes.is_empty() {
+            return Err(PolicyError::Denied(
+                "Controller-configured Keychain secret resolved to an empty value".to_owned(),
+            ));
+        }
+        Ok(SecretValue::from_provider_bytes(bytes))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RegisteredSecret {
+    secret_ref: SecretRef,
+    locator: ControllerSecretLocator,
+}
+
+/// Controller-owned broker registry. Only exact preconfigured handles can be resolved; there is no
+/// API that accepts an arbitrary provider lookup string from repository/model content.
+#[derive(Default)]
+pub struct SecretBroker {
+    providers: BTreeMap<SecretProviderKind, Arc<dyn SecretProviderBackend>>,
+    registrations: BTreeMap<String, RegisteredSecret>,
+}
+
+impl SecretBroker {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers one Controller-owned provider implementation.
+    ///
+    /// # Errors
+    /// Returns a denial instead of silently replacing an existing provider binding.
+    pub fn register_provider(
+        &mut self,
+        provider: Arc<dyn SecretProviderBackend>,
+    ) -> Result<(), PolicyError> {
+        let kind = provider.kind();
+        if self.providers.contains_key(&kind) {
+            return Err(PolicyError::Denied(
+                "secret provider kind is already Controller-configured".to_owned(),
+            ));
+        }
+        self.providers.insert(kind, provider);
+        Ok(())
+    }
+
+    /// Registers one exact durable handle to a private provider locator.
+    ///
+    /// # Errors
+    /// Returns a denial for malformed metadata, provider mismatch, missing provider, or rebinding.
+    pub fn register_secret(
+        &mut self,
+        secret_ref: SecretRef,
+        locator: ControllerSecretLocator,
+    ) -> Result<(), PolicyError> {
+        secret_ref.validate()?;
+        locator.validate()?;
+        if secret_ref.provider != locator.provider() {
+            return Err(PolicyError::Denied(
+                "SecretRef provider does not match Controller locator provider".to_owned(),
+            ));
+        }
+        if !self.providers.contains_key(&secret_ref.provider) {
+            return Err(PolicyError::Denied(
+                "SecretRef provider has not been Controller-configured".to_owned(),
+            ));
+        }
+        if self.registrations.contains_key(&secret_ref.secret_ref_id) {
+            return Err(PolicyError::Denied(
+                "SecretRef id is already registered and cannot be rebound".to_owned(),
+            ));
+        }
+        self.registrations.insert(
+            secret_ref.secret_ref_id.clone(),
+            RegisteredSecret {
+                secret_ref,
+                locator,
+            },
+        );
+        Ok(())
+    }
+
+    /// Resolves one exact preconfigured handle into an ephemeral exact-scope lease.
+    ///
+    /// # Errors
+    /// Returns a denial for unknown/modified handles, missing `secret_use`, stale scope, expiry, or
+    /// provider failure.
+    pub fn resolve(
+        &self,
+        secret_ref: &SecretRef,
+        scope: SecretScope,
+        effective_capabilities: &CapabilitySet,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<SecretLease, PolicyError> {
+        secret_ref.validate()?;
+        scope.validate()?;
+        if !effective_capabilities.contains(Capability::SecretUse) {
+            return Err(PolicyError::Denied(
+                "secret resolution requires effective secret_use capability".to_owned(),
+            ));
+        }
+        if now_ms < 0 || expires_at_ms <= now_ms {
+            return Err(PolicyError::Denied(
+                "secret lease is already expired or has invalid time bounds".to_owned(),
+            ));
+        }
+        let registration = self
+            .registrations
+            .get(&secret_ref.secret_ref_id)
+            .ok_or_else(|| PolicyError::Denied("unknown SecretRef handle".to_owned()))?;
+        if &registration.secret_ref != secret_ref {
+            return Err(PolicyError::Denied(
+                "SecretRef metadata does not match Controller configuration".to_owned(),
+            ));
+        }
+        let provider = self.providers.get(&secret_ref.provider).ok_or_else(|| {
+            PolicyError::Denied("SecretRef provider is no longer configured".to_owned())
+        })?;
+        let value = provider.resolve(&registration.locator)?;
+        Ok(SecretLease {
+            secret_ref: secret_ref.clone(),
+            scope,
+            issued_at_ms: now_ms,
+            expires_at_ms,
+            value: Some(value),
+            closed: false,
+            temp_cleanup: None,
+        })
+    }
+}
+
+/// Ephemeral resolved secret authority. This type is intentionally neither serializable nor
+/// clonable; its `Debug` output exposes metadata only.
+pub struct SecretLease {
+    secret_ref: SecretRef,
+    scope: SecretScope,
+    issued_at_ms: i64,
+    expires_at_ms: i64,
+    value: Option<SecretValue>,
+    closed: bool,
+    temp_cleanup: Option<Arc<AtomicBool>>,
+}
+
+impl std::fmt::Debug for SecretLease {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretLease")
+            .field("secret_ref", &self.secret_ref)
+            .field("scope", &self.scope)
+            .field("issued_at_ms", &self.issued_at_ms)
+            .field("expires_at_ms", &self.expires_at_ms)
+            .field("closed", &self.closed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SecretLease {
+    #[must_use]
+    pub fn secret_ref(&self) -> &SecretRef {
+        &self.secret_ref
+    }
+
+    #[must_use]
+    pub const fn expires_at_ms(&self) -> i64 {
+        self.expires_at_ms
+    }
+
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    fn validate_use(
+        &self,
+        scope: &SecretScope,
+        effective_capabilities: &CapabilitySet,
+        now_ms: i64,
+    ) -> Result<(), PolicyError> {
+        scope.validate()?;
+        if !effective_capabilities.contains(Capability::SecretUse) {
+            return Err(PolicyError::Denied(
+                "secret value use requires current effective secret_use capability".to_owned(),
+            ));
+        }
+        if self.closed || self.value.is_none() {
+            return Err(PolicyError::Denied("secret lease is closed".to_owned()));
+        }
+        if scope != &self.scope {
+            return Err(PolicyError::Denied(
+                "secret lease scope does not match exact Controller authority".to_owned(),
+            ));
+        }
+        if now_ms < self.issued_at_ms || now_ms >= self.expires_at_ms {
+            return Err(PolicyError::Denied("secret lease expired".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Exposes resolved bytes only inside one exact-scope ephemeral injection closure.
+    ///
+    /// # Errors
+    /// Returns a denial for closed, expired, or mismatched scope.
+    pub fn with_value<T>(
+        &self,
+        scope: &SecretScope,
+        effective_capabilities: &CapabilitySet,
+        now_ms: i64,
+        use_value: impl FnOnce(&[u8]) -> T,
+    ) -> Result<T, PolicyError> {
+        self.validate_use(scope, effective_capabilities, now_ms)?;
+        let value = self
+            .value
+            .as_ref()
+            .ok_or_else(|| PolicyError::Denied("secret lease is closed".to_owned()))?;
+        Ok(use_value(&value.0))
+    }
+
+    /// Creates a private, exact-task/action temporary secret file. The returned guard must prove
+    /// deletion before this lease can close successfully.
+    ///
+    /// # Errors
+    /// Returns a denial for a non-temporary-file handle, stale scope, unsafe private directory, or
+    /// any file creation/write/permission failure.
+    pub fn inject_temporary_file(
+        &mut self,
+        scope: &SecretScope,
+        effective_capabilities: &CapabilitySet,
+        now_ms: i64,
+        controller_private_root: impl AsRef<Path>,
+    ) -> Result<TempSecretFileGuard, PolicyError> {
+        self.validate_use(scope, effective_capabilities, now_ms)?;
+        if self.secret_ref.injection != SecretInjection::TemporaryFile {
+            return Err(PolicyError::Denied(
+                "SecretRef is not authorized for temporary_file injection".to_owned(),
+            ));
+        }
+        if self.temp_cleanup.is_some() {
+            return Err(PolicyError::Denied(
+                "secret lease already owns a temporary injection lifecycle".to_owned(),
+            ));
+        }
+        let root = controller_private_root.as_ref();
+        ensure_private_directory(root)?;
+        let task_dir = root.join(format!("task-{}", secret_scope_fragment(&scope.task_id)));
+        ensure_private_directory(&task_dir)?;
+        let action_dir = task_dir.join(format!(
+            "action-{}",
+            secret_scope_fragment(&format!("{}:{}", scope.action_id, scope.execution_epoch))
+        ));
+        ensure_private_directory(&action_dir)?;
+        let path = action_dir.join(format!(
+            "secret-{}",
+            secret_scope_fragment(&self.secret_ref.secret_ref_id)
+        ));
+        let cleanup_proven = Arc::new(AtomicBool::new(false));
+
+        let write_result = self.with_value(scope, effective_capabilities, now_ms, |bytes| {
+            create_private_secret_file(&path, bytes)
+        })?;
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+        self.temp_cleanup = Some(Arc::clone(&cleanup_proven));
+        Ok(TempSecretFileGuard {
+            path,
+            action_dir,
+            task_dir,
+            cleanup_proven,
+            explicitly_closed: false,
+        })
+    }
+
+    /// Closes an exact-scope lease and destroys the in-memory value. A temporary-file injection
+    /// cannot close until explicit deletion has been proven by its guard.
+    ///
+    /// # Errors
+    /// Returns a denial for scope mismatch, double-close, or unproven temporary-file cleanup.
+    pub fn close(&mut self, scope: &SecretScope) -> Result<(), PolicyError> {
+        scope.validate()?;
+        if scope != &self.scope {
+            return Err(PolicyError::Denied(
+                "secret lease close scope does not match exact authority".to_owned(),
+            ));
+        }
+        if self.closed {
+            return Err(PolicyError::Denied(
+                "secret lease is already closed".to_owned(),
+            ));
+        }
+        if self
+            .temp_cleanup
+            .as_ref()
+            .is_some_and(|proof| !proof.load(Ordering::Acquire))
+        {
+            return Err(PolicyError::Denied(
+                "temporary secret file deletion is not proven".to_owned(),
+            ));
+        }
+        self.value.take();
+        self.closed = true;
+        Ok(())
+    }
+}
+
+/// Exact private temporary-file lifecycle for one secret-use action.
+pub struct TempSecretFileGuard {
+    path: PathBuf,
+    action_dir: PathBuf,
+    task_dir: PathBuf,
+    cleanup_proven: Arc<AtomicBool>,
+    explicitly_closed: bool,
+}
+
+impl std::fmt::Debug for TempSecretFileGuard {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TempSecretFileGuard")
+            .field("path", &self.path)
+            .field("explicitly_closed", &self.explicitly_closed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TempSecretFileGuard {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Explicitly deletes the secret file and verifies `NotFound` before publishing cleanup proof.
+    ///
+    /// # Errors
+    /// Returns fail-closed if deletion or absence verification cannot be proven.
+    pub fn close(&mut self) -> Result<(), PolicyError> {
+        if self.explicitly_closed {
+            return Err(PolicyError::Denied(
+                "temporary secret file guard is already closed".to_owned(),
+            ));
+        }
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        match fs::symlink_metadata(&self.path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(PolicyError::Denied(
+                    "temporary secret file still exists after deletion".to_owned(),
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        self.cleanup_proven.store(true, Ordering::Release);
+        self.explicitly_closed = true;
+        let _ = fs::remove_dir(&self.action_dir);
+        let _ = fs::remove_dir(&self.task_dir);
+        Ok(())
+    }
+}
+
+impl Drop for TempSecretFileGuard {
+    fn drop(&mut self) {
+        if !self.explicitly_closed {
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_dir(&self.action_dir);
+            let _ = fs::remove_dir(&self.task_dir);
+        }
+    }
+}
+
+fn secret_scope_fragment(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())[..20].to_owned()
+}
+
+#[cfg(unix)]
+fn ensure_private_directory(path: &Path) -> Result<(), PolicyError> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(PolicyError::Denied(
+            "secret injection directory must be a real directory".to_owned(),
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    if fs::symlink_metadata(path)?.permissions().mode() & 0o777 != 0o700 {
+        return Err(PolicyError::Denied(
+            "secret injection directory privacy could not be proven".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_directory(_path: &Path) -> Result<(), PolicyError> {
+    Err(PolicyError::IsolationUnavailable(
+        "private secret-file permission proof requires Unix mode semantics".to_owned(),
+    ))
+}
+
+#[cfg(unix)]
+fn create_private_secret_file(path: &Path, bytes: &[u8]) -> Result<(), PolicyError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    IoWrite::write_all(&mut file, bytes)?;
+    file.sync_all()?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.permissions().mode() & 0o777 != 0o600
+    {
+        return Err(PolicyError::Denied(
+            "temporary secret file privacy could not be proven".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_secret_file(_path: &Path, _bytes: &[u8]) -> Result<(), PolicyError> {
+    Err(PolicyError::IsolationUnavailable(
+        "private secret-file permission proof requires Unix mode semantics".to_owned(),
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1193,6 +1916,12 @@ impl CommandPolicy {
             ));
         }
         let executable = spec.executable.canonicalize()?;
+        if command_requests_keychain_access(&executable, &spec.args) {
+            return Err(PolicyError::Denied(
+                "generic process_exec cannot invoke macOS Keychain/securityd; use SecretBroker"
+                    .to_owned(),
+            ));
+        }
         let Some(pin) = self.pinned.get(&executable) else {
             return Err(PolicyError::Denied(format!(
                 "executable is not digest/version pinned: {}",
@@ -1301,6 +2030,20 @@ impl CommandPolicy {
         pin.verify()?;
         Ok(pin)
     }
+}
+
+fn command_requests_keychain_access(executable: &Path, args: &[String]) -> bool {
+    if executable == Path::new("/usr/bin/security") {
+        return true;
+    }
+    let joined = args.join(" ").to_ascii_lowercase();
+    joined.contains("/usr/bin/security")
+        || joined.contains("security find-generic-password")
+        || joined.contains("security find-internet-password")
+        || joined.contains("security dump-keychain")
+        || joined.contains("security list-keychains")
+        || joined.contains("security unlock-keychain")
+        || joined.contains("security export")
 }
 
 fn deterministic_risk_floor(spec: &CommandSpec, executable: &Path) -> CommandRisk {
@@ -1814,6 +2557,7 @@ pub enum IsolationCapability {
     ProtectedHomeReadDeny,
     RepositoryWriteJail,
     FullFilesystemReadJail,
+    SecretProviderDeny,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1956,6 +2700,27 @@ impl MacSandboxExecBackend {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()?;
+        let secret_provider_support_profile = format!(
+            "(version 1)(allow default){}",
+            secret_provider_mach_lookup_rules()
+        );
+        let secret_provider_rules_supported = std::process::Command::new(&self.sandbox_exec)
+            .args(["-p", &secret_provider_support_profile, "/usr/bin/true"])
+            .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        let process_exec_deny_profile = format!(
+            "(version 1)(allow default)(deny process-exec (literal {})){}",
+            seatbelt_string(Path::new("/usr/bin/true")),
+            secret_provider_mach_lookup_rules()
+        );
+        let process_exec_denied = std::process::Command::new(&self.sandbox_exec)
+            .args(["-p", &process_exec_deny_profile, "/usr/bin/true"])
+            .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
         let write_profile = format!(
             "(version 1)(allow default)(deny file-write* (subpath \"/\"))(allow file-write* (subpath {}))",
             seatbelt_string(&writable)
@@ -1980,11 +2745,13 @@ impl MacSandboxExecBackend {
         let _ = fs::remove_dir_all(&root);
         if denied_read.success()
             || denied_network.success()
+            || !secret_provider_rules_supported.success()
+            || process_exec_denied.success()
             || !allowed_write.success()
             || denied_write.success()
         {
             return Err(PolicyError::IsolationUnavailable(
-                "sandbox-exec runtime self-test did not enforce required read/network denial"
+                "sandbox-exec runtime self-test did not enforce required read/network/secret-provider denial"
                     .to_owned(),
             ));
         }
@@ -1999,6 +2766,7 @@ impl ExecutionIsolationBackend for MacSandboxExecBackend {
                 IsolationCapability::NetworkDeny,
                 IsolationCapability::ProtectedHomeReadDeny,
                 IsolationCapability::RepositoryWriteJail,
+                IsolationCapability::SecretProviderDeny,
             ]),
         }
     }
@@ -2054,6 +2822,8 @@ impl ExecutionIsolationBackend for MacSandboxExecBackend {
             )
             .map_err(|_| PolicyError::Denied("failed to build isolation profile".to_owned()))?;
         }
+        profile.push_str("(deny process-exec (literal \"/usr/bin/security\"))");
+        profile.push_str(secret_provider_mach_lookup_rules());
         profile.push_str("(deny network*)");
         if spec.subprocess_limit == 0 {
             profile.push_str("(deny process-fork)");
@@ -2069,6 +2839,10 @@ impl ExecutionIsolationBackend for MacSandboxExecBackend {
             args,
         })
     }
+}
+
+fn secret_provider_mach_lookup_rules() -> &'static str {
+    "(deny mach-lookup (global-name \"com.apple.securityd\"))(deny mach-lookup (global-name \"com.apple.securityd.xpc\"))(deny mach-lookup (global-name \"com.apple.securityd.system\"))"
 }
 
 fn seatbelt_string(path: &Path) -> String {

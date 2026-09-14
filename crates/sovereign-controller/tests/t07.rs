@@ -4,18 +4,20 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sovereign_context::{
     ContextBudget, ContextMode, ContextPacket, ContextPacketInput, ContextPlanner, EvidenceItem,
-    EvidenceKind,
+    EvidenceKind, RepairPacket,
 };
 use sovereign_controller::{
     CheckpointActionRecord, CheckpointManifest, Controller, ControllerError, ExecutionRuntime,
-    ExecutionSuccess, ModelProposalV1, PermissionContext, PlanValidity, ReadinessInputs,
-    RecoveryManager, ResourcePressureProbe, RoleId, RoleRegistry, SchedulerView, TaskState,
+    ExecutionSuccess, FailureClassification, FailureClassificationKind, ModelProposalV1,
+    PermissionContext, PlanValidity, ReadinessInputs, RecoveryManager, ResourcePressureProbe,
+    RoleId, RoleRegistry, SchedulerView, SecretProcessRuntime, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_memory::{MemoryKind, MemoryTrust, ProcedurePattern};
 use sovereign_model::{
-    DeterministicFakeBackend, MODEL_SCHEMA_VERSION, ModelBackend, ModelCapabilities,
-    ModelFinishReason, ModelLoadProfile, ModelResidencyProof, ModelResponse, ModelUsage,
+    BackendHealth, DeterministicFakeBackend, MODEL_SCHEMA_VERSION, ModelBackend, ModelCapabilities,
+    ModelError, ModelFinishReason, ModelLease, ModelLoadProfile, ModelRequest, ModelResidencyProof,
+    ModelResponse, ModelUsage,
 };
 use sovereign_plan::{
     DepthClassifier, DepthFeatureInput, ExecutionDepth, M3PlanningInput,
@@ -23,23 +25,29 @@ use sovereign_plan::{
     PlanCompilationResult, PlanCompiler, PlanValidator, ValidationEnvironment,
 };
 use sovereign_policy::{
-    CapabilitySet, CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend,
-    IsolatedCommand, IsolationCapabilities, IsolationRequest, MacSandboxExecBackend,
-    ModelCallBudget, OsMemoryPressure, PinnedExecutable, PolicyError,
-    RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ResourcePressureSnapshotV1, ThermalPressure,
+    CapabilitySet, CommandMode, CommandPolicy, CommandRisk, CommandSpec, ControllerSecretLocator,
+    ExecutionIsolationBackend, FakeSecretProvider, IsolatedCommand, IsolationCapabilities,
+    IsolationRequest, MacSandboxExecBackend, ModelCallBudget, OsMemoryPressure, PinnedExecutable,
+    PolicyError, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ResourcePressureSnapshotV1, SecretBroker,
+    SecretInjection, SecretProviderBackend, SecretProviderKind, SecretRef, SecretValue,
+    ThermalPressure,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence};
 use sovereign_state::{
-    ActionTransition, NewActionRecord, NewCheckpointIntegrityRecord, NewJournalEvent, StateStore,
+    ActionTransition, NewActionRecord, NewCheckpointIntegrityRecord, NewJournalEvent,
+    StateRecordUpdate, StateStore,
 };
-use sovereign_tools::{PermissionClass, ToolManifest, ToolSchemaV1};
-use std::collections::BTreeSet;
+use sovereign_tools::{EPHEMERAL_SECRET_FILE_ENV, PermissionClass, ToolManifest, ToolSchemaV1};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SOURCE: &str =
@@ -174,6 +182,105 @@ fn git_text(root: &Path, args: &[&str]) -> String {
 
 fn sha256_prefixed(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn runtime_secret_sentinel(label: &str) -> Vec<u8> {
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let seed = format!("{label}\0{}\0{nanos}\0{sequence}", std::process::id());
+    let mut sentinel = b"M6-RUNTIME-SECRET-".to_vec();
+    sentinel.extend_from_slice(&Sha256::digest(seed.as_bytes()));
+    sentinel.extend_from_slice(&[0xff, 0x00, 0xfe]);
+    sentinel
+}
+
+fn sha256_needles(bytes: &[u8]) -> Vec<Vec<u8>> {
+    let digest = Sha256::digest(bytes);
+    let hex = format!("{digest:x}");
+    vec![
+        digest.to_vec(),
+        hex.as_bytes().to_vec(),
+        format!("sha256:{hex}").into_bytes(),
+    ]
+}
+
+fn assert_file_excludes_needles(path: &Path, needles: &[(&str, &[u8])]) {
+    if !path.is_file() {
+        return;
+    }
+    let bytes = fs::read(path)
+        .unwrap_or_else(|error| panic!("read runtime persistence {}: {error}", path.display()));
+    for (label, needle) in needles {
+        assert!(
+            !needle.is_empty() && !bytes.windows(needle.len()).any(|window| window == *needle),
+            "runtime persistence {} contains forbidden {label}",
+            path.display()
+        );
+    }
+}
+
+fn assert_tree_excludes_needles(root: &Path, needles: &[(&str, &[u8])]) {
+    if !root.exists() {
+        return;
+    }
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = fs::symlink_metadata(&path).unwrap_or_else(|error| {
+            panic!("runtime persistence metadata {}: {error}", path.display())
+        });
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_file() {
+            assert_file_excludes_needles(&path, needles);
+            continue;
+        }
+        if metadata.is_dir() {
+            let entries = fs::read_dir(&path).unwrap_or_else(|error| {
+                panic!("read runtime persistence dir {}: {error}", path.display())
+            });
+            for entry in entries {
+                pending.push(
+                    entry
+                        .unwrap_or_else(|error| {
+                            panic!("read runtime persistence entry {}: {error}", path.display())
+                        })
+                        .path(),
+                );
+            }
+        }
+    }
+}
+
+fn assert_runtime_persistence_excludes_secret(
+    repo: &TestRepo,
+    artifacts: &ArtifactStore,
+    sentinel: &[u8],
+    raw_stdout: &[u8],
+    raw_stderr: &[u8],
+) {
+    let stdout_needles = sha256_needles(raw_stdout);
+    let stderr_needles = sha256_needles(raw_stderr);
+    let needles = vec![
+        ("resolved secret bytes", sentinel),
+        ("raw stdout sha256 bytes", stdout_needles[0].as_slice()),
+        ("raw stdout sha256 hex", stdout_needles[1].as_slice()),
+        ("raw stdout sha256 tag", stdout_needles[2].as_slice()),
+        ("raw stderr sha256 bytes", stderr_needles[0].as_slice()),
+        ("raw stderr sha256 hex", stderr_needles[1].as_slice()),
+        ("raw stderr sha256 tag", stderr_needles[2].as_slice()),
+    ];
+
+    assert_file_excludes_needles(&repo.state_path, &needles);
+    for suffix in ["-wal", "-shm"] {
+        let mut path = repo.state_path.as_os_str().to_os_string();
+        path.push(suffix);
+        assert_file_excludes_needles(&PathBuf::from(path), &needles);
+    }
+    assert_tree_excludes_needles(artifacts.root(), &needles);
+    assert_tree_excludes_needles(&repo.base.join("checkpoint-cas"), &needles);
 }
 
 fn append_modified_checkpoint(
@@ -456,13 +563,64 @@ fn compiled_fixture(label: &str, evidence_query: bool) -> CompiledFixture {
         None,
         None,
         None,
+        None,
     )
+}
+
+fn test_secret_ref() -> SecretRef {
+    SecretRef {
+        secret_ref_id: "secret.t07.sentinel".to_owned(),
+        provider: SecretProviderKind::ExternalBroker,
+        purpose: "T07 exact secret sentinel".to_owned(),
+        injection: SecretInjection::TemporaryFile,
+        target: EPHEMERAL_SECRET_FILE_ENV.to_owned(),
+    }
+}
+
+fn compiled_secret_fixture(label: &str) -> (CompiledFixture, SecretRef) {
+    let mut policy = global_policy();
+    policy["capability_ceiling"] = json!(["read", "repo_write", "process_exec", "secret_use"]);
+    policy["secrets"]["allowed_providers"] = json!(["external_broker"]);
+    let mut fixture = compiled_fixture_inner(
+        label,
+        false,
+        false,
+        None,
+        None,
+        false,
+        false,
+        None,
+        None,
+        None,
+        Some(policy),
+    );
+    let secret_ref = test_secret_ref();
+    let target_task_id = fixture
+        .compilation
+        .as_ref()
+        .and_then(|compilation| compilation.plan().as_value()["tasks"].as_array())
+        .and_then(|tasks| tasks.first())
+        .and_then(|task| task["task_id"].as_str())
+        .unwrap_or_else(|| panic!("compiled secret fixture target task"))
+        .to_owned();
+    let validator = PlanValidator::new(ValidationEnvironment::default())
+        .unwrap_or_else(|error| panic!("secret binding validator: {error}"));
+    let source = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("compiled secret fixture source"));
+    fixture.compilation = Some(
+        source
+            .bind_controller_secret_ref(&validator, &target_task_id, &secret_ref)
+            .unwrap_or_else(|error| panic!("bind Controller SecretRef: {error}")),
+    );
+    (fixture, secret_ref)
 }
 
 #[allow(clippy::too_many_lines)]
 fn compiled_fixture_with_dirty_target(label: &str) -> CompiledFixture {
     compiled_fixture_inner(
-        label, false, true, None, None, false, false, None, None, None,
+        label, false, true, None, None, false, false, None, None, None, None,
     )
 }
 
@@ -476,6 +634,7 @@ fn compiled_fixture_with_task_model_call_cap(label: &str, cap: u64) -> CompiledF
         None,
         false,
         false,
+        None,
         None,
         None,
         None,
@@ -502,6 +661,7 @@ fn compiled_fixture_with_resource_override(
         None,
         None,
         Some(resource_override),
+        None,
     )
 }
 
@@ -517,12 +677,13 @@ fn compiled_fixture_with_target_mode(label: &str, mode: u32) -> CompiledFixture 
         None,
         None,
         None,
+        None,
     )
 }
 
 fn compiled_two_task_fixture(label: &str) -> CompiledFixture {
     compiled_fixture_inner(
-        label, false, false, None, None, true, false, None, None, None,
+        label, false, false, None, None, true, false, None, None, None, None,
     )
 }
 
@@ -562,12 +723,13 @@ fn compiled_learning_two_path_fixture(label: &str) -> CompiledFixture {
                 .to_owned(),
         ),
         None,
+        None,
     )
 }
 
 fn compiled_worktree_fixture(label: &str) -> CompiledFixture {
     compiled_fixture_inner(
-        label, false, false, None, None, false, true, None, None, None,
+        label, false, false, None, None, false, true, None, None, None, None,
     )
 }
 
@@ -585,6 +747,7 @@ fn compiled_worktree_graph_fixture(label: &str, tasks: &[Value]) -> CompiledFixt
             "Change Save to Apply, Apply to Applied, Apply to Approved, baseline to branchthree, imported to finalized."
                 .to_owned(),
         ),
+        None,
         None,
     )
 }
@@ -605,6 +768,7 @@ fn compiled_fixture_inner(
     planning_override: Option<Value>,
     goal_statement_override: Option<String>,
     resource_override: Option<ResourceFixtureOverride>,
+    policy_override: Option<Value>,
 ) -> CompiledFixture {
     let repo = TestRepo::create(label);
     if let Some(mode) = target_mode {
@@ -738,7 +902,7 @@ fn compiled_fixture_inner(
         .unwrap_or_else(|error| panic!("validator: {error}"));
     let compiler = PlanCompiler::new(&planner, &validator, "t07-test-compiler")
         .unwrap_or_else(|error| panic!("compiler: {error}"));
-    let mut policy = global_policy();
+    let mut policy = policy_override.unwrap_or_else(global_policy);
     if let Some(cap) = task_model_call_cap {
         let resource_cap = policy
             .pointer_mut("/resources/max_model_calls")
@@ -916,6 +1080,20 @@ fn write_tool_manifest() -> ToolManifest {
             PermissionClass::RepositoryWrite,
         ]),
         declared_risk_floor: CommandRisk::RepositoryMutation,
+    }
+}
+
+fn secret_tool_manifest() -> ToolManifest {
+    ToolManifest {
+        tool_id: "tool.patch".to_owned(),
+        version: "1.0.0".to_owned(),
+        content_digest: WRITE_TOOL_DIGEST.to_owned(),
+        permission_ceiling: BTreeSet::from([
+            PermissionClass::ProcessExec,
+            PermissionClass::RepositoryWrite,
+            PermissionClass::SecretUse,
+        ]),
+        declared_risk_floor: CommandRisk::ReadOnly,
     }
 }
 
@@ -1134,6 +1312,113 @@ impl ExecutionIsolationBackend for SwapIsolation {
             executable: self.executable.clone(),
             args: Vec::new(),
         })
+    }
+}
+
+struct PassthroughIsolation {
+    capabilities: MacSandboxExecBackend,
+}
+
+impl ExecutionIsolationBackend for PassthroughIsolation {
+    fn capabilities(&self) -> IsolationCapabilities {
+        self.capabilities.capabilities()
+    }
+
+    fn isolate(
+        &self,
+        spec: &CommandSpec,
+        _request: &IsolationRequest,
+    ) -> Result<IsolatedCommand, PolicyError> {
+        Ok(IsolatedCommand {
+            executable: spec.executable.clone(),
+            args: spec.args.clone(),
+        })
+    }
+}
+
+struct SentinelFailingSecretProvider {
+    sentinel: String,
+}
+
+impl SecretProviderBackend for SentinelFailingSecretProvider {
+    fn kind(&self) -> SecretProviderKind {
+        SecretProviderKind::ExternalBroker
+    }
+
+    fn resolve(&self, _locator: &ControllerSecretLocator) -> Result<SecretValue, PolicyError> {
+        Err(PolicyError::Denied(format!(
+            "provider runtime failure leaked {}",
+            self.sentinel
+        )))
+    }
+}
+
+struct CapturingBackend {
+    inner: DeterministicFakeBackend,
+    captured: Mutex<Vec<ModelRequest>>,
+}
+
+impl CapturingBackend {
+    fn new() -> Self {
+        let inner = DeterministicFakeBackend::new(
+            ModelCapabilities {
+                schema_version: MODEL_SCHEMA_VERSION,
+                model_id: "fake-controller-capture".to_owned(),
+                parameter_class: "fixture".to_owned(),
+                quantization: "fixture".to_owned(),
+                max_context_tokens: 16_384,
+                supports_tools: false,
+                supports_json_schema: true,
+                local: true,
+            },
+            Vec::new(),
+        )
+        .unwrap_or_else(|error| panic!("capturing fake backend: {error}"));
+        Self {
+            inner,
+            captured: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn captured(&self) -> Vec<ModelRequest> {
+        self.captured
+            .lock()
+            .unwrap_or_else(|error| panic!("captured model requests lock: {error}"))
+            .clone()
+    }
+}
+
+impl ModelBackend for CapturingBackend {
+    fn capabilities(&self) -> ModelCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn load(&self, profile: ModelLoadProfile) -> Result<ModelLease, ModelError> {
+        self.inner.load(profile)
+    }
+
+    fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.captured
+            .lock()
+            .map_err(|_| ModelError::LockPoisoned("captured model requests"))?
+            .push(request.clone());
+        Err(ModelError::InvalidResponse("capture-stop".to_owned()))
+    }
+
+    fn count_tokens(&self, content: &str) -> Result<u32, ModelError> {
+        self.inner.count_tokens(content)
+    }
+
+    fn health(&self) -> Result<BackendHealth, ModelError> {
+        self.inner.health()
+    }
+
+    fn residency_proof(&self) -> Result<ModelResidencyProof, ModelError> {
+        self.inner.residency_proof()
+    }
+
+    fn unload(&self) -> Result<(), ModelError> {
+        self.inner.unload()
     }
 }
 
@@ -1804,6 +2089,1174 @@ fn permission_context_is_controller_owned_and_can_deny_repo_write() {
         panic!("read-only permission context unexpectedly produced readiness")
     };
     assert!(error.to_string().contains("permission intersection"));
+}
+
+#[test]
+fn m6_secret_use_requires_explicit_local_profile() {
+    let mut fixture = compiled_fixture("m6-secret-profile-denied", false);
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let Err(error) = controller.set_task_capability_grant(
+        &task_id,
+        CapabilitySet::new([
+            PermissionClass::ProcessExec,
+            PermissionClass::RepositoryWrite,
+            PermissionClass::SecretUse,
+        ]),
+    ) else {
+        panic!("default local profile unexpectedly granted secret_use")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("cannot exceed configured user authority")
+    );
+}
+
+#[test]
+fn m6_secret_profile_does_not_manufacture_missing_plan_secret_binding() {
+    let mut fixture = compiled_fixture("m6-secret-plan-binding-denied", false);
+    let state =
+        StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m6_local_secret_execution());
+    let compilation = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("compiled fixture already activated"));
+    let activation = controller
+        .activate(compilation, &fixture.registry)
+        .unwrap_or_else(|error| panic!("activate: {error}"));
+    let task_id = &activation.task_ids[0];
+    controller
+        .set_task_capability_grant(
+            task_id,
+            CapabilitySet::new([
+                PermissionClass::ProcessExec,
+                PermissionClass::RepositoryWrite,
+                PermissionClass::SecretUse,
+            ]),
+        )
+        .unwrap_or_else(|error| panic!("explicit secret profile grant ceiling: {error}"));
+
+    let Err(error) = controller.task_secret_ref(task_id, "secret.test") else {
+        panic!("Controller profile/grant unexpectedly manufactured a Plan IR SecretRef")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("does not bind SecretRef secret.test")
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn m6_secret_provider_failure_never_persists_or_returns_provider_free_text() {
+    let (mut fixture, secret_ref) = compiled_secret_fixture("m6-secret-provider-error-redaction");
+    let state =
+        StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m6_local_secret_execution());
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
+    let compilation = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("compiled secret fixture already activated"));
+    let activation = controller
+        .activate(compilation, &fixture.registry)
+        .unwrap_or_else(|error| panic!("activate secret fixture: {error}"));
+    let task_id = &activation.task_ids[0];
+    let manifest = secret_tool_manifest();
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, task_id, readiness(), &manifest)
+        .unwrap_or_else(|error| panic!("secret readiness: {error}"));
+
+    let sentinel = "T07-PROVIDER-RUNTIME-SECRET-SENTINEL".to_owned();
+    let mut broker = SecretBroker::new();
+    broker
+        .register_provider(Arc::new(SentinelFailingSecretProvider {
+            sentinel: sentinel.clone(),
+        }))
+        .unwrap_or_else(|error| panic!("register failing secret provider: {error}"));
+    broker
+        .register_secret(
+            secret_ref.clone(),
+            ControllerSecretLocator::FakeKey {
+                provider: SecretProviderKind::ExternalBroker,
+                key: "provider-error-sentinel".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("register exact failing secret handle: {error}"));
+
+    let parts = runtime_parts(&fixture);
+    let mut isolation_request = parts.isolation_request.clone();
+    isolation_request.allow_repository_write = false;
+    let isolation = PassthroughIsolation {
+        capabilities: MacSandboxExecBackend::detect()
+            .unwrap_or_else(|error| panic!("seatbelt capability source: {error}")),
+    };
+    let private_root = fixture.repo.base.join("controller-private-secrets");
+    let runtime = SecretProcessRuntime {
+        registry: &fixture.registry,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &manifest,
+        secret_broker: &broker,
+        controller_private_root: &private_root,
+    };
+    let command = CommandSpec {
+        executable: PathBuf::from("/usr/bin/python3"),
+        args: vec!["-I".to_owned(), "-c".to_owned(), "pass".to_owned()],
+        working_directory: fixture.repo.root.clone(),
+        environment: BTreeMap::new(),
+        mode: CommandMode::Direct,
+        declared_risk: CommandRisk::ReadOnly,
+        timeout_ms: 5_000,
+        output_limit_bytes: 64 * 1024,
+        disk_write_limit_bytes: 64 * 1024,
+        subprocess_limit: 1,
+    };
+    let error = controller
+        .execute_secret_process(ready, &runtime, &secret_ref.secret_ref_id, command)
+        .err()
+        .unwrap_or_else(|| panic!("failing provider unexpectedly executed"));
+    let public_error = error.to_string();
+    assert!(!public_error.contains(&sentinel));
+    assert!(public_error.contains("provider details withheld"));
+
+    let failure_rows = controller
+        .state()
+        .state_records("controller.failure_record")
+        .unwrap_or_else(|error| panic!("failure rows: {error}"));
+    assert!(
+        !failure_rows.is_empty(),
+        "provider failure must route a durable FailureRecord"
+    );
+    for row in &failure_rows {
+        assert!(!row.value_json.contains(&sentinel));
+        let value: Value = serde_json::from_str(&row.value_json)
+            .unwrap_or_else(|error| panic!("decode provider failure row: {error}"));
+        assert!(
+            value["synopsis"].as_str().is_some_and(|synopsis| synopsis
+                .contains("Controller secret resolution denied; provider details withheld")),
+            "durable provider failure synopsis must contain only the safe diagnostic"
+        );
+    }
+    for row in controller
+        .state()
+        .state_records("controller.repair_packet")
+        .unwrap_or_else(|error| panic!("repair rows: {error}"))
+    {
+        assert!(!row.value_json.contains(&sentinel));
+    }
+    for event in controller
+        .state()
+        .journal_after(0)
+        .unwrap_or_else(|error| panic!("provider failure journal: {error}"))
+    {
+        assert!(!event.payload_json.contains(&sentinel));
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn m6_unresolved_historical_secret_lifecycle_fences_live_authority() {
+    let (mut fixture, secret_ref) = compiled_secret_fixture("m6-live-secret-lifecycle-fence");
+    let state =
+        StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m6_local_secret_execution());
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
+    let compilation = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("compiled secret fixture already activated"));
+    let activation = controller
+        .activate(compilation, &fixture.registry)
+        .unwrap_or_else(|error| panic!("activate secret fixture: {error}"));
+    let task_id = activation.task_ids[0].clone();
+    let task_contract_digest = controller
+        .task_contract_digest(&task_id)
+        .unwrap_or_else(|| panic!("secret task contract digest"))
+        .to_owned();
+    let write_manifest = write_tool_manifest();
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, &task_id, readiness(), &write_manifest)
+        .unwrap_or_else(|error| panic!("pre-marker readiness: {error}"));
+    let before = fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+        .unwrap_or_else(|error| panic!("read target before fenced mutation: {error}"));
+    let manifest = latest_checkpoint_manifest(controller.state());
+    let execution_epoch = controller
+        .state()
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("live fence epoch: {error}"));
+
+    let action_id = "action.m6-historical-unresolved".to_owned();
+    let marker_revision = manifest.plan_revision.saturating_sub(1);
+    let marker = json!({
+        "schema_version": 1,
+        "plan_id": manifest.plan_id,
+        "plan_revision": marker_revision,
+        "task_id": task_id,
+        "task_contract_digest": task_contract_digest,
+        "action_id": action_id,
+        "permission_decision_digest": sha256_prefixed(b"historical-unresolved-permission"),
+        "execution_epoch": execution_epoch,
+        "secret_ref_binding_digest": secret_ref
+            .binding_digest()
+            .unwrap_or_else(|error| panic!("secret ref binding digest: {error}")),
+        "provider": "external_broker",
+        "injection": "temporary_file",
+        "target": EPHEMERAL_SECRET_FILE_ENV,
+        "expires_at_ms": 1_900_000_000_000_i64,
+        "action_payload_digest": sha256_prefixed(b"historical-unresolved-action"),
+        "state": "cleanup_proven",
+        "result_digest": Value::Null,
+    });
+    let marker_json = serde_json::to_string(&marker)
+        .unwrap_or_else(|error| panic!("encode historical marker: {error}"));
+    let marker_digest = sha256_prefixed(marker_json.as_bytes());
+    let marker_event_payload = json!({
+        "plan_id": manifest.plan_id,
+        "plan_revision": marker_revision,
+        "plan_digest": manifest.plan_digest,
+        "secret_action_lifecycle": marker,
+        "record_digest": marker_digest,
+    })
+    .to_string();
+    let mut external_state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open external marker writer: {error}"));
+    external_state
+        .put_state_records_with_events(
+            &[StateRecordUpdate {
+                namespace: "controller.secret_action_lifecycle",
+                key: &action_id,
+                value_json: &marker_json,
+            }],
+            &[NewJournalEvent {
+                event_id: "event.m6-historical-unresolved.cleanup-proven",
+                entity_type: "controller",
+                entity_id: &action_id,
+                event_kind: "secret_action_cleanup_proven",
+                payload_json: &marker_event_payload,
+            }],
+        )
+        .unwrap_or_else(|error| panic!("persist historical unresolved marker: {error}"));
+    drop(external_state);
+
+    let readiness_error = controller
+        .derive_ready_lease(&fixture.registry, &task_id, readiness(), &write_manifest)
+        .err()
+        .unwrap_or_else(|| panic!("unresolved historical marker unexpectedly allowed readiness"));
+    assert!(
+        readiness_error
+            .to_string()
+            .contains("secret action lifecycle blocked")
+    );
+
+    let grant_error = controller
+        .set_task_capability_grant(
+            &task_id,
+            CapabilitySet::new([
+                PermissionClass::ProcessExec,
+                PermissionClass::RepositoryWrite,
+                PermissionClass::SecretUse,
+            ]),
+        )
+        .err()
+        .unwrap_or_else(|| {
+            panic!("unresolved historical marker unexpectedly allowed grant mutation")
+        });
+    assert!(
+        grant_error
+            .to_string()
+            .contains("secret action lifecycle blocked")
+    );
+
+    let classification = FailureClassification {
+        kind: FailureClassificationKind::PlanFailure,
+        scope: None,
+        affected_task_ids: vec![task_id.clone()],
+        affected_contract_ids: Vec::new(),
+        evidence_refs: Vec::new(),
+    };
+    let replan_error = controller
+        .replan_input(&classification)
+        .err()
+        .unwrap_or_else(|| {
+            panic!("unresolved historical marker unexpectedly allowed replan input")
+        });
+    assert!(
+        replan_error
+            .to_string()
+            .contains("secret action lifecycle blocked")
+    );
+
+    let mut unrelated = compiled_fixture("m6-live-fence-supersession-candidate", false);
+    let unrelated_compilation = unrelated
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("supersession candidate compilation"));
+    let supersession_error = controller
+        .activate_superseding_revision(unrelated_compilation, &classification, &fixture.registry)
+        .err()
+        .unwrap_or_else(|| {
+            panic!("unresolved historical marker unexpectedly allowed supersession")
+        });
+    assert!(
+        supersession_error
+            .to_string()
+            .contains("secret action lifecycle blocked")
+    );
+
+    let execution = backend(vec![model_response(
+        execution_proposal(
+            "src/settings/SettingsForm.tsx",
+            &fixture.form_digest,
+            "Save",
+            "Apply",
+        ),
+        fixture.packet.metrics.final_serialized_input_tokens,
+    )]);
+    let parts = runtime_parts(&fixture);
+    let isolation =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("seatbelt: {error}"));
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut budget = ModelCallBudget::new(1, 30_000);
+    let mutation_error = controller
+        .execute_replace(ready, &runtime, &fixture.packet, &mut budget)
+        .err()
+        .unwrap_or_else(|| panic!("pre-existing ready lease bypassed unresolved marker fence"));
+    assert!(
+        mutation_error
+            .to_string()
+            .contains("secret action lifecycle blocked")
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+            .unwrap_or_else(|error| panic!("read target after fenced mutation: {error}")),
+        before,
+        "unresolved secret lifecycle must block mutation before repository change"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn m6_secret_process_redacts_binary_sentinel_closes_lease_and_stops_at_verifying() {
+    let (mut fixture, secret_ref) = compiled_secret_fixture("m6-secret-sentinel");
+    let state =
+        StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m6_local_secret_execution());
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
+    let compilation = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("compiled secret fixture already activated"));
+    let activation = controller
+        .activate(compilation, &fixture.registry)
+        .unwrap_or_else(|error| panic!("activate secret fixture: {error}"));
+    let task_id = &activation.task_ids[0];
+    let manifest = secret_tool_manifest();
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, task_id, readiness(), &manifest)
+        .unwrap_or_else(|error| panic!("secret readiness: {error}"));
+
+    let sentinel = b"T07-SECRET-\xff-\x00-SENTINEL".to_vec();
+    let mut broker = SecretBroker::new();
+    broker
+        .register_provider(Arc::new(FakeSecretProvider::new(
+            SecretProviderKind::ExternalBroker,
+            [("sentinel-key".to_owned(), sentinel.clone())],
+        )))
+        .unwrap_or_else(|error| panic!("register fake secret provider: {error}"));
+    broker
+        .register_secret(
+            secret_ref.clone(),
+            ControllerSecretLocator::FakeKey {
+                provider: SecretProviderKind::ExternalBroker,
+                key: "sentinel-key".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("register exact secret handle: {error}"));
+
+    let parts = runtime_parts(&fixture);
+    let mut isolation_request = parts.isolation_request.clone();
+    isolation_request.allow_repository_write = false;
+    let isolation = PassthroughIsolation {
+        capabilities: MacSandboxExecBackend::detect()
+            .unwrap_or_else(|error| panic!("seatbelt capability source: {error}")),
+    };
+    let private_root = fixture.repo.base.join("controller-private-secrets");
+    let runtime = SecretProcessRuntime {
+        registry: &fixture.registry,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &manifest,
+        secret_broker: &broker,
+        controller_private_root: &private_root,
+    };
+    let command = CommandSpec {
+        executable: PathBuf::from("/usr/bin/python3"),
+        args: vec![
+            "-I".to_owned(),
+            "-c".to_owned(),
+            "import os,sys; p=os.environ['SOVEREIGN_SECRET_FILE']; b=open(p,'rb').read(); sys.stdout.buffer.write(b); sys.stderr.buffer.write(b)".to_owned(),
+        ],
+        working_directory: fixture.repo.root.clone(),
+        environment: BTreeMap::new(),
+        mode: CommandMode::Direct,
+        declared_risk: CommandRisk::ReadOnly,
+        timeout_ms: 5_000,
+        output_limit_bytes: 64 * 1024,
+        disk_write_limit_bytes: 64 * 1024,
+        subprocess_limit: 1,
+    };
+    let raw = controller
+        .execute_secret_process(ready, &runtime, &secret_ref.secret_ref_id, command)
+        .unwrap_or_else(|error| panic!("execute secret sentinel: {error}"));
+    assert_eq!(raw.exit_code, Some(0));
+    assert!(raw.process_group_reaped);
+    assert!(
+        !raw.stdout
+            .windows(sentinel.len())
+            .any(|window| window == sentinel)
+    );
+    assert!(
+        !raw.stderr
+            .windows(sentinel.len())
+            .any(|window| window == sentinel)
+    );
+    assert_eq!(raw.stdout, b"[REDACTED]");
+    assert_eq!(raw.stderr, b"[REDACTED]");
+    assert_eq!(controller.task_state(task_id), Some(TaskState::Verifying));
+
+    let action = controller
+        .state()
+        .action_records()
+        .unwrap_or_else(|error| panic!("secret action records: {error}"))
+        .into_iter()
+        .find(|record| record.state == "committed" && record.result_digest.is_some())
+        .unwrap_or_else(|| panic!("committed secret action record"));
+    let action_id = action.action_id.clone();
+    let receipt_digest = action
+        .result_digest
+        .clone()
+        .unwrap_or_else(|| panic!("secret action result digest"));
+    let lifecycle_raw = controller
+        .state()
+        .get_state("controller.secret_action_lifecycle", &action_id)
+        .unwrap_or_else(|error| panic!("secret lifecycle marker: {error}"))
+        .unwrap_or_else(|| panic!("secret lifecycle marker missing"));
+    let lifecycle: Value = serde_json::from_str(&lifecycle_raw)
+        .unwrap_or_else(|error| panic!("decode secret lifecycle marker: {error}"));
+    assert_eq!(lifecycle["state"], json!("complete"));
+    assert_eq!(lifecycle["action_id"], json!(action_id));
+    assert_eq!(lifecycle["result_digest"], json!(receipt_digest));
+    assert_eq!(lifecycle["provider"], json!("external_broker"));
+    assert_eq!(lifecycle["injection"], json!("temporary_file"));
+    assert_eq!(lifecycle["target"], json!(EPHEMERAL_SECRET_FILE_ENV));
+    assert!(!lifecycle_raw.contains("sentinel-key"));
+    let receipt_path = parts
+        .artifacts
+        .root()
+        .join("sha256")
+        .join(&receipt_digest[..2])
+        .join(&receipt_digest);
+    let receipt = fs::read(receipt_path).unwrap_or_else(|error| panic!("secret receipt: {error}"));
+    assert!(
+        !receipt
+            .windows(sentinel.len())
+            .any(|window| window == sentinel)
+    );
+    assert!(
+        fs::read_dir(&private_root)
+            .unwrap_or_else(|error| panic!("private secret root: {error}"))
+            .next()
+            .is_none(),
+        "secret task/action injection directories must be absent after committed execution"
+    );
+    drop(controller);
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen complete secret lifecycle: {error}"));
+    let (_, recovery) = RecoveryManager::recover_with_permission_context(
+        state,
+        &fixture.registry,
+        PermissionContext::m6_local_secret_execution(),
+    )
+    .unwrap_or_else(|error| panic!("complete secret lifecycle must recover: {error}"));
+    assert!(
+        !recovery.mutation_blocked,
+        "complete secret lifecycle must not become a recovery blocker"
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn m6_runtime_secret_failure_never_reaches_persistence_context_or_local_model_request() {
+    let (mut fixture, secret_ref) = compiled_secret_fixture("m6-secret-runtime-persistence");
+    let state =
+        StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m6_local_secret_execution());
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
+    let compilation = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("compiled secret fixture already activated"));
+    let activation = controller
+        .activate(compilation, &fixture.registry)
+        .unwrap_or_else(|error| panic!("activate secret fixture: {error}"));
+    let task_id = activation.task_ids[0].clone();
+    let secret_manifest = secret_tool_manifest();
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, &task_id, readiness(), &secret_manifest)
+        .unwrap_or_else(|error| panic!("secret readiness: {error}"));
+
+    let sentinel = runtime_secret_sentinel("m6-secret-runtime-persistence");
+    let mut raw_stdout = b"stdout:".to_vec();
+    raw_stdout.extend_from_slice(&sentinel);
+    let mut raw_stderr = b"stderr:".to_vec();
+    raw_stderr.extend_from_slice(&sentinel);
+    let mut broker = SecretBroker::new();
+    broker
+        .register_provider(Arc::new(FakeSecretProvider::new(
+            SecretProviderKind::ExternalBroker,
+            [("runtime-sentinel-key".to_owned(), sentinel.clone())],
+        )))
+        .unwrap_or_else(|error| panic!("register runtime fake secret provider: {error}"));
+    broker
+        .register_secret(
+            secret_ref.clone(),
+            ControllerSecretLocator::FakeKey {
+                provider: SecretProviderKind::ExternalBroker,
+                key: "runtime-sentinel-key".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("register runtime secret handle: {error}"));
+
+    let parts = runtime_parts(&fixture);
+    let mut secret_isolation_request = parts.isolation_request.clone();
+    secret_isolation_request.allow_repository_write = false;
+    let isolation = PassthroughIsolation {
+        capabilities: MacSandboxExecBackend::detect()
+            .unwrap_or_else(|error| panic!("seatbelt capability source: {error}")),
+    };
+    let private_root = fixture.repo.base.join("controller-private-secrets");
+    let secret_runtime = SecretProcessRuntime {
+        registry: &fixture.registry,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &secret_isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &secret_manifest,
+        secret_broker: &broker,
+        controller_private_root: &private_root,
+    };
+    let command = CommandSpec {
+        executable: PathBuf::from("/usr/bin/python3"),
+        args: vec![
+            "-I".to_owned(),
+            "-c".to_owned(),
+            "import os,sys; p=os.environ['SOVEREIGN_SECRET_FILE']; b=open(p,'rb').read(); sys.stdout.buffer.write(b'stdout:'+b); sys.stderr.buffer.write(b'stderr:'+b); sys.exit(7)".to_owned(),
+        ],
+        working_directory: fixture.repo.root.clone(),
+        environment: BTreeMap::new(),
+        mode: CommandMode::Direct,
+        declared_risk: CommandRisk::ReadOnly,
+        timeout_ms: 5_000,
+        output_limit_bytes: 64 * 1024,
+        disk_write_limit_bytes: 64 * 1024,
+        subprocess_limit: 1,
+    };
+    let error = controller
+        .execute_secret_process(ready, &secret_runtime, &secret_ref.secret_ref_id, command)
+        .err()
+        .unwrap_or_else(|| panic!("nonzero secret child unexpectedly succeeded"));
+    let ControllerError::ExecutionFailed(failure) = error else {
+        panic!("nonzero secret child must route as ExecutionFailed, got {error}")
+    };
+    assert_eq!(failure.exit_code, Some(7));
+    assert_eq!(failure.decision, "repair");
+    assert_eq!(
+        controller.task_state(&task_id),
+        Some(TaskState::RepairPending)
+    );
+    let failure_json = serde_json::to_vec(failure.as_ref())
+        .unwrap_or_else(|error| panic!("serialize secret failure record: {error}"));
+    assert!(
+        !failure_json
+            .windows(sentinel.len())
+            .any(|window| window == sentinel)
+    );
+    assert!(failure.synopsis.contains("[REDACTED]"));
+
+    for event in controller
+        .state()
+        .journal_after(0)
+        .unwrap_or_else(|error| panic!("secret failure journal: {error}"))
+    {
+        assert!(
+            !event
+                .payload_json
+                .as_bytes()
+                .windows(sentinel.len())
+                .any(|window| window == sentinel),
+            "journal event {} leaked runtime secret bytes",
+            event.event_id
+        );
+    }
+    for record in controller
+        .state()
+        .action_records()
+        .unwrap_or_else(|error| panic!("secret action records: {error}"))
+    {
+        let encoded = serde_json::to_vec(&json!({
+            "action_id": record.action_id,
+            "state": record.state,
+            "payload_digest": record.payload_digest,
+            "policy_digest": record.policy_digest,
+            "execution_epoch": record.execution_epoch,
+            "result_digest": record.result_digest,
+            "last_event_sequence": record.last_event_sequence,
+            "updated_at_ms": record.updated_at_ms,
+        }))
+        .unwrap_or_else(|error| panic!("encode action record: {error}"));
+        assert!(
+            !encoded
+                .windows(sentinel.len())
+                .any(|window| window == sentinel)
+        );
+    }
+    assert!(
+        fs::read_dir(&private_root)
+            .unwrap_or_else(|error| panic!("runtime private secret root: {error}"))
+            .next()
+            .is_none(),
+        "failed secret process must remove its task/action private injection directories"
+    );
+
+    let capture = CapturingBackend::new();
+    let repair_runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &capture,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &secret_manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut repair_budget = ModelCallBudget::new(1, 30_000);
+    let repair_error = controller
+        .repair_replace(
+            &task_id,
+            &repair_runtime,
+            &fixture.packet,
+            &[],
+            readiness(),
+            &mut repair_budget,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("capturing repair backend unexpectedly returned a proposal"));
+    assert!(repair_error.to_string().contains("capture-stop"));
+
+    let repair_row = controller
+        .state()
+        .state_records("controller.repair_packet")
+        .unwrap_or_else(|error| panic!("repair packet rows: {error}"))
+        .into_iter()
+        .find(|record| record.value_json.contains(&task_id))
+        .unwrap_or_else(|| panic!("production repair packet missing"));
+    let repair_packet: RepairPacket = serde_json::from_str(&repair_row.value_json)
+        .unwrap_or_else(|error| panic!("decode production repair packet: {error}"));
+    let repair_context_bytes = serde_json::to_vec(&repair_packet.context)
+        .unwrap_or_else(|error| panic!("serialize repair ContextPacket: {error}"));
+    assert!(
+        !repair_context_bytes
+            .windows(sentinel.len())
+            .any(|window| window == sentinel),
+        "Controller-built repair ContextPacket leaked runtime secret bytes"
+    );
+
+    let captured = capture.captured();
+    assert_eq!(
+        captured.len(),
+        1,
+        "repair must reach exactly one local ModelRequest boundary"
+    );
+    let request = &captured[0];
+    assert!(request.tools.is_empty());
+    assert_eq!(request.messages.len(), 2);
+    assert_eq!(
+        request.messages[1].content, repair_packet.context.serialized_input,
+        "captured user message must be the exact production repair ContextPacket input"
+    );
+    let request_bytes = serde_json::to_vec(request)
+        .unwrap_or_else(|error| panic!("serialize captured ModelRequest: {error}"));
+    assert!(
+        !request_bytes
+            .windows(sentinel.len())
+            .any(|window| window == sentinel),
+        "local ModelRequest leaked runtime secret bytes"
+    );
+
+    let checkpoint = latest_checkpoint_manifest(controller.state());
+    let checkpoint_bytes = serde_json::to_vec(&checkpoint)
+        .unwrap_or_else(|error| panic!("serialize checkpoint manifest: {error}"));
+    assert!(
+        !checkpoint_bytes
+            .windows(sentinel.len())
+            .any(|window| window == sentinel),
+        "checkpoint manifest leaked runtime secret bytes"
+    );
+    assert_runtime_persistence_excludes_secret(
+        &fixture.repo,
+        &parts.artifacts,
+        &sentinel,
+        &raw_stdout,
+        &raw_stderr,
+    );
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_incomplete_secret_lifecycle_recovery_blocked(
+    label: &str,
+    lifecycle_state: &str,
+    lifecycle_event_kind: &str,
+    commit_action: bool,
+    marker_revision_override: Option<u32>,
+    expected_state_debug: &str,
+) {
+    let (mut fixture, secret_ref) = compiled_secret_fixture(label);
+    let state =
+        StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m6_local_secret_execution());
+    let compilation = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("compiled secret fixture already activated"));
+    let activation = controller
+        .activate(compilation, &fixture.registry)
+        .unwrap_or_else(|error| panic!("activate secret fixture: {error}"));
+    let task_id = activation.task_ids[0].clone();
+    let task_contract_digest = controller
+        .task_contract_digest(&task_id)
+        .unwrap_or_else(|| panic!("secret task contract digest"))
+        .to_owned();
+    let manifest = latest_checkpoint_manifest(controller.state());
+    let execution_epoch = controller
+        .state()
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("secret recovery epoch: {error}"));
+    drop(controller);
+
+    let mut state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen crash state: {error}"));
+    let result_store = ArtifactStore::open(fixture.repo.base.join("cas"))
+        .unwrap_or_else(|error| panic!("secret crash result store: {error}"));
+    let result = result_store
+        .put(&mut state, format!("sanitized-{label}-result").as_bytes())
+        .unwrap_or_else(|error| panic!("secret crash result artifact: {error}"));
+    let action_id = format!("action.{label}");
+    let payload_digest = sha256_prefixed(format!("payload-{label}").as_bytes());
+    let prepared_event_id = format!("event.{label}.prepared");
+    state
+        .insert_action_record(NewActionRecord {
+            action_id: &action_id,
+            state: "prepared",
+            payload_digest: &payload_digest,
+            policy_digest: &manifest.policy_digest,
+            execution_epoch,
+            event_id: &prepared_event_id,
+            event_kind: "prepared",
+            payload_json: "{}",
+        })
+        .unwrap_or_else(|error| panic!("insert secret crash action: {error}"));
+    let observed_event_id = format!("event.{label}.observed");
+    state
+        .transition_action_with_event(ActionTransition {
+            action_id: &action_id,
+            expected_state: "prepared",
+            next_state: "observed",
+            expected_epoch: execution_epoch,
+            event_id: &observed_event_id,
+            event_kind: "observed",
+            payload_json: "{}",
+            result_digest: Some(&result.digest),
+        })
+        .unwrap_or_else(|error| panic!("observe secret crash action: {error}"));
+
+    let marker_revision = marker_revision_override.unwrap_or(manifest.plan_revision);
+    let marker = json!({
+        "schema_version": 1,
+        "plan_id": manifest.plan_id,
+        "plan_revision": marker_revision,
+        "task_id": task_id,
+        "task_contract_digest": task_contract_digest,
+        "action_id": action_id,
+        "permission_decision_digest": sha256_prefixed(format!("permission-{label}").as_bytes()),
+        "execution_epoch": execution_epoch,
+        "secret_ref_binding_digest": secret_ref
+            .binding_digest()
+            .unwrap_or_else(|error| panic!("secret ref binding digest: {error}")),
+        "provider": "external_broker",
+        "injection": "temporary_file",
+        "target": EPHEMERAL_SECRET_FILE_ENV,
+        "expires_at_ms": 1_900_000_000_000_i64,
+        "action_payload_digest": payload_digest,
+        "state": lifecycle_state,
+        "result_digest": Value::Null,
+    });
+    let marker_json = serde_json::to_string(&marker)
+        .unwrap_or_else(|error| panic!("encode secret crash marker: {error}"));
+    let marker_digest = sha256_prefixed(marker_json.as_bytes());
+    let marker_event_payload = json!({
+        "plan_id": manifest.plan_id,
+        "plan_revision": marker_revision,
+        "plan_digest": manifest.plan_digest,
+        "secret_action_lifecycle": marker,
+        "record_digest": marker_digest,
+    })
+    .to_string();
+    let marker_event_id = format!("event.{label}.{lifecycle_state}");
+    state
+        .put_state_records_with_events(
+            &[StateRecordUpdate {
+                namespace: "controller.secret_action_lifecycle",
+                key: &action_id,
+                value_json: &marker_json,
+            }],
+            &[NewJournalEvent {
+                event_id: &marker_event_id,
+                entity_type: "controller",
+                entity_id: &action_id,
+                event_kind: lifecycle_event_kind,
+                payload_json: &marker_event_payload,
+            }],
+        )
+        .unwrap_or_else(|error| panic!("persist secret crash marker: {error}"));
+
+    if commit_action {
+        let committed_event_id = format!("event.{label}.committed");
+        state
+            .transition_action_with_event(ActionTransition {
+                action_id: &action_id,
+                expected_state: "observed",
+                next_state: "committed",
+                expected_epoch: execution_epoch,
+                event_id: &committed_event_id,
+                event_kind: "committed",
+                payload_json: "{}",
+                result_digest: Some(&result.digest),
+            })
+            .unwrap_or_else(|error| panic!("commit secret crash action: {error}"));
+    }
+
+    let epoch_before_recovery = state
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("epoch before blocked recovery: {error}"));
+    let sequence_before_recovery = state
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("sequence before blocked recovery: {error}"));
+    drop(state);
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open blocked secret recovery state: {error}"));
+    let error = RecoveryManager::recover_with_permission_context(
+        state,
+        &fixture.registry,
+        PermissionContext::m6_local_secret_execution(),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("incomplete secret lifecycle {lifecycle_state} must block recovery"));
+    assert!(
+        error.to_string().contains("secret action recovery blocked")
+            && error.to_string().contains(expected_state_debug),
+        "unexpected secret recovery blocker for {lifecycle_state}: {error}"
+    );
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen state after blocked recovery: {error}"));
+    assert_eq!(
+        state
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("epoch after blocked recovery: {error}")),
+        epoch_before_recovery,
+        "blocked recovery must not advance execution authority"
+    );
+    assert_eq!(
+        state
+            .latest_journal_sequence()
+            .unwrap_or_else(|error| panic!("sequence after blocked recovery: {error}")),
+        sequence_before_recovery,
+        "blocked recovery must not replay, commit, or append recovery state"
+    );
+    assert_eq!(
+        state
+            .action_record(&action_id)
+            .unwrap_or_else(|error| panic!("secret crash action after recovery: {error}"))
+            .map(|record| record.state),
+        Some(
+            if commit_action {
+                "committed"
+            } else {
+                "observed"
+            }
+            .to_owned()
+        ),
+        "recovery must not reinterpret or replay the crashed action"
+    );
+}
+
+#[test]
+fn m6_recovery_blocks_all_incomplete_secret_lifecycle_crash_windows() {
+    assert_incomplete_secret_lifecycle_recovery_blocked(
+        "m6-cleanup-proven-before-close",
+        "cleanup_proven",
+        "secret_action_cleanup_proven",
+        false,
+        None,
+        "CleanupProven",
+    );
+    assert_incomplete_secret_lifecycle_recovery_blocked(
+        "m6-lease-closed-before-commit",
+        "lease_closed",
+        "secret_action_lease_closed",
+        false,
+        None,
+        "LeaseClosed",
+    );
+    assert_incomplete_secret_lifecycle_recovery_blocked(
+        "m6-commit-before-complete",
+        "lease_closed",
+        "secret_action_lease_closed",
+        true,
+        None,
+        "LeaseClosed",
+    );
+    assert_incomplete_secret_lifecycle_recovery_blocked(
+        "m6-old-revision-unresolved",
+        "cleanup_proven",
+        "secret_action_cleanup_proven",
+        false,
+        Some(0),
+        "CleanupProven",
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn m6_recovery_blocks_observed_secret_action_without_durable_cleanup_or_lease_close() {
+    let (mut fixture, secret_ref) = compiled_secret_fixture("m6-secret-recovery-block");
+    let state =
+        StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m6_local_secret_execution());
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
+    let compilation = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("compiled secret fixture already activated"));
+    let activation = controller
+        .activate(compilation, &fixture.registry)
+        .unwrap_or_else(|error| panic!("activate secret fixture: {error}"));
+    let task_id = activation.task_ids[0].clone();
+    let task_contract_digest = controller
+        .task_contract_digest(&task_id)
+        .unwrap_or_else(|| panic!("secret task contract digest"))
+        .to_owned();
+    let manifest = latest_checkpoint_manifest(controller.state());
+    let execution_epoch = controller
+        .state()
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("secret recovery epoch: {error}"));
+    drop(controller);
+
+    let mut state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen crash state: {error}"));
+    let result_store = ArtifactStore::open(fixture.repo.base.join("cas"))
+        .unwrap_or_else(|error| panic!("secret crash result store: {error}"));
+    let result = result_store
+        .put(&mut state, b"sanitized observed secret result")
+        .unwrap_or_else(|error| panic!("secret crash result artifact: {error}"));
+    let action_id = "action.secret-observed-before-cleanup".to_owned();
+    let payload_digest = sha256_prefixed(b"secret-observed-before-cleanup-payload");
+    state
+        .insert_action_record(NewActionRecord {
+            action_id: &action_id,
+            state: "prepared",
+            payload_digest: &payload_digest,
+            policy_digest: &manifest.policy_digest,
+            execution_epoch,
+            event_id: "event.secret-crash-prepared",
+            event_kind: "prepared",
+            payload_json: "{}",
+        })
+        .unwrap_or_else(|error| panic!("insert secret crash action: {error}"));
+    state
+        .transition_action_with_event(ActionTransition {
+            action_id: &action_id,
+            expected_state: "prepared",
+            next_state: "observed",
+            expected_epoch: execution_epoch,
+            event_id: "event.secret-crash-observed",
+            event_kind: "observed",
+            payload_json: "{}",
+            result_digest: Some(&result.digest),
+        })
+        .unwrap_or_else(|error| panic!("observe secret crash action: {error}"));
+
+    let marker = json!({
+        "schema_version": 1,
+        "plan_id": manifest.plan_id,
+        "plan_revision": manifest.plan_revision,
+        "task_id": task_id,
+        "task_contract_digest": task_contract_digest,
+        "action_id": action_id,
+        "permission_decision_digest": sha256_prefixed(b"secret-crash-permission-decision"),
+        "execution_epoch": execution_epoch,
+        "secret_ref_binding_digest": secret_ref
+            .binding_digest()
+            .unwrap_or_else(|error| panic!("secret ref binding digest: {error}")),
+        "provider": "external_broker",
+        "injection": "temporary_file",
+        "target": EPHEMERAL_SECRET_FILE_ENV,
+        "expires_at_ms": 1_900_000_000_000_i64,
+        "action_payload_digest": payload_digest,
+        "state": "pending_cleanup",
+        "result_digest": Value::Null,
+    });
+    let marker_json = serde_json::to_string(&marker)
+        .unwrap_or_else(|error| panic!("encode secret crash marker: {error}"));
+    let marker_digest = sha256_prefixed(marker_json.as_bytes());
+    let marker_event_payload = json!({
+        "plan_id": manifest.plan_id,
+        "plan_revision": manifest.plan_revision,
+        "plan_digest": manifest.plan_digest,
+        "secret_action_lifecycle": marker,
+        "record_digest": marker_digest,
+    })
+    .to_string();
+    state
+        .put_state_records_with_events(
+            &[StateRecordUpdate {
+                namespace: "controller.secret_action_lifecycle",
+                key: &action_id,
+                value_json: &marker_json,
+            }],
+            &[NewJournalEvent {
+                event_id: "event.secret-crash-pending-cleanup",
+                entity_type: "controller",
+                entity_id: &action_id,
+                event_kind: "secret_action_pending_cleanup",
+                payload_json: &marker_event_payload,
+            }],
+        )
+        .unwrap_or_else(|error| panic!("persist secret crash marker: {error}"));
+    let epoch_before_recovery = state
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("epoch before blocked recovery: {error}"));
+    let sequence_before_recovery = state
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("sequence before blocked recovery: {error}"));
+    drop(state);
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open blocked secret recovery state: {error}"));
+    let error = RecoveryManager::recover_with_permission_context(
+        state,
+        &fixture.registry,
+        PermissionContext::m6_local_secret_execution(),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("observed secret action without cleanup proof must block recovery"));
+    assert!(
+        error.to_string().contains("secret action recovery blocked")
+            && error.to_string().contains("PendingCleanup"),
+        "unexpected secret recovery blocker: {error}"
+    );
+
+    let mut state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen state after blocked recovery: {error}"));
+    assert_eq!(
+        state
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("epoch after blocked recovery: {error}")),
+        epoch_before_recovery,
+        "blocked recovery must not advance execution authority"
+    );
+    assert_eq!(
+        state
+            .latest_journal_sequence()
+            .unwrap_or_else(|error| panic!("sequence after blocked recovery: {error}")),
+        sequence_before_recovery,
+        "blocked recovery must not replay, commit, or append recovery state"
+    );
+    assert_eq!(
+        state
+            .action_record(&action_id)
+            .unwrap_or_else(|error| panic!("secret crash action after recovery: {error}"))
+            .map(|record| record.state),
+        Some("observed".to_owned()),
+        "Observed alone must never imply temp cleanup or SecretLease closure"
+    );
+    let durable_marker = state
+        .get_state("controller.secret_action_lifecycle", &action_id)
+        .unwrap_or_else(|error| panic!("durable secret crash marker: {error}"))
+        .unwrap_or_else(|| panic!("durable secret crash marker missing"));
+    let durable_marker: Value = serde_json::from_str(&durable_marker)
+        .unwrap_or_else(|error| panic!("decode durable secret crash marker: {error}"));
+    assert_eq!(durable_marker["state"], json!("pending_cleanup"));
+
+    let mut tampered = durable_marker;
+    tampered["target"] = json!("SOVEREIGN_SECRET_FILE_TAMPERED");
+    state
+        .put_state(
+            "controller.secret_action_lifecycle",
+            &action_id,
+            &tampered.to_string(),
+        )
+        .unwrap_or_else(|error| panic!("tamper secret crash marker: {error}"));
+    drop(state);
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen tampered secret marker state: {error}"));
+    let tamper_error = RecoveryManager::recover_with_permission_context(
+        state,
+        &fixture.registry,
+        PermissionContext::m6_local_secret_execution(),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("tampered secret lifecycle marker must fail recovery"));
+    assert!(
+        tamper_error
+            .to_string()
+            .contains("trusted checkpoint plus ordered journal replay"),
+        "unexpected secret marker tamper error: {tamper_error}"
+    );
 }
 
 #[test]

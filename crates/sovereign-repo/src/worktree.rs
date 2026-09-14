@@ -1,7 +1,7 @@
 use super::{
-    capture_snapshot, git_output, hardened_git_command, reject_existing_symlink_components,
-    sha256_prefixed, validate_relative_path, ExactDiffEvidence, ExactFileEvidence, ProjectRegistry,
-    RegisteredRepository, RepoError, RepositorySnapshot,
+    ExactDiffEvidence, ExactFileEvidence, ProjectRegistry, RegisteredRepository, RepoError,
+    RepositorySnapshot, capture_snapshot, git_output, hardened_git_command,
+    reject_existing_symlink_components, sha256_prefixed, validate_relative_path,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

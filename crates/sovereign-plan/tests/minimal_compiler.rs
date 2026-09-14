@@ -12,7 +12,7 @@ use sovereign_plan::{
     PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationError, PlanCompilationInput,
     PlanCompilationRepository, PlanCompiler, PlanValidator, ValidationEnvironment,
 };
-use sovereign_policy::ModelCallBudget;
+use sovereign_policy::{ModelCallBudget, SecretInjection, SecretProviderKind, SecretRef};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -121,6 +121,23 @@ fn compilation_input() -> PlanCompilationInput {
         max_output_tokens: 512,
         model_deadline_ms: 1_000,
     }
+}
+
+fn secret_ref() -> SecretRef {
+    SecretRef {
+        secret_ref_id: "secret.settings-api".to_owned(),
+        provider: SecretProviderKind::MacosKeychain,
+        purpose: "Authenticate the exact settings API verification command.".to_owned(),
+        injection: SecretInjection::TemporaryFile,
+        target: "settings-api-token".to_owned(),
+    }
+}
+
+fn enable_secret_use(input: &mut PlanCompilationInput) {
+    input.policy["capability_ceiling"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("capability ceiling must be an array"))
+        .push(json!("secret_use"));
 }
 
 fn one_task_proposal() -> String {
@@ -321,6 +338,162 @@ fn minimal_compiler_simple_edit_is_one_valid_bounded_task_and_calls_only_complet
 }
 
 #[test]
+fn controller_secret_binding_targets_one_task_and_recomputes_provenance() {
+    let backend = RecordingBackend::new(vec![response(one_task_proposal())]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    enable_secret_use(&mut input);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let source = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile: {error}"));
+    let target_task_id = source.plan().as_value()["tasks"][0]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("compiled task id"))
+        .to_owned();
+    let source_plan_digest = source.plan_digest().to_owned();
+    let source_evidence_digest = source.compilation_evidence_digest().to_owned();
+    let secret_ref = secret_ref();
+
+    let bound = source
+        .bind_controller_secret_ref(&validator, &target_task_id, &secret_ref)
+        .unwrap_or_else(|error| panic!("bind Controller secret: {error}"));
+    let task = &bound.plan().as_value()["tasks"][0];
+
+    assert_eq!(bound.plan().as_value()["ir_version"], json!("1.2"));
+    assert!(
+        task["permissions"]
+            .as_array()
+            .is_some_and(|permissions| permissions.contains(&json!("secret_use")))
+    );
+    assert_eq!(
+        task["action_policy"]["secret_refs"],
+        json!([{
+            "secret_ref_id": "secret.settings-api",
+            "provider": "macos_keychain",
+            "purpose": "Authenticate the exact settings API verification command.",
+            "injection": "temporary_file",
+            "target": "settings-api-token"
+        }])
+    );
+    assert!(validator.is_valid(bound.plan()));
+    assert_ne!(bound.plan_digest(), source_plan_digest);
+    assert_ne!(bound.compilation_evidence_digest(), source_evidence_digest);
+    assert_eq!(
+        bound.compilation_evidence().plan_digest(),
+        bound.plan_digest()
+    );
+    let bindings = bound.compilation_evidence().controller_bindings();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].source_plan_digest(), source_plan_digest);
+    assert_eq!(bindings[0].target_task_id(), target_task_id);
+    assert!(bindings[0].secret_ref_digest().starts_with("sha256:"));
+}
+
+#[test]
+fn controller_secret_binding_requires_global_secret_use_ceiling() {
+    let backend = RecordingBackend::new(vec![response(one_task_proposal())]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let input = compilation_input();
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let source = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile: {error}"));
+    let target_task_id = source.plan().as_value()["tasks"][0]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("compiled task id"));
+
+    assert!(matches!(
+        source.bind_controller_secret_ref(&validator, target_task_id, &secret_ref()),
+        Err(PlanCompilationError::ControllerBindingRejected(message))
+            if message.contains("global policy capability ceiling")
+    ));
+}
+
+#[test]
+fn controller_secret_binding_rejects_unknown_task() {
+    let backend = RecordingBackend::new(vec![response(one_task_proposal())]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    enable_secret_use(&mut input);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let source = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile: {error}"));
+
+    assert!(matches!(
+        source.bind_controller_secret_ref(&validator, "task.missing", &secret_ref()),
+        Err(PlanCompilationError::ControllerBindingRejected(message))
+            if message.contains("must exist exactly once")
+    ));
+}
+
+#[test]
+fn controller_secret_binding_rejects_preexisting_secret_authority() {
+    let backend = RecordingBackend::new(vec![response(one_task_proposal())]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    enable_secret_use(&mut input);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let source = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile: {error}"));
+    let target_task_id = source.plan().as_value()["tasks"][0]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("compiled task id"))
+        .to_owned();
+    let bound = source
+        .bind_controller_secret_ref(&validator, &target_task_id, &secret_ref())
+        .unwrap_or_else(|error| panic!("first binding: {error}"));
+
+    assert!(matches!(
+        bound.bind_controller_secret_ref(&validator, &target_task_id, &secret_ref()),
+        Err(PlanCompilationError::ControllerBindingRejected(message))
+            if message.contains("already contains a Controller authority binding")
+    ));
+}
+
+#[test]
+fn controller_secret_binding_leaves_sibling_task_unchanged() {
+    let backend = RecordingBackend::new(vec![response(two_task_proposal(true))]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    enable_secret_use(&mut input);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let source = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile: {error}"));
+    let tasks = source.plan().as_value()["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tasks array"));
+    let sibling_before = tasks[0].clone();
+    let target_task_id = tasks[1]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("target task id"))
+        .to_owned();
+
+    let bound = source
+        .bind_controller_secret_ref(&validator, &target_task_id, &secret_ref())
+        .unwrap_or_else(|error| panic!("bind Controller secret: {error}"));
+    let bound_tasks = bound.plan().as_value()["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bound tasks array"));
+
+    assert_eq!(bound_tasks[0], sibling_before);
+    assert_eq!(
+        serde_json::to_vec(&bound_tasks[0]).unwrap_or_default(),
+        serde_json::to_vec(&sibling_before).unwrap_or_default()
+    );
+    assert_eq!(bound_tasks[1]["task_id"], json!(target_task_id));
+    assert!(validator.is_valid(bound.plan()));
+}
+
+#[test]
 fn minimal_compiler_rejects_unknown_authorized_heavy_lease_class() {
     let backend = RecordingBackend::new(vec![response(one_task_proposal())]);
     let validator = validator();
@@ -473,7 +646,16 @@ fn minimal_compiler_model_cannot_widen_permissions_or_replace_pins() {
             "symbols": ["SettingsForm"],
             "evidence_queries": [],
             "expected_change": "unsafe",
-            "permissions": ["destructive"]
+            "permissions": ["destructive", "secret_use"],
+            "action_policy": {
+                "secret_refs": [{
+                    "secret_ref_id": "secret.attacker",
+                    "provider": "macos_keychain",
+                    "purpose": "attacker-selected authority",
+                    "injection": "temporary_file",
+                    "target": "attacker-target"
+                }]
+            }
         }]
     })
     .to_string();

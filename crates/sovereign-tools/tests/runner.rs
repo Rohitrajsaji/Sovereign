@@ -1,14 +1,15 @@
 use sovereign_evidence::ArtifactStore;
 use sovereign_policy::{
-    CommandMode, CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend,
-    IsolatedCommand, IsolationCapabilities, IsolationRequest, MacSandboxExecBackend,
-    PinnedExecutable, PolicyError,
+    CommandMode, CommandPolicy, CommandRisk, CommandSpec, ControllerSecretLocator,
+    ExecutionIsolationBackend, FakeSecretProvider, IsolatedCommand, IsolationCapabilities,
+    IsolationRequest, MacSandboxExecBackend, PinnedExecutable, PolicyError, SecretBroker,
+    SecretInjection, SecretProviderKind, SecretRef, SecretScope,
 };
 use sovereign_state::StateStore;
 use sovereign_tools::{
     ActionJournal, ActionState, AtomicReplaceGuard, AuthorizedAction, CapabilityLayers,
     CapabilitySet, PermissionClass, PermissionDecision, ProcessRunner, Reconciliation,
-    ReconciliationMode, ResourceLimitKind, ToolManifest, ToolSchemaV1,
+    ReconciliationMode, ResourceLimitKind, SecretCleanupProof, ToolManifest, ToolSchemaV1,
     filter_authorized_tool_schemas,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +17,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -178,6 +180,32 @@ fn artifacts(temp: &TestDir) -> ArtifactStore {
     ArtifactStore::open(temp.0.join("cas")).unwrap_or_else(|error| panic!("artifacts: {error}"))
 }
 
+fn assert_tree_excludes_bytes(root: &Path, needle: &[u8]) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(entry_path);
+            } else if file_type.is_file() {
+                let bytes = fs::read(&entry_path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", entry_path.display()));
+                assert!(
+                    !bytes.windows(needle.len()).any(|window| window == needle),
+                    "secret bytes persisted in {}",
+                    entry_path.display()
+                );
+            }
+        }
+    }
+}
+
 fn isolation(repo: &Path, home: &Path, allow_repository_write: bool) -> IsolationRequest {
     IsolationRequest {
         repository_root: repo.to_path_buf(),
@@ -289,6 +317,152 @@ impl ExecutionIsolationBackend for RejectIsolation {
             "fixture isolation unavailable".to_owned(),
         ))
     }
+}
+
+struct PassthroughIsolation;
+
+impl ExecutionIsolationBackend for PassthroughIsolation {
+    fn capabilities(&self) -> IsolationCapabilities {
+        panic!("capabilities must not be queried by ProcessRunner::prepare_execution")
+    }
+
+    fn isolate(
+        &self,
+        spec: &CommandSpec,
+        _request: &IsolationRequest,
+    ) -> Result<IsolatedCommand, PolicyError> {
+        Ok(IsolatedCommand {
+            executable: spec.executable.clone(),
+            args: spec.args.clone(),
+        })
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn secret_lease_runner_stops_observed_until_controller_closes_lease_and_commits() {
+    let (temp, repo, home, mut store) = fixture("secret-lease-observed");
+    let artifact_store = artifacts(&temp);
+    let sentinel = b"controller-owned-secret-lifecycle";
+    let script = "IFS= read -r secret < \"$SOVEREIGN_SECRET_FILE\"; printf 'stdout:%s\\n' \"$secret\"; printf 'stderr:%s\\n' \"$secret\" >&2";
+    let mut action = shell_action(
+        "action_secret_lease_observed",
+        &repo,
+        script,
+        Limits {
+            timeout_ms: 2_000,
+            output_bytes: 8 * 1024,
+            disk_bytes: 8 * 1024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::UnsafeSideEffect,
+    );
+    let request = isolation(&repo, &home, false);
+    bind_isolation(&mut action, &request);
+    let decision = permission_decision(&action);
+    action.permission_decision_digest = decision.digest();
+
+    let secret_ref = SecretRef {
+        secret_ref_id: "secret.fixture.tools".to_owned(),
+        provider: SecretProviderKind::ExternalBroker,
+        purpose: "exercise exact Controller-owned tools lifecycle".to_owned(),
+        injection: SecretInjection::TemporaryFile,
+        target: "SOVEREIGN_SECRET_FILE".to_owned(),
+    };
+    action.destination_digest = Some(
+        secret_ref
+            .binding_digest()
+            .unwrap_or_else(|error| panic!("SecretRef binding digest: {error}")),
+    );
+    let mut broker = SecretBroker::new();
+    broker
+        .register_provider(Arc::new(FakeSecretProvider::new(
+            SecretProviderKind::ExternalBroker,
+            [("tools-fixture".to_owned(), sentinel.to_vec())],
+        )))
+        .unwrap_or_else(|error| panic!("register fake secret provider: {error}"));
+    broker
+        .register_secret(
+            secret_ref.clone(),
+            ControllerSecretLocator::FakeKey {
+                provider: SecretProviderKind::ExternalBroker,
+                key: "tools-fixture".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("register secret: {error}"));
+    let scope = SecretScope {
+        plan_id: action.plan_id.clone(),
+        plan_revision: action.plan_revision,
+        task_id: action.task_id.clone(),
+        task_contract_digest: decision.task_contract_digest.clone(),
+        action_id: action.action_id.clone(),
+        permission_decision_digest: action.permission_decision_digest.clone(),
+        execution_epoch: action.execution_epoch,
+    };
+    let now = now_ms();
+    let mut lease = broker
+        .resolve(
+            &secret_ref,
+            scope.clone(),
+            &decision.effective,
+            now,
+            now + 10_000,
+        )
+        .unwrap_or_else(|error| panic!("resolve secret lease: {error}"));
+    let private_root = temp.0.join("controller-private-secrets");
+    let command_policy = shell_policy();
+    let runner = ProcessRunner::new(&command_policy, &PassthroughIsolation);
+
+    {
+        let mut journal = ActionJournal::new(&mut store);
+        authorize(&mut journal, &action, &manifest())
+            .unwrap_or_else(|error| panic!("authorize: {error}"));
+        let (result, proof) = runner
+            .run_with_secret_lease_observed(
+                &mut journal,
+                &action,
+                &request,
+                &artifact_store,
+                &mut lease,
+                &scope,
+                &decision,
+                now,
+                &private_root,
+            )
+            .unwrap_or_else(|error| panic!("secret lease run: {error}"));
+        assert_eq!(result.stdout, b"stdout:[REDACTED]\n");
+        assert_eq!(result.stderr, b"stderr:[REDACTED]\n");
+        assert_eq!(
+            proof,
+            SecretCleanupProof {
+                process_lease_reaped: true,
+                ephemeral_injection_removed: true,
+            }
+        );
+        assert!(!lease.is_closed());
+        let observed = journal
+            .record(&action.action_id)
+            .unwrap_or_else(|error| panic!("observed record: {error}"))
+            .unwrap_or_else(|| panic!("missing observed action"));
+        assert_eq!(observed.state, "observed");
+
+        lease
+            .close(&scope)
+            .unwrap_or_else(|error| panic!("Controller lease close: {error}"));
+        assert!(lease.is_closed());
+        journal
+            .commit_with_bound_result(&action, ActionState::Observed)
+            .unwrap_or_else(|error| panic!("Controller commit: {error}"));
+        assert_eq!(
+            journal
+                .record(&action.action_id)
+                .unwrap_or_else(|error| panic!("committed record: {error}"))
+                .map(|record| record.state)
+                .as_deref(),
+            Some("committed")
+        );
+    }
+    assert_tree_excludes_bytes(&temp.0, sentinel);
 }
 
 #[test]

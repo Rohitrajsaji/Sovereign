@@ -4,13 +4,14 @@
 //! Controller-created authority to exist durably before an operating-system process starts.
 
 use sha2::{Digest, Sha256};
-use sovereign_evidence::{ArtifactStore, EvidenceError};
+use sovereign_evidence::{ArtifactStore, EvidenceError, Redactor};
 pub use sovereign_policy::{
     Capability, CapabilityLayers, CapabilitySet, PermissionDecision, TaskCapabilityGrant,
 };
 use sovereign_policy::{
     CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, IsolatedCommand,
-    IsolationRequest, PolicyError, sanitized_environment,
+    IsolationRequest, PolicyError, SecretInjection, SecretLease, SecretScope,
+    sanitized_environment,
 };
 use sovereign_state::{
     ActionTransition, NewActionRecord, PersistedActionRecord, StateError, StateStore,
@@ -964,6 +965,20 @@ pub struct RawToolResult {
     pub process_group_reaped: bool,
 }
 
+/// Fixed environment handle exposed only by the secret-aware runner path. The value is an
+/// ephemeral private file path, never secret material.
+pub const EPHEMERAL_SECRET_FILE_ENV: &str = "SOVEREIGN_SECRET_FILE";
+
+/// Proof returned to the Controller after the policy-owned temporary secret file has been
+/// deleted with an absence check and the owned process group is durably marked reaped. It contains
+/// no secret bytes; the Controller must still close the exact `SecretLease` before committing the
+/// already-observed action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecretCleanupProof {
+    pub process_lease_reaped: bool,
+    pub ephemeral_injection_removed: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceLimitKind {
     Timeout,
@@ -1011,6 +1026,126 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
         journal.record_process_lease(action, None, None, "pending_spawn")?;
         self.execute_dispatched(journal, action, artifacts, prepared)
+    }
+
+    /// Executes one exact temporary-file secret lease through durable observation, but deliberately
+    /// leaves the action uncommitted. This is the Controller integration seam: after this returns,
+    /// the Controller still owns the `SecretLease`, can close it only after the returned cleanup
+    /// proof, and may then commit the already-redacted observed action.
+    ///
+    /// The temporary file is created by the policy-owned lease under a Controller-private root,
+    /// with task/action-derived directories and restrictive permissions. Raw secret bytes are used
+    /// only inside the lease value-use closure for pre-persistence redaction and never enter the
+    /// authorized action, command specification, receipt, CAS object, or returned result.
+    ///
+    /// # Errors
+    /// Returns fail-closed for stale/mismatched authority, non-temporary-file refs, unsafe target
+    /// metadata, execution ambiguity, redaction failure, or unproven temporary-file cleanup. On a
+    /// successful return the durable action is exactly `observed`, never `committed`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_secret_lease_observed(
+        &self,
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        isolation_request: &IsolationRequest,
+        artifacts: &ArtifactStore,
+        secret_lease: &mut SecretLease,
+        secret_scope: &SecretScope,
+        permission_decision: &PermissionDecision,
+        now_ms: i64,
+        controller_private_root: &Path,
+    ) -> Result<(RawToolResult, SecretCleanupProof), ToolError> {
+        journal.verify_authorized(action)?;
+        action.verify_permission_decision(permission_decision)?;
+        if !permission_decision
+            .effective
+            .contains(Capability::ProcessExec)
+            || !permission_decision
+                .effective
+                .contains(Capability::SecretUse)
+        {
+            return Err(ToolError::Authority(
+                "secret process execution requires exact process_exec + secret_use authority"
+                    .to_owned(),
+            ));
+        }
+        if secret_scope.plan_id != action.plan_id
+            || secret_scope.plan_revision != action.plan_revision
+            || secret_scope.task_id != action.task_id
+            || secret_scope.task_contract_digest != permission_decision.task_contract_digest
+            || secret_scope.action_id != action.action_id
+            || secret_scope.permission_decision_digest != action.permission_decision_digest
+            || secret_scope.execution_epoch != action.execution_epoch
+        {
+            return Err(ToolError::Authority(
+                "secret scope does not match the exact authorized action and permission decision"
+                    .to_owned(),
+            ));
+        }
+        let secret_ref = secret_lease.secret_ref();
+        let secret_ref_binding_digest = secret_ref.binding_digest()?;
+        if action.destination_digest.as_deref() != Some(secret_ref_binding_digest.as_str()) {
+            return Err(ToolError::Authority(
+                "authorized action is not bound to the exact SecretRef metadata".to_owned(),
+            ));
+        }
+        if secret_ref.injection != SecretInjection::TemporaryFile
+            || secret_ref.target != EPHEMERAL_SECRET_FILE_ENV
+        {
+            return Err(ToolError::Authority(format!(
+                "temporary-file secret execution requires target {EPHEMERAL_SECRET_FILE_ENV}"
+            )));
+        }
+        if action
+            .command
+            .environment
+            .contains_key(EPHEMERAL_SECRET_FILE_ENV)
+        {
+            return Err(ToolError::Authority(format!(
+                "{EPHEMERAL_SECRET_FILE_ENV} is Controller-owned on secret execution paths"
+            )));
+        }
+
+        let mut prepared = self.prepare_execution(action, isolation_request)?;
+        let mut secret_file = secret_lease.inject_temporary_file(
+            secret_scope,
+            &permission_decision.effective,
+            now_ms,
+            controller_private_root,
+        )?;
+        let secret_path = secret_file.path().to_str().ok_or_else(|| {
+            ToolError::Authority("ephemeral secret path is not valid UTF-8".to_owned())
+        })?;
+        prepared
+            .environment
+            .insert(EPHEMERAL_SECRET_FILE_ENV.to_owned(), secret_path.to_owned());
+        journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
+        journal.record_process_lease(action, None, None, "pending_spawn")?;
+
+        let execution = secret_lease.with_value(
+            secret_scope,
+            &permission_decision.effective,
+            now_ms,
+            |secret_bytes| {
+                self.execute_secret_dispatched(journal, action, artifacts, prepared, secret_bytes)
+            },
+        )?;
+        match execution {
+            Ok(result) => {
+                secret_file.close()?;
+                Ok((
+                    result,
+                    SecretCleanupProof {
+                        process_lease_reaped: true,
+                        ephemeral_injection_removed: true,
+                    },
+                ))
+            }
+            Err(error) => {
+                secret_file.close()?;
+                Err(error)
+            }
+        }
     }
 
     fn prepare_execution(
@@ -1176,6 +1311,118 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         journal.observe_with_receipt(action, artifacts, &receipt)?;
         journal.commit_with_bound_result(action, ActionState::Observed)?;
         journal.record_process_lease(action, Some(pgid), Some(&leader_identity), "reaped")?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_secret_dispatched(
+        &self,
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        artifacts: &ArtifactStore,
+        prepared: PreparedExecution,
+        secret_bytes: &[u8],
+    ) -> Result<RawToolResult, ToolError> {
+        let mut command = Command::new(&prepared.isolated.executable);
+        command
+            .args(&prepared.isolated.args)
+            .current_dir(&action.command.working_directory)
+            .env_clear()
+            .envs(prepared.environment)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                journal.record_process_lease(action, None, None, "reaped")?;
+                Self::reconcile_proven_no_child(journal, action)?;
+                return Err(ToolError::Io(error));
+            }
+        };
+        let pgid = child.id();
+        recovery_test_hook("after_process_spawn_before_identity_lease");
+        let Some(leader_identity) = process_group_leader_identity(pgid)? else {
+            terminate_process_group(&mut child, pgid)?;
+            if wait_group_absent(pgid, Duration::from_millis(500))? {
+                journal.record_process_lease(action, Some(pgid), None, "reaped")?;
+            }
+            journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
+            return Err(ToolError::RecoveryBlocked(
+                "spawned process leader identity could not be proven".to_owned(),
+            ));
+        };
+        if let Err(error) =
+            journal.record_process_lease(action, Some(pgid), Some(&leader_identity), "active")
+        {
+            terminate_process_group(&mut child, pgid)?;
+            if !wait_group_absent(pgid, Duration::from_millis(500))? {
+                let _ = journal.transition(action, ActionState::Dispatched, ActionState::Unknown);
+            }
+            return Err(error);
+        }
+        let output_count = Arc::new(AtomicU64::new(0));
+        let stdout_handle = spawn_reader(
+            child.stdout.take(),
+            action.command.output_limit_bytes,
+            Arc::clone(&output_count),
+        );
+        let stderr_handle = spawn_reader(
+            child.stderr.take(),
+            action.command.output_limit_bytes,
+            Arc::clone(&output_count),
+        );
+        let start = Instant::now();
+        let (status, limited) = self.monitor_child(
+            &mut child,
+            pgid,
+            action,
+            prepared.baseline_disk,
+            &output_count,
+        )?;
+        let reaped = wait_group_absent(pgid, Duration::from_millis(500))?;
+        if !reaped {
+            journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
+            return Err(ToolError::RecoveryBlocked(format!(
+                "process group {pgid} still has members after cleanup"
+            )));
+        }
+        journal.record_process_lease(action, Some(pgid), Some(&leader_identity), "reaped")?;
+
+        if limited.is_some() && action.command.subprocess_limit > 0 {
+            journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
+            return Err(ToolError::RecoveryBlocked(
+                "forced cleanup cannot prove absence of descendants that may have escaped the process group"
+                    .to_owned(),
+            ));
+        }
+
+        let mut raw_stdout = receive_reader(stdout_handle, Duration::from_millis(500))
+            .inspect_err(|_| {
+                let _ = journal.transition(action, ActionState::Dispatched, ActionState::Unknown);
+            })?;
+        let mut raw_stderr = receive_reader(stderr_handle, Duration::from_millis(500))
+            .inspect_err(|_| {
+                let _ = journal.transition(action, ActionState::Dispatched, ActionState::Unknown);
+            })?;
+        let redactor = Redactor::v1();
+        let stdout = redactor.redact_bytes(&raw_stdout, &[secret_bytes])?.bytes;
+        let stderr = redactor.redact_bytes(&raw_stderr, &[secret_bytes])?.bytes;
+        raw_stdout.fill(0);
+        raw_stderr.fill(0);
+
+        let result = RawToolResult {
+            exit_code: status.code(),
+            stdout,
+            stderr,
+            elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            terminated_for_limit: limited,
+            process_group_reaped: true,
+        };
+        let receipt = durable_result_receipt(action, &result)?;
+        journal.observe_with_receipt(action, artifacts, &receipt)?;
         Ok(result)
     }
 

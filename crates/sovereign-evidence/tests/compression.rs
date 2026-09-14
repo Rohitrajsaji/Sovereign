@@ -1,9 +1,11 @@
 use sovereign_evidence::{
     ArtifactStore, EvidenceCapture, EvidenceCompressor, EvidenceExpandQuery, EvidenceKind,
+    REDACTION_EVENT_SCHEMA_V1, REDACTOR_VERSION_V1, Redactor,
 };
 use sovereign_state::StateStore;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -166,6 +168,203 @@ fn known_and_generic_credentials_are_redacted_before_cas_persistence() {
     }
     assert!(retained_text.matches("[REDACTED]").count() >= 6);
     assert!(!evidence.redaction_event_ids.is_empty());
+}
+
+#[test]
+fn secret_redactor_reusable_output_redacts_multiple_exact_and_generic_shapes() {
+    let exact_a = "exact-secret-alpha";
+    let exact_b = "exact-secret-beta";
+    let raw = format!(
+        "first={exact_a}\nsecond={exact_b}\nAuthorization: Bearer  bearer-value\nAPI_KEY = api-value\ntoken='token-value'\npassword=\"password-value\"\nsecret = secret-value\nnpm_token = npm-value\n//registry.example/:_authToken = npm-auth-value\n{{\n  \"secret\": \"json-secret-value\",\n  \"token\": 'json-token-value'\n}}\nsk-abcdefghijklmnopqrstuvwxyz123456\n"
+    );
+    let redactor = Redactor::v1();
+    assert_eq!(redactor.version(), REDACTOR_VERSION_V1);
+    let first = redactor
+        .redact(raw.as_bytes(), &[exact_a, exact_b])
+        .unwrap_or_else(|error| panic!("redact: {error}"));
+    let reordered = redactor
+        .redact(raw.as_bytes(), &[exact_b, exact_a, exact_a])
+        .unwrap_or_else(|error| panic!("redact reordered: {error}"));
+    assert_eq!(
+        first, reordered,
+        "event metadata must be input-order stable"
+    );
+
+    let redacted = String::from_utf8_lossy(&first.bytes);
+    for secret in [
+        exact_a,
+        exact_b,
+        "bearer-value",
+        "api-value",
+        "token-value",
+        "password-value",
+        "secret-value",
+        "npm-value",
+        "npm-auth-value",
+        "json-secret-value",
+        "json-token-value",
+        "sk-abcdefghijklmnopqrstuvwxyz123456",
+    ] {
+        assert!(!redacted.contains(secret), "secret leaked: {secret}");
+    }
+    assert!(redacted.matches("[REDACTED]").count() >= 12);
+    assert!(!first.events.is_empty());
+    for event in &first.events {
+        assert_eq!(event.schema, REDACTION_EVENT_SCHEMA_V1);
+        assert_eq!(event.redactor_version, REDACTOR_VERSION_V1);
+        assert!(event.event_id.starts_with("redact_"));
+        assert!(event.occurrences > 0);
+    }
+}
+
+#[test]
+fn secret_capture_never_persists_secret_in_raw_synopsis_or_event_metadata() {
+    let mut ctx = TestContext::new("secret-persistence");
+    let exact_a = "persist-exact-alpha";
+    let exact_b = "persist-exact-beta";
+    let raw = format!(
+        "ERROR request failed exact={exact_a}\nsecret={exact_b}\nAuthorization: Bearer  persisted-bearer\napi_key = persisted-api\ntoken='persisted-token'\npassword=\"persisted-password\"\nsecret = persisted-generic-secret\n//registry.example/:_authToken = persisted-npm\n{{\n  \"secret\": \"persisted-json-secret\",\n  \"token\": \"persisted-json-token\"\n}}\nsk-abcdefghijklmnopqrstuvwxyz987654\n"
+    );
+    let redacted = Redactor::v1()
+        .redact(raw.as_bytes(), &[exact_a, exact_b])
+        .unwrap_or_else(|error| panic!("pre-persistence redact: {error}"));
+    let event_bytes = serde_json::to_vec(&redacted.events)
+        .unwrap_or_else(|error| panic!("serialize events: {error}"));
+
+    let compressor = EvidenceCompressor::new("secret-v1", 1);
+    let evidence = compressor
+        .capture(
+            &ctx.store,
+            &mut ctx.state,
+            &capture(
+                "act_secret_persistence",
+                EvidenceKind::Log,
+                raw.as_bytes(),
+                &[exact_a, exact_b],
+                16 * 1024,
+                1_024,
+            ),
+        )
+        .unwrap_or_else(|error| panic!("capture: {error}"));
+
+    let raw_bytes = ctx
+        .store
+        .range(
+            &ctx.state,
+            &evidence.raw_artifact_digest,
+            0,
+            usize::try_from(evidence.retained_bytes).unwrap_or(usize::MAX),
+        )
+        .unwrap_or_else(|error| panic!("read raw: {error}"));
+    let mut synopsis_file = ctx
+        .store
+        .open_artifact(&ctx.state, &evidence.synopsis_artifact_digest)
+        .unwrap_or_else(|error| panic!("open synopsis: {error}"));
+    let mut synopsis_bytes = Vec::new();
+    synopsis_file
+        .read_to_end(&mut synopsis_bytes)
+        .unwrap_or_else(|error| panic!("read synopsis: {error}"));
+
+    let persisted_and_model_facing = [
+        raw_bytes.as_slice(),
+        synopsis_bytes.as_slice(),
+        evidence.synopsis.as_bytes(),
+        event_bytes.as_slice(),
+    ];
+    for secret in [
+        exact_a,
+        exact_b,
+        "persisted-bearer",
+        "persisted-api",
+        "persisted-token",
+        "persisted-password",
+        "persisted-generic-secret",
+        "persisted-npm",
+        "persisted-json-secret",
+        "persisted-json-token",
+        "sk-abcdefghijklmnopqrstuvwxyz987654",
+    ] {
+        for surface in persisted_and_model_facing {
+            assert!(
+                !String::from_utf8_lossy(surface).contains(secret),
+                "secret leaked to retained/synopsis/event surface: {secret}"
+            );
+        }
+    }
+    assert_eq!(
+        evidence.redaction_event_ids,
+        redacted
+            .events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn secret_redaction_event_metadata_is_stable_and_contains_no_input_values() {
+    let first_secret = "metadata-secret-one";
+    let second_secret = "metadata-secret-two";
+    let raw = format!(
+        "a={first_secret}\nb={second_secret}\npassword=metadata-password\nsecret=metadata-generic\n"
+    );
+    let redactor = Redactor::v1();
+    let first = redactor
+        .redact(raw.as_bytes(), &[first_secret, second_secret])
+        .unwrap_or_else(|error| panic!("first redact: {error}"));
+    let second = redactor
+        .redact(raw.as_bytes(), &[second_secret, first_secret])
+        .unwrap_or_else(|error| panic!("second redact: {error}"));
+    assert_eq!(first.events, second.events);
+
+    let metadata = serde_json::to_string(&first.events)
+        .unwrap_or_else(|error| panic!("serialize metadata: {error}"));
+    for secret in [
+        first_secret,
+        second_secret,
+        "metadata-password",
+        "metadata-generic",
+    ] {
+        assert!(!metadata.contains(secret));
+    }
+}
+
+#[test]
+fn secret_redactor_byte_exact_api_handles_non_utf8_secret_material() {
+    let secret_a: &[u8] = b"\xff\x00\xfeopaque-secret";
+    let secret_b: &[u8] = b"\x80\x81second-secret";
+    let mut raw = b"prefix:".to_vec();
+    raw.extend_from_slice(secret_a);
+    raw.extend_from_slice(b":middle:");
+    raw.extend_from_slice(secret_b);
+    raw.extend_from_slice(b":suffix");
+
+    let redactor = Redactor::v1();
+    let first = redactor
+        .redact_bytes(&raw, &[secret_a, secret_b])
+        .unwrap_or_else(|error| panic!("byte redact: {error}"));
+    let reordered = redactor
+        .redact_bytes(&raw, &[secret_b, secret_a, secret_a])
+        .unwrap_or_else(|error| panic!("byte redact reordered: {error}"));
+    assert_eq!(first, reordered);
+    assert_eq!(first.bytes, b"prefix:[REDACTED]:middle:[REDACTED]:suffix");
+    for secret in [secret_a, secret_b] {
+        assert!(
+            !first
+                .bytes
+                .windows(secret.len())
+                .any(|window| window == secret)
+        );
+    }
+    let metadata = serde_json::to_vec(&first.events)
+        .unwrap_or_else(|error| panic!("serialize byte redaction events: {error}"));
+    for secret in [secret_a, secret_b] {
+        assert!(
+            !metadata
+                .windows(secret.len())
+                .any(|window| window == secret)
+        );
+    }
 }
 
 #[test]

@@ -20,7 +20,7 @@ use sovereign_model::{
     ModelFinishReason, ModelMessage, ModelMessageRole, ModelOutputContract, ModelRequest,
     ModelResponse,
 };
-use sovereign_policy::{ModelCallBudget, PlanHeavyLeaseClass, PolicyError};
+use sovereign_policy::{ModelCallBudget, PlanHeavyLeaseClass, PolicyError, SecretRef};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -174,6 +174,33 @@ pub struct ModelAttemptEvidence {
     pub validation_diagnostics: Vec<String>,
 }
 
+/// Digest-only provenance for one Controller-owned post-compilation authority
+/// binding. The durable `SecretRef` metadata itself remains in Plan IR; provider
+/// lookup locators and resolved values are deliberately absent here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerBindingEvidence {
+    source_plan_digest: String,
+    target_task_id: String,
+    secret_ref_digest: String,
+}
+
+impl ControllerBindingEvidence {
+    #[must_use]
+    pub fn source_plan_digest(&self) -> &str {
+        &self.source_plan_digest
+    }
+
+    #[must_use]
+    pub fn target_task_id(&self) -> &str {
+        &self.target_task_id
+    }
+
+    #[must_use]
+    pub fn secret_ref_digest(&self) -> &str {
+        &self.secret_ref_digest
+    }
+}
+
 /// Immutable provenance record for a successful compilation candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilationEvidence {
@@ -187,6 +214,8 @@ pub struct CompilationEvidence {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     depth_decision_digest: Option<String>,
     model_attempts: Vec<ModelAttemptEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    controller_bindings: Vec<ControllerBindingEvidence>,
     validator_passed: bool,
     plan_digest: String,
 }
@@ -225,6 +254,11 @@ impl CompilationEvidence {
     #[must_use]
     pub fn model_attempts(&self) -> &[ModelAttemptEvidence] {
         &self.model_attempts
+    }
+
+    #[must_use]
+    pub fn controller_bindings(&self) -> &[ControllerBindingEvidence] {
+        &self.controller_bindings
     }
 
     #[must_use]
@@ -268,6 +302,152 @@ impl PlanCompilationResult {
     pub fn compilation_evidence_digest(&self) -> &str {
         &self.compilation_evidence_digest
     }
+
+    /// Adds one exact Controller-selected `SecretRef` to one already-generated
+    /// task without exposing this authority to model/proposal text.
+    ///
+    /// The source compilation must still be digest-consistent and valid under
+    /// the supplied validator. The authoritative global policy must already
+    /// permit `secret_use`, and the source plan must contain no pre-existing
+    /// task-level secret authority. Only the exact target task gains
+    /// `secret_use` plus the five-field `SecretRef` metadata. The whole candidate
+    /// is then revalidated and all affected compilation/provenance digests are
+    /// recomputed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed binding rejection for stale/inconsistent source
+    /// results, missing global authority, unknown/duplicate targets, or
+    /// pre-existing task secret authority. Returns validation/serialization or
+    /// policy errors when the exact transformed candidate or `SecretRef` is
+    /// invalid.
+    pub fn bind_controller_secret_ref(
+        &self,
+        validator: &PlanValidator,
+        target_task_id: &str,
+        secret_ref: &SecretRef,
+    ) -> Result<Self, PlanCompilationError> {
+        secret_ref.validate()?;
+        self.validate_binding_source(validator)?;
+
+        let source_plan_digest = self.plan_digest.clone();
+        let secret_ref_digest = canonical_digest(secret_ref)?;
+        let mut document = self.plan.as_value().clone();
+        if !string_set(document.pointer("/policy/capability_ceiling")).contains("secret_use") {
+            return Err(PlanCompilationError::ControllerBindingRejected(
+                "global policy capability ceiling does not include secret_use".to_owned(),
+            ));
+        }
+
+        let tasks = document
+            .get_mut("tasks")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                PlanCompilationError::ControllerBindingRejected(
+                    "source plan does not contain tasks[]".to_owned(),
+                )
+            })?;
+        for task in tasks.iter() {
+            let has_secret_use = string_set(task.get("permissions")).contains("secret_use");
+            let has_secret_refs = task
+                .pointer("/action_policy/secret_refs")
+                .and_then(Value::as_array)
+                .is_some_and(|refs| !refs.is_empty());
+            if has_secret_use || has_secret_refs {
+                let task_id = task
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                return Err(PlanCompilationError::ControllerBindingRejected(format!(
+                    "source plan already contains task-level secret authority on {task_id}"
+                )));
+            }
+        }
+
+        let matching = tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, task)| task.get("task_id").and_then(Value::as_str) == Some(target_task_id))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        let [target_index] = matching.as_slice() else {
+            return Err(PlanCompilationError::ControllerBindingRejected(format!(
+                "target task {target_task_id} must exist exactly once"
+            )));
+        };
+        let target = &mut tasks[*target_index];
+        let permissions = target
+            .get_mut("permissions")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                PlanCompilationError::ControllerBindingRejected(format!(
+                    "target task {target_task_id} lacks permissions[]"
+                ))
+            })?;
+        permissions.push(Value::String("secret_use".to_owned()));
+        let secret_refs = target
+            .pointer_mut("/action_policy/secret_refs")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                PlanCompilationError::ControllerBindingRejected(format!(
+                    "target task {target_task_id} lacks action_policy.secret_refs[]"
+                ))
+            })?;
+        secret_refs.push(serde_json::to_value(secret_ref)?);
+
+        let plan = PlanIr::from_value(canonicalize(&document));
+        let diagnostics = validator.validate(&plan);
+        if !diagnostics.is_empty() {
+            return Err(PlanCompilationError::ValidationRejected(diagnostics));
+        }
+        let plan_digest = plan.canonical_digest()?;
+        let mut compilation_evidence = self.compilation_evidence.clone();
+        compilation_evidence
+            .controller_bindings
+            .push(ControllerBindingEvidence {
+                source_plan_digest,
+                target_task_id: target_task_id.to_owned(),
+                secret_ref_digest,
+            });
+        compilation_evidence.plan_digest.clone_from(&plan_digest);
+        compilation_evidence.validator_passed = true;
+        let compilation_evidence_digest = canonical_digest(&compilation_evidence)?;
+
+        Ok(Self {
+            plan,
+            plan_digest,
+            compilation_evidence,
+            compilation_evidence_digest,
+        })
+    }
+
+    fn validate_binding_source(
+        &self,
+        validator: &PlanValidator,
+    ) -> Result<(), PlanCompilationError> {
+        let actual_plan_digest = self.plan.canonical_digest()?;
+        let actual_evidence_digest = canonical_digest(&self.compilation_evidence)?;
+        if actual_plan_digest != self.plan_digest
+            || self.compilation_evidence.plan_digest != self.plan_digest
+            || actual_evidence_digest != self.compilation_evidence_digest
+            || !self.compilation_evidence.validator_passed
+        {
+            return Err(PlanCompilationError::ControllerBindingRejected(
+                "source compilation result is not digest-consistent".to_owned(),
+            ));
+        }
+        if !self.compilation_evidence.controller_bindings.is_empty() {
+            return Err(PlanCompilationError::ControllerBindingRejected(
+                "source compilation already contains a Controller authority binding".to_owned(),
+            ));
+        }
+        if !validator.validate(&self.plan).is_empty() {
+            return Err(PlanCompilationError::ControllerBindingRejected(
+                "source compilation no longer passes the supplied PlanValidator".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Deterministic compiler failures. Validation rejection never returns a
@@ -275,6 +455,7 @@ impl PlanCompilationResult {
 #[derive(Debug)]
 pub enum PlanCompilationError {
     InvalidInput(String),
+    ControllerBindingRejected(String),
     Model(ModelError),
     Policy(PolicyError),
     ProposalRejected { attempts: u8, reason: String },
@@ -286,6 +467,9 @@ impl Display for PlanCompilationError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidInput(message) => write!(f, "invalid PlanCompiler input: {message}"),
+            Self::ControllerBindingRejected(message) => {
+                write!(f, "Controller plan binding rejected: {message}")
+            }
             Self::Model(error) => write!(f, "PlanCompiler model call failed: {error}"),
             Self::Policy(error) => write!(f, "PlanCompiler outer budget rejected call: {error}"),
             Self::ProposalRejected { attempts, reason } => write!(
@@ -456,6 +640,7 @@ impl<'a> PlanCompiler<'a> {
                         supplied_sources,
                         depth_decision_digest,
                         model_attempts: attempts,
+                        controller_bindings: Vec::new(),
                         validator_passed: true,
                         plan_digest: plan_digest.clone(),
                     };

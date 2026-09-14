@@ -29,8 +29,8 @@ use sovereign_policy::{
     CommandRisk, CommandSpec, ConditionalLeaseContextV1, HeavyLeaseClass, IsolationRequest,
     LeaseStateV1, M6ResourceGovernorSnapshotV1, ModelCallBudget, PermissionDecision,
     PlanHeavyLeaseClass, PolicyError, ResourceLeaseOwnerV1, ResourceLeaseRequestV1,
-    ResourceLeaseV1, ResourcePolicyEventV1, ResourcePressureEventV1, TaskCapabilityGrant,
-    TaskResourceBudgetV1,
+    ResourceLeaseV1, ResourcePolicyEventV1, ResourcePressureEventV1, SecretBroker, SecretInjection,
+    SecretProviderKind, SecretRef, SecretScope, TaskCapabilityGrant, TaskResourceBudgetV1,
 };
 use sovereign_repo::{
     ChangeSet, ChangeSetCompositionInput, ComposeChangeSetsOutcome, CompositionConflictEvidence,
@@ -42,9 +42,9 @@ use sovereign_state::{
     StateError, StateRecordUpdate, StateStore,
 };
 use sovereign_tools::{
-    ActionJournal, AuthorizedAction, PermissionClass, ProcessRunner, RawToolResult,
-    ReconciliationMode, ToolError, ToolManifest, ToolSchemaV1, filter_authorized_tool_schemas,
-    reap_owned_process_group,
+    ActionJournal, ActionState, AuthorizedAction, EPHEMERAL_SECRET_FILE_ENV, PermissionClass,
+    ProcessRunner, RawToolResult, ReconciliationMode, ToolError, ToolManifest, ToolSchemaV1,
+    filter_authorized_tool_schemas, reap_owned_process_group,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -431,6 +431,25 @@ impl PermissionContext {
         }
     }
 
+    /// Explicit local profile for Controller-owned secret execution. Secret authority is opt-in at
+    /// construction time and still remains subject to the active Plan IR, task, role, tool, and
+    /// persisted task-grant ceilings.
+    #[must_use]
+    pub fn m6_local_secret_execution() -> Self {
+        let granted = BTreeSet::from([
+            PermissionClass::ProcessExec,
+            PermissionClass::RepositoryWrite,
+            PermissionClass::SecretUse,
+        ]);
+        Self {
+            controller_ceiling: granted.clone(),
+            project_ceiling: granted.clone(),
+            role_ceiling: granted.clone(),
+            persisted_grants: granted,
+            persisted_grant_issuer: "user:local-secret-execution-profile".to_owned(),
+        }
+    }
+
     #[must_use]
     pub fn read_only() -> Self {
         let granted = BTreeSet::from([PermissionClass::ProcessExec]);
@@ -491,6 +510,92 @@ impl PermissionContext {
 
 const TASK_CAPABILITY_GRANT_SCHEMA_VERSION: u32 = 1;
 const TASK_CAPABILITY_GRANT_NAMESPACE: &str = "controller.task_capability_grant";
+const SECRET_ACTION_LIFECYCLE_SCHEMA_VERSION: u32 = 1;
+const SECRET_ACTION_LIFECYCLE_NAMESPACE: &str = "controller.secret_action_lifecycle";
+const SAFE_SECRET_RESOLUTION_DIAGNOSTIC: &str =
+    "Controller secret resolution denied; provider details withheld";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SecretActionLifecycleStateV1 {
+    PendingCleanup,
+    CleanupProven,
+    LeaseClosed,
+    Complete,
+}
+
+impl SecretActionLifecycleStateV1 {
+    const fn event_kind(self) -> &'static str {
+        match self {
+            Self::PendingCleanup => "secret_action_pending_cleanup",
+            Self::CleanupProven => "secret_action_cleanup_proven",
+            Self::LeaseClosed => "secret_action_lease_closed",
+            Self::Complete => "secret_action_complete",
+        }
+    }
+
+    const fn can_advance_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (Self::PendingCleanup, Self::CleanupProven)
+                | (Self::CleanupProven, Self::LeaseClosed)
+                | (Self::LeaseClosed, Self::Complete)
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedSecretActionLifecycleV1 {
+    schema_version: u32,
+    plan_id: String,
+    plan_revision: u32,
+    task_id: String,
+    task_contract_digest: String,
+    action_id: String,
+    permission_decision_digest: String,
+    execution_epoch: i64,
+    secret_ref_binding_digest: String,
+    provider: SecretProviderKind,
+    injection: SecretInjection,
+    target: String,
+    expires_at_ms: i64,
+    action_payload_digest: String,
+    state: SecretActionLifecycleStateV1,
+    result_digest: Option<String>,
+}
+
+impl PersistedSecretActionLifecycleV1 {
+    fn validate(&self) -> Result<(), ControllerError> {
+        if self.schema_version != SECRET_ACTION_LIFECYCLE_SCHEMA_VERSION
+            || self.plan_id.trim().is_empty()
+            || self.task_id.trim().is_empty()
+            || self.action_id.trim().is_empty()
+            || self.target.trim().is_empty()
+            || self.execution_epoch < 0
+            || self.expires_at_ms <= 0
+            || !is_sha256_digest(&self.task_contract_digest)
+            || !is_sha256_digest(&self.permission_decision_digest)
+            || !is_sha256_digest(&self.secret_ref_binding_digest)
+            || !is_sha256_digest(&self.action_payload_digest)
+            || self
+                .result_digest
+                .as_ref()
+                .is_some_and(|digest| !is_sha256_hex_digest(digest))
+        {
+            return Err(ControllerError::InvalidPlan(
+                "secret action lifecycle marker has incomplete exact bindings".to_owned(),
+            ));
+        }
+        if (self.state == SecretActionLifecycleStateV1::Complete) != self.result_digest.is_some() {
+            return Err(ControllerError::InvalidPlan(
+                "secret action lifecycle result binding is inconsistent with lifecycle state"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1068,6 +1173,7 @@ impl Controller {
         capabilities: CapabilitySet,
     ) -> Result<i64, ControllerError> {
         self.require_execution_not_paused()?;
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         if !capabilities.is_subset_of(&self.permission_context.persisted_grant_capabilities()) {
             return Err(ControllerError::Policy(PolicyError::Denied(
                 "task capability grant cannot exceed configured user authority".to_owned(),
@@ -1233,6 +1339,142 @@ impl Controller {
             .tasks
             .get(task_id)
             .map(|task| task.task_contract_digest.as_str())
+    }
+
+    /// Decodes one exact durable secret handle from the immutable active task contract.
+    ///
+    /// The returned handle contains metadata only. Provider locators and resolved values remain
+    /// Controller-owned inside [`SecretBroker`]. Duplicate handle ids are rejected so repository or
+    /// model text cannot make handle selection ambiguous.
+    ///
+    /// # Errors
+    /// Returns a fail-closed plan/policy error for an unknown task, malformed/duplicate handle, or
+    /// a provider outside the active global secret-provider ceiling.
+    pub fn task_secret_ref(
+        &self,
+        task_id: &str,
+        secret_ref_id: &str,
+    ) -> Result<SecretRef, ControllerError> {
+        if secret_ref_id.trim().is_empty() {
+            return Err(ControllerError::InvalidPlan(
+                "secret ref id cannot be empty".to_owned(),
+            ));
+        }
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        let mut matched = None;
+        for value in required_array(&task.task, "/action_policy/secret_refs")? {
+            let secret_ref: SecretRef = serde_json::from_value(value.clone()).map_err(|error| {
+                ControllerError::InvalidPlan(format!(
+                    "task {task_id} contains malformed SecretRef metadata: {error}"
+                ))
+            })?;
+            secret_ref.validate()?;
+            if secret_ref.secret_ref_id == secret_ref_id && matched.replace(secret_ref).is_some() {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "task {task_id} contains duplicate SecretRef id {secret_ref_id}"
+                )));
+            }
+        }
+        let secret_ref = matched.ok_or_else(|| {
+            ControllerError::NotReady(format!(
+                "task {task_id} does not bind SecretRef {secret_ref_id}"
+            ))
+        })?;
+        let allowed_providers =
+            required_array(&active.plan_document, "/policy/secrets/allowed_providers")?;
+        let provider = serde_json::to_value(secret_ref.provider)?;
+        let provider = provider.as_str().ok_or_else(|| {
+            ControllerError::InvalidPlan("SecretRef provider is not a string enum".to_owned())
+        })?;
+        if !allowed_providers
+            .iter()
+            .any(|allowed| allowed.as_str() == Some(provider))
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(format!(
+                "SecretRef provider {provider} exceeds the active global secret-provider ceiling"
+            ))));
+        }
+        Ok(secret_ref)
+    }
+
+    fn persist_secret_action_lifecycle(
+        &mut self,
+        marker: &PersistedSecretActionLifecycleV1,
+    ) -> Result<(), ControllerError> {
+        marker.validate()?;
+        if self
+            .state
+            .get_state(SECRET_ACTION_LIFECYCLE_NAMESPACE, &marker.action_id)?
+            .is_some()
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "secret action lifecycle marker already exists for {}",
+                marker.action_id
+            )));
+        }
+        self.write_secret_action_lifecycle(marker)
+    }
+
+    fn advance_secret_action_lifecycle(
+        &mut self,
+        action_id: &str,
+        expected: SecretActionLifecycleStateV1,
+        next: SecretActionLifecycleStateV1,
+        result_digest: Option<String>,
+    ) -> Result<(), ControllerError> {
+        if !expected.can_advance_to(next) {
+            return Err(ControllerError::InvalidPlan(format!(
+                "illegal secret action lifecycle transition {expected:?} -> {next:?}"
+            )));
+        }
+        let raw = self
+            .state
+            .get_state(SECRET_ACTION_LIFECYCLE_NAMESPACE, action_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "secret action lifecycle marker disappeared for {action_id}"
+                ))
+            })?;
+        let mut marker: PersistedSecretActionLifecycleV1 = serde_json::from_str(&raw)?;
+        marker.validate()?;
+        if marker.action_id != action_id || marker.state != expected {
+            return Err(ControllerError::NotReady(format!(
+                "secret action lifecycle state changed before exact transition for {action_id}"
+            )));
+        }
+        marker.state = next;
+        marker.result_digest = result_digest;
+        marker.validate()?;
+        self.write_secret_action_lifecycle(&marker)
+    }
+
+    fn write_secret_action_lifecycle(
+        &mut self,
+        marker: &PersistedSecretActionLifecycleV1,
+    ) -> Result<(), ControllerError> {
+        marker.validate()?;
+        let marker_value = canonicalize(&serde_json::to_value(marker)?);
+        let value_json = serde_json::to_string(&marker_value)?;
+        let record_digest = sha256_prefixed(value_json.as_bytes());
+        self.persist_runtime_records_with_events(
+            &[(
+                SECRET_ACTION_LIFECYCLE_NAMESPACE.to_owned(),
+                marker.action_id.clone(),
+                value_json,
+            )],
+            &[(
+                marker.state.event_kind().to_owned(),
+                marker.action_id.clone(),
+                json!({
+                    "secret_action_lifecycle": marker_value,
+                    "record_digest": record_digest,
+                }),
+            )],
+        )
     }
 
     #[must_use]
@@ -1733,6 +1975,7 @@ impl Controller {
     /// # Errors
     /// Returns a durable-state/checkpoint error when the transition cannot be recorded safely.
     pub fn resume(&mut self) -> Result<ExecutionControlV1, ControllerError> {
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         self.set_execution_paused(false, None)
     }
 
@@ -2228,6 +2471,7 @@ impl Controller {
         context: &ContextPacket,
         invalidations: &[StableContractInvalidation],
     ) -> Result<FailureClassification, ControllerError> {
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         self.require_current_baseline(registry)?;
         let (repository_id, plan_document, plan_id, plan_revision, plan_digest) = {
             let active = self.active_ref()?;
@@ -2484,6 +2728,7 @@ impl Controller {
         &self,
         classification: &FailureClassification,
     ) -> Result<PlanReplanInput, ControllerError> {
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         if classification.kind != FailureClassificationKind::PlanFailure {
             return Err(ControllerError::InvalidPlan(
                 "execution failure has no replan input".to_owned(),
@@ -2674,6 +2919,7 @@ impl Controller {
                 "M1 Controller already has an active plan".to_owned(),
             ));
         }
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         if compilation.plan().canonical_digest()? != compilation.plan_digest() {
             return Err(ControllerError::InvalidPlan(
                 "compiler result plan digest does not match canonical Plan IR".to_owned(),
@@ -2827,6 +3073,7 @@ impl Controller {
                 "only a verified plan failure may supersede the active revision".to_owned(),
             ));
         }
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         let durable_classification = self.durable_plan_failure_classification()?;
         if durable_classification != *classification {
             return Err(ControllerError::InvalidPlan(
@@ -3236,6 +3483,7 @@ impl Controller {
         tool_manifest: &ToolManifest,
     ) -> Result<ReadyLease, ControllerError> {
         self.require_execution_not_paused()?;
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         self.require_current_baseline(registry)?;
         self.ensure_task_worktree(registry, task_id)?;
         if self.task_state(task_id) == Some(TaskState::DeferredResource) {
@@ -4628,6 +4876,456 @@ impl Controller {
         self.resources.clear_model_residency();
         self.release_logical_resource_lease(&mut lease)?;
         self.checkpoint_now()?;
+        Ok(())
+    }
+
+    /// Executes one Controller-authorized process with one exact task-bound secret handle.
+    ///
+    /// This path accepts only temporary-file injection through the fixed
+    /// [`EPHEMERAL_SECRET_FILE_ENV`] handle. The active Plan IR contributes metadata only; provider
+    /// lookup configuration remains inside the Controller-supplied [`SecretBroker`]. Controller
+    /// recomputes the exact permission decision, requires both `process_exec` and `secret_use`, and
+    /// binds the durable action payload to the selected `SecretRef` digest before resolution.
+    ///
+    /// A zero exit moves the attempt/task only to `Verifying`; it never marks task success. A
+    /// non-zero or resource-limited result is routed through the same sanitized durable failure
+    /// path as ordinary process execution.
+    ///
+    /// # Errors
+    /// Returns a fail-closed readiness, policy, broker, tool, or execution error for stale authority,
+    /// unsupported secret injection, widened command/isolation, cleanup failure, or failed process.
+    #[allow(clippy::too_many_lines)]
+    pub fn execute_secret_process<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        mut lease: ReadyLease,
+        runtime: &SecretProcessRuntime<'_, I>,
+        secret_ref_id: &str,
+        command: CommandSpec,
+    ) -> Result<RawToolResult, ControllerError> {
+        let result = self.execute_secret_process_inner(&mut lease, runtime, secret_ref_id, command);
+        let cleanup = self.cancel_ready_lease(lease);
+        match (result, cleanup) {
+            (Ok(raw), Ok(())) => Ok(raw),
+            (_, Err(error)) | (Err(error), Ok(())) => Err(error),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_secret_process_inner<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        lease: &mut ReadyLease,
+        runtime: &SecretProcessRuntime<'_, I>,
+        secret_ref_id: &str,
+        command: CommandSpec,
+    ) -> Result<RawToolResult, ControllerError> {
+        self.validate_ready_lease(lease, runtime.registry, runtime.tool_manifest)?;
+        let secret_ref = self.task_secret_ref(&lease.task_id, secret_ref_id)?;
+        if secret_ref.injection != SecretInjection::TemporaryFile
+            || secret_ref.target != EPHEMERAL_SECRET_FILE_ENV
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(format!(
+                "secret process execution requires temporary_file injection targeting {EPHEMERAL_SECRET_FILE_ENV}"
+            ))));
+        }
+
+        let permission_decision =
+            self.permission_decision_for_task(&lease.task_id, runtime.tool_manifest)?;
+        if permission_decision != lease.permission_decision {
+            return Err(ControllerError::NotReady(
+                "secret process permission decision changed after readiness".to_owned(),
+            ));
+        }
+        permission_decision.validate()?;
+        if !permission_decision
+            .effective
+            .contains(Capability::ProcessExec)
+            || !permission_decision
+                .effective
+                .contains(Capability::SecretUse)
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "secret process execution requires effective process_exec + secret_use authority"
+                    .to_owned(),
+            )));
+        }
+
+        let execution_root = self.task_execution_root(&lease.task_id)?;
+        let mut isolation_request = runtime.isolation_request.clone();
+        isolation_request
+            .repository_root
+            .clone_from(&execution_root);
+        Self::validate_secret_process_command(
+            &command,
+            runtime.command_policy,
+            runtime.tool_manifest,
+            &isolation_request,
+            &execution_root,
+            &permission_decision,
+        )?;
+        let attempt_id = self.start_attempt(lease, runtime.registry)?;
+        let action = self.lower_secret_process_action(
+            lease,
+            &attempt_id,
+            &secret_ref,
+            command,
+            runtime.command_policy,
+            runtime.tool_manifest,
+            &isolation_request,
+            &execution_root,
+            &permission_decision,
+        )?;
+        let secret_scope = SecretScope {
+            plan_id: action.plan_id.clone(),
+            plan_revision: action.plan_revision,
+            task_id: action.task_id.clone(),
+            task_contract_digest: lease.task_contract_digest.clone(),
+            action_id: action.action_id.clone(),
+            permission_decision_digest: action.permission_decision_digest.clone(),
+            execution_epoch: action.execution_epoch,
+        };
+        let now_ms = unix_millis()?;
+        let mut secret_lease = match runtime.secret_broker.resolve(
+            &secret_ref,
+            secret_scope.clone(),
+            &permission_decision.effective,
+            now_ms,
+            action.expires_at_ms,
+        ) {
+            Ok(secret_lease) => secret_lease,
+            Err(_provider_error) => {
+                // Provider backends are an untrusted error-text boundary. Their PolicyError may
+                // contain runtime/provider details, so neither durable FailureRecord state nor the
+                // caller-visible Controller error may preserve that free text.
+                let safe_diagnostic = SAFE_SECRET_RESOLUTION_DIAGNOSTIC.to_owned();
+                let failure = self.build_failure_record(FailureRecordInput {
+                    task_id: lease.task_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    action_id: Some(action.action_id.clone()),
+                    result_digest: None,
+                    exit_code: None,
+                    category: "secret_resolution_failure".to_owned(),
+                    failure_code: "secret_resolution_denied".to_owned(),
+                    diagnostic: safe_diagnostic.clone(),
+                    failed_action_facts: BTreeMap::from([(
+                        "action_id".to_owned(),
+                        action.action_id.clone(),
+                    )]),
+                    evidence_refs: vec![format!("action:{}", action.action_id)],
+                })?;
+                let _ = self.route_failure_record(failure)?;
+                return Err(ControllerError::Policy(PolicyError::Denied(
+                    safe_diagnostic,
+                )));
+            }
+        };
+        let secret_lifecycle = PersistedSecretActionLifecycleV1 {
+            schema_version: SECRET_ACTION_LIFECYCLE_SCHEMA_VERSION,
+            plan_id: action.plan_id.clone(),
+            plan_revision: action.plan_revision,
+            task_id: action.task_id.clone(),
+            task_contract_digest: lease.task_contract_digest.clone(),
+            action_id: action.action_id.clone(),
+            permission_decision_digest: action.permission_decision_digest.clone(),
+            execution_epoch: action.execution_epoch,
+            secret_ref_binding_digest: secret_ref.binding_digest()?,
+            provider: secret_ref.provider,
+            injection: secret_ref.injection,
+            target: secret_ref.target.clone(),
+            expires_at_ms: action.expires_at_ms,
+            action_payload_digest: action.payload_digest(),
+            state: SecretActionLifecycleStateV1::PendingCleanup,
+            result_digest: None,
+        };
+
+        let authorization = {
+            let mut journal = ActionJournal::new(&mut self.state);
+            journal.authorize(&action, runtime.tool_manifest, &permission_decision)
+        };
+        if let Err(error) = authorization {
+            secret_lease.close(&secret_scope)?;
+            let failure = self.build_failure_record(FailureRecordInput {
+                task_id: lease.task_id.clone(),
+                attempt_id: attempt_id.clone(),
+                action_id: Some(action.action_id.clone()),
+                result_digest: None,
+                exit_code: None,
+                category: "tool_authorization_failure".to_owned(),
+                failure_code: tool_error_code(&error).to_owned(),
+                diagnostic: error.to_string(),
+                failed_action_facts: BTreeMap::from([(
+                    "action_id".to_owned(),
+                    action.action_id.clone(),
+                )]),
+                evidence_refs: vec![format!("action:{}", action.action_id)],
+            })?;
+            let _ = self.route_failure_record(failure)?;
+            return Err(ControllerError::Tool(error));
+        }
+        if let Err(error) = self.persist_secret_action_lifecycle(&secret_lifecycle) {
+            secret_lease.close(&secret_scope)?;
+            return Err(error);
+        }
+        self.checkpoint_now()?;
+        self.rebind_ready_checkpoint(lease)?;
+        self.validate_ready_lease_allowing_secret_action(
+            lease,
+            runtime.registry,
+            runtime.tool_manifest,
+            Some(&action.action_id),
+        )?;
+
+        let runner = ProcessRunner::new(runtime.command_policy, runtime.isolation_backend);
+        let observed = {
+            let mut journal = ActionJournal::new(&mut self.state);
+            runner.run_with_secret_lease_observed(
+                &mut journal,
+                &action,
+                &isolation_request,
+                runtime.artifacts,
+                &mut secret_lease,
+                &secret_scope,
+                &permission_decision,
+                unix_millis()?,
+                runtime.controller_private_root,
+            )
+        };
+        let (result, cleanup_proof) = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                let _ = secret_lease.close(&secret_scope);
+                let record = self.state.action_record(&action.action_id)?;
+                if record
+                    .as_ref()
+                    .is_some_and(|record| record.state == ActionState::Unknown.as_str())
+                {
+                    self.mark_unknown(&attempt_id, &lease.task_id, &action.action_id)?;
+                    return Err(ControllerError::UnknownAction(action.action_id));
+                }
+                if record.as_ref().is_some_and(|record| {
+                    matches!(record.state.as_str(), "dispatched" | "observed")
+                }) {
+                    return Err(ControllerError::Tool(error));
+                }
+                let failure = self.build_failure_record(FailureRecordInput {
+                    task_id: lease.task_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    action_id: Some(action.action_id.clone()),
+                    result_digest: record.and_then(|record| record.result_digest),
+                    exit_code: None,
+                    category: "tool_execution_failure".to_owned(),
+                    failure_code: tool_error_code(&error).to_owned(),
+                    diagnostic: error.to_string(),
+                    failed_action_facts: BTreeMap::from([(
+                        "action_id".to_owned(),
+                        action.action_id.clone(),
+                    )]),
+                    evidence_refs: vec![format!("action:{}", action.action_id)],
+                })?;
+                let _ = self.route_failure_record(failure)?;
+                return Err(ControllerError::Tool(error));
+            }
+        };
+        if !cleanup_proof.process_lease_reaped || !cleanup_proof.ephemeral_injection_removed {
+            return Err(ControllerError::Tool(ToolError::RecoveryBlocked(
+                "secret process cleanup proof is incomplete before lease close".to_owned(),
+            )));
+        }
+        self.advance_secret_action_lifecycle(
+            &action.action_id,
+            SecretActionLifecycleStateV1::PendingCleanup,
+            SecretActionLifecycleStateV1::CleanupProven,
+            None,
+        )?;
+        recovery_test_hook("after_secret_cleanup_proven_before_lease_close");
+        secret_lease.close(&secret_scope)?;
+        self.advance_secret_action_lifecycle(
+            &action.action_id,
+            SecretActionLifecycleStateV1::CleanupProven,
+            SecretActionLifecycleStateV1::LeaseClosed,
+            None,
+        )?;
+        recovery_test_hook("after_secret_lease_closed_before_action_commit");
+        {
+            let mut journal = ActionJournal::new(&mut self.state);
+            journal.commit_with_bound_result(&action, ActionState::Observed)?;
+        }
+        let committed = self
+            .state
+            .action_record(&action.action_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(
+                    "committed secret action disappeared before lifecycle completion".to_owned(),
+                )
+            })?;
+        let result_digest = committed.result_digest.clone().ok_or_else(|| {
+            ControllerError::NotReady(
+                "committed secret action lacks durable sanitized result binding".to_owned(),
+            )
+        })?;
+        if committed.state != ActionState::Committed.as_str()
+            || committed.payload_digest != secret_lifecycle.action_payload_digest
+            || committed.execution_epoch != secret_lifecycle.execution_epoch
+        {
+            return Err(ControllerError::NotReady(
+                "committed secret action no longer matches lifecycle authority".to_owned(),
+            ));
+        }
+        self.advance_secret_action_lifecycle(
+            &action.action_id,
+            SecretActionLifecycleStateV1::LeaseClosed,
+            SecretActionLifecycleStateV1::Complete,
+            Some(result_digest),
+        )?;
+        recovery_test_hook("after_secret_action_commit_before_checkpoint");
+        self.checkpoint_now()?;
+
+        if result.exit_code != Some(0) || result.terminated_for_limit.is_some() {
+            let failure = self.execution_failure(lease, &attempt_id, &action, &result)?;
+            let failure = self.route_failure_record(failure)?;
+            return Err(ControllerError::ExecutionFailed(Box::new(failure)));
+        }
+        self.transition_attempt(&attempt_id, AttemptState::Verifying, "attempt_verifying")?;
+        self.transition_task(&lease.task_id, TaskState::Verifying, "task_verifying")?;
+        self.checkpoint_now()?;
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_secret_process_action(
+        &self,
+        lease: &ReadyLease,
+        attempt_id: &str,
+        secret_ref: &SecretRef,
+        command: CommandSpec,
+        command_policy: &CommandPolicy,
+        tool_manifest: &ToolManifest,
+        isolation_request: &IsolationRequest,
+        execution_root: &Path,
+        permission_decision: &PermissionDecision,
+    ) -> Result<AuthorizedAction, ControllerError> {
+        Self::validate_secret_process_command(
+            &command,
+            command_policy,
+            tool_manifest,
+            isolation_request,
+            execution_root,
+            permission_decision,
+        )?;
+        let permission_class = if isolation_request.allow_repository_write {
+            PermissionClass::RepositoryWrite
+        } else {
+            PermissionClass::ProcessExec
+        };
+        let pinned = command_policy.pinned_executable(&command.executable)?;
+        let secret_ref_binding_digest = secret_ref.binding_digest()?;
+        let action_seed = sha256_prefixed(
+            format!(
+                "secret_process\0{}\0{}\0{}\0{}\0{}",
+                lease.plan_digest,
+                lease.task_contract_digest,
+                attempt_id,
+                secret_ref_binding_digest,
+                permission_decision.digest()
+            )
+            .as_bytes(),
+        );
+        let active = self.active_ref()?;
+        let action_id = format!("action.{}", &action_seed[7..27]);
+        let now_ms = unix_millis()?;
+        let timeout_i64 = i64::try_from(command.timeout_ms).unwrap_or(i64::MAX);
+        Ok(AuthorizedAction {
+            action_id,
+            plan_id: active.plan_id.clone(),
+            plan_revision: active.revision,
+            task_id: lease.task_id.clone(),
+            attempt_id: attempt_id.to_owned(),
+            tool_id: permission_decision.tool_id.clone(),
+            tool_version: permission_decision.tool_version.clone(),
+            tool_digest: permission_decision.tool_digest.clone(),
+            executable_digest: pinned.sha256.clone(),
+            repository_id: active.repository_id.clone(),
+            // AuthorizedAction has no SecretRef field yet. This safe metadata-only digest binds the
+            // exact handle into the existing payload digest until the frozen action contract grows
+            // a dedicated secret-ref binding field.
+            destination_digest: Some(secret_ref_binding_digest),
+            permission_class,
+            execution_epoch: lease.execution_epoch,
+            policy_digest: active.policy_digest.clone(),
+            permission_decision_digest: permission_decision.digest(),
+            isolation_policy_digest: isolation_request.digest()?,
+            nonce: format!("nonce.{}", &action_seed[27..47]),
+            expires_at_ms: now_ms.saturating_add(timeout_i64).saturating_add(60_000),
+            command,
+            individually_authorized_environment: BTreeSet::new(),
+            reconciliation_mode: ReconciliationMode::UnsafeSideEffect,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn validate_secret_process_command(
+        command: &CommandSpec,
+        command_policy: &CommandPolicy,
+        tool_manifest: &ToolManifest,
+        isolation_request: &IsolationRequest,
+        execution_root: &Path,
+        permission_decision: &PermissionDecision,
+    ) -> Result<(), ControllerError> {
+        if command.mode != CommandMode::Direct || !command.environment.is_empty() {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "secret process execution requires a direct command with no caller environment"
+                    .to_owned(),
+            )));
+        }
+        if command.working_directory.canonicalize()? != execution_root.canonicalize()? {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "secret process working directory must equal the exact task execution root"
+                    .to_owned(),
+            )));
+        }
+        if !isolation_request.network_offline
+            || isolation_request.repository_root.canonicalize()? != execution_root.canonicalize()?
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "secret process execution requires exact offline task-root isolation".to_owned(),
+            )));
+        }
+        let permission_class = if isolation_request.allow_repository_write {
+            if !permission_decision
+                .effective
+                .contains(Capability::RepositoryWrite)
+            {
+                return Err(ControllerError::Policy(PolicyError::Denied(
+                    "secret process write isolation requires repository_write capability"
+                        .to_owned(),
+                )));
+            }
+            PermissionClass::RepositoryWrite
+        } else {
+            PermissionClass::ProcessExec
+        };
+        if !tool_manifest.permission_ceiling.contains(&permission_class)
+            || !tool_manifest
+                .permission_ceiling
+                .contains(&PermissionClass::ProcessExec)
+            || !tool_manifest
+                .permission_ceiling
+                .contains(&PermissionClass::SecretUse)
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "secret process tool ceiling lacks exact process/secret/action authority"
+                    .to_owned(),
+            )));
+        }
+        let effective_risk = command_policy.authorize(command)?;
+        if matches!(
+            effective_risk,
+            CommandRisk::PackageInstall | CommandRisk::Destructive | CommandRisk::Shell
+        ) {
+            return Err(ControllerError::Policy(PolicyError::Denied(format!(
+                "secret process execution forbids {effective_risk:?} commands"
+            ))));
+        }
+        command_policy.pinned_executable(&command.executable)?;
         Ok(())
     }
 
@@ -6143,7 +6841,21 @@ impl Controller {
         registry: &ProjectRegistry,
         tool_manifest: &ToolManifest,
     ) -> Result<(), ControllerError> {
+        self.validate_ready_lease_allowing_secret_action(lease, registry, tool_manifest, None)
+    }
+
+    fn validate_ready_lease_allowing_secret_action(
+        &mut self,
+        lease: &ReadyLease,
+        registry: &ProjectRegistry,
+        tool_manifest: &ToolManifest,
+        allowed_unresolved_secret_action_id: Option<&str>,
+    ) -> Result<(), ControllerError> {
         self.require_execution_not_paused()?;
+        require_no_unresolved_secret_action_lifecycles(
+            &self.state,
+            allowed_unresolved_secret_action_id,
+        )?;
         self.require_current_baseline(registry)?;
         let execution_baseline_digest =
             snapshot_digest(&self.task_execution_snapshot(registry, &lease.task_id)?)?;
@@ -7979,11 +8691,20 @@ impl Controller {
             RESOURCE_LEASE_NAMESPACE,
             RESOURCE_RESIDENCY_NAMESPACE,
             RESOURCE_GOVERNOR_NAMESPACE,
+            SECRET_ACTION_LIFECYCLE_NAMESPACE,
         ] {
             for record in self.state.state_records(namespace)? {
-                if namespace != "controller.action_intent"
-                    && !key_belongs_to_revision(&record.key, &active.plan_id, active.revision)
-                {
+                let belongs_to_active_revision = if namespace == "controller.action_intent" {
+                    true
+                } else if namespace == SECRET_ACTION_LIFECYCLE_NAMESPACE {
+                    let marker: PersistedSecretActionLifecycleV1 =
+                        serde_json::from_str(&record.value_json)?;
+                    marker.validate()?;
+                    marker.plan_id == active.plan_id && marker.plan_revision == active.revision
+                } else {
+                    key_belongs_to_revision(&record.key, &active.plan_id, active.revision)
+                };
+                if !belongs_to_active_revision {
                     continue;
                 }
                 evidence_binding_digests.insert(
@@ -8898,6 +9619,261 @@ fn recovered_build_heavy_absence_is_proven(
     Ok(process_lease_is_terminal(&process))
 }
 
+fn validate_post_checkpoint_secret_action_correlation(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+    active_plan_id: &str,
+    active_revision: u32,
+) -> Result<(), ControllerError> {
+    let binding_prefix = format!("{SECRET_ACTION_LIFECYCLE_NAMESPACE}:");
+    let mut replayed =
+        if active_plan_id == manifest.plan_id && active_revision == manifest.plan_revision {
+            manifest
+                .evidence_binding_digests
+                .iter()
+                .filter_map(|(binding_key, digest)| {
+                    binding_key
+                        .strip_prefix(&binding_prefix)
+                        .map(|action_id| (action_id.to_owned(), digest.clone()))
+                })
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+
+    for event in state.journal_after(checkpoint_sequence)? {
+        if event.entity_type != "controller"
+            || !matches!(
+                event.event_kind.as_str(),
+                "secret_action_pending_cleanup"
+                    | "secret_action_cleanup_proven"
+                    | "secret_action_lease_closed"
+                    | "secret_action_complete"
+            )
+        {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        let marker_value = payload
+            .get("secret_action_lifecycle")
+            .cloned()
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "secret action lifecycle event lacks its safe durable marker".to_owned(),
+                )
+            })?;
+        let marker: PersistedSecretActionLifecycleV1 = serde_json::from_value(marker_value)?;
+        marker.validate()?;
+        if marker.plan_id != active_plan_id || marker.plan_revision != active_revision {
+            continue;
+        }
+        if event.entity_id != marker.action_id
+            || event.event_kind != marker.state.event_kind()
+            || required_str(&payload, "/plan_id")? != marker.plan_id
+            || required_u32(&payload, "/plan_revision")? != marker.plan_revision
+        {
+            return Err(ControllerError::InvalidPlan(
+                "secret action lifecycle event is misbound to its exact plan/action state"
+                    .to_owned(),
+            ));
+        }
+        let marker_json = serde_json::to_string(&canonicalize(&serde_json::to_value(&marker)?))?;
+        let marker_digest = sha256_prefixed(marker_json.as_bytes());
+        if required_str(&payload, "/record_digest")? != marker_digest {
+            return Err(ControllerError::InvalidPlan(
+                "secret action lifecycle event digest does not match its durable marker".to_owned(),
+            ));
+        }
+        replayed.insert(marker.action_id, marker_digest);
+    }
+
+    let mut current = BTreeMap::new();
+    for record in state.state_records(SECRET_ACTION_LIFECYCLE_NAMESPACE)? {
+        let marker: PersistedSecretActionLifecycleV1 = serde_json::from_str(&record.value_json)?;
+        marker.validate()?;
+        if marker.action_id != record.key {
+            return Err(ControllerError::InvalidPlan(
+                "secret action lifecycle state key does not equal its bound action id".to_owned(),
+            ));
+        }
+        if marker.plan_id == active_plan_id && marker.plan_revision == active_revision {
+            current.insert(record.key, sha256_prefixed(record.value_json.as_bytes()));
+        }
+    }
+    if replayed != current {
+        return Err(ControllerError::InvalidPlan(
+            "current secret action lifecycle state does not equal trusted checkpoint plus ordered journal replay"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn current_secret_action_lifecycles(
+    state: &StateStore,
+) -> Result<Vec<PersistedSecretActionLifecycleV1>, ControllerError> {
+    let mut latest_events = BTreeMap::<String, (String, String)>::new();
+    for event in state.journal_after(0)? {
+        if event.entity_type == "controller"
+            && matches!(
+                event.event_kind.as_str(),
+                "secret_action_pending_cleanup"
+                    | "secret_action_cleanup_proven"
+                    | "secret_action_lease_closed"
+                    | "secret_action_complete"
+            )
+        {
+            latest_events.insert(
+                event.entity_id.clone(),
+                (event.event_kind.clone(), event.payload_json.clone()),
+            );
+        }
+    }
+
+    let mut markers = Vec::new();
+    for record in state.state_records(SECRET_ACTION_LIFECYCLE_NAMESPACE)? {
+        let marker: PersistedSecretActionLifecycleV1 = serde_json::from_str(&record.value_json)?;
+        marker.validate()?;
+        if marker.action_id != record.key {
+            return Err(ControllerError::InvalidPlan(
+                "secret action lifecycle state key does not equal its bound action id".to_owned(),
+            ));
+        }
+        let (event_kind, payload_json) = latest_events.get(&marker.action_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "secret action lifecycle {} has no durable lifecycle event",
+                marker.action_id
+            ))
+        })?;
+        let payload: Value = serde_json::from_str(payload_json)?;
+        let event_marker: PersistedSecretActionLifecycleV1 =
+            serde_json::from_value(payload.get("secret_action_lifecycle").cloned().ok_or_else(
+                || {
+                    ControllerError::InvalidPlan(
+                        "secret action lifecycle event lacks its safe durable marker".to_owned(),
+                    )
+                },
+            )?)?;
+        let marker_json = serde_json::to_string(&canonicalize(&serde_json::to_value(&marker)?))?;
+        let marker_digest = sha256_prefixed(marker_json.as_bytes());
+        if *event_kind != marker.state.event_kind()
+            || event_marker != marker
+            || required_str(&payload, "/plan_id")? != marker.plan_id
+            || required_u32(&payload, "/plan_revision")? != marker.plan_revision
+            || required_str(&payload, "/record_digest")? != marker_digest
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "secret action lifecycle {} differs from its latest durable lifecycle event",
+                marker.action_id
+            )));
+        }
+        markers.push(marker);
+    }
+    Ok(markers)
+}
+
+fn require_no_unresolved_secret_action_lifecycles(
+    state: &StateStore,
+    allowed_action_id: Option<&str>,
+) -> Result<(), ControllerError> {
+    for marker in current_secret_action_lifecycles(state)? {
+        if marker.state != SecretActionLifecycleStateV1::Complete
+            && allowed_action_id != Some(marker.action_id.as_str())
+        {
+            return Err(ControllerError::NotReady(format!(
+                "secret action lifecycle blocked: {} remains {:?}; no later readiness, mutation, replan, supersession, or recovery authority is available until durable completion",
+                marker.action_id, marker.state
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_recoverable_secret_action_lifecycles(
+    state: &StateStore,
+    active: &ActivePlan,
+) -> Result<(), ControllerError> {
+    let markers = current_secret_action_lifecycles(state)?;
+    for marker in markers {
+        if marker.state != SecretActionLifecycleStateV1::Complete {
+            return Err(ControllerError::NotReady(format!(
+                "secret action recovery blocked: {} remains {:?}; durable cleanup, lease closure, and commit proof are incomplete",
+                marker.action_id, marker.state
+            )));
+        }
+        if marker.plan_id != active.plan_id || marker.plan_revision != active.revision {
+            continue;
+        }
+        validate_secret_action_marker_against_active_plan(&marker, active)?;
+        let action = state.action_record(&marker.action_id)?.ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "complete secret action lifecycle {} has no durable action record",
+                marker.action_id
+            ))
+        })?;
+        let result_digest = marker.result_digest.as_deref().ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "complete secret action lifecycle lacks its sanitized result digest".to_owned(),
+            )
+        })?;
+        if action.state != ActionState::Committed.as_str()
+            || action.payload_digest != marker.action_payload_digest
+            || action.policy_digest != active.policy_digest
+            || action.execution_epoch != marker.execution_epoch
+            || action.result_digest.as_deref() != Some(result_digest)
+            || state.artifact_metadata(result_digest)?.is_none()
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "complete secret action lifecycle {} does not correlate to the exact committed action/result binding",
+                marker.action_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_secret_action_marker_against_active_plan(
+    marker: &PersistedSecretActionLifecycleV1,
+    active: &ActivePlan,
+) -> Result<(), ControllerError> {
+    let task = active.tasks.get(&marker.task_id).ok_or_else(|| {
+        ControllerError::InvalidPlan(format!(
+            "secret action lifecycle task {} is absent from the active plan",
+            marker.task_id
+        ))
+    })?;
+    if task.task_contract_digest != marker.task_contract_digest {
+        return Err(ControllerError::InvalidPlan(
+            "secret action lifecycle task contract binding is stale".to_owned(),
+        ));
+    }
+    let mut matching_refs = 0_u8;
+    for value in required_array(&task.task, "/action_policy/secret_refs")? {
+        let secret_ref: SecretRef = serde_json::from_value(value.clone())?;
+        secret_ref.validate()?;
+        if secret_ref.binding_digest()? == marker.secret_ref_binding_digest {
+            if secret_ref.provider != marker.provider
+                || secret_ref.injection != marker.injection
+                || secret_ref.target != marker.target
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "secret action lifecycle metadata differs from its active Plan IR SecretRef"
+                        .to_owned(),
+                ));
+            }
+            matching_refs = matching_refs.saturating_add(1);
+        }
+    }
+    if matching_refs != 1 {
+        return Err(ControllerError::InvalidPlan(
+            "secret action lifecycle SecretRef binding is missing or ambiguous in the active task"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 impl RecoveryManager {
     /// Reconstructs the active Controller exclusively from durable SQLite/CAS/Git state.
     /// No chat transcript, model call, or raw `PlanIr` activation surface participates.
@@ -8943,6 +9919,17 @@ impl RecoveryManager {
             &manifest,
             trusted_checkpoint.action_sequence,
         )?;
+        let (recovery_plan_id, recovery_revision) = supersession.as_ref().map_or_else(
+            || (manifest.plan_id.as_str(), manifest.plan_revision),
+            |validated| (validated.plan_id.as_str(), validated.revision),
+        );
+        validate_post_checkpoint_secret_action_correlation(
+            &state,
+            &manifest,
+            trusted_checkpoint.action_sequence,
+            recovery_plan_id,
+            recovery_revision,
+        )?;
         let replayed_events = if supersession.is_some() {
             let replayed = state
                 .journal_after(trusted_checkpoint.action_sequence)?
@@ -8985,6 +9972,7 @@ impl RecoveryManager {
             )));
         }
         let active = reconstruct_active_plan(&state, registry, &manifest, supersession.as_ref())?;
+        require_recoverable_secret_action_lifecycles(&state, &active)?;
         let trusted_recovery_intent_digests = manifest
             .evidence_binding_digests
             .iter()
@@ -10553,6 +11541,20 @@ pub struct ExecutionRuntime<'a, I: sovereign_policy::ExecutionIsolationBackend> 
     pub artifacts: &'a ArtifactStore,
     pub tool_manifest: &'a ToolManifest,
     pub python_executable: &'a Path,
+}
+
+/// Controller-owned runtime inputs for one exact secret-bearing process action. The broker is
+/// configured out of band by Controller/bootstrap code; Plan IR can select only a registered
+/// [`SecretRef`] handle and never supplies provider lookup locators or resolved bytes.
+pub struct SecretProcessRuntime<'a, I: sovereign_policy::ExecutionIsolationBackend> {
+    pub registry: &'a ProjectRegistry,
+    pub command_policy: &'a CommandPolicy,
+    pub isolation_backend: &'a I,
+    pub isolation_request: &'a IsolationRequest,
+    pub artifacts: &'a ArtifactStore,
+    pub tool_manifest: &'a ToolManifest,
+    pub secret_broker: &'a SecretBroker,
+    pub controller_private_root: &'a Path,
 }
 
 struct ValidatedReplace {
@@ -12728,6 +13730,16 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
     format!("sha256:{:x}", hasher.finalize())
 }
 
+fn is_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(is_sha256_hex_digest)
+}
+
+fn is_sha256_hex_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 fn heavy_build_action_id(resource_lease_id: &str) -> String {
     let digest = sha256_prefixed(format!("build-heavy-action\0{resource_lease_id}").as_bytes());
     format!("resource-build-action.{}", &digest[7..31])
@@ -12937,6 +13949,82 @@ mod tests {
             drop(controller);
             let _ = std::fs::remove_dir_all(base);
         }
+    }
+
+    #[test]
+    fn active_task_secret_ref_decoder_is_exact_and_rejects_ambiguity() {
+        let (base, state) = temp_state("secret-ref-decoder");
+        let plan_digest = format!("sha256:{}", "a".repeat(64));
+        let mut active = active_fixture(&base, 1, &plan_digest);
+        active.plan_document = json!({
+            "policy": {
+                "secrets": {"allowed_providers": ["external_broker"]}
+            }
+        });
+        let task = json!({
+            "task_id": "task.secret",
+            "action_policy": {
+                "secret_refs": [{
+                    "secret_ref_id": "secret.fixture",
+                    "provider": "external_broker",
+                    "purpose": "test sentinel",
+                    "injection": "temporary_file",
+                    "target": "SOVEREIGN_SECRET_FILE"
+                }]
+            }
+        });
+        active.tasks.insert(
+            "task.secret".to_owned(),
+            fresh_task_runtime(&task)
+                .unwrap_or_else(|error| panic!("secret task runtime: {error}")),
+        );
+        let mut controller = Controller::new(state);
+        controller.active = Some(active);
+
+        let secret_ref = controller
+            .task_secret_ref("task.secret", "secret.fixture")
+            .unwrap_or_else(|error| panic!("decode exact SecretRef: {error}"));
+        assert_eq!(secret_ref.secret_ref_id, "secret.fixture");
+        assert_eq!(secret_ref.purpose, "test sentinel");
+        assert_eq!(secret_ref.target, "SOVEREIGN_SECRET_FILE");
+
+        let duplicate_task = json!({
+            "task_id": "task.secret",
+            "action_policy": {
+                "secret_refs": [
+                    {
+                        "secret_ref_id": "secret.fixture",
+                        "provider": "external_broker",
+                        "purpose": "first",
+                        "injection": "temporary_file",
+                        "target": "SOVEREIGN_SECRET_FILE"
+                    },
+                    {
+                        "secret_ref_id": "secret.fixture",
+                        "provider": "external_broker",
+                        "purpose": "second",
+                        "injection": "temporary_file",
+                        "target": "SOVEREIGN_SECRET_FILE"
+                    }
+                ]
+            }
+        });
+        controller
+            .active
+            .as_mut()
+            .unwrap_or_else(|| panic!("active plan"))
+            .tasks
+            .insert(
+                "task.secret".to_owned(),
+                fresh_task_runtime(&duplicate_task)
+                    .unwrap_or_else(|error| panic!("duplicate secret task runtime: {error}")),
+            );
+        let Err(error) = controller.task_secret_ref("task.secret", "secret.fixture") else {
+            panic!("duplicate SecretRef ids must fail closed")
+        };
+        assert!(error.to_string().contains("duplicate SecretRef id"));
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

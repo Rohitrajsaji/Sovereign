@@ -1,0 +1,239 @@
+{
+  "schema_version": 1,
+  "task_id": "M6-T03",
+  "title": "Implement secret broker and redaction",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "c4fa99868ea9573b41b06f0ca570d79e2cf26b61",
+  "status": "completed",
+  "completed_at": "2026-09-14T09:45:54Z",
+  "verified_at": "2026-09-14T09:45:54Z",
+  "dependencies": [
+    "M6-T02",
+    "M0-T03"
+  ],
+  "interfaces": [
+    "SecretBroker",
+    "SecretRef",
+    "Redactor"
+  ],
+  "secret_contract": {
+    "controller_remains_sole_execution_authority": true,
+    "plan_ir_persists_handle_metadata_only": true,
+    "secret_ref_wire_fields": [
+      "secret_ref_id",
+      "provider",
+      "purpose",
+      "injection",
+      "target"
+    ],
+    "controller_private_provider_locator_is_nonserializable": true,
+    "process_exec_never_implies_secret_use": true,
+    "default_m1_profile_has_no_secret_use": true,
+    "explicit_m6_secret_profile_required": true,
+    "secret_use_requires_global_task_role_tool_persisted_grant_and_controller_ceiling": true,
+    "public_raw_byte_process_runner_secret_bypass_removed": true,
+    "canonical_public_runner": "ProcessRunner::run_with_secret_lease_observed",
+    "resolved_value_lifetime_is_ephemeral": true,
+    "temporary_secret_root_task_action_scoped": true,
+    "temporary_secret_permissions": "0700 directories / 0600 file",
+    "temporary_secret_absence_proven_before_lease_close": true,
+    "redaction_precedes_receipt_cas_return_and_failure_routing": true,
+    "raw_secret_bearing_stdout_stderr_never_hash_into_durable_receipts": true,
+    "provider_free_text_is_never_persisted": true,
+    "safe_resolution_diagnostic": "Controller secret resolution denied; provider details withheld",
+    "ambient_credentials_stripped": true,
+    "direct_and_transitive_keychain_security_access_denied": true,
+    "real_keychain_access_in_tests": false
+  },
+  "compiler_binding": {
+    "entrypoint": "PlanCompilationResult::bind_controller_secret_ref",
+    "controller_selected_exact_task_only": true,
+    "requires_global_secret_use_ceiling": true,
+    "rejects_preexisting_secret_authority": true,
+    "revalidates_plan_and_recomputes_plan_and_evidence_digests": true,
+    "provider_locator_or_value_in_plan_or_compilation_evidence": false
+  },
+  "secret_action_lifecycle": {
+    "durable_states": [
+      "pending_cleanup",
+      "cleanup_proven",
+      "lease_closed",
+      "complete"
+    ],
+    "pending_before_dispatch": true,
+    "cleanup_proven_only_after_verified_temp_absence": true,
+    "lease_closed_only_after_secret_lease_close": true,
+    "complete_only_after_sanitized_action_commit_result_binding": true,
+    "all_revision_unresolved_fence": true,
+    "fences_readiness_existing_ready_mutation_grants_resume_replan_supersession_activation_and_recovery": true,
+    "historical_complete_markers_nonblocking": true,
+    "recovery_never_replays_or_autocommits_incomplete_secret_actions": true,
+    "execution_epoch_never_advances_around_unresolved_secret_lifecycle": true,
+    "crash_windows_proven": [
+      "pending_cleanup/Observed",
+      "cleanup_proven before lease close",
+      "lease_closed before action commit",
+      "committed action before Complete/checkpoint",
+      "unresolved marker from older revision"
+    ]
+  },
+  "same_sentinel_acceptance": {
+    "runtime_generated_binary_sentinel": true,
+    "production_flow": "execute_secret_process nonzero -> sanitized FailureRecord/RepairPending -> repair_replace -> durable RepairPacket/ContextPacket -> production request_model_proposal -> captured local ModelRequest",
+    "raw_child_exit_code": 7,
+    "raw_stdout_shape": "stdout:<runtime binary sentinel>",
+    "raw_stderr_shape": "stderr:<runtime binary sentinel>",
+    "scanned_runtime_surfaces": [
+      "state.sqlite3",
+      "state.sqlite3-wal when present",
+      "state.sqlite3-shm when present",
+      "full ArtifactStore CAS",
+      "checkpoint-cas",
+      "FailureRecord/repair state",
+      "journal/action/receipt/lifecycle payloads",
+      "durable RepairPacket/ContextPacket",
+      "captured local ModelRequest",
+      "checkpoint manifest"
+    ],
+    "forbidden_needles": [
+      "runtime sentinel bytes",
+      "raw pre-redaction stdout SHA256 bytes",
+      "raw pre-redaction stderr SHA256 bytes",
+      "lowercase hex of each raw digest",
+      "sha256:<hex> of each raw digest"
+    ],
+    "all_forbidden_needles_absent": true,
+    "model_request_user_equals_repair_packet_serialized_input": true,
+    "model_request_tools_empty": true,
+    "failed_attempt_does_not_gain_success_authority": true
+  },
+  "external_gateway_boundary": {
+    "implemented_in_m6_t03": false,
+    "deferred_task": "M6-T07",
+    "reason": "M6-T07 owns the actual external intelligence gateway/remote transport boundary; M6-T03 proves resolved bytes are absent from shared durable/context/local-model surfaces without inventing future transport behavior."
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --offline --test t07 m6_runtime_secret_failure_never_reaches_persistence_context_or_local_model_request -- --nocapture",
+      "result": "passed",
+      "detail": "1/1; real failure -> repair packet -> captured production local ModelRequest plus physical runtime-store/digest scan"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-policy -p sovereign-evidence --offline -- secret",
+      "result": "passed",
+      "detail": "12/12 focused secret tests (8 policy + 4 evidence)"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-tools --offline -- secret",
+      "result": "passed",
+      "detail": "1/1 focused canonical SecretLease runner path"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-plan --offline -- secret",
+      "result": "passed",
+      "detail": "5/5 Controller secret-binding regressions"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --offline -- secret",
+      "result": "passed",
+      "detail": "2 secret unit tests + 8 M6 secret integration tests; no failures"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-policy -p sovereign-evidence -p sovereign-tools -p sovereign-plan -p sovereign-controller --offline",
+      "result": "passed",
+      "detail": "full five affected package suites passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy -p sovereign-policy -p sovereign-evidence -p sovereign-tools -p sovereign-plan -p sovereign-controller --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test --workspace --all-targets --offline",
+      "result": "passed",
+      "detail": "all non-ignored tests passed; only explicit local-Qwen qualification/smoke tests ignored"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-repo --offline",
+      "result": "passed",
+      "detail": "full repository package passed after formatting-only baseline repair"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy -p sovereign-repo --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "real_qwen_runtime_on_current_tree": "deferred to mandatory final-release current-tree qualification; not claimed by M6-T03",
+  "independent_audit": {
+    "worker": "worker-38",
+    "final_result": "CLOSABLE",
+    "final_verdict": "M6-T03 frozen task: CLOSABLE",
+    "final_blockers": [],
+    "notes": "Fresh FINAL READ-ONLY exact-tree audit re-read final source/hashes/contracts, independently confirmed authority, persistence/model redaction, recovery crash matrix, and final gates. External transport proof remains correctly owned by M6-T07."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "source_hashes": {
+    "crates/sovereign-controller/src/lib.rs": "sha256:da9f8ed4c37e995c53e765e5d16147f18e0a787b30da56ef79a2a503cb8b4dfc",
+    "crates/sovereign-controller/src/roles.rs": "sha256:4af97bce90b5af11356c900e39da4ec77a076bccea7c988955b33fba89a13329",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:169c3be56a17c5ed73843400f2bf774ff0fa00abbd4303627ea49c3a00c9d5bb",
+    "crates/sovereign-evidence/src/lib.rs": "sha256:9180dd91cf3489d16615ee8cd7cc9bfe6d47edbada373037328f24aad10a5884",
+    "crates/sovereign-evidence/tests/compression.rs": "sha256:c5915eb199bf1e9601d6fd072a3e741e8c620f213cfd8970c6573f95954efa53",
+    "crates/sovereign-plan/src/compiler.rs": "sha256:220c8af2b279ea0d4b3a427bf99805417731502e58fc6b078445d1d52ffbac63",
+    "crates/sovereign-plan/src/lib.rs": "sha256:f2a611d59560c6db6d02f4af0221c06a955c1e322b5b338e58c828c9d02ac431",
+    "crates/sovereign-plan/tests/minimal_compiler.rs": "sha256:8ab53cd869c7e6b764fe6605aa139f27ebaff6482ec776a4a1ae58a98bc24c47",
+    "crates/sovereign-policy/src/lib.rs": "sha256:dfe7d04b2ca52e17ebb38e40e4ba6e076751ff6f37ad4fbfaecf07b4b8fede7d",
+    "crates/sovereign-policy/tests/secret.rs": "sha256:eb8e0d81131748b351c4beb335e1de24c34691e0125214af2512a81792b70b2a",
+    "crates/sovereign-repo/src/worktree.rs": "sha256:b0709633234a8f682be794671576bf5487e457902d1147b0378bdb65ecdc5e02",
+    "crates/sovereign-repo/tests/worktree.rs": "sha256:b29436ad3e8607a7458b85a66eac2cd6b2145c37bc8300896bcd609d914b1253",
+    "crates/sovereign-tools/src/lib.rs": "sha256:df61288fd0140c4a6b7fe14567f346a86184debeba670a711a040bc0742c1d82",
+    "crates/sovereign-tools/tests/runner.rs": "sha256:6fd168e557b0967a8118d34424db3e032fef218ae8befd9bbf0ad1a79aa1b9ee"
+  },
+  "frozen_tree": {
+    "head": "c4fa99868ea9573b41b06f0ca570d79e2cf26b61",
+    "tracked_modified_files": 13,
+    "untracked_files": 1,
+    "formatting_only_baseline_repair": [
+      "crates/sovereign-repo/src/worktree.rs",
+      "crates/sovereign-repo/tests/worktree.rs"
+    ]
+  },
+  "state_authority": {
+    "new_database": false,
+    "new_secret_database": false,
+    "new_memory_database": false,
+    "new_resource_database": false,
+    "controller_remains_sole_execution_authority": true
+  },
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false
+  }
+}

@@ -10,7 +10,8 @@ use sovereign_policy::{Capability, CapabilitySet};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ROLE_PROFILE_SCHEMA_VERSION: u32 = 1;
-pub const ROLE_PROFILE_VERSION: &str = "1.0.0";
+pub const ROLE_PROFILE_VERSION: &str = "1.1.0";
+const LEGACY_ROLE_PROFILE_VERSION: &str = "1.0.0";
 pub const ROLE_OUTPUT_SCHEMA_VERSION: u32 = 1;
 const ROLE_OUTPUT_TOKEN_CEILING: u32 = 512;
 const MAX_ROLE_FINDINGS: usize = 32;
@@ -211,6 +212,7 @@ pub struct RoleOutputV1 {
 #[derive(Debug, Clone)]
 pub struct RoleRegistry {
     profiles: BTreeMap<RoleId, RoleProfile>,
+    legacy_profiles: BTreeMap<RoleId, RoleProfile>,
 }
 
 impl Default for RoleRegistry {
@@ -225,8 +227,8 @@ impl RoleRegistry {
         let profiles = [
             explorer_profile(),
             planner_profile(),
-            implementer_profile(),
-            debugger_profile(),
+            implementer_profile(true),
+            debugger_profile(true),
             reviewer_profile(),
             security_reviewer_profile(),
             verifier_profile(),
@@ -234,7 +236,22 @@ impl RoleRegistry {
         .into_iter()
         .map(|profile| (profile.role, profile))
         .collect();
-        Self { profiles }
+        let legacy_profiles = [
+            explorer_profile(),
+            planner_profile(),
+            implementer_profile(false),
+            debugger_profile(false),
+            reviewer_profile(),
+            security_reviewer_profile(),
+            verifier_profile(),
+        ]
+        .into_iter()
+        .map(|profile| (profile.role, profile))
+        .collect();
+        Self {
+            profiles,
+            legacy_profiles,
+        }
     }
 
     #[must_use]
@@ -270,12 +287,18 @@ impl RoleRegistry {
         let role = RoleId::from_plan_ir_id(id).ok_or_else(|| {
             ControllerError::InvalidPlan(format!("unknown canonical role pin id {id}"))
         })?;
-        if version != ROLE_PROFILE_VERSION {
-            return Err(ControllerError::InvalidPlan(format!(
-                "unsupported canonical role pin version {version}"
-            )));
-        }
-        let profile = self.profile(role);
+        let profile = match version {
+            ROLE_PROFILE_VERSION => self.profile(role),
+            LEGACY_ROLE_PROFILE_VERSION => self
+                .legacy_profiles
+                .get(&role)
+                .unwrap_or_else(|| unreachable!("legacy role registry is complete")),
+            _ => {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "unsupported canonical role pin version {version}"
+                )));
+            }
+        };
         let expected = profile.digest()?;
         if digest != expected {
             return Err(ControllerError::InvalidPlan(format!(
@@ -427,7 +450,12 @@ fn planner_profile() -> RoleProfile {
     }
 }
 
-fn implementer_profile() -> RoleProfile {
+fn implementer_profile(secret_use_ceiling: bool) -> RoleProfile {
+    let mut allowed_tool_classes_ceiling =
+        BTreeSet::from([Capability::ProcessExec, Capability::RepositoryWrite]);
+    if secret_use_ceiling {
+        allowed_tool_classes_ceiling.insert(Capability::SecretUse);
+    }
     RoleProfile {
         schema_version: ROLE_PROFILE_SCHEMA_VERSION,
         role: RoleId::Implementer,
@@ -441,10 +469,7 @@ fn implementer_profile() -> RoleProfile {
             EvidenceKind::Instruction,
             EvidenceKind::ToolSchema,
         ]),
-        allowed_tool_classes_ceiling: BTreeSet::from([
-            Capability::ProcessExec,
-            Capability::RepositoryWrite,
-        ]),
+        allowed_tool_classes_ceiling,
         output_schema: "RoleOutputV1".to_owned(),
         allowed_dispositions: BTreeSet::from([
             RoleDisposition::Proposed,
@@ -456,7 +481,12 @@ fn implementer_profile() -> RoleProfile {
     }
 }
 
-fn debugger_profile() -> RoleProfile {
+fn debugger_profile(secret_use_ceiling: bool) -> RoleProfile {
+    let mut allowed_tool_classes_ceiling =
+        BTreeSet::from([Capability::ProcessExec, Capability::RepositoryWrite]);
+    if secret_use_ceiling {
+        allowed_tool_classes_ceiling.insert(Capability::SecretUse);
+    }
     RoleProfile {
         schema_version: ROLE_PROFILE_SCHEMA_VERSION,
         role: RoleId::Debugger,
@@ -473,10 +503,7 @@ fn debugger_profile() -> RoleProfile {
             EvidenceKind::Verification,
             EvidenceKind::ToolSchema,
         ]),
-        allowed_tool_classes_ceiling: BTreeSet::from([
-            Capability::ProcessExec,
-            Capability::RepositoryWrite,
-        ]),
+        allowed_tool_classes_ceiling,
         output_schema: "RoleOutputV1".to_owned(),
         allowed_dispositions: BTreeSet::from([
             RoleDisposition::Proposed,
@@ -877,6 +904,48 @@ mod tests {
     }
 
     #[test]
+    fn secret_use_is_an_opt_in_ceiling_for_implementer_and_debugger_only() {
+        let registry = RoleRegistry::canonical();
+        for role in [RoleId::Implementer, RoleId::Debugger] {
+            assert!(
+                registry
+                    .profile(role)
+                    .capability_ceiling()
+                    .contains(Capability::SecretUse)
+            );
+        }
+        for role in [
+            RoleId::Explorer,
+            RoleId::Planner,
+            RoleId::Reviewer,
+            RoleId::SecurityReviewer,
+            RoleId::Verifier,
+        ] {
+            assert!(
+                !registry
+                    .profile(role)
+                    .capability_ceiling()
+                    .contains(Capability::SecretUse)
+            );
+        }
+
+        let base = PermissionContext::m1_local_autonomous();
+        assert!(!base.permits(Capability::SecretUse));
+        let secret = PermissionContext::m6_local_secret_execution();
+        assert!(secret.permits(Capability::SecretUse));
+        assert!(
+            secret
+                .narrow_for_role(registry.profile(RoleId::Implementer))
+                .permits(Capability::SecretUse)
+        );
+        assert!(
+            !secret
+                .narrow_for_role(registry.profile(RoleId::Reviewer))
+                .permits(Capability::SecretUse)
+        );
+    }
+
+    #[test]
     fn role_ceiling_accepts_the_full_canonical_twelve_capability_domain() {
         let mut profile = RoleRegistry::canonical()
             .profile(RoleId::Implementer)
@@ -947,5 +1016,31 @@ mod tests {
                 .is_err()
         );
         assert!(registry.resolve_pin(&pin.id, "0.9.0", &pin.digest).is_err());
+
+        let legacy = implementer_profile(false);
+        let legacy_digest = legacy
+            .digest()
+            .unwrap_or_else(|error| panic!("legacy implementer digest: {error}"));
+        let resolved_legacy = registry
+            .resolve_pin(
+                RoleId::Implementer.plan_ir_id(),
+                LEGACY_ROLE_PROFILE_VERSION,
+                &legacy_digest,
+            )
+            .unwrap_or_else(|error| panic!("resolve legacy implementer pin: {error}"));
+        assert!(
+            !resolved_legacy
+                .capability_ceiling()
+                .contains(Capability::SecretUse)
+        );
+        assert!(
+            registry
+                .resolve_pin(
+                    RoleId::Implementer.plan_ir_id(),
+                    LEGACY_ROLE_PROFILE_VERSION,
+                    &pin.digest,
+                )
+                .is_err()
+        );
     }
 }
