@@ -23,7 +23,8 @@ use sovereign_policy::{
     CommandMode, CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend,
     IsolatedCommand, IsolationCapabilities, IsolationRequest, M6ResourceGovernor,
     MacSandboxExecBackend, ModelCallBudget, OsMemoryPressure, PinnedExecutable, PolicyError,
-    RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ResourcePressureSnapshotV1, ThermalPressure,
+    RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ReconciliationPolicy, ResourcePressureSnapshotV1,
+    ThermalPressure,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot};
 use sovereign_state::{
@@ -88,6 +89,7 @@ fn write_tool_manifest() -> ToolManifest {
             PermissionClass::RepositoryWrite,
         ]),
         declared_risk_floor: CommandRisk::RepositoryMutation,
+        reconciliation_policy: ReconciliationPolicy::proof_required_local(),
     }
 }
 

@@ -34,6 +34,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
 pub const CAPABILITY_SET_SCHEMA_VERSION: u32 = 1;
 pub const PERMISSION_DECISION_SCHEMA_VERSION: u32 = 1;
+pub const APPROVAL_CLAIM_SCHEMA_VERSION: u32 = 1;
+pub const RECONCILIATION_POLICY_SCHEMA_VERSION: u32 = 1;
 
 /// Canonical Plan IR v1 capability vocabulary.
 ///
@@ -106,6 +108,182 @@ impl Capability {
             "destructive" => Some(Self::Destructive),
             _ => None,
         }
+    }
+}
+
+/// Exact Controller-issued approval for one immutable action payload.
+///
+/// The claim deliberately contains no free-form approval text: authority is only the typed,
+/// exact action binding below. Resolved secrets, provider locators, prompts, and model output are
+/// never approval fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalClaim {
+    pub schema_version: u32,
+    pub claim_id: String,
+    pub action_id: String,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub task_id: String,
+    pub permission_class: String,
+    pub payload_digest: String,
+    pub destination_digest: Option<String>,
+    pub executable_digest: String,
+    pub policy_digest: String,
+    pub execution_epoch: i64,
+    pub nonce: String,
+    pub issued_by: String,
+    pub issued_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+/// Frozen v1 name for callers that prefer version-suffixed authority types.
+pub type ApprovalClaimV1 = ApprovalClaim;
+
+impl ApprovalClaim {
+    /// Validates claim shape and expiry without consulting tool/action state.
+    ///
+    /// # Errors
+    /// Returns a policy denial for malformed bindings, future-issued claims, or expiration.
+    pub fn validate(&self, now_ms: i64) -> Result<(), PolicyError> {
+        if self.schema_version != APPROVAL_CLAIM_SCHEMA_VERSION
+            || self.claim_id.trim().is_empty()
+            || self.action_id.trim().is_empty()
+            || self.plan_id.trim().is_empty()
+            || self.task_id.trim().is_empty()
+            || Capability::from_plan_ir_str(&self.permission_class).is_none()
+            || !is_sha256_binding(&self.payload_digest)
+            || self
+                .destination_digest
+                .as_ref()
+                .is_some_and(|digest| !is_sha256_binding(digest))
+            || !is_sha256_binding(&self.executable_digest)
+            || !is_sha256_binding(&self.policy_digest)
+            || self.execution_epoch < 0
+            || self.nonce.trim().is_empty()
+            || self.issued_by.trim().is_empty()
+            || self.issued_at_ms < 0
+            || self.expires_at_ms <= self.issued_at_ms
+        {
+            return Err(PolicyError::Denied(
+                "approval claim has incomplete exact-binding fields".to_owned(),
+            ));
+        }
+        if self.issued_at_ms > now_ms {
+            return Err(PolicyError::Denied(
+                "approval claim was issued in the future".to_owned(),
+            ));
+        }
+        if self.expires_at_ms <= now_ms {
+            return Err(PolicyError::Denied("approval claim expired".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Stable digest used by Controller audit/checkpoint provenance.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(APPROVAL_CLAIM_SCHEMA_VERSION.to_be_bytes());
+        digest_policy_field(&mut hasher, &self.claim_id);
+        digest_policy_field(&mut hasher, &self.action_id);
+        digest_policy_field(&mut hasher, &self.plan_id);
+        hasher.update(self.plan_revision.to_be_bytes());
+        digest_policy_field(&mut hasher, &self.task_id);
+        digest_policy_field(&mut hasher, &self.permission_class);
+        digest_policy_field(&mut hasher, &self.payload_digest);
+        digest_policy_field(
+            &mut hasher,
+            self.destination_digest.as_deref().unwrap_or("none"),
+        );
+        digest_policy_field(&mut hasher, &self.executable_digest);
+        digest_policy_field(&mut hasher, &self.policy_digest);
+        hasher.update(self.execution_epoch.to_be_bytes());
+        digest_policy_field(&mut hasher, &self.nonce);
+        digest_policy_field(&mut hasher, &self.issued_by);
+        hasher.update(self.issued_at_ms.to_be_bytes());
+        hasher.update(self.expires_at_ms.to_be_bytes());
+        format!("sha256:{:x}", hasher.finalize())
+    }
+}
+
+/// Deterministic unknown-outcome policy declared by a tool/adapter.
+///
+/// Ordering is intentionally monotonic: callers may make an action stricter than the adapter's
+/// minimum but may never downgrade it. Only `IdempotentLocal` permits retry without proof that the
+/// prior effect is present/absent. Consequential local and external actions require outcome proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationClass {
+    IdempotentLocal,
+    ProofRequiredLocal,
+    ConsequentialExternal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconciliationPolicy {
+    pub schema_version: u32,
+    pub class: ReconciliationClass,
+}
+
+/// Frozen v1 name for callers that prefer version-suffixed policy types.
+pub type ReconciliationPolicyV1 = ReconciliationPolicy;
+
+impl ReconciliationPolicy {
+    #[must_use]
+    pub const fn idempotent_local() -> Self {
+        Self {
+            schema_version: RECONCILIATION_POLICY_SCHEMA_VERSION,
+            class: ReconciliationClass::IdempotentLocal,
+        }
+    }
+
+    #[must_use]
+    pub const fn proof_required_local() -> Self {
+        Self {
+            schema_version: RECONCILIATION_POLICY_SCHEMA_VERSION,
+            class: ReconciliationClass::ProofRequiredLocal,
+        }
+    }
+
+    #[must_use]
+    pub const fn consequential_external() -> Self {
+        Self {
+            schema_version: RECONCILIATION_POLICY_SCHEMA_VERSION,
+            class: ReconciliationClass::ConsequentialExternal,
+        }
+    }
+
+    /// Returns whether `candidate` is at least as strict as this adapter/tool floor.
+    #[must_use]
+    pub const fn permits_candidate(self, candidate: Self) -> bool {
+        self.schema_version == RECONCILIATION_POLICY_SCHEMA_VERSION
+            && candidate.schema_version == RECONCILIATION_POLICY_SCHEMA_VERSION
+            && reconciliation_rank(candidate.class) >= reconciliation_rank(self.class)
+    }
+
+    #[must_use]
+    pub const fn allows_unproven_retry(self) -> bool {
+        self.schema_version == RECONCILIATION_POLICY_SCHEMA_VERSION
+            && matches!(self.class, ReconciliationClass::IdempotentLocal)
+    }
+
+    /// # Errors
+    /// Returns a policy denial for unsupported schema versions.
+    pub fn validate(self) -> Result<(), PolicyError> {
+        if self.schema_version != RECONCILIATION_POLICY_SCHEMA_VERSION {
+            return Err(PolicyError::Denied(
+                "unsupported reconciliation policy schema".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+const fn reconciliation_rank(class: ReconciliationClass) -> u8 {
+    match class {
+        ReconciliationClass::IdempotentLocal => 0,
+        ReconciliationClass::ProofRequiredLocal => 1,
+        ReconciliationClass::ConsequentialExternal => 2,
     }
 }
 

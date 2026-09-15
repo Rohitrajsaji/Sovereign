@@ -7,10 +7,11 @@ use sovereign_policy::{
 };
 use sovereign_state::StateStore;
 use sovereign_tools::{
-    ActionJournal, ActionState, AtomicReplaceGuard, AuthorizedAction, CapabilityLayers,
-    CapabilitySet, PermissionClass, PermissionDecision, ProcessRunner, Reconciliation,
-    ReconciliationMode, ResourceLimitKind, SecretCleanupProof, ToolManifest, ToolSchemaV1,
-    filter_authorized_tool_schemas,
+    ACTION_RECEIPT_SCHEMA_VERSION, APPROVAL_CLAIM_NAMESPACE, ActionJournal, ActionReceipt,
+    ActionState, ApprovalClaim, AtomicReplaceGuard, AuthorizedAction, CapabilityLayers,
+    CapabilitySet, PermissionClass, PermissionDecision, ProcessRunner, RawToolResult,
+    Reconciliation, ReconciliationMode, ReconciliationPolicy, ResourceLimitKind,
+    SecretCleanupProof, ToolManifest, ToolSchemaV1, filter_authorized_tool_schemas,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -78,6 +79,7 @@ fn manifest() -> ToolManifest {
             PermissionClass::RepositoryWrite,
         ]),
         declared_risk_floor: CommandRisk::Shell,
+        reconciliation_policy: ReconciliationPolicy::idempotent_local(),
     }
 }
 
@@ -130,6 +132,7 @@ fn shell_action(
             subprocess_limit: limits.subprocesses,
         },
         individually_authorized_environment: BTreeSet::new(),
+        approval_required: false,
         reconciliation_mode: mode,
     };
     action.permission_decision_digest = permission_decision(&action).digest();
@@ -164,6 +167,27 @@ fn authorize(
     tool_manifest: &ToolManifest,
 ) -> Result<i64, sovereign_tools::ToolError> {
     journal.authorize(action, tool_manifest, &permission_decision(action))
+}
+
+fn approval_claim(action: &AuthorizedAction, issued_at_ms: i64) -> ApprovalClaim {
+    ApprovalClaim {
+        schema_version: 1,
+        claim_id: format!("claim.{}", action.action_id),
+        action_id: action.action_id.clone(),
+        plan_id: action.plan_id.clone(),
+        plan_revision: action.plan_revision,
+        task_id: action.task_id.clone(),
+        permission_class: action.permission_class.as_plan_ir_str().to_owned(),
+        payload_digest: action.payload_digest(),
+        destination_digest: action.destination_digest.clone(),
+        executable_digest: action.executable_digest.clone(),
+        policy_digest: action.policy_digest.clone(),
+        execution_epoch: action.execution_epoch,
+        nonce: action.nonce.clone(),
+        issued_by: "user:test-approver".to_owned(),
+        issued_at_ms,
+        expires_at_ms: action.expires_at_ms.min(issued_at_ms + 30_000),
+    }
 }
 
 fn fixture(label: &str) -> (TestDir, PathBuf, PathBuf, StateStore) {
@@ -929,6 +953,278 @@ fn crash_after_dispatch_becomes_unknown_safe_read_reconciles_and_unsafe_unknown_
             .unwrap_or(None)
             .map(|record| record.state),
         Some("unknown".to_owned())
+    );
+}
+
+#[test]
+fn reconciliation_approval_claim_is_exact_expiring_and_durable_before_dispatch() {
+    let (_temp, repo, _home, mut store) = fixture("reconciliation-approval");
+    let mut action = shell_action(
+        "action_reconciliation_approval",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 1_024,
+            disk_bytes: 1_024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::IdempotentRead,
+    );
+    action.approval_required = true;
+    let issued_at_ms = now_ms().saturating_sub(1);
+    let claim = approval_claim(&action, issued_at_ms);
+    action
+        .verify_approval_claim(&claim, now_ms())
+        .unwrap_or_else(|error| panic!("exact claim should validate: {error}"));
+
+    let mut changed = action.clone();
+    changed.command.args.push("payload-drift".to_owned());
+    assert!(changed.verify_approval_claim(&claim, now_ms()).is_err());
+    let mut changed = action.clone();
+    changed.executable_digest = test_digest('4');
+    assert!(changed.verify_approval_claim(&claim, now_ms()).is_err());
+    let mut changed = action.clone();
+    changed.destination_digest = Some(test_digest('5'));
+    assert!(changed.verify_approval_claim(&claim, now_ms()).is_err());
+    let mut changed = action.clone();
+    changed.policy_digest = test_digest('6');
+    assert!(changed.verify_approval_claim(&claim, now_ms()).is_err());
+    let mut changed = action.clone();
+    changed.execution_epoch = action.execution_epoch.saturating_add(1);
+    assert!(changed.verify_approval_claim(&claim, now_ms()).is_err());
+    let mut expired = claim.clone();
+    expired.expires_at_ms = expired.issued_at_ms.saturating_add(1);
+    assert!(
+        action
+            .verify_approval_claim(&expired, expired.expires_at_ms)
+            .is_err()
+    );
+
+    {
+        let mut journal = ActionJournal::new(&mut store);
+        authorize(&mut journal, &action, &manifest())
+            .unwrap_or_else(|error| panic!("authorize approval-required action: {error}"));
+        let error = journal
+            .transition(&action, ActionState::Authorized, ActionState::Dispatched)
+            .err()
+            .unwrap_or_else(|| panic!("missing durable claim must deny dispatch"));
+        assert!(error.to_string().contains("no durable approval claim"));
+        assert_eq!(
+            journal
+                .record(&action.action_id)
+                .unwrap_or_else(|error| panic!("authorized record: {error}"))
+                .map(|record| record.state),
+            Some("authorized".to_owned())
+        );
+    }
+
+    store
+        .put_state(
+            APPROVAL_CLAIM_NAMESPACE,
+            &action.action_id,
+            &serde_json::to_string(&claim)
+                .unwrap_or_else(|error| panic!("serialize claim: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("persist claim: {error}"));
+    let mut journal = ActionJournal::new(&mut store);
+    journal
+        .transition(&action, ActionState::Authorized, ActionState::Dispatched)
+        .unwrap_or_else(|error| panic!("durable exact claim dispatch: {error}"));
+}
+
+#[test]
+fn reconciliation_tool_policy_is_non_downgradable_and_external_unknown_never_blind_replays() {
+    let (_temp, repo, _home, mut store) = fixture("reconciliation-policy");
+    let mut tool_manifest = manifest();
+    tool_manifest.reconciliation_policy = ReconciliationPolicy::consequential_external();
+    let mut action = shell_action(
+        "action_external_reconciliation",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 1_024,
+            disk_bytes: 1_024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::UnsafeSideEffect,
+    );
+    {
+        let mut journal = ActionJournal::new(&mut store);
+        assert!(authorize(&mut journal, &action, &tool_manifest).is_err());
+        assert!(journal.record(&action.action_id).unwrap_or(None).is_none());
+    }
+
+    action.reconciliation_mode = ReconciliationMode::ConsequentialExternal;
+    let mut journal = ActionJournal::new(&mut store);
+    authorize(&mut journal, &action, &tool_manifest)
+        .unwrap_or_else(|error| panic!("strict external authorization: {error}"));
+    journal
+        .transition(&action, ActionState::Authorized, ActionState::Dispatched)
+        .unwrap_or_else(|error| panic!("dispatch: {error}"));
+    journal
+        .recover_dispatched_as_unknown(&action)
+        .unwrap_or_else(|error| panic!("unknown: {error}"));
+    assert_eq!(
+        journal
+            .reconcile_unknown(&action, None)
+            .unwrap_or_else(|error| panic!("external reconcile: {error}")),
+        Reconciliation::BlockedUnsafeUnknown
+    );
+    assert_eq!(
+        journal
+            .reconcile_unknown(
+                &action,
+                Some(sovereign_tools::ReconciliationProof::SafeIdempotentRetry),
+            )
+            .unwrap_or_else(|error| panic!("external retry proof: {error}")),
+        Reconciliation::BlockedUnsafeUnknown
+    );
+    assert_eq!(
+        journal
+            .record(&action.action_id)
+            .unwrap_or_else(|error| panic!("external record: {error}"))
+            .map(|record| record.state),
+        Some("unknown".to_owned())
+    );
+}
+
+#[test]
+fn reconciliation_idempotent_local_retry_requires_explicit_policy_and_new_dispatch_authority() {
+    let (_temp, repo, _home, mut store) = fixture("reconciliation-idempotent");
+    let action = shell_action(
+        "action_idempotent_reconciliation",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 1_024,
+            disk_bytes: 1_024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::IdempotentRead,
+    );
+    let mut journal = ActionJournal::new(&mut store);
+    authorize(&mut journal, &action, &manifest())
+        .unwrap_or_else(|error| panic!("authorize: {error}"));
+    journal
+        .transition(&action, ActionState::Authorized, ActionState::Dispatched)
+        .unwrap_or_else(|error| panic!("dispatch: {error}"));
+    journal
+        .recover_dispatched_as_unknown(&action)
+        .unwrap_or_else(|error| panic!("unknown: {error}"));
+    assert_eq!(
+        journal
+            .reconcile_unknown(&action, None)
+            .unwrap_or_else(|error| panic!("idempotent reconcile: {error}")),
+        Reconciliation::SafeToRetry
+    );
+    assert_eq!(
+        journal
+            .record(&action.action_id)
+            .unwrap_or_else(|error| panic!("reconciled record: {error}"))
+            .map(|record| record.state),
+        Some("reconciled".to_owned())
+    );
+    assert!(
+        journal
+            .transition(&action, ActionState::Reconciled, ActionState::Dispatched)
+            .is_err(),
+        "reconciliation never grants blind replay of the old action"
+    );
+}
+
+#[test]
+fn reconciliation_action_receipt_v1_binds_only_sanitized_durable_result() {
+    let (_temp, repo, _home, _store) = fixture("reconciliation-receipt");
+    let action = shell_action(
+        "action_receipt_reconciliation",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 1_024,
+            disk_bytes: 1_024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::IdempotentRead,
+    );
+    let result = RawToolResult {
+        exit_code: Some(0),
+        stdout: b"stdout:[REDACTED]\n".to_vec(),
+        stderr: b"stderr:[REDACTED]\n".to_vec(),
+        elapsed_ms: 7,
+        terminated_for_limit: None,
+        process_group_reaped: true,
+    };
+    let receipt = ActionReceipt::from_sanitized_result(&action, &result);
+    assert_eq!(receipt.schema_version, ACTION_RECEIPT_SCHEMA_VERSION);
+    receipt
+        .validate_for_action(&action)
+        .unwrap_or_else(|error| panic!("receipt binding: {error}"));
+    let bytes = receipt
+        .to_bytes()
+        .unwrap_or_else(|error| panic!("receipt bytes: {error}"));
+    assert!(
+        !bytes
+            .windows(b"raw-secret".len())
+            .any(|window| window == b"raw-secret")
+    );
+    assert!(
+        !bytes
+            .windows(result.stdout.len())
+            .any(|window| window == result.stdout)
+    );
+    let decoded =
+        ActionReceipt::from_bytes(&bytes).unwrap_or_else(|error| panic!("decode receipt: {error}"));
+    assert_eq!(decoded, receipt);
+    let mut drifted = action.clone();
+    drifted.command.args.push("changed".to_owned());
+    assert!(decoded.validate_for_action(&drifted).is_err());
+}
+
+#[test]
+fn reconciliation_rollback_compensation_uses_same_claim_and_external_unknown_contract() {
+    let (_temp, repo, _home, mut store) = fixture("reconciliation-rollback");
+    let mut tool_manifest = manifest();
+    tool_manifest.reconciliation_policy = ReconciliationPolicy::consequential_external();
+    let mut rollback = shell_action(
+        "rollback_action_reconciliation",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 1_024,
+            disk_bytes: 1_024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::ConsequentialExternal,
+    );
+    rollback.approval_required = true;
+    let claim = approval_claim(&rollback, now_ms().saturating_sub(1));
+    store
+        .put_state(
+            APPROVAL_CLAIM_NAMESPACE,
+            &rollback.action_id,
+            &serde_json::to_string(&claim)
+                .unwrap_or_else(|error| panic!("serialize rollback claim: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("persist rollback claim: {error}"));
+    let mut journal = ActionJournal::new(&mut store);
+    authorize(&mut journal, &rollback, &tool_manifest)
+        .unwrap_or_else(|error| panic!("authorize rollback: {error}"));
+    journal
+        .transition(&rollback, ActionState::Authorized, ActionState::Dispatched)
+        .unwrap_or_else(|error| panic!("dispatch rollback: {error}"));
+    journal
+        .recover_dispatched_as_unknown(&rollback)
+        .unwrap_or_else(|error| panic!("unknown rollback: {error}"));
+    assert_eq!(
+        journal
+            .reconcile_unknown(&rollback, None)
+            .unwrap_or_else(|error| panic!("rollback reconcile: {error}")),
+        Reconciliation::BlockedUnsafeUnknown
     );
 }
 

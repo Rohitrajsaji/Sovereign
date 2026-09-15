@@ -22,7 +22,7 @@ use sovereign_plan::{
 use sovereign_policy::{
     CommandPolicy, CommandRisk, IsolationRequest, MacSandboxExecBackend, ModelCallBudget,
     OsMemoryPressure, PinnedExecutable, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
-    ResourcePressureSnapshotV1, ThermalPressure,
+    ReconciliationPolicy, ResourcePressureSnapshotV1, ThermalPressure,
 };
 use sovereign_repo::{
     ExactRetriever, IndexConfig, LexicalRetriever, ProjectRegistry, RepositoryIntelligence,
@@ -83,6 +83,7 @@ fn write_tool_manifest() -> ToolManifest {
             PermissionClass::RepositoryWrite,
         ]),
         declared_risk_floor: CommandRisk::RepositoryMutation,
+        reconciliation_policy: ReconciliationPolicy::proof_required_local(),
     }
 }
 

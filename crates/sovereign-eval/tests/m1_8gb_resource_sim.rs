@@ -22,9 +22,9 @@ use sovereign_policy::{
     ConditionalLeaseContextV1, HardwareProfileV1, HeavyLeaseClass, IsolationRequest,
     M6ResourceGovernor, M6ResourceGovernorSnapshotV1, MacSandboxExecBackend, ModelCallBudget,
     OsMemoryPressure, PinnedExecutable, PlanHeavyLeaseClass, PressureBand,
-    RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ResourceLeaseOwnerV1, ResourceLeaseRequestV1,
-    ResourcePolicyEventV1, ResourcePressureEventV1, ResourcePressureSnapshotV1,
-    TaskResourceBudgetV1, ThermalPressure,
+    RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ReconciliationPolicy, ResourceLeaseOwnerV1,
+    ResourceLeaseRequestV1, ResourcePolicyEventV1, ResourcePressureEventV1,
+    ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence};
 use sovereign_state::StateStore;
@@ -306,6 +306,7 @@ fn tool_manifest() -> ToolManifest {
             PermissionClass::RepositoryWrite,
         ]),
         declared_risk_floor: CommandRisk::RepositoryMutation,
+        reconciliation_policy: ReconciliationPolicy::proof_required_local(),
     }
 }
 

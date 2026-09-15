@@ -25,11 +25,12 @@ use sovereign_plan::{
     smallest_replan_scope_tasks,
 };
 use sovereign_policy::{
-    AdmissionStatus, Capability, CapabilityLayers, CapabilitySet, CommandMode, CommandPolicy,
-    CommandRisk, CommandSpec, ConditionalLeaseContextV1, HeavyLeaseClass, IsolationRequest,
-    LeaseStateV1, M6ResourceGovernorSnapshotV1, ModelCallBudget, PermissionDecision,
-    PlanHeavyLeaseClass, PolicyError, ResourceLeaseOwnerV1, ResourceLeaseRequestV1,
-    ResourceLeaseV1, ResourcePolicyEventV1, ResourcePressureEventV1, SecretBroker, SecretInjection,
+    APPROVAL_CLAIM_SCHEMA_VERSION, AdmissionStatus, Capability, CapabilityLayers, CapabilitySet,
+    CommandMode, CommandPolicy, CommandRisk, CommandSpec, ConditionalLeaseContextV1,
+    HeavyLeaseClass, IsolationRequest, LeaseStateV1, M6ResourceGovernorSnapshotV1, ModelCallBudget,
+    PermissionDecision, PlanHeavyLeaseClass, PolicyError, ReconciliationClass,
+    ReconciliationPolicy, ResourceLeaseOwnerV1, ResourceLeaseRequestV1, ResourceLeaseV1,
+    ResourcePolicyEventV1, ResourcePressureEventV1, SecretBroker, SecretInjection,
     SecretProviderKind, SecretRef, SecretScope, TaskCapabilityGrant, TaskResourceBudgetV1,
 };
 use sovereign_repo::{
@@ -42,9 +43,10 @@ use sovereign_state::{
     StateError, StateRecordUpdate, StateStore,
 };
 use sovereign_tools::{
-    ActionJournal, ActionState, AuthorizedAction, EPHEMERAL_SECRET_FILE_ENV, PermissionClass,
-    ProcessRunner, RawToolResult, ReconciliationMode, ToolError, ToolManifest, ToolSchemaV1,
-    filter_authorized_tool_schemas, reap_owned_process_group,
+    APPROVAL_CLAIM_NAMESPACE, ActionJournal, ActionState, ApprovalClaim, AuthorizedAction,
+    EPHEMERAL_SECRET_FILE_ENV, PermissionClass, ProcessRunner, RawToolResult, ReconciliationMode,
+    ToolError, ToolManifest, ToolSchemaV1, filter_authorized_tool_schemas,
+    reap_owned_process_group,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -93,6 +95,10 @@ pub const CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const RECOVERY_PROCESS_LEASE_SCHEMA_VERSION: u32 = 1;
 pub const EXECUTION_CONTROL_SCHEMA_VERSION: u32 = 1;
 pub const GOAL_INTENT_SCHEMA_VERSION: u32 = 1;
+pub const APPROVAL_REQUEST_SCHEMA_VERSION: u32 = 1;
+const APPROVAL_REQUEST_NAMESPACE: &str = "controller.approval_request";
+const ACTION_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
+const ACTION_RECONCILIATION_NAMESPACE: &str = "controller.action_reconciliation";
 const LEGACY_ACTION_INTENT_SCHEMA_VERSION: u32 = 2;
 const ACTION_INTENT_SCHEMA_VERSION: u32 = 3;
 const MAX_PROPOSAL_EVIDENCE_IDS: usize = 16;
@@ -130,6 +136,10 @@ pub enum ControllerError {
     Io(std::io::Error),
     InvalidPlan(String),
     NotReady(String),
+    AwaitingApproval {
+        action_id: String,
+        request_id: String,
+    },
     ProposalRejected(String),
     ExecutionFailed(Box<ExecutionFailureV1>),
     VerificationFailed(Box<VerificationResultV1>),
@@ -150,6 +160,13 @@ impl Display for ControllerError {
             Self::Io(error) => write!(f, "controller I/O error: {error}"),
             Self::InvalidPlan(message) => write!(f, "invalid active plan: {message}"),
             Self::NotReady(message) => write!(f, "task is not ready: {message}"),
+            Self::AwaitingApproval {
+                action_id,
+                request_id,
+            } => write!(
+                f,
+                "action {action_id} is awaiting exact approval request {request_id}"
+            ),
             Self::ProposalRejected(message) => write!(f, "model proposal rejected: {message}"),
             Self::ExecutionFailed(failure) => write!(f, "execution failed: {}", failure.signature),
             Self::VerificationFailed(result) => write!(
@@ -250,6 +267,70 @@ pub struct GoalIntentV1 {
     pub natural_language_goal: String,
     pub status: String,
     pub submitted_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalRequestStatusV1 {
+    Pending,
+    Approved,
+    Denied,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecisionV1 {
+    Approve,
+    Deny,
+}
+
+/// Controller-owned, durable request for one exact approval-sensitive action.
+///
+/// This record intentionally contains no free-form approval text and no resolved secret data.
+/// A user response can only approve or deny the immutable binding that the Controller already
+/// derived; the response API never accepts replacement payload/destination/executable fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalRequestV1 {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub action_id: String,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub task_id: String,
+    pub permission_class: String,
+    pub payload_digest: String,
+    pub destination_digest: Option<String>,
+    pub executable_digest: String,
+    pub policy_digest: String,
+    pub execution_epoch: i64,
+    pub nonce: String,
+    pub requested_at_ms: i64,
+    /// Exact expiry embedded in the immutable [`AuthorizedAction`] payload. This is distinct from
+    /// the approval request/claim TTL below, which may be shorter due to Plan IR policy.
+    pub action_expires_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub status: ApprovalRequestStatusV1,
+    pub decided_by: Option<String>,
+    pub decided_at_ms: Option<i64>,
+    pub claim_id: Option<String>,
+}
+
+/// Controller-owned durable reconciliation binding for one exact authorized action.
+///
+/// Recovery consumes this record before applying any effect inference. It deliberately stores only
+/// typed authority metadata and never tool output, approval prose, or secret material.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedActionReconciliationBindingV1 {
+    schema_version: u32,
+    action_id: String,
+    plan_id: String,
+    plan_revision: u32,
+    task_id: String,
+    payload_digest: String,
+    policy_digest: String,
+    execution_epoch: i64,
+    policy: ReconciliationPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1916,6 +1997,576 @@ impl Controller {
     /// Fails closed on malformed durable state.
     pub fn execution_control(&self) -> Result<ExecutionControlV1, ControllerError> {
         load_execution_control(&self.state)
+    }
+
+    fn reconciliation_mode_for_manifest(
+        manifest: &ToolManifest,
+    ) -> Result<ReconciliationMode, ControllerError> {
+        manifest.reconciliation_policy.validate()?;
+        Ok(match manifest.reconciliation_policy.class {
+            ReconciliationClass::IdempotentLocal => ReconciliationMode::IdempotentRead,
+            ReconciliationClass::ProofRequiredLocal => ReconciliationMode::UnsafeSideEffect,
+            ReconciliationClass::ConsequentialExternal => ReconciliationMode::ConsequentialExternal,
+        })
+    }
+
+    fn ensure_action_authorized(
+        &mut self,
+        action: &AuthorizedAction,
+        manifest: &ToolManifest,
+        permission_decision: &PermissionDecision,
+    ) -> Result<(), ControllerError> {
+        let existing = self.state.action_record(&action.action_id)?;
+        let mut journal = ActionJournal::new(&mut self.state);
+        match existing.as_ref().map(|record| record.state.as_str()) {
+            None | Some("prepared") => {
+                journal.authorize(action, manifest, permission_decision)?;
+            }
+            Some("authorized") => {
+                journal.verify_authorized(action)?;
+            }
+            Some("unknown") => {
+                return Err(ControllerError::UnknownAction(action.action_id.clone()));
+            }
+            Some(state) => {
+                return Err(ControllerError::NotReady(format!(
+                    "action {} cannot be re-authorized from durable state {state}",
+                    action.action_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_action_reconciliation_binding(
+        &mut self,
+        action: &AuthorizedAction,
+    ) -> Result<(), ControllerError> {
+        let binding = PersistedActionReconciliationBindingV1 {
+            schema_version: ACTION_RECONCILIATION_SCHEMA_VERSION,
+            action_id: action.action_id.clone(),
+            plan_id: action.plan_id.clone(),
+            plan_revision: action.plan_revision,
+            task_id: action.task_id.clone(),
+            payload_digest: action.payload_digest(),
+            policy_digest: action.policy_digest.clone(),
+            execution_epoch: action.execution_epoch,
+            policy: action.reconciliation_mode.policy(),
+        };
+        binding.policy.validate()?;
+        let value_json = serde_json::to_string(&binding)?;
+        if let Some(existing) = self
+            .state
+            .get_state(ACTION_RECONCILIATION_NAMESPACE, &action.action_id)?
+        {
+            if existing != value_json {
+                return Err(ControllerError::NotReady(
+                    "durable action reconciliation binding drifted from exact authority".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        let binding_key = format!("{ACTION_RECONCILIATION_NAMESPACE}:{}", action.action_id);
+        let record_digest = sha256_prefixed(value_json.as_bytes());
+        self.persist_runtime_records_with_events(
+            &[(
+                ACTION_RECONCILIATION_NAMESPACE.to_owned(),
+                action.action_id.clone(),
+                value_json,
+            )],
+            &[(
+                "action_reconciliation_bound".to_owned(),
+                action.action_id.clone(),
+                json!({
+                    "action_id": action.action_id,
+                    "plan_id": action.plan_id,
+                    "plan_revision": action.plan_revision,
+                    "task_id": action.task_id,
+                    "payload_digest": binding.payload_digest,
+                    "policy_digest": binding.policy_digest,
+                    "execution_epoch": binding.execution_epoch,
+                    "reconciliation_policy": binding.policy,
+                    "post_image_digests": {binding_key: record_digest},
+                }),
+            )],
+        )?;
+        Ok(())
+    }
+
+    fn require_dispatch_approval(
+        &mut self,
+        action: &AuthorizedAction,
+    ) -> Result<(), ControllerError> {
+        if !action.approval_required {
+            return Ok(());
+        }
+        let request = self.persist_approval_request_for_action(action)?;
+        match request.status {
+            ApprovalRequestStatusV1::Pending => Err(ControllerError::AwaitingApproval {
+                action_id: action.action_id.clone(),
+                request_id: request.request_id,
+            }),
+            ApprovalRequestStatusV1::Denied => Err(ControllerError::NotReady(format!(
+                "action {} was denied by approval request {}",
+                action.action_id, request.request_id
+            ))),
+            ApprovalRequestStatusV1::Approved => {
+                let raw = self
+                    .state
+                    .get_state(APPROVAL_CLAIM_NAMESPACE, &action.action_id)?
+                    .ok_or_else(|| {
+                        ControllerError::NotReady(
+                            "approved request has no durable exact approval claim".to_owned(),
+                        )
+                    })?;
+                let claim: ApprovalClaim = serde_json::from_str(&raw)?;
+                if request.claim_id.as_deref() != Some(claim.claim_id.as_str()) {
+                    return Err(ControllerError::NotReady(
+                        "approved request claim identity differs from durable action claim"
+                            .to_owned(),
+                    ));
+                }
+                action.verify_approval_claim(&claim, unix_millis()?)?;
+                Ok(())
+            }
+        }
+    }
+
+    fn prepare_action_for_dispatch(
+        &mut self,
+        action: &AuthorizedAction,
+        manifest: &ToolManifest,
+        permission_decision: &PermissionDecision,
+    ) -> Result<(), ControllerError> {
+        self.ensure_action_authorized(action, manifest, permission_decision)?;
+        self.persist_action_reconciliation_binding(action)?;
+        self.require_dispatch_approval(action)?;
+        self.checkpoint_now()?;
+        Ok(())
+    }
+
+    /// Applies a user decision to one exact durable Controller approval request.
+    ///
+    /// The caller supplies only the request identity, decision, and approving principal. Exact
+    /// action fields are reloaded from Controller state and revalidated against the current active
+    /// plan/action/epoch before an [`ApprovalClaim`] can be minted. Free-form approval text is not
+    /// accepted and therefore cannot become execution authority.
+    ///
+    /// # Errors
+    /// Fails closed for stale/expired/already-decided requests, action or policy drift, missing
+    /// durable pre-dispatch authorization, an empty principal, or persistence/checkpoint failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn respond_to_approval(
+        &mut self,
+        request_id: &str,
+        decision: ApprovalDecisionV1,
+        decided_by: &str,
+    ) -> Result<ApprovalRequestV1, ControllerError> {
+        self.require_execution_not_paused()?;
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
+        let decided_by = decided_by.trim();
+        if decided_by.is_empty() {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "approval decision principal must not be empty".to_owned(),
+            )));
+        }
+        let raw = self
+            .state
+            .get_state(APPROVAL_REQUEST_NAMESPACE, request_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!("unknown approval request {request_id}"))
+            })?;
+        let mut request: ApprovalRequestV1 = serde_json::from_str(&raw)?;
+        self.validate_current_approval_request(&request)?;
+        if request.status != ApprovalRequestStatusV1::Pending {
+            return Err(ControllerError::NotReady(
+                "approval request was already decided".to_owned(),
+            ));
+        }
+        let now_ms = unix_millis()?;
+        if now_ms >= request.expires_at_ms {
+            return Err(ControllerError::NotReady(
+                "approval request expired before decision".to_owned(),
+            ));
+        }
+
+        request.decided_by = Some(decided_by.to_owned());
+        request.decided_at_ms = Some(now_ms);
+        let mut records = Vec::with_capacity(2);
+        let mut event_payload = json!({
+            "request_id": request.request_id,
+            "action_id": request.action_id,
+            "plan_id": request.plan_id,
+            "plan_revision": request.plan_revision,
+            "task_id": request.task_id,
+            "permission_class": request.permission_class,
+            "payload_digest": request.payload_digest,
+            "executable_digest": request.executable_digest,
+            "destination_digest": request.destination_digest,
+            "policy_digest": request.policy_digest,
+            "execution_epoch": request.execution_epoch,
+            "action_expires_at_ms": request.action_expires_at_ms,
+            "expires_at_ms": request.expires_at_ms,
+            "decided_by": decided_by,
+        });
+        let event_kind = match decision {
+            ApprovalDecisionV1::Approve => {
+                let claim_seed = sha256_prefixed(
+                    format!(
+                        "approval-claim\0{}\0{}\0{}",
+                        request.request_id, decided_by, now_ms
+                    )
+                    .as_bytes(),
+                );
+                let claim = ApprovalClaim {
+                    schema_version: APPROVAL_CLAIM_SCHEMA_VERSION,
+                    claim_id: format!("claim.{}", digest_fragment(&claim_seed, 24)),
+                    action_id: request.action_id.clone(),
+                    plan_id: request.plan_id.clone(),
+                    plan_revision: request.plan_revision,
+                    task_id: request.task_id.clone(),
+                    permission_class: request.permission_class.clone(),
+                    payload_digest: request.payload_digest.clone(),
+                    destination_digest: request.destination_digest.clone(),
+                    executable_digest: request.executable_digest.clone(),
+                    policy_digest: request.policy_digest.clone(),
+                    execution_epoch: request.execution_epoch,
+                    nonce: request.nonce.clone(),
+                    issued_by: decided_by.to_owned(),
+                    issued_at_ms: now_ms,
+                    expires_at_ms: request.expires_at_ms,
+                };
+                claim.validate(now_ms)?;
+                request.status = ApprovalRequestStatusV1::Approved;
+                request.claim_id = Some(claim.claim_id.clone());
+                event_payload["claim_id"] = json!(claim.claim_id);
+                event_payload["claim_digest"] = json!(claim.digest());
+                records.push((
+                    APPROVAL_CLAIM_NAMESPACE.to_owned(),
+                    request.action_id.clone(),
+                    serde_json::to_string(&claim)?,
+                ));
+                "approval_claim_issued"
+            }
+            ApprovalDecisionV1::Deny => {
+                request.status = ApprovalRequestStatusV1::Denied;
+                "approval_request_denied"
+            }
+        };
+        records.push((
+            APPROVAL_REQUEST_NAMESPACE.to_owned(),
+            request.request_id.clone(),
+            serde_json::to_string(&request)?,
+        ));
+        event_payload["post_image_digests"] =
+            serde_json::to_value(state_record_post_image_digests(&records))?;
+        self.persist_runtime_records_with_events(
+            &records,
+            &[(
+                event_kind.to_owned(),
+                request.request_id.clone(),
+                event_payload,
+            )],
+        )?;
+        self.checkpoint_now()?;
+        Ok(request)
+    }
+
+    fn approval_required_for_task_permission(
+        &self,
+        task_id: &str,
+        permission: PermissionClass,
+    ) -> Result<bool, ControllerError> {
+        let active = self.active_ref()?;
+        if active.validity != PlanValidity::Current {
+            return Err(ControllerError::NotReady(
+                "approval policy requires the current active plan".to_owned(),
+            ));
+        }
+        let exact_action_binding = active
+            .plan_document
+            .pointer("/policy/approval/exact_action_binding")
+            .and_then(Value::as_bool);
+        let reapprove_on_payload_change = active
+            .plan_document
+            .pointer("/policy/approval/reapprove_on_payload_change")
+            .and_then(Value::as_bool);
+        if exact_action_binding != Some(true) || reapprove_on_payload_change != Some(true) {
+            return Err(ControllerError::InvalidPlan(
+                "active approval policy lost exact-action/reapproval invariants".to_owned(),
+            ));
+        }
+        let global = required_array(
+            &active.plan_document,
+            "/policy/approval/required_permissions",
+        )?;
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::InvalidPlan(format!("unknown task {task_id}")))?;
+        let task_required =
+            required_array(&task.task, "/action_policy/approval_required_permissions")?;
+        let permission = permission.as_plan_ir_str();
+        Ok(global.iter().chain(task_required.iter()).any(|value| {
+            value
+                .as_str()
+                .is_some_and(|required| required == permission)
+        }))
+    }
+
+    fn approval_max_ttl_ms(&self) -> Result<i64, ControllerError> {
+        let seconds = required_u32(
+            &self.active_ref()?.plan_document,
+            "/policy/approval/max_ttl_seconds",
+        )?;
+        Ok(i64::from(seconds).saturating_mul(1_000))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn persist_approval_request_for_action(
+        &mut self,
+        action: &AuthorizedAction,
+    ) -> Result<ApprovalRequestV1, ControllerError> {
+        let now_ms = unix_millis()?;
+        action.validate(now_ms)?;
+        if !action.approval_required
+            || !self
+                .approval_required_for_task_permission(&action.task_id, action.permission_class)?
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "Controller cannot request approval for an action not required by active Plan IR policy"
+                    .to_owned(),
+            )));
+        }
+        let (plan_id, plan_revision, policy_digest) = {
+            let active = self.active_ref()?;
+            (
+                active.plan_id.clone(),
+                active.revision,
+                active.policy_digest.clone(),
+            )
+        };
+        if action.plan_id != plan_id
+            || action.plan_revision != plan_revision
+            || action.policy_digest != policy_digest
+            || action.execution_epoch != self.state.current_execution_epoch()?
+        {
+            return Err(ControllerError::NotReady(
+                "approval-sensitive action is stale for the active plan/epoch".to_owned(),
+            ));
+        }
+        let durable_action = self
+            .state
+            .action_record(&action.action_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(
+                    "approval request requires durable pre-dispatch action authorization"
+                        .to_owned(),
+                )
+            })?;
+        if durable_action.state != ActionState::Authorized.as_str()
+            || durable_action.payload_digest != action.payload_digest()
+            || durable_action.policy_digest != action.policy_digest
+            || durable_action.execution_epoch != action.execution_epoch
+        {
+            return Err(ControllerError::NotReady(
+                "durable pre-dispatch action authorization does not match approval request"
+                    .to_owned(),
+            ));
+        }
+        let expires_at_ms = action
+            .expires_at_ms
+            .min(now_ms.saturating_add(self.approval_max_ttl_ms()?));
+        if expires_at_ms <= now_ms {
+            return Err(ControllerError::NotReady(
+                "approval-sensitive action expires before a request can be issued".to_owned(),
+            ));
+        }
+        let request_seed = sha256_prefixed(
+            format!(
+                "approval-request\0{}\0{}\0{}",
+                action.action_id,
+                action.payload_digest(),
+                action.execution_epoch
+            )
+            .as_bytes(),
+        );
+        let request = ApprovalRequestV1 {
+            schema_version: APPROVAL_REQUEST_SCHEMA_VERSION,
+            request_id: format!("approval.{}", digest_fragment(&request_seed, 24)),
+            action_id: action.action_id.clone(),
+            plan_id: action.plan_id.clone(),
+            plan_revision: action.plan_revision,
+            task_id: action.task_id.clone(),
+            permission_class: action.permission_class.as_plan_ir_str().to_owned(),
+            payload_digest: action.payload_digest(),
+            destination_digest: action.destination_digest.clone(),
+            executable_digest: action.executable_digest.clone(),
+            policy_digest: action.policy_digest.clone(),
+            execution_epoch: action.execution_epoch,
+            nonce: action.nonce.clone(),
+            requested_at_ms: now_ms,
+            action_expires_at_ms: action.expires_at_ms,
+            expires_at_ms,
+            status: ApprovalRequestStatusV1::Pending,
+            decided_by: None,
+            decided_at_ms: None,
+            claim_id: None,
+        };
+        if let Some(raw) = self
+            .state
+            .get_state(APPROVAL_REQUEST_NAMESPACE, &request.request_id)?
+        {
+            let existing: ApprovalRequestV1 = serde_json::from_str(&raw)?;
+            self.validate_current_approval_request(&existing)?;
+            if existing.action_id == request.action_id
+                && existing.plan_id == request.plan_id
+                && existing.plan_revision == request.plan_revision
+                && existing.task_id == request.task_id
+                && existing.permission_class == request.permission_class
+                && existing.payload_digest == request.payload_digest
+                && existing.destination_digest == request.destination_digest
+                && existing.executable_digest == request.executable_digest
+                && existing.policy_digest == request.policy_digest
+                && existing.execution_epoch == request.execution_epoch
+                && existing.nonce == request.nonce
+                && existing.action_expires_at_ms == request.action_expires_at_ms
+            {
+                return Ok(existing);
+            }
+            return Err(ControllerError::NotReady(
+                "approval request identity collision or stale binding".to_owned(),
+            ));
+        }
+        let records = [(
+            APPROVAL_REQUEST_NAMESPACE.to_owned(),
+            request.request_id.clone(),
+            serde_json::to_string(&request)?,
+        )];
+        let post_image_digests = state_record_post_image_digests(&records);
+        self.persist_runtime_records_with_events(
+            &records,
+            &[(
+                "approval_request_pending".to_owned(),
+                request.request_id.clone(),
+                json!({
+                    "request_id": request.request_id,
+                    "action_id": request.action_id,
+                    "plan_id": request.plan_id,
+                    "plan_revision": request.plan_revision,
+                    "task_id": request.task_id,
+                    "permission_class": request.permission_class,
+                    "payload_digest": request.payload_digest,
+                    "executable_digest": request.executable_digest,
+                    "destination_digest": request.destination_digest,
+                    "policy_digest": request.policy_digest,
+                    "execution_epoch": request.execution_epoch,
+                    "action_expires_at_ms": request.action_expires_at_ms,
+                    "expires_at_ms": request.expires_at_ms,
+                    "post_image_digests": post_image_digests,
+                }),
+            )],
+        )?;
+        self.checkpoint_now()?;
+        Ok(request)
+    }
+
+    fn validate_current_approval_request(
+        &self,
+        request: &ApprovalRequestV1,
+    ) -> Result<(), ControllerError> {
+        if request.schema_version != APPROVAL_REQUEST_SCHEMA_VERSION
+            || request.request_id.trim().is_empty()
+            || request.action_id.trim().is_empty()
+            || request.task_id.trim().is_empty()
+            || request.nonce.trim().is_empty()
+            || request.requested_at_ms < 0
+            || request.action_expires_at_ms <= request.requested_at_ms
+            || request.expires_at_ms <= request.requested_at_ms
+            || request.expires_at_ms > request.action_expires_at_ms
+            || !request.payload_digest.starts_with("sha256:")
+            || !request.executable_digest.starts_with("sha256:")
+            || !request.policy_digest.starts_with("sha256:")
+            || request
+                .destination_digest
+                .as_ref()
+                .is_some_and(|digest| !digest.starts_with("sha256:"))
+        {
+            return Err(ControllerError::InvalidPlan(
+                "durable approval request is malformed".to_owned(),
+            ));
+        }
+        let permission =
+            Capability::from_plan_ir_str(&request.permission_class).ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "approval request has unknown permission class".to_owned(),
+                )
+            })?;
+        let active = self.active_ref()?;
+        if request.plan_id != active.plan_id
+            || request.plan_revision != active.revision
+            || request.policy_digest != active.policy_digest
+            || request.execution_epoch != self.state.current_execution_epoch()?
+            || !self.approval_required_for_task_permission(&request.task_id, permission)?
+        {
+            return Err(ControllerError::NotReady(
+                "approval request is stale for the current active authority".to_owned(),
+            ));
+        }
+        let max_expiry = request
+            .requested_at_ms
+            .saturating_add(self.approval_max_ttl_ms()?);
+        if request.expires_at_ms > max_expiry {
+            return Err(ControllerError::InvalidPlan(
+                "approval request exceeds active Plan IR TTL ceiling".to_owned(),
+            ));
+        }
+        let action = self
+            .state
+            .action_record(&request.action_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady("approval action record is missing".to_owned())
+            })?;
+        if action.state != ActionState::Authorized.as_str()
+            || action.payload_digest != request.payload_digest
+            || action.policy_digest != request.policy_digest
+            || action.execution_epoch != request.execution_epoch
+        {
+            return Err(ControllerError::NotReady(
+                "approval request no longer matches durable pre-dispatch authorization".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn approval_bound_action_expiry(
+        &self,
+        action_id: &str,
+        fallback_expires_at_ms: i64,
+    ) -> Result<i64, ControllerError> {
+        let active = self.active_ref()?;
+        let execution_epoch = self.state.current_execution_epoch()?;
+        let matching = self
+            .state
+            .state_records(APPROVAL_REQUEST_NAMESPACE)?
+            .into_iter()
+            .map(|record| serde_json::from_str::<ApprovalRequestV1>(&record.value_json))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|request| {
+                request.action_id == action_id
+                    && request.plan_id == active.plan_id
+                    && request.plan_revision == active.revision
+                    && request.execution_epoch == execution_epoch
+            })
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [] => Ok(fallback_expires_at_ms),
+            [request] => Ok(request.action_expires_at_ms),
+            _ => Err(ControllerError::InvalidPlan(format!(
+                "action {action_id} has multiple current approval requests"
+            ))),
+        }
     }
 
     /// Durably records a natural-language goal intent without bypassing the `PlanCompiler`.
@@ -4565,6 +5216,9 @@ impl Controller {
         let action_id = heavy_build_action_id(&lease.resource_lease.lease_id);
         let now_ms = unix_millis()?;
         let timeout_i64 = i64::try_from(command.timeout_ms).unwrap_or(i64::MAX);
+        let fallback_expires_at_ms = now_ms.saturating_add(timeout_i64).saturating_add(60_000);
+        let expires_at_ms =
+            self.approval_bound_action_expiry(&action_id, fallback_expires_at_ms)?;
         let action = AuthorizedAction {
             action_id: action_id.clone(),
             plan_id: lease.plan_id.clone(),
@@ -4583,16 +5237,14 @@ impl Controller {
             permission_decision_digest: permission_decision.digest(),
             isolation_policy_digest,
             nonce: format!("nonce.{action_id}"),
-            expires_at_ms: now_ms.saturating_add(timeout_i64).saturating_add(60_000),
+            expires_at_ms,
             command,
             individually_authorized_environment: BTreeSet::new(),
-            reconciliation_mode: ReconciliationMode::UnsafeSideEffect,
+            approval_required: self
+                .approval_required_for_task_permission(&lease.task_id, permission_class)?,
+            reconciliation_mode: Self::reconciliation_mode_for_manifest(tool_manifest)?,
         };
-        {
-            let mut journal = ActionJournal::new(&mut self.state);
-            journal.authorize(&action, tool_manifest, &permission_decision)?;
-        }
-        self.checkpoint_now()?;
+        self.prepare_action_for_dispatch(&action, tool_manifest, &permission_decision)?;
         Ok(action)
     }
 
@@ -4634,6 +5286,7 @@ impl Controller {
             tool_manifest,
         ) {
             Ok(action) => action,
+            Err(error @ ControllerError::AwaitingApproval { .. }) => return Err(error),
             Err(error) => {
                 // No ProcessRunner dispatch has happened yet. Retire the exact logical heavy lease
                 // so a malformed/permanently denied command cannot strand BUILD_HEAVY in-session.
@@ -4902,7 +5555,93 @@ impl Controller {
         secret_ref_id: &str,
         command: CommandSpec,
     ) -> Result<RawToolResult, ControllerError> {
-        let result = self.execute_secret_process_inner(&mut lease, runtime, secret_ref_id, command);
+        let result = self.execute_secret_process_inner(
+            &mut lease,
+            runtime,
+            secret_ref_id,
+            command,
+            None,
+            None,
+        );
+        let cleanup = self.cancel_ready_lease(lease);
+        match (result, cleanup) {
+            (Ok(raw), Ok(())) => Ok(raw),
+            (_, Err(error)) | (Err(error), Ok(())) => Err(error),
+        }
+    }
+
+    /// Resumes one approval-gated secret process from its exact already-authorized action without
+    /// creating a new attempt/action identity or resolving secret material before approval.
+    ///
+    /// The caller must resupply the same safe secret handle and command candidate. They are not
+    /// authority: Controller re-derives the exact action and the durable authorization/approval
+    /// records must match its complete payload before the secret broker is touched or a process is
+    /// dispatched.
+    ///
+    /// # Errors
+    /// Fails closed unless the request is still approved/current, exactly one original executing
+    /// attempt exists for the task, the re-derived action identity/payload still matches durable
+    /// authorization, and all ordinary secret/process permission and cleanup guards pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume_approved_secret_process<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        action_id: &str,
+        runtime: &SecretProcessRuntime<'_, I>,
+        readiness: ReadinessInputs<'_>,
+        secret_ref_id: &str,
+        command: CommandSpec,
+    ) -> Result<RawToolResult, ControllerError> {
+        let matching_requests = self
+            .state
+            .state_records(APPROVAL_REQUEST_NAMESPACE)?
+            .into_iter()
+            .map(|record| serde_json::from_str::<ApprovalRequestV1>(&record.value_json))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|request| request.action_id == action_id)
+            .collect::<Vec<_>>();
+        let [request] = matching_requests.as_slice() else {
+            return Err(ControllerError::NotReady(
+                "approval-gated secret action must have exactly one durable request".to_owned(),
+            ));
+        };
+        self.validate_current_approval_request(request)?;
+        if request.status != ApprovalRequestStatusV1::Approved {
+            return Err(ControllerError::NotReady(
+                "secret action approval request is not approved".to_owned(),
+            ));
+        }
+        let attempt_ids = self
+            .active_ref()?
+            .attempts
+            .values()
+            .filter(|attempt| {
+                attempt.task_id == request.task_id && attempt.state == AttemptState::Executing
+            })
+            .map(|attempt| attempt.attempt_id.clone())
+            .collect::<Vec<_>>();
+        let [attempt_id] = attempt_ids.as_slice() else {
+            return Err(ControllerError::NotReady(
+                "approval-gated secret action must retain exactly one original executing attempt"
+                    .to_owned(),
+            ));
+        };
+        let mut lease = self.derive_ready_lease_for_state(
+            runtime.registry,
+            &request.task_id,
+            readiness,
+            TaskState::Running,
+            runtime.tool_manifest,
+            false,
+        )?;
+        let result = self.execute_secret_process_inner(
+            &mut lease,
+            runtime,
+            secret_ref_id,
+            command,
+            Some(attempt_id),
+            Some(action_id),
+        );
         let cleanup = self.cancel_ready_lease(lease);
         match (result, cleanup) {
             (Ok(raw), Ok(())) => Ok(raw),
@@ -4917,6 +5656,8 @@ impl Controller {
         runtime: &SecretProcessRuntime<'_, I>,
         secret_ref_id: &str,
         command: CommandSpec,
+        existing_attempt_id: Option<&str>,
+        expected_action_id: Option<&str>,
     ) -> Result<RawToolResult, ControllerError> {
         self.validate_ready_lease(lease, runtime.registry, runtime.tool_manifest)?;
         let secret_ref = self.task_secret_ref(&lease.task_id, secret_ref_id)?;
@@ -4962,7 +5703,10 @@ impl Controller {
             &execution_root,
             &permission_decision,
         )?;
-        let attempt_id = self.start_attempt(lease, runtime.registry)?;
+        let attempt_id = existing_attempt_id.map_or_else(
+            || self.start_attempt(lease, runtime.registry),
+            |attempt_id| Ok(attempt_id.to_owned()),
+        )?;
         let action = self.lower_secret_process_action(
             lease,
             &attempt_id,
@@ -4974,6 +5718,13 @@ impl Controller {
             &execution_root,
             &permission_decision,
         )?;
+        if expected_action_id.is_some_and(|expected| action.action_id != expected) {
+            return Err(ControllerError::NotReady(
+                "resumed secret action no longer re-derives the approved exact action identity"
+                    .to_owned(),
+            ));
+        }
+        self.prepare_action_for_dispatch(&action, runtime.tool_manifest, &permission_decision)?;
         let secret_scope = SecretScope {
             plan_id: action.plan_id.clone(),
             plan_revision: action.plan_revision,
@@ -5037,30 +5788,6 @@ impl Controller {
             result_digest: None,
         };
 
-        let authorization = {
-            let mut journal = ActionJournal::new(&mut self.state);
-            journal.authorize(&action, runtime.tool_manifest, &permission_decision)
-        };
-        if let Err(error) = authorization {
-            secret_lease.close(&secret_scope)?;
-            let failure = self.build_failure_record(FailureRecordInput {
-                task_id: lease.task_id.clone(),
-                attempt_id: attempt_id.clone(),
-                action_id: Some(action.action_id.clone()),
-                result_digest: None,
-                exit_code: None,
-                category: "tool_authorization_failure".to_owned(),
-                failure_code: tool_error_code(&error).to_owned(),
-                diagnostic: error.to_string(),
-                failed_action_facts: BTreeMap::from([(
-                    "action_id".to_owned(),
-                    action.action_id.clone(),
-                )]),
-                evidence_refs: vec![format!("action:{}", action.action_id)],
-            })?;
-            let _ = self.route_failure_record(failure)?;
-            return Err(ControllerError::Tool(error));
-        }
         if let Err(error) = self.persist_secret_action_lifecycle(&secret_lifecycle) {
             secret_lease.close(&secret_scope)?;
             return Err(error);
@@ -5233,6 +5960,9 @@ impl Controller {
         let action_id = format!("action.{}", &action_seed[7..27]);
         let now_ms = unix_millis()?;
         let timeout_i64 = i64::try_from(command.timeout_ms).unwrap_or(i64::MAX);
+        let fallback_expires_at_ms = now_ms.saturating_add(timeout_i64).saturating_add(60_000);
+        let expires_at_ms =
+            self.approval_bound_action_expiry(&action_id, fallback_expires_at_ms)?;
         Ok(AuthorizedAction {
             action_id,
             plan_id: active.plan_id.clone(),
@@ -5254,10 +5984,12 @@ impl Controller {
             permission_decision_digest: permission_decision.digest(),
             isolation_policy_digest: isolation_request.digest()?,
             nonce: format!("nonce.{}", &action_seed[27..47]),
-            expires_at_ms: now_ms.saturating_add(timeout_i64).saturating_add(60_000),
+            expires_at_ms,
             command,
             individually_authorized_environment: BTreeSet::new(),
-            reconciliation_mode: ReconciliationMode::UnsafeSideEffect,
+            approval_required: self
+                .approval_required_for_task_permission(&lease.task_id, permission_class)?,
+            reconciliation_mode: Self::reconciliation_mode_for_manifest(tool_manifest)?,
         })
     }
 
@@ -5770,6 +6502,84 @@ impl Controller {
         }
     }
 
+    /// Resumes one approval-gated replacement from its exact already-authorized action without
+    /// another model call or a new attempt/action identity.
+    ///
+    /// # Errors
+    /// Fails closed unless the action is still `authorized`, the original attempt is still the
+    /// current running attempt under the same plan/revision/epoch, the durable action intent still
+    /// matches current repository truth, and an exact non-expired approval claim is present.
+    pub fn resume_approved_replace<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        action_id: &str,
+        runtime: &ExecutionRuntime<'_, I>,
+        readiness: ReadinessInputs<'_>,
+    ) -> Result<ExecutionSuccess, ControllerError> {
+        let raw = self
+            .state
+            .get_state("controller.action_intent", action_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "approval-gated action intent {action_id} is missing"
+                ))
+            })?;
+        let raw_intent: PersistedActionIntent = serde_json::from_str(&raw)?;
+        let repository_root = runtime
+            .registry
+            .repository(&raw_intent.repository_id)
+            .ok_or_else(|| {
+                ControllerError::NotReady("approval-gated action repository is missing".to_owned())
+            })?
+            .root
+            .clone();
+        let intent = normalize_persisted_action_intent(raw_intent, &repository_root)?;
+        let prior = self.state.action_record(action_id)?.ok_or_else(|| {
+            ControllerError::NotReady("approval-gated action record is missing".to_owned())
+        })?;
+        if prior.state != ActionState::Authorized.as_str()
+            || intent.action_id != prior.action_id
+            || intent.payload_digest != prior.payload_digest
+            || intent.policy_digest != prior.policy_digest
+            || intent.execution_epoch != prior.execution_epoch
+            || intent.execution_epoch != self.state.current_execution_epoch()?
+        {
+            return Err(ControllerError::NotReady(
+                "approval-gated action no longer matches exact current authorization".to_owned(),
+            ));
+        }
+        let (task_state, attempt_state) = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&intent.task_id).ok_or_else(|| {
+                ControllerError::NotReady("approval-gated task disappeared".to_owned())
+            })?;
+            let attempt = active.attempts.get(&intent.attempt_id).ok_or_else(|| {
+                ControllerError::NotReady("approval-gated attempt disappeared".to_owned())
+            })?;
+            (task.state, attempt.state)
+        };
+        if task_state != TaskState::Running || attempt_state != AttemptState::Executing {
+            return Err(ControllerError::NotReady(
+                "approval-gated action is not attached to the original running attempt".to_owned(),
+            ));
+        }
+        let validated = self.validate_recovered_action_intent(&intent, runtime.registry)?;
+        let mut lease = self.derive_ready_lease_for_state(
+            runtime.registry,
+            &intent.task_id,
+            readiness,
+            TaskState::Running,
+            runtime.tool_manifest,
+            false,
+        )?;
+        let result =
+            self.execute_validated_replace(&mut lease, runtime, &intent.attempt_id, &validated);
+        let cleanup = self.unload_model_for_ready_lease(&mut lease, runtime.backend);
+        match (result, cleanup) {
+            (Ok(success), Ok(())) => Ok(success),
+            (_, Err(error)) | (Err(error), Ok(())) => Err(error),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn execute_replace_inner<I: sovereign_policy::ExecutionIsolationBackend>(
         &mut self,
@@ -5889,11 +6699,7 @@ impl Controller {
             &execution_root,
         )?;
         self.persist_action_intent(&action, validated, runtime.artifacts.root())?;
-        {
-            let mut journal = ActionJournal::new(&mut self.state);
-            journal.authorize(&action, runtime.tool_manifest, &permission_decision)?;
-        }
-        self.checkpoint_now()?;
+        self.prepare_action_for_dispatch(&action, runtime.tool_manifest, &permission_decision)?;
         self.rebind_ready_checkpoint(lease)?;
         self.validate_ready_lease(lease, runtime.registry, runtime.tool_manifest)?;
         let runner = ProcessRunner::new(runtime.command_policy, runtime.isolation_backend);
@@ -7173,8 +7979,12 @@ impl Controller {
             "attempt": attempt_id,
             "proposal": validated.proposal,
         }))?;
+        let action_id = format!("action.{}", &action_seed[7..27]);
+        let fallback_expires_at_ms = unix_millis()?.saturating_add(60_000);
+        let expires_at_ms =
+            self.approval_bound_action_expiry(&action_id, fallback_expires_at_ms)?;
         Ok(AuthorizedAction {
-            action_id: format!("action.{}", &action_seed[7..27]),
+            action_id,
             plan_id: active.plan_id.clone(),
             plan_revision: active.revision,
             task_id: lease.task_id.clone(),
@@ -7191,10 +8001,14 @@ impl Controller {
             permission_decision_digest: lease.permission_decision.digest(),
             isolation_policy_digest: isolation_request.digest()?,
             nonce: format!("nonce.{}", &action_seed[27..47]),
-            expires_at_ms: unix_millis()?.saturating_add(60_000),
+            expires_at_ms,
             command,
             individually_authorized_environment: BTreeSet::new(),
-            reconciliation_mode: ReconciliationMode::UnsafeSideEffect,
+            approval_required: self.approval_required_for_task_permission(
+                &lease.task_id,
+                PermissionClass::RepositoryWrite,
+            )?,
+            reconciliation_mode: Self::reconciliation_mode_for_manifest(runtime.tool_manifest)?,
         })
     }
 
@@ -8662,6 +9476,7 @@ impl Controller {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn checkpoint_manifest(&self) -> Result<CheckpointManifest, ControllerError> {
         let active = self.active_ref()?;
         let task_records = active
@@ -8686,6 +9501,9 @@ impl Controller {
             "controller.repair_packet",
             "controller.change_set",
             "controller.worktree_conflict",
+            APPROVAL_REQUEST_NAMESPACE,
+            APPROVAL_CLAIM_NAMESPACE,
+            ACTION_RECONCILIATION_NAMESPACE,
             TASK_CAPABILITY_GRANT_NAMESPACE,
             RESOURCE_PRESSURE_NAMESPACE,
             RESOURCE_LEASE_NAMESPACE,
@@ -8701,6 +9519,18 @@ impl Controller {
                         serde_json::from_str(&record.value_json)?;
                     marker.validate()?;
                     marker.plan_id == active.plan_id && marker.plan_revision == active.revision
+                } else if matches!(
+                    namespace,
+                    APPROVAL_REQUEST_NAMESPACE
+                        | APPROVAL_CLAIM_NAMESPACE
+                        | ACTION_RECONCILIATION_NAMESPACE
+                ) {
+                    authority_record_matches_plan_revision(
+                        namespace,
+                        &record.value_json,
+                        &active.plan_id,
+                        active.revision,
+                    )?
                 } else {
                     key_belongs_to_revision(&record.key, &active.plan_id, active.revision)
                 };
@@ -9930,6 +10760,11 @@ impl RecoveryManager {
             recovery_plan_id,
             recovery_revision,
         )?;
+        validate_post_checkpoint_action_authority_correlation(
+            &state,
+            &manifest,
+            trusted_checkpoint.action_sequence,
+        )?;
         let replayed_events = if supersession.is_some() {
             let replayed = state
                 .journal_after(trusted_checkpoint.action_sequence)?
@@ -10175,6 +11010,8 @@ fn validate_checkpoint_immutable_bindings(
                 | "controller.repair_packet"
                 | "controller.change_set"
                 | "controller.worktree_conflict"
+                | APPROVAL_CLAIM_NAMESPACE
+                | ACTION_RECONCILIATION_NAMESPACE
         ) {
             continue;
         }
@@ -10683,6 +11520,106 @@ fn validate_post_checkpoint_resource_correlation(
     if replayed != current {
         return Err(ControllerError::InvalidPlan(
             "current resource state does not equal checkpoint plus ordered resource-journal replay"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_post_checkpoint_action_authority_correlation(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+) -> Result<(), ControllerError> {
+    let namespaces = [
+        APPROVAL_REQUEST_NAMESPACE,
+        APPROVAL_CLAIM_NAMESPACE,
+        ACTION_RECONCILIATION_NAMESPACE,
+    ];
+    let mut replayed = manifest
+        .evidence_binding_digests
+        .iter()
+        .filter(|(binding_key, _)| {
+            namespaces
+                .iter()
+                .any(|namespace| binding_key.starts_with(&format!("{namespace}:")))
+        })
+        .map(|(binding_key, digest)| (binding_key.clone(), digest.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    for event in state.journal_after(checkpoint_sequence)? {
+        if event.entity_type != "controller"
+            || !matches!(
+                event.event_kind.as_str(),
+                "approval_request_pending"
+                    | "approval_claim_issued"
+                    | "approval_request_denied"
+                    | "action_reconciliation_bound"
+            )
+        {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        if required_str(&payload, "/plan_id")? != manifest.plan_id
+            || required_u32(&payload, "/plan_revision")? != manifest.plan_revision
+        {
+            continue;
+        }
+        let post_images = payload
+            .get("post_image_digests")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "post-checkpoint approval/reconciliation event is missing exact post-image digests"
+                        .to_owned(),
+                )
+            })?;
+        if post_images.is_empty() {
+            return Err(ControllerError::InvalidPlan(
+                "post-checkpoint approval/reconciliation event has an empty post-image digest map"
+                    .to_owned(),
+            ));
+        }
+        for (binding_key, digest) in post_images {
+            if namespaces
+                .iter()
+                .any(|namespace| binding_key.starts_with(&format!("{namespace}:")))
+            {
+                replayed.insert(
+                    binding_key.clone(),
+                    digest
+                        .as_str()
+                        .ok_or_else(|| {
+                            ControllerError::InvalidPlan(
+                                "approval/reconciliation post-image digest must be a string"
+                                    .to_owned(),
+                            )
+                        })?
+                        .to_owned(),
+                );
+            }
+        }
+    }
+
+    let mut current = BTreeMap::new();
+    for namespace in namespaces {
+        for record in state.state_records(namespace)? {
+            if authority_record_matches_plan_revision(
+                namespace,
+                &record.value_json,
+                &manifest.plan_id,
+                manifest.plan_revision,
+            )? {
+                current.insert(
+                    format!("{}:{}", record.namespace, record.key),
+                    sha256_prefixed(record.value_json.as_bytes()),
+                );
+            }
+        }
+    }
+    if replayed != current {
+        return Err(ControllerError::InvalidPlan(
+            "current approval/reconciliation authority does not equal checkpoint plus journal replay"
                 .to_owned(),
         ));
     }
@@ -11259,6 +12196,39 @@ fn reconcile_recovery_actions(
             unknown.push(record.action_id);
             continue;
         }
+        let Some(raw_reconciliation) =
+            state.get_state(ACTION_RECONCILIATION_NAMESPACE, &record.action_id)?
+        else {
+            unknown.push(record.action_id);
+            continue;
+        };
+        let reconciliation_key = format!("{ACTION_RECONCILIATION_NAMESPACE}:{}", record.action_id);
+        if manifest
+            .evidence_binding_digests
+            .get(&reconciliation_key)
+            .is_none_or(|digest| *digest != sha256_prefixed(raw_reconciliation.as_bytes()))
+        {
+            unknown.push(record.action_id);
+            continue;
+        }
+        let reconciliation: PersistedActionReconciliationBindingV1 =
+            serde_json::from_str(&raw_reconciliation)?;
+        reconciliation.policy.validate()?;
+        if reconciliation.schema_version != ACTION_RECONCILIATION_SCHEMA_VERSION
+            || reconciliation.action_id != record.action_id
+            || reconciliation.payload_digest != record.payload_digest
+            || reconciliation.policy_digest != record.policy_digest
+            || reconciliation.execution_epoch != record.execution_epoch
+        {
+            unknown.push(record.action_id);
+            continue;
+        }
+        if reconciliation.policy.class == ReconciliationClass::ConsequentialExternal {
+            // An external/consequential adapter needs adapter-specific effect evidence. Local file
+            // coincidence is never proof that the remote side effect did or did not happen.
+            unknown.push(record.action_id);
+            continue;
+        }
         let Some(raw_intent) = state.get_state("controller.action_intent", &record.action_id)?
         else {
             unknown.push(record.action_id);
@@ -11285,6 +12255,9 @@ fn reconcile_recovery_actions(
         if intent.action_id != record.action_id
             || intent.payload_digest != record.payload_digest
             || intent.policy_digest != record.policy_digest
+            || intent.plan_id != reconciliation.plan_id
+            || intent.plan_revision != reconciliation.plan_revision
+            || intent.task_id != reconciliation.task_id
         {
             unknown.push(record.action_id);
             continue;
@@ -11978,6 +12951,7 @@ fn controller_failure_code(error: &ControllerError) -> &'static str {
         ControllerError::Io(_) => "io_error",
         ControllerError::InvalidPlan(_) => "invalid_plan",
         ControllerError::NotReady(_) => "not_ready",
+        ControllerError::AwaitingApproval { .. } => "awaiting_approval",
         ControllerError::ExecutionFailed(_) => "execution_failed",
         ControllerError::VerificationFailed(_) => "verification_failed",
         ControllerError::UnknownAction(_) => "unknown_action",
@@ -12454,6 +13428,43 @@ fn revision_scoped_key(plan_id: &str, revision: u32, logical_key: &str) -> Strin
         logical_key.to_owned()
     } else {
         format!("{plan_id}@r{revision}:{logical_key}")
+    }
+}
+
+fn state_record_post_image_digests(
+    records: &[(String, String, String)],
+) -> BTreeMap<String, String> {
+    records
+        .iter()
+        .map(|(namespace, key, value_json)| {
+            (
+                format!("{namespace}:{key}"),
+                sha256_prefixed(value_json.as_bytes()),
+            )
+        })
+        .collect()
+}
+
+fn authority_record_matches_plan_revision(
+    namespace: &str,
+    value_json: &str,
+    plan_id: &str,
+    plan_revision: u32,
+) -> Result<bool, ControllerError> {
+    match namespace {
+        APPROVAL_REQUEST_NAMESPACE => {
+            let request: ApprovalRequestV1 = serde_json::from_str(value_json)?;
+            Ok(request.plan_id == plan_id && request.plan_revision == plan_revision)
+        }
+        APPROVAL_CLAIM_NAMESPACE => {
+            let claim: ApprovalClaim = serde_json::from_str(value_json)?;
+            Ok(claim.plan_id == plan_id && claim.plan_revision == plan_revision)
+        }
+        ACTION_RECONCILIATION_NAMESPACE => {
+            let binding: PersistedActionReconciliationBindingV1 = serde_json::from_str(value_json)?;
+            Ok(binding.plan_id == plan_id && binding.plan_revision == plan_revision)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -13884,7 +14895,8 @@ fn unix_millis() -> Result<i64, ControllerError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTION_INTENT_SCHEMA_VERSION, ActivePlan, Controller, ExactRequirementProbe,
+        ACTION_INTENT_SCHEMA_VERSION, APPROVAL_REQUEST_NAMESPACE, ActivePlan, ApprovalDecisionV1,
+        ApprovalRequestStatusV1, Controller, ControllerError, ExactRequirementProbe,
         FailureClassification, FailureClassificationKind, LEGACY_ACTION_INTENT_SCHEMA_VERSION,
         PlanValidity, ReadyLease, RecoveryProcessLease, ResourceResidencyStateV1,
         ResourceResidencyV1, TaskCarryExecutionProvenanceV1, TaskCarryFingerprintV1, TaskRuntime,
@@ -13908,14 +14920,19 @@ mod tests {
     use sovereign_policy::{
         AdmissionStatus, CapabilityLayers, CapabilitySet, CommandMode, CommandRisk, CommandSpec,
         ConditionalLeaseContextV1, HeavyLeaseClass, OsMemoryPressure, PermissionDecision,
-        PlanHeavyLeaseClass, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ResourceLeaseOwnerV1,
-        ResourceLeaseRequestV1, ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
+        PlanHeavyLeaseClass, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ReconciliationPolicy,
+        ResourceLeaseOwnerV1, ResourceLeaseRequestV1, ResourcePressureSnapshotV1,
+        TaskResourceBudgetV1, ThermalPressure,
     };
     use sovereign_repo::{
         ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot, WorktreeLease,
     };
     use sovereign_state::StateStore;
-    use std::collections::BTreeMap;
+    use sovereign_tools::{
+        APPROVAL_CLAIM_NAMESPACE, ApprovalClaim, AuthorizedAction, PermissionClass,
+        ReconciliationMode, ToolManifest,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -14286,6 +15303,310 @@ mod tests {
             "changed compilation input source digest must block carry"
         );
         drop(state);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn reconciliation_external_side_effect_fixture(
+        label: &str,
+    ) -> (
+        PathBuf,
+        Controller,
+        AuthorizedAction,
+        ToolManifest,
+        PermissionDecision,
+    ) {
+        let (base, state) = temp_state(label);
+        let plan_digest = format!("sha256:{}", "a".repeat(64));
+        let mut active = active_fixture(&base, 1, &plan_digest);
+        active.plan_document = json!({
+            "policy": {
+                "approval": {
+                    "exact_action_binding": true,
+                    "reapprove_on_payload_change": true,
+                    "max_ttl_seconds": 30,
+                    "required_permissions": ["external_side_effect"]
+                }
+            }
+        });
+        let task = json!({
+            "task_id": "task.reconciliation",
+            "action_policy": {
+                "approval_required_permissions": []
+            }
+        });
+        let runtime = fresh_task_runtime(&task)
+            .unwrap_or_else(|error| panic!("reconciliation task runtime: {error}"));
+        let task_contract_digest = runtime.task_contract_digest.clone();
+        let policy_digest = active.policy_digest.clone();
+        active
+            .tasks
+            .insert("task.reconciliation".to_owned(), runtime);
+
+        let mut controller = Controller::new(state);
+        controller.active = Some(active);
+        let execution_epoch = controller
+            .state
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("reconciliation execution epoch: {error}"));
+        let exact_capability = CapabilitySet::new([PermissionClass::ExternalSideEffect]);
+        let permission_decision = PermissionDecision::new(
+            "plan.fixture",
+            1,
+            "task.reconciliation",
+            task_contract_digest,
+            policy_digest.clone(),
+            "tool.reconciliation.external",
+            "1.0.0",
+            format!("sha256:{}", "b".repeat(64)),
+            CapabilityLayers {
+                global: exact_capability.clone(),
+                project: exact_capability.clone(),
+                task: exact_capability.clone(),
+                role: exact_capability.clone(),
+                tool: exact_capability.clone(),
+                user: exact_capability,
+            },
+        )
+        .unwrap_or_else(|error| panic!("reconciliation permission decision: {error}"));
+        let manifest = ToolManifest {
+            tool_id: "tool.reconciliation.external".to_owned(),
+            version: "1.0.0".to_owned(),
+            content_digest: format!("sha256:{}", "b".repeat(64)),
+            permission_ceiling: BTreeSet::from([PermissionClass::ExternalSideEffect]),
+            declared_risk_floor: CommandRisk::ReadOnly,
+            reconciliation_policy: ReconciliationPolicy::consequential_external(),
+        };
+        let now_ms = super::unix_millis()
+            .unwrap_or_else(|error| panic!("reconciliation fixture clock: {error}"));
+        let action = AuthorizedAction {
+            action_id: format!("action.reconciliation.{label}"),
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            task_id: "task.reconciliation".to_owned(),
+            attempt_id: format!("attempt.reconciliation.{label}"),
+            tool_id: manifest.tool_id.clone(),
+            tool_version: manifest.version.clone(),
+            tool_digest: manifest.content_digest.clone(),
+            executable_digest: format!("sha256:{}", "c".repeat(64)),
+            repository_id: "repo.app".to_owned(),
+            destination_digest: Some(format!("sha256:{}", "d".repeat(64))),
+            permission_class: PermissionClass::ExternalSideEffect,
+            execution_epoch,
+            policy_digest,
+            permission_decision_digest: permission_decision.digest(),
+            isolation_policy_digest: format!("sha256:{}", "e".repeat(64)),
+            nonce: format!("nonce.reconciliation.{label}"),
+            expires_at_ms: now_ms.saturating_add(300_000),
+            command: CommandSpec {
+                executable: PathBuf::from("/usr/bin/true"),
+                args: vec!["external-side-effect-fixture".to_owned()],
+                working_directory: base.clone(),
+                environment: BTreeMap::new(),
+                mode: CommandMode::Direct,
+                declared_risk: CommandRisk::ReadOnly,
+                timeout_ms: 1_000,
+                output_limit_bytes: 1_024,
+                disk_write_limit_bytes: 0,
+                subprocess_limit: 0,
+            },
+            individually_authorized_environment: BTreeSet::new(),
+            approval_required: true,
+            reconciliation_mode: ReconciliationMode::ConsequentialExternal,
+        };
+        (base, controller, action, manifest, permission_decision)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reconciliation_external_side_effect_approval_is_exact_durable_and_epoch_bound() {
+        let (base, mut controller, action, manifest, permission_decision) =
+            reconciliation_external_side_effect_fixture("approval-exact");
+        let action_expires_at_ms = action.expires_at_ms;
+        let (action_id, request_id) = match controller.prepare_action_for_dispatch(
+            &action,
+            &manifest,
+            &permission_decision,
+        ) {
+            Err(ControllerError::AwaitingApproval {
+                action_id,
+                request_id,
+            }) => (action_id, request_id),
+            other => panic!("external action must await exact approval, got {other:?}"),
+        };
+        assert_eq!(action_id, action.action_id);
+
+        let pending_raw = controller
+            .state
+            .get_state(APPROVAL_REQUEST_NAMESPACE, &request_id)
+            .unwrap_or_else(|error| panic!("read pending approval request: {error}"))
+            .unwrap_or_else(|| panic!("pending approval request missing"));
+        let pending: super::ApprovalRequestV1 = serde_json::from_str(&pending_raw)
+            .unwrap_or_else(|error| panic!("decode pending approval request: {error}"));
+        assert_eq!(pending.status, ApprovalRequestStatusV1::Pending);
+        assert_eq!(pending.action_id, action.action_id);
+        assert_eq!(pending.permission_class, "external_side_effect");
+        assert_eq!(pending.payload_digest, action.payload_digest());
+        assert_eq!(pending.action_expires_at_ms, action_expires_at_ms);
+        assert!(pending.expires_at_ms < pending.action_expires_at_ms);
+        assert_eq!(
+            pending.expires_at_ms,
+            pending.requested_at_ms.saturating_add(30_000)
+        );
+        let fresh_fallback_expiry = super::unix_millis()
+            .unwrap_or_else(|error| panic!("approved-resume fallback clock: {error}"))
+            .saturating_add(60_000);
+        assert_ne!(fresh_fallback_expiry, action_expires_at_ms);
+        assert_eq!(
+            controller
+                .approval_bound_action_expiry(&action.action_id, fresh_fallback_expiry)
+                .unwrap_or_else(|error| panic!("approval-bound action expiry: {error}")),
+            action_expires_at_ms,
+            "re-lowering after an approval pause must restore the immutable original action expiry"
+        );
+        let status = controller
+            .durable_status()
+            .unwrap_or_else(|error| panic!("durable approval status: {error}"));
+        let status_pending = status
+            .approval_requests
+            .iter()
+            .find(|request| request["request_id"].as_str() == Some(request_id.as_str()))
+            .unwrap_or_else(|| panic!("pending approval absent from durable status"));
+        assert_eq!(status_pending["status"], json!("pending"));
+        assert_eq!(
+            status_pending["action_expires_at_ms"],
+            json!(action_expires_at_ms)
+        );
+
+        let approved = controller
+            .respond_to_approval(
+                &request_id,
+                ApprovalDecisionV1::Approve,
+                "unit-test-operator",
+            )
+            .unwrap_or_else(|error| panic!("approve external action: {error}"));
+        assert_eq!(approved.status, ApprovalRequestStatusV1::Approved);
+        let claim_raw = controller
+            .state
+            .get_state(APPROVAL_CLAIM_NAMESPACE, &action.action_id)
+            .unwrap_or_else(|error| panic!("read durable approval claim: {error}"))
+            .unwrap_or_else(|| panic!("durable approval claim missing"));
+        let claim: ApprovalClaim = serde_json::from_str(&claim_raw)
+            .unwrap_or_else(|error| panic!("decode durable approval claim: {error}"));
+        assert_eq!(approved.claim_id.as_deref(), Some(claim.claim_id.as_str()));
+        assert_eq!(claim.action_id, action.action_id);
+        assert_eq!(claim.payload_digest, action.payload_digest());
+        assert_eq!(claim.permission_class, "external_side_effect");
+        assert_eq!(claim.expires_at_ms, pending.expires_at_ms);
+        action
+            .verify_approval_claim(
+                &claim,
+                super::unix_millis()
+                    .unwrap_or_else(|error| panic!("claim verification clock: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("exact approval claim must validate: {error}"));
+        controller
+            .require_dispatch_approval(&action)
+            .unwrap_or_else(|error| {
+                panic!("approved exact action must pass dispatch gate: {error}")
+            });
+        controller
+            .prepare_action_for_dispatch(&action, &manifest, &permission_decision)
+            .unwrap_or_else(|error| {
+                panic!("approved exact action must resume without a replacement action: {error}")
+            });
+
+        let assert_claim_rejects = |candidate: &AuthorizedAction, label: &str| {
+            let now_ms = super::unix_millis()
+                .unwrap_or_else(|error| panic!("{label} verification clock: {error}"));
+            assert!(
+                candidate.verify_approval_claim(&claim, now_ms).is_err(),
+                "approval claim unexpectedly accepted {label} drift"
+            );
+        };
+        let mut drifted = action.clone();
+        drifted.command.args.push("payload-drift".to_owned());
+        assert_claim_rejects(&drifted, "command payload");
+        let mut drifted = action.clone();
+        drifted.executable_digest = format!("sha256:{}", "1".repeat(64));
+        assert_claim_rejects(&drifted, "executable digest");
+        let mut drifted = action.clone();
+        drifted.destination_digest = Some(format!("sha256:{}", "2".repeat(64)));
+        assert_claim_rejects(&drifted, "destination digest");
+        let mut drifted = action.clone();
+        drifted.policy_digest = format!("sha256:{}", "3".repeat(64));
+        assert_claim_rejects(&drifted, "policy digest");
+        let mut drifted = action.clone();
+        drifted.execution_epoch = drifted.execution_epoch.saturating_add(1);
+        assert_claim_rejects(&drifted, "execution epoch");
+        let mut drifted = action.clone();
+        drifted.nonce.push_str(".drift");
+        assert_claim_rejects(&drifted, "nonce");
+        let mut drifted = action.clone();
+        drifted.expires_at_ms = drifted.expires_at_ms.saturating_add(1);
+        assert_claim_rejects(&drifted, "action expiry");
+        let mut drifted = action.clone();
+        drifted.permission_class = PermissionClass::NetworkWrite;
+        assert_claim_rejects(&drifted, "permission class");
+        let mut drifted = action.clone();
+        drifted.action_id.push_str(".drift");
+        assert_claim_rejects(&drifted, "action id");
+
+        controller
+            .state
+            .advance_execution_epoch()
+            .unwrap_or_else(|error| panic!("advance stale-claim epoch: {error}"));
+        assert!(
+            matches!(
+                controller.require_dispatch_approval(&action),
+                Err(ControllerError::NotReady(_))
+            ),
+            "old-epoch approval must not pass the Controller dispatch gate"
+        );
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn reconciliation_external_side_effect_denial_mints_no_claim_and_cannot_dispatch() {
+        let (base, mut controller, action, manifest, permission_decision) =
+            reconciliation_external_side_effect_fixture("approval-denied");
+        let request_id = match controller.prepare_action_for_dispatch(
+            &action,
+            &manifest,
+            &permission_decision,
+        ) {
+            Err(ControllerError::AwaitingApproval { request_id, .. }) => request_id,
+            other => panic!("external action must await approval before denial, got {other:?}"),
+        };
+        let denied = controller
+            .respond_to_approval(&request_id, ApprovalDecisionV1::Deny, "unit-test-operator")
+            .unwrap_or_else(|error| panic!("deny external action: {error}"));
+        assert_eq!(denied.status, ApprovalRequestStatusV1::Denied);
+        assert_eq!(denied.claim_id, None);
+        assert!(
+            controller
+                .state
+                .get_state(APPROVAL_CLAIM_NAMESPACE, &action.action_id)
+                .unwrap_or_else(|error| panic!("read denied action claim slot: {error}"))
+                .is_none(),
+            "denied action must never mint dispatch authority"
+        );
+        assert!(
+            matches!(
+                controller.require_dispatch_approval(&action),
+                Err(ControllerError::NotReady(_))
+            ),
+            "denied approval must remain non-dispatchable"
+        );
+        let durable_action = controller
+            .state
+            .action_record(&action.action_id)
+            .unwrap_or_else(|error| panic!("read denied durable action: {error}"))
+            .unwrap_or_else(|| panic!("denied durable action missing"));
+        assert_eq!(durable_action.state, "authorized");
+
+        drop(controller);
         let _ = std::fs::remove_dir_all(base);
     }
 

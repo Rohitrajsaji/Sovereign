@@ -20,17 +20,17 @@ use sovereign_model::{
     ModelResponse, ModelUsage,
 };
 use sovereign_plan::{
-    DepthClassifier, DepthFeatureInput, ExecutionDepth, M3PlanningInput,
+    DepthClassifier, DepthFeatureInput, DiagnosticCode, ExecutionDepth, M3PlanningInput,
     PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationInput, PlanCompilationRepository,
-    PlanCompilationResult, PlanCompiler, PlanValidator, ValidationEnvironment,
+    PlanCompilationResult, PlanCompiler, PlanIr, PlanValidator, ValidationEnvironment,
 };
 use sovereign_policy::{
     CapabilitySet, CommandMode, CommandPolicy, CommandRisk, CommandSpec, ControllerSecretLocator,
     ExecutionIsolationBackend, FakeSecretProvider, IsolatedCommand, IsolationCapabilities,
     IsolationRequest, MacSandboxExecBackend, ModelCallBudget, OsMemoryPressure, PinnedExecutable,
-    PolicyError, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ResourcePressureSnapshotV1, SecretBroker,
-    SecretInjection, SecretProviderBackend, SecretProviderKind, SecretRef, SecretValue,
-    ThermalPressure,
+    PolicyError, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ReconciliationPolicy,
+    ResourcePressureSnapshotV1, SecretBroker, SecretInjection, SecretProviderBackend,
+    SecretProviderKind, SecretRef, SecretValue, ThermalPressure,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence};
 use sovereign_state::{
@@ -1080,6 +1080,7 @@ fn write_tool_manifest() -> ToolManifest {
             PermissionClass::RepositoryWrite,
         ]),
         declared_risk_floor: CommandRisk::RepositoryMutation,
+        reconciliation_policy: ReconciliationPolicy::proof_required_local(),
     }
 }
 
@@ -1094,6 +1095,7 @@ fn secret_tool_manifest() -> ToolManifest {
             PermissionClass::SecretUse,
         ]),
         declared_risk_floor: CommandRisk::ReadOnly,
+        reconciliation_policy: ReconciliationPolicy::proof_required_local(),
     }
 }
 
@@ -3260,6 +3262,310 @@ fn m6_recovery_blocks_observed_secret_action_without_durable_cleanup_or_lease_cl
 }
 
 #[test]
+fn reconciliation_repo_write_approval_required_policy_is_schema_rejected() {
+    let fixture = compiled_fixture("m6-reconciliation-invalid-repo-write-approval", false);
+    let mut document = fixture
+        .compilation
+        .as_ref()
+        .unwrap_or_else(|| panic!("compiled fixture missing"))
+        .plan()
+        .as_value()
+        .clone();
+    document["policy"]["approval"]["required_permissions"] = json!(["repo_write"]);
+    let validator = PlanValidator::new(ValidationEnvironment::default())
+        .unwrap_or_else(|error| panic!("validator: {error}"));
+    let diagnostics = validator.validate(&PlanIr::from_value(document));
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::Schema),
+        "repo_write must remain invalid in approval.required_permissions: {diagnostics:#?}"
+    );
+}
+
+#[derive(Clone, Copy)]
+enum RecoveryEffectFixture {
+    Preimage,
+    Postimage,
+    Ambiguous,
+}
+
+#[allow(clippy::too_many_lines)]
+fn seeded_reconciliation_recovery(
+    label: &str,
+    policy: ReconciliationPolicy,
+    observed: RecoveryEffectFixture,
+) -> (CompiledFixture, String, String) {
+    let mut fixture = compiled_fixture(label, false);
+    let (controller, task_id) = controller_for(&mut fixture);
+    let task_contract_digest = controller
+        .task_contract_digest(&task_id)
+        .unwrap_or_else(|| panic!("reconciliation task contract digest"))
+        .to_owned();
+    drop(controller);
+
+    let mut state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen reconciliation state: {error}"));
+    let manifest = latest_checkpoint_manifest(&state);
+    let execution_epoch = state
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("reconciliation execution epoch: {error}"));
+    let target = fixture.repo.root.join("src/settings/SettingsForm.tsx");
+    let expected_target_mode = fs::metadata(&target)
+        .unwrap_or_else(|error| panic!("reconciliation target metadata: {error}"))
+        .permissions()
+        .mode()
+        & 0o7777;
+    let postimage = SOURCE.replacen("Save", "Apply", 1);
+    let observed_content = match observed {
+        RecoveryEffectFixture::Preimage => SOURCE.to_owned(),
+        RecoveryEffectFixture::Postimage => postimage.clone(),
+        RecoveryEffectFixture::Ambiguous => SOURCE.replacen("Save", "Review", 1),
+    };
+    fs::write(&target, &observed_content)
+        .unwrap_or_else(|error| panic!("materialize reconciliation observed file: {error}"));
+
+    let action_id = format!("action.{label}");
+    let payload_digest = sha256_prefixed(format!("payload-{label}").as_bytes());
+    let intent = json!({
+        "schema_version": 3,
+        "action_id": action_id,
+        "plan_id": manifest.plan_id,
+        "plan_revision": manifest.plan_revision,
+        "plan_digest": manifest.plan_digest,
+        "task_id": task_id,
+        "task_contract_digest": task_contract_digest,
+        "attempt_id": format!("attempt.{label}"),
+        "execution_epoch": execution_epoch,
+        "payload_digest": payload_digest,
+        "action_nonce": format!("nonce.{label}"),
+        "policy_digest": manifest.policy_digest,
+        "repository_id": manifest.repository_id,
+        "worktree_lease_id": Value::Null,
+        "execution_root": fixture.repo.root,
+        "path": "src/settings/SettingsForm.tsx",
+        "expected_source_digest": fixture.form_digest,
+        "old_literal": "Save",
+        "new_literal": "Apply",
+        "expected_post_digest": sha256_prefixed(postimage.as_bytes()),
+        "expected_target_mode": expected_target_mode,
+        "artifact_store_root": fixture.repo.base.join("cas")
+    });
+    let intent_raw = serde_json::to_string(&intent)
+        .unwrap_or_else(|error| panic!("encode reconciliation action intent: {error}"));
+    state
+        .put_state("controller.action_intent", &action_id, &intent_raw)
+        .unwrap_or_else(|error| panic!("persist reconciliation action intent: {error}"));
+
+    let reconciliation = json!({
+        "schema_version": 1,
+        "action_id": action_id,
+        "plan_id": manifest.plan_id,
+        "plan_revision": manifest.plan_revision,
+        "task_id": task_id,
+        "payload_digest": payload_digest,
+        "policy_digest": manifest.policy_digest,
+        "execution_epoch": execution_epoch,
+        "policy": policy,
+    });
+    let reconciliation_raw = serde_json::to_string(&reconciliation)
+        .unwrap_or_else(|error| panic!("encode reconciliation binding: {error}"));
+    state
+        .put_state(
+            "controller.action_reconciliation",
+            &action_id,
+            &reconciliation_raw,
+        )
+        .unwrap_or_else(|error| panic!("persist reconciliation binding: {error}"));
+
+    state
+        .insert_action_record(NewActionRecord {
+            action_id: &action_id,
+            state: "prepared",
+            payload_digest: &payload_digest,
+            policy_digest: &manifest.policy_digest,
+            execution_epoch,
+            event_id: &format!("event.{label}.prepared"),
+            event_kind: "prepared",
+            payload_json: "{}",
+        })
+        .unwrap_or_else(|error| panic!("insert reconciliation action: {error}"));
+    state
+        .transition_action_with_event(ActionTransition {
+            action_id: &action_id,
+            expected_state: "prepared",
+            next_state: "authorized",
+            expected_epoch: execution_epoch,
+            event_id: &format!("event.{label}.authorized"),
+            event_kind: "authorized",
+            payload_json: "{}",
+            result_digest: None,
+        })
+        .unwrap_or_else(|error| panic!("authorize reconciliation action: {error}"));
+    state
+        .transition_action_with_event(ActionTransition {
+            action_id: &action_id,
+            expected_state: "authorized",
+            next_state: "dispatched",
+            expected_epoch: execution_epoch,
+            event_id: &format!("event.{label}.dispatched"),
+            event_kind: "dispatched",
+            payload_json: "{}",
+            result_digest: None,
+        })
+        .unwrap_or_else(|error| panic!("dispatch reconciliation action: {error}"));
+
+    let action_sequence = state
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("reconciliation action sequence: {error}"));
+    let action_records = state
+        .action_records()
+        .unwrap_or_else(|error| panic!("reconciliation checkpoint actions: {error}"))
+        .into_iter()
+        .map(|record| CheckpointActionRecord {
+            action_id: record.action_id,
+            state: record.state,
+            payload_digest: record.payload_digest,
+            policy_digest: record.policy_digest,
+            execution_epoch: record.execution_epoch,
+            result_digest: record.result_digest,
+            last_event_sequence: record.last_event_sequence,
+        })
+        .collect::<Vec<_>>();
+    let intent_digest = sha256_prefixed(intent_raw.as_bytes());
+    let reconciliation_digest = sha256_prefixed(reconciliation_raw.as_bytes());
+    append_modified_checkpoint(&mut state, |checkpoint| {
+        checkpoint.action_records = action_records;
+        checkpoint.action_journal_sequence = action_sequence;
+        checkpoint.evidence_binding_digests.insert(
+            format!("controller.action_intent:{action_id}"),
+            intent_digest,
+        );
+        checkpoint.evidence_binding_digests.insert(
+            format!("controller.action_reconciliation:{action_id}"),
+            reconciliation_digest,
+        );
+    });
+    drop(state);
+    (fixture, task_id, action_id)
+}
+
+#[test]
+fn reconciliation_consequential_external_recovery_never_infers_local_postimage_or_replays() {
+    let (fixture, task_id, action_id) = seeded_reconciliation_recovery(
+        "m6-reconciliation-external-unknown",
+        ReconciliationPolicy::consequential_external(),
+        RecoveryEffectFixture::Postimage,
+    );
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open external recovery state: {error}"));
+    let (recovered, summary) = RecoveryManager::recover(state, &fixture.registry)
+        .unwrap_or_else(|error| panic!("recover consequential external action: {error}"));
+
+    assert!(summary.mutation_blocked);
+    assert_eq!(summary.unknown_action_ids, vec![action_id.clone()]);
+    assert_eq!(
+        recovered.task_state(&task_id),
+        Some(TaskState::ReconcilingUnknown)
+    );
+    assert_eq!(
+        recovered
+            .state()
+            .action_record(&action_id)
+            .unwrap_or_else(|error| panic!("external recovered action: {error}"))
+            .map(|record| record.state),
+        Some("unknown".to_owned())
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+            .unwrap_or_else(|error| panic!("read external observed postimage: {error}")),
+        SOURCE.replacen("Save", "Apply", 1),
+        "recovery must not blind replay or rewrite a consequential external unknown"
+    );
+}
+
+#[test]
+fn reconciliation_proof_required_local_postimage_commits_historical_unknown() {
+    let (fixture, _task_id, action_id) = seeded_reconciliation_recovery(
+        "m6-reconciliation-local-postimage",
+        ReconciliationPolicy::proof_required_local(),
+        RecoveryEffectFixture::Postimage,
+    );
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open local postimage recovery state: {error}"));
+    let (recovered, summary) = RecoveryManager::recover(state, &fixture.registry)
+        .unwrap_or_else(|error| panic!("recover local postimage action: {error}"));
+
+    assert!(!summary.mutation_blocked);
+    assert!(summary.unknown_action_ids.is_empty());
+    let action = recovered
+        .state()
+        .action_record(&action_id)
+        .unwrap_or_else(|error| panic!("local postimage recovered action: {error}"))
+        .unwrap_or_else(|| panic!("local postimage action missing"));
+    assert_eq!(action.state, "committed");
+    assert!(action.result_digest.is_some());
+}
+
+#[test]
+fn reconciliation_proof_required_local_preimage_fails_historical_unknown() {
+    let (fixture, _task_id, action_id) = seeded_reconciliation_recovery(
+        "m6-reconciliation-local-preimage",
+        ReconciliationPolicy::proof_required_local(),
+        RecoveryEffectFixture::Preimage,
+    );
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open local preimage recovery state: {error}"));
+    let (recovered, summary) = RecoveryManager::recover(state, &fixture.registry)
+        .unwrap_or_else(|error| panic!("recover local preimage action: {error}"));
+
+    assert!(!summary.mutation_blocked);
+    assert!(summary.unknown_action_ids.is_empty());
+    assert_eq!(
+        recovered
+            .state()
+            .action_record(&action_id)
+            .unwrap_or_else(|error| panic!("local preimage recovered action: {error}"))
+            .map(|record| record.state),
+        Some("failed".to_owned())
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+            .unwrap_or_else(|error| panic!("read local preimage after recovery: {error}")),
+        SOURCE,
+        "effect-absent reconciliation must not dispatch the action"
+    );
+}
+
+#[test]
+fn reconciliation_proof_required_local_ambiguous_digest_remains_unknown() {
+    let (fixture, task_id, action_id) = seeded_reconciliation_recovery(
+        "m6-reconciliation-local-ambiguous",
+        ReconciliationPolicy::proof_required_local(),
+        RecoveryEffectFixture::Ambiguous,
+    );
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open local ambiguous recovery state: {error}"));
+    let (recovered, summary) = RecoveryManager::recover(state, &fixture.registry)
+        .unwrap_or_else(|error| panic!("recover local ambiguous action: {error}"));
+
+    assert!(summary.mutation_blocked);
+    assert_eq!(summary.unknown_action_ids, vec![action_id.clone()]);
+    assert_eq!(
+        recovered.task_state(&task_id),
+        Some(TaskState::ReconcilingUnknown)
+    );
+    assert_eq!(
+        recovered
+            .state()
+            .action_record(&action_id)
+            .unwrap_or_else(|error| panic!("local ambiguous recovered action: {error}"))
+            .map(|record| record.state),
+        Some("unknown".to_owned())
+    );
+}
+
+#[test]
 fn m5_t03_task_grant_change_is_exact_and_invalidates_stale_ready_authority() {
     let mut fixture = compiled_fixture("m5-grant-scope", false);
     let (mut controller, task_id) = controller_for(&mut fixture);
@@ -3322,6 +3628,7 @@ fn m5_t03_only_exact_pinned_authorized_tool_schema_enters_context_packet() {
             PermissionClass::RepositoryWrite,
         ]),
         declared_risk_floor: CommandRisk::RepositoryMutation,
+        reconciliation_policy: ReconciliationPolicy::proof_required_local(),
     };
     let patch_schema = ToolSchemaV1 {
         tool_id: patch_manifest.tool_id.clone(),

@@ -1,0 +1,248 @@
+{
+  "schema_version": 1,
+  "task_id": "M6-T04",
+  "title": "Implement exact approval claims and unknown-outcome reconciliation",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "331817821b83832ee1aedf592bbca3418178edfe",
+  "status": "completed",
+  "completed_at": "2026-09-15T02:06:18Z",
+  "verified_at": "2026-09-15T02:06:18Z",
+  "dependencies": [
+    "M1-T04",
+    "M6-T02"
+  ],
+  "interfaces": [
+    "ApprovalClaim",
+    "ActionReceipt",
+    "ReconciliationPolicy"
+  ],
+  "approval_contract": {
+    "controller_remains_sole_execution_authority": true,
+    "durable_waiting_truth": "controller.approval_request",
+    "persistent_task_state_awaiting_approval": false,
+    "typed_flow_control": "ControllerError::AwaitingApproval",
+    "valid_frozen_fixture_permission": "external_side_effect",
+    "frozen_schema_rejects_approval_required_repo_write": true,
+    "frozen_schema_rejects_approval_required_process_exec": true,
+    "approval_claim_exact_bindings": [
+      "action_id",
+      "plan_id",
+      "plan_revision",
+      "task_id",
+      "permission_class",
+      "payload_digest",
+      "destination_digest",
+      "executable_digest",
+      "policy_digest",
+      "execution_epoch",
+      "nonce",
+      "issuer",
+      "issued_at_ms",
+      "expires_at_ms"
+    ],
+    "request_preserves_original_action_expiry": true,
+    "request_claim_ttl_is_bounded_separately": true,
+    "missing_durable_claim_denies_dispatch": true,
+    "dispatch_rechecks_durable_claim": true,
+    "approval_text_has_no_authority": true,
+    "approved_resume_requires_no_new_model_proposal": true,
+    "same_action_relowering_restores_original_action_expiry": true,
+    "denial_mints_no_claim": true,
+    "stale_execution_epoch_invalidates_claim": true
+  },
+  "payload_bound_approval_fixture_report": {
+    "fixture": "reconciliation_external_side_effect_fixture",
+    "permission_class": "external_side_effect",
+    "reconciliation_mode": "ConsequentialExternal",
+    "reconciliation_policy": "consequential_external",
+    "approval_required": true,
+    "plan_required_permissions": [
+      "external_side_effect"
+    ],
+    "exact_action_binding": true,
+    "reapprove_on_payload_change": true,
+    "max_ttl_seconds": 30,
+    "pending_request_durable": true,
+    "status_projection_contains_pending_request": true,
+    "approve_persists_exact_claim": true,
+    "deny_keeps_action_non_dispatchable": true,
+    "drift_invalidations": [
+      "command/payload",
+      "executable_digest",
+      "destination_digest",
+      "policy_digest",
+      "execution_epoch",
+      "nonce",
+      "action_expires_at_ms",
+      "permission_class",
+      "action_id",
+      "request_or_claim_expiry"
+    ],
+    "schema_negative": "approval.required_permissions=[repo_write] is rejected by PlanValidator schema diagnostics"
+  },
+  "reconciliation_contract": {
+    "policy_classes": [
+      "IdempotentLocal",
+      "ProofRequiredLocal",
+      "ConsequentialExternal"
+    ],
+    "adapter_policy_non_downgradable": true,
+    "same_ambiguous_action_never_redispatched": true,
+    "idempotent_retry_requires_explicit_policy_and_fresh_action_authority": true,
+    "rollback_compensation_uses_same_claim_lifecycle": true,
+    "rollback_unknown_never_blind_replays": true,
+    "ordinary_local_recovery_does_not_fabricate_action_receipt": true,
+    "consequential_external_local_file_coincidence_is_not_effect_proof": true
+  },
+  "unknown_outcome_reconciliation_traces": {
+    "consequential_external": {
+      "setup": "durable Dispatched/Unknown + exact persisted action intent + reconciliation binding + local file matching expected postimage",
+      "result": "remains Unknown",
+      "mutation_blocked": true,
+      "blind_replay": false,
+      "local_postimage_inferred_as_remote_effect": false
+    },
+    "proof_required_local_postimage": {
+      "observation": "current digest == expected postimage and expected mode",
+      "result": [
+        "Unknown",
+        "Reconciled",
+        "Committed"
+      ]
+    },
+    "proof_required_local_preimage": {
+      "observation": "current digest == expected source/preimage and expected mode",
+      "result": [
+        "Unknown",
+        "Reconciled",
+        "Failed"
+      ]
+    },
+    "proof_required_local_ambiguous": {
+      "observation": "current digest is neither expected source nor expected postimage",
+      "result": "Unknown",
+      "mutation_blocked": true
+    }
+  },
+  "recovery_and_checkpoint_correlation": {
+    "approval_request_namespace_checkpointed": true,
+    "approval_claim_namespace_checkpointed": true,
+    "action_reconciliation_binding_durable": true,
+    "post_checkpoint_authority_correlation_validated_before_mutation": true,
+    "recovery_advances_execution_epoch_after_reconciliation": true,
+    "pre_restart_request_or_claim_cannot_authorize_new_epoch": true
+  },
+  "workspace_fixture_compatibility": {
+    "reason": "ToolManifest gained required reconciliation_policy field",
+    "mechanical_eval_fixture_policy": "ReconciliationPolicy::proof_required_local()",
+    "files": [
+      "crates/sovereign-eval/tests/crash_resume.rs",
+      "crates/sovereign-eval/tests/m1_8gb_resource_sim.rs",
+      "crates/sovereign-eval/tests/m1_real_qualification.rs",
+      "crates/sovereign-eval/tests/repair_loop.rs",
+      "crates/sovereign-eval/tests/vertical_slice.rs"
+    ],
+    "authority_expansion": false
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --offline --lib reconciliation -- --nocapture",
+      "result": "passed",
+      "detail": "2/2 valid external_side_effect approval/denial unit tests"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --offline --test t07 reconciliation -- --nocapture",
+      "result": "passed",
+      "detail": "5/5; schema-negative plus ConsequentialExternal and ProofRequiredLocal recovery matrix"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller -p sovereign-tools --offline -- reconciliation",
+      "result": "passed",
+      "detail": "Controller lib 2 + Controller t07 5 + tools runner 5; no failures"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-policy -p sovereign-tools -p sovereign-controller --offline",
+      "result": "passed",
+      "detail": "affected packages green; controller lib 36, t07 49, policy suites 42 total, tools runner 21"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy -p sovereign-policy -p sovereign-tools -p sovereign-controller --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test --workspace --all-targets --offline",
+      "result": "passed",
+      "detail": "all non-ignored tests passed; only explicit local-Qwen runtime qualification/smoke tests ignored by design"
+    },
+    {
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "real_qwen_runtime_on_current_tree": "deferred to mandatory final-release current-tree qualification; not claimed by M6-T04",
+  "independent_audit": {
+    "worker": "worker-46",
+    "session": "2026-09-14-ba2c9e4d",
+    "final_result": "CLOSABLE",
+    "final_verdict": "M6-T04 frozen task: CLOSABLE",
+    "final_blockers": [],
+    "notes": "Fresh final read-only exact-tree audit rechecked HEAD/status/all 10 hashes, frozen M6-T04, architecture 24.8, Plan IR approval schema correction, approval/expiry/persistence, recovery traces, idempotent fresh retry, rollback/compensation, and eval compatibility diffs."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "source_hashes": {
+    "crates/sovereign-controller/src/lib.rs": "sha256:9bf878f28ce89d82e15242b5114ab2ac7966ce1c2197d5991bdb1045c006eee8",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:e8d2351189e91e16c490efba84b8a67915b2ad38c6860ec8d8f1cdcb1cd0d2a2",
+    "crates/sovereign-policy/src/lib.rs": "sha256:24dda056782062ebebcbd999ac5b65a98a43a74acd7379bc80373661e2231907",
+    "crates/sovereign-tools/src/lib.rs": "sha256:e50e90965f2015a11341a4f4fd415168c84d70a045097ac271a22bfd5d86bfb0",
+    "crates/sovereign-tools/tests/runner.rs": "sha256:7ea53da1ab5bfea2bf90cd192c5cf97a46fd5ff61880bb6494259019600d88f1",
+    "crates/sovereign-eval/tests/crash_resume.rs": "sha256:15dfedb697d91ecba672fc3a4e81336885a3af440186140d7040584877bb0b01",
+    "crates/sovereign-eval/tests/m1_8gb_resource_sim.rs": "sha256:89caa9752092cfd017a44378dc94d20258e6ee21a8d6e1c209530a99454bb496",
+    "crates/sovereign-eval/tests/m1_real_qualification.rs": "sha256:a6af1ab8da8fa3cbd3302faae901473dd20528e2167994b96cb234b75235e514",
+    "crates/sovereign-eval/tests/repair_loop.rs": "sha256:e2b3a65bf290e7f09c93a705957547d96b5807db9dd24dde29da2081b375c060",
+    "crates/sovereign-eval/tests/vertical_slice.rs": "sha256:7c748f914f2fbec95e5ddbaf5f90fdc21e3cdd6cca3122afffebb0c6ab8ed22a"
+  },
+  "frozen_tree": {
+    "head": "331817821b83832ee1aedf592bbca3418178edfe",
+    "dirty_paths_before_evidence_state": 10
+  },
+  "state_authority": {
+    "new_database": false,
+    "new_approval_database": false,
+    "new_action_database": false,
+    "new_reconciliation_database": false,
+    "controller_remains_sole_execution_authority": true
+  },
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false
+  }
+}

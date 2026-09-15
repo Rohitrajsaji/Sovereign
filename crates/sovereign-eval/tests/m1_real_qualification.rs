@@ -21,7 +21,7 @@ use sovereign_plan::{
 };
 use sovereign_policy::{
     CommandPolicy, CommandRisk, IsolationRequest, MacSandboxExecBackend, ModelCallBudget,
-    PinnedExecutable,
+    PinnedExecutable, ReconciliationPolicy,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot};
 use sovereign_state::StateStore;
@@ -201,6 +201,7 @@ impl RuntimeHarness {
                 PermissionClass::RepositoryWrite,
             ]),
             declared_risk_floor: CommandRisk::RepositoryMutation,
+            reconciliation_policy: ReconciliationPolicy::proof_required_local(),
         };
         Self {
             artifacts,

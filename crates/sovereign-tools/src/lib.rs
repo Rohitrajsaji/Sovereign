@@ -6,7 +6,9 @@
 use sha2::{Digest, Sha256};
 use sovereign_evidence::{ArtifactStore, EvidenceError, Redactor};
 pub use sovereign_policy::{
-    Capability, CapabilityLayers, CapabilitySet, PermissionDecision, TaskCapabilityGrant,
+    ApprovalClaim, ApprovalClaimV1, Capability, CapabilityLayers, CapabilitySet,
+    PermissionDecision, ReconciliationClass, ReconciliationPolicy, ReconciliationPolicyV1,
+    TaskCapabilityGrant,
 };
 use sovereign_policy::{
     CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, IsolatedCommand,
@@ -30,6 +32,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub const APPROVAL_CLAIM_NAMESPACE: &str = "controller.approval_claim";
+pub const ACTION_RECEIPT_SCHEMA_VERSION: u32 = 1;
+pub const ACTION_RECEIPT_SCHEMA: &str = "sovereign-action-receipt-v1";
 
 #[derive(Debug)]
 pub enum ToolError {
@@ -301,6 +307,7 @@ pub struct ToolManifest {
     pub content_digest: String,
     pub permission_ceiling: BTreeSet<PermissionClass>,
     pub declared_risk_floor: CommandRisk,
+    pub reconciliation_policy: ReconciliationPolicy,
 }
 
 impl ToolManifest {
@@ -317,6 +324,9 @@ impl ToolManifest {
                 "tool manifest requires id, version, and sha256 content digest".to_owned(),
             ));
         }
+        self.reconciliation_policy
+            .validate()
+            .map_err(|error| ToolError::Authority(error.to_string()))?;
         Ok(())
     }
 }
@@ -434,6 +444,18 @@ pub fn filter_authorized_tool_schemas<'a>(
 pub enum ReconciliationMode {
     IdempotentRead,
     UnsafeSideEffect,
+    ConsequentialExternal,
+}
+
+impl ReconciliationMode {
+    #[must_use]
+    pub const fn policy(self) -> ReconciliationPolicy {
+        match self {
+            Self::IdempotentRead => ReconciliationPolicy::idempotent_local(),
+            Self::UnsafeSideEffect => ReconciliationPolicy::proof_required_local(),
+            Self::ConsequentialExternal => ReconciliationPolicy::consequential_external(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -458,6 +480,7 @@ pub struct AuthorizedAction {
     pub expires_at_ms: i64,
     pub command: CommandSpec,
     pub individually_authorized_environment: BTreeSet<String>,
+    pub approval_required: bool,
     pub reconciliation_mode: ReconciliationMode,
 }
 
@@ -515,11 +538,13 @@ impl AuthorizedAction {
         for name in &self.individually_authorized_environment {
             digest_field(&mut hasher, name);
         }
+        hasher.update([u8::from(self.approval_required)]);
         digest_field(
             &mut hasher,
             match self.reconciliation_mode {
                 ReconciliationMode::IdempotentRead => "idempotent_read",
                 ReconciliationMode::UnsafeSideEffect => "unsafe_side_effect",
+                ReconciliationMode::ConsequentialExternal => "consequential_external",
             },
         );
         format!("sha256:{:x}", hasher.finalize())
@@ -586,6 +611,39 @@ impl AuthorizedAction {
         }
         Ok(())
     }
+
+    /// Validates one Controller-issued approval against this exact immutable action.
+    ///
+    /// # Errors
+    /// Returns an authority error for any payload/scope/destination/executable/policy/epoch/nonce
+    /// drift, expiration, or a claim that outlives the action authorization itself.
+    pub fn verify_approval_claim(
+        &self,
+        claim: &ApprovalClaim,
+        now_ms: i64,
+    ) -> Result<(), ToolError> {
+        claim
+            .validate(now_ms)
+            .map_err(|error| ToolError::Authority(error.to_string()))?;
+        if claim.action_id != self.action_id
+            || claim.plan_id != self.plan_id
+            || claim.plan_revision != self.plan_revision
+            || claim.task_id != self.task_id
+            || claim.permission_class != permission_name(self.permission_class)
+            || claim.payload_digest != self.payload_digest()
+            || claim.destination_digest != self.destination_digest
+            || claim.executable_digest != self.executable_digest
+            || claim.policy_digest != self.policy_digest
+            || claim.execution_epoch != self.execution_epoch
+            || claim.nonce != self.nonce
+            || claim.expires_at_ms > self.expires_at_ms
+        {
+            return Err(ToolError::Authority(
+                "approval claim does not match exact authorized action".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub struct ActionJournal<'a> {
@@ -631,6 +689,15 @@ impl<'a> ActionJournal<'a> {
         action.validate(now)?;
         action.verify_permission_decision(permission_decision)?;
         manifest.validate()?;
+        if !manifest
+            .reconciliation_policy
+            .permits_candidate(action.reconciliation_mode.policy())
+        {
+            return Err(ToolError::Authority(
+                "authorized action reconciliation policy weakens tool/adapter declaration"
+                    .to_owned(),
+            ));
+        }
         if manifest.tool_id != action.tool_id {
             return Err(ToolError::Authority(format!(
                 "action tool {} does not match manifest {}",
@@ -734,6 +801,9 @@ impl<'a> ActionJournal<'a> {
                 expected.as_str(),
                 next.as_str()
             )));
+        }
+        if expected == ActionState::Authorized && next == ActionState::Dispatched {
+            self.verify_dispatch_approval(action)?;
         }
         Ok(self.store.transition_action_with_event(ActionTransition {
             action_id: &action.action_id,
@@ -844,6 +914,32 @@ impl<'a> ActionJournal<'a> {
         Ok(self.store.action_record(action_id)?)
     }
 
+    /// Revalidates the durable Controller claim immediately before dispatch.
+    ///
+    /// Ordinary M1 actions keep their existing behavior when `approval_required=false`. For an
+    /// approval-required action the claim must already be durably present in authoritative state;
+    /// missing/garbled/stale records deny dispatch before any side effect can start.
+    ///
+    /// # Errors
+    /// Returns an authority/state error when a required current exact claim is unavailable.
+    pub fn verify_dispatch_approval(&self, action: &AuthorizedAction) -> Result<(), ToolError> {
+        if !action.approval_required {
+            return Ok(());
+        }
+        let raw = self
+            .store
+            .get_state(APPROVAL_CLAIM_NAMESPACE, &action.action_id)?
+            .ok_or_else(|| {
+                ToolError::Authority(format!(
+                    "approval-required action {} has no durable approval claim",
+                    action.action_id
+                ))
+            })?;
+        let claim: ApprovalClaim = serde_json::from_str(&raw)
+            .map_err(|_| ToolError::Authority("durable approval claim is malformed".to_owned()))?;
+        action.verify_approval_claim(&claim, unix_millis()?)
+    }
+
     fn record_process_lease(
         &mut self,
         action: &AuthorizedAction,
@@ -937,22 +1033,35 @@ pub const fn reconcile(
     mode: ReconciliationMode,
     proof: Option<ReconciliationProof>,
 ) -> Reconciliation {
-    match (mode, proof) {
-        (
-            ReconciliationMode::IdempotentRead,
-            None | Some(ReconciliationProof::SafeIdempotentRetry),
-        ) => Reconciliation::SafeToRetry,
-        (_, Some(ReconciliationProof::EffectObserved)) => Reconciliation::CommitObservedEffect,
-        (_, Some(ReconciliationProof::EffectAbsent)) => Reconciliation::FailProvenAbsent,
-        (
-            ReconciliationMode::UnsafeSideEffect,
-            None | Some(ReconciliationProof::SafeIdempotentRetry),
-        ) => Reconciliation::BlockedUnsafeUnknown,
+    reconcile_with_policy(mode.policy(), proof)
+}
+
+/// Deterministically reconciles unknown outcome under one exact v1 tool/adapter policy.
+#[must_use]
+pub const fn reconcile_with_policy(
+    policy: ReconciliationPolicy,
+    proof: Option<ReconciliationProof>,
+) -> Reconciliation {
+    match proof {
+        Some(ReconciliationProof::EffectObserved) => Reconciliation::CommitObservedEffect,
+        Some(ReconciliationProof::EffectAbsent) => Reconciliation::FailProvenAbsent,
+        None | Some(ReconciliationProof::SafeIdempotentRetry) => {
+            if policy.allows_unproven_retry() {
+                Reconciliation::SafeToRetry
+            } else {
+                Reconciliation::BlockedUnsafeUnknown
+            }
+        }
     }
 }
 
 pub trait ToolAdapter {
     fn manifest(&self) -> &ToolManifest;
+
+    #[must_use]
+    fn reconciliation_policy(&self) -> ReconciliationPolicy {
+        self.manifest().reconciliation_policy
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -985,6 +1094,159 @@ pub enum ResourceLimitKind {
     OutputBytes,
     DiskBytes,
     Subprocesses,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionReceiptStream {
+    pub sha256: String,
+    pub retained_bytes: usize,
+}
+
+/// Durable typed receipt for the already-sanitized result of one exact action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionReceipt {
+    pub schema: String,
+    pub schema_version: u32,
+    pub action_id: String,
+    pub payload_digest: String,
+    pub policy_digest: String,
+    pub execution_epoch: i64,
+    pub exit_code: Option<i32>,
+    pub elapsed_ms: u64,
+    pub terminated_for_limit: Option<ResourceLimitKind>,
+    pub process_group_reaped: bool,
+    pub stdout: ActionReceiptStream,
+    pub stderr: ActionReceiptStream,
+}
+
+/// Frozen v1 name for callers that prefer version-suffixed receipt types.
+pub type ActionReceiptV1 = ActionReceipt;
+
+impl ActionReceipt {
+    /// Builds a durable receipt from a result that has already crossed the ingress/redaction
+    /// boundary. The receipt retains only digests/lengths for stdout/stderr, never raw bytes.
+    #[must_use]
+    pub fn from_sanitized_result(action: &AuthorizedAction, result: &RawToolResult) -> Self {
+        Self {
+            schema: ACTION_RECEIPT_SCHEMA.to_owned(),
+            schema_version: ACTION_RECEIPT_SCHEMA_VERSION,
+            action_id: action.action_id.clone(),
+            payload_digest: action.payload_digest(),
+            policy_digest: action.policy_digest.clone(),
+            execution_epoch: action.execution_epoch,
+            exit_code: result.exit_code,
+            elapsed_ms: result.elapsed_ms,
+            terminated_for_limit: result.terminated_for_limit,
+            process_group_reaped: result.process_group_reaped,
+            stdout: ActionReceiptStream {
+                sha256: digest_bytes(&result.stdout),
+                retained_bytes: result.stdout.len(),
+            },
+            stderr: ActionReceiptStream {
+                sha256: digest_bytes(&result.stderr),
+                retained_bytes: result.stderr.len(),
+            },
+        }
+    }
+
+    /// Validates immutable receipt/action correlation before recovery consumes it.
+    ///
+    /// # Errors
+    /// Returns an authority error for unsupported schema, malformed digests, or action drift.
+    pub fn validate_for_action(&self, action: &AuthorizedAction) -> Result<(), ToolError> {
+        if self.schema != ACTION_RECEIPT_SCHEMA
+            || self.schema_version != ACTION_RECEIPT_SCHEMA_VERSION
+            || self.action_id != action.action_id
+            || self.payload_digest != action.payload_digest()
+            || self.policy_digest != action.policy_digest
+            || self.execution_epoch != action.execution_epoch
+            || !self.stdout.sha256.starts_with("sha256:")
+            || !self.stderr.sha256.starts_with("sha256:")
+        {
+            return Err(ToolError::Authority(
+                "action receipt does not match exact authorized action".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Serializes the stable receipt for CAS publication.
+    ///
+    /// # Errors
+    /// Returns an authority error if serialization fails.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ToolError> {
+        let value = serde_json::json!({
+            "schema": self.schema,
+            "schema_version": self.schema_version,
+            "action_id": self.action_id,
+            "payload_digest": self.payload_digest,
+            "policy_digest": self.policy_digest,
+            "execution_epoch": self.execution_epoch,
+            "exit_code": self.exit_code,
+            "elapsed_ms": self.elapsed_ms,
+            "terminated_for_limit": self.terminated_for_limit.map(resource_limit_name),
+            "process_group_reaped": self.process_group_reaped,
+            "stdout": {
+                "sha256": self.stdout.sha256,
+                "retained_bytes": self.stdout.retained_bytes,
+            },
+            "stderr": {
+                "sha256": self.stderr.sha256,
+                "retained_bytes": self.stderr.retained_bytes,
+            },
+        });
+        serde_json::to_vec(&value).map_err(|error| {
+            ToolError::Authority(format!("result receipt serialization failed: {error}"))
+        })
+    }
+
+    /// Parses one durable v1 receipt for Controller/recovery inspection.
+    ///
+    /// # Errors
+    /// Returns an authority error for malformed JSON.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ToolError> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|_| ToolError::Authority("durable action receipt is malformed".to_owned()))?;
+        let object = value.as_object().ok_or_else(malformed_action_receipt)?;
+        let schema_version = receipt_u64(object, "schema_version")
+            .and_then(|value| u32::try_from(value).map_err(|_| malformed_action_receipt()))?;
+        let execution_epoch = object
+            .get("execution_epoch")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(malformed_action_receipt)?;
+        let exit_code = match object.get("exit_code") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .and_then(|value| i32::try_from(value).ok())
+                    .ok_or_else(malformed_action_receipt)?,
+            ),
+        };
+        let terminated_for_limit = match object.get("terminated_for_limit") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(parse_resource_limit_name(
+                value.as_str().ok_or_else(malformed_action_receipt)?,
+            )?),
+        };
+        Ok(Self {
+            schema: receipt_string(object, "schema")?,
+            schema_version,
+            action_id: receipt_string(object, "action_id")?,
+            payload_digest: receipt_string(object, "payload_digest")?,
+            policy_digest: receipt_string(object, "policy_digest")?,
+            execution_epoch,
+            exit_code,
+            elapsed_ms: receipt_u64(object, "elapsed_ms")?,
+            terminated_for_limit,
+            process_group_reaped: object
+                .get("process_group_reaped")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(malformed_action_receipt)?,
+            stdout: receipt_stream(object, "stdout")?,
+            stderr: receipt_stream(object, "stderr")?,
+        })
+    }
 }
 
 pub struct ProcessRunner<'a, I: ExecutionIsolationBackend> {
@@ -1022,6 +1284,7 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         artifacts: &ArtifactStore,
     ) -> Result<RawToolResult, ToolError> {
         journal.verify_authorized(action)?;
+        journal.verify_dispatch_approval(action)?;
         let prepared = self.prepare_execution(action, isolation_request)?;
         journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
         journal.record_process_lease(action, None, None, "pending_spawn")?;
@@ -1056,6 +1319,7 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         controller_private_root: &Path,
     ) -> Result<(RawToolResult, SecretCleanupProof), ToolError> {
         journal.verify_authorized(action)?;
+        journal.verify_dispatch_approval(action)?;
         action.verify_permission_decision(permission_decision)?;
         if !permission_decision
             .effective
@@ -1583,27 +1847,49 @@ fn durable_result_receipt(
     action: &AuthorizedAction,
     result: &RawToolResult,
 ) -> Result<Vec<u8>, ToolError> {
-    let stdout_digest = digest_bytes(&result.stdout);
-    let stderr_digest = digest_bytes(&result.stderr);
-    let value = serde_json::json!({
-        "schema": "sovereign-tool-result-receipt-v1",
-        "action_id": action.action_id,
-        "payload_digest": action.payload_digest(),
-        "exit_code": result.exit_code,
-        "elapsed_ms": result.elapsed_ms,
-        "terminated_for_limit": result.terminated_for_limit.map(resource_limit_name),
-        "process_group_reaped": result.process_group_reaped,
-        "stdout": {
-            "sha256": stdout_digest,
-            "retained_bytes": result.stdout.len()
-        },
-        "stderr": {
-            "sha256": stderr_digest,
-            "retained_bytes": result.stderr.len()
-        }
-    });
-    serde_json::to_vec(&value).map_err(|error| {
-        ToolError::Authority(format!("result receipt serialization failed: {error}"))
+    let receipt = ActionReceipt::from_sanitized_result(action, result);
+    receipt.validate_for_action(action)?;
+    receipt.to_bytes()
+}
+
+fn malformed_action_receipt() -> ToolError {
+    ToolError::Authority("durable action receipt is malformed".to_owned())
+}
+
+fn receipt_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<String, ToolError> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(malformed_action_receipt)
+}
+
+fn receipt_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<u64, ToolError> {
+    object
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(malformed_action_receipt)
+}
+
+fn receipt_stream(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<ActionReceiptStream, ToolError> {
+    let stream = object
+        .get(key)
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(malformed_action_receipt)?;
+    let retained_bytes = receipt_u64(stream, "retained_bytes")
+        .and_then(|value| usize::try_from(value).map_err(|_| malformed_action_receipt()))?;
+    Ok(ActionReceiptStream {
+        sha256: receipt_string(stream, "sha256")?,
+        retained_bytes,
     })
 }
 
@@ -1619,6 +1905,16 @@ const fn resource_limit_name(limit: ResourceLimitKind) -> &'static str {
         ResourceLimitKind::OutputBytes => "output_bytes",
         ResourceLimitKind::DiskBytes => "disk_bytes",
         ResourceLimitKind::Subprocesses => "subprocesses",
+    }
+}
+
+fn parse_resource_limit_name(value: &str) -> Result<ResourceLimitKind, ToolError> {
+    match value {
+        "timeout" => Ok(ResourceLimitKind::Timeout),
+        "output_bytes" => Ok(ResourceLimitKind::OutputBytes),
+        "disk_bytes" => Ok(ResourceLimitKind::DiskBytes),
+        "subprocesses" => Ok(ResourceLimitKind::Subprocesses),
+        _ => Err(malformed_action_receipt()),
     }
 }
 
