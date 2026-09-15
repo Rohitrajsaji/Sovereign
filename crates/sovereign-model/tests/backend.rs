@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static LOCAL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -428,6 +428,76 @@ fn local_provider_unload_releases_lease_for_clean_reload() {
     backend
         .unload()
         .unwrap_or_else(|error| panic!("second unload: {error}"));
+    server.finish();
+}
+
+#[test]
+fn unload_interrupts_in_flight_attached_completion() {
+    let _guard = local_test_guard();
+    let completion_started = Arc::new(AtomicBool::new(false));
+    let release_response = Arc::new(AtomicBool::new(false));
+    let handler_started = Arc::clone(&completion_started);
+    let handler_release = Arc::clone(&release_response);
+    let server = TestServer::spawn(4, move |request| match request.path.as_str() {
+        "/health" => TestReply::json(200, &json!({"status":"ok"})),
+        "/apply-template" => template_reply(),
+        "/tokenize" => token_reply(8),
+        "/v1/chat/completions" => {
+            handler_started.store(true, Ordering::Release);
+            while !handler_release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            TestReply::json(
+                200,
+                &json!({
+                    "choices": [{"message": {"content":"too late"}, "finish_reason":"stop"}],
+                    "usage": {"prompt_tokens":8,"completion_tokens":1}
+                }),
+            )
+        }
+        _ => TestReply::json(404, &json!({"error":"not found"})),
+    });
+    let backend = Arc::new(attached_backend(server.address(), 1_500));
+    let long_profile = ModelLoadProfile {
+        provider_call_timeout_ms: 1_500,
+        ..profile()
+    };
+    backend
+        .load(long_profile)
+        .unwrap_or_else(|error| panic!("load: {error}"));
+
+    let worker_backend = Arc::clone(&backend);
+    let completion = thread::spawn(move || {
+        let mut request = text_request("request.cancelled");
+        request.deadline_ms = 1_500;
+        worker_backend.complete(&request)
+    });
+    let dispatch_wait = Instant::now();
+    while !completion_started.load(Ordering::Acquire) {
+        assert!(
+            dispatch_wait.elapsed() < Duration::from_millis(500),
+            "completion never reached provider"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    let cancellation_started = Instant::now();
+    backend
+        .unload()
+        .unwrap_or_else(|error| panic!("unload: {error}"));
+    let result = completion
+        .join()
+        .unwrap_or_else(|_| panic!("completion thread panicked"));
+    assert!(
+        result.is_err(),
+        "cancelled completion unexpectedly succeeded"
+    );
+    assert!(
+        cancellation_started.elapsed() < Duration::from_millis(250),
+        "in-flight completion was not interrupted promptly"
+    );
+
+    release_response.store(true, Ordering::Release);
     server.finish();
 }
 

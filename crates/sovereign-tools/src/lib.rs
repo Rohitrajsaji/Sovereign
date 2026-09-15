@@ -28,7 +28,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1074,6 +1074,32 @@ pub struct RawToolResult {
     pub process_group_reaped: bool,
 }
 
+/// Cloneable cancellation signal for one Controller-owned process dispatch.
+///
+/// Cancellation is advisory until [`ProcessRunner`] proves ownership of the already-spawned
+/// process group and reaps it. A cancelled dispatched action is therefore returned as an error and
+/// left `unknown` for ordinary reconciliation rather than being reported as a successful result.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessCancellationToken {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl ProcessCancellationToken {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
 /// Fixed environment handle exposed only by the secret-aware runner path. The value is an
 /// ephemeral private file path, never secret material.
 pub const EPHEMERAL_SECRET_FILE_ENV: &str = "SOVEREIGN_SECRET_FILE";
@@ -1261,6 +1287,16 @@ struct PreparedExecution {
     baseline_disk: u64,
 }
 
+#[derive(Clone, Copy)]
+struct ProcessMonitorContext<'a> {
+    pgid: u32,
+    leader_identity: &'a str,
+    action: &'a AuthorizedAction,
+    baseline_disk: u64,
+    output_count: &'a AtomicU64,
+    cancellation: Option<&'a ProcessCancellationToken>,
+}
+
 impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
     #[must_use]
     pub fn new(command_policy: &'a CommandPolicy, isolation: &'a I) -> Self {
@@ -1283,12 +1319,44 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         isolation_request: &IsolationRequest,
         artifacts: &ArtifactStore,
     ) -> Result<RawToolResult, ToolError> {
+        self.run_cancellable(
+            journal,
+            action,
+            isolation_request,
+            artifacts,
+            &ProcessCancellationToken::new(),
+        )
+    }
+
+    /// Executes one authorized action while observing an external cancellation token.
+    ///
+    /// A cancellation observed before dispatch prevents the process from starting. Once dispatch
+    /// has occurred, cancellation succeeds only after the persisted process-group identity still
+    /// matches the live leader and the exact owned group is proven absent. The action is then left
+    /// `unknown` because a partially executed mutation must be reconciled from durable evidence.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::run`], plus a recovery-blocking cancellation result after
+    /// dispatch or when exact process ownership/cleanup cannot be proven.
+    pub fn run_cancellable(
+        &self,
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        isolation_request: &IsolationRequest,
+        artifacts: &ArtifactStore,
+        cancellation: &ProcessCancellationToken,
+    ) -> Result<RawToolResult, ToolError> {
         journal.verify_authorized(action)?;
         journal.verify_dispatch_approval(action)?;
         let prepared = self.prepare_execution(action, isolation_request)?;
+        if cancellation.is_cancelled() {
+            return Err(ToolError::RecoveryBlocked(
+                "process execution cancelled before dispatch".to_owned(),
+            ));
+        }
         journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
         journal.record_process_lease(action, None, None, "pending_spawn")?;
-        self.execute_dispatched(journal, action, artifacts, prepared)
+        self.execute_dispatched(journal, action, artifacts, prepared, cancellation)
     }
 
     /// Executes one exact temporary-file secret lease through durable observation, but deliberately
@@ -1318,6 +1386,115 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         now_ms: i64,
         controller_private_root: &Path,
     ) -> Result<(RawToolResult, SecretCleanupProof), ToolError> {
+        self.run_with_secret_lease_observed_cancellable(
+            journal,
+            action,
+            isolation_request,
+            artifacts,
+            secret_lease,
+            secret_scope,
+            permission_decision,
+            now_ms,
+            controller_private_root,
+            &ProcessCancellationToken::new(),
+        )
+    }
+
+    /// Secret-aware variant of [`Self::run_with_secret_lease_observed`] that observes an external
+    /// cancellation token while the exact owned process group is running.
+    ///
+    /// Cancellation before dispatch prevents process creation. Cancellation after dispatch first
+    /// proves the persisted leader identity still owns the live process group, terminates/reaps that
+    /// exact group, drains and redacts any secret-bearing output, and leaves the action `unknown`
+    /// for reconciliation. The temporary secret file is closed before the error escapes, while the
+    /// Controller-owned `SecretLease` itself remains open for Controller closure.
+    ///
+    /// # Errors
+    /// Returns the same fail-closed errors as [`Self::run_with_secret_lease_observed`], plus a
+    /// recovery-blocking cancellation result when execution is cancelled or exact cleanup cannot be
+    /// proven.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_secret_lease_observed_cancellable(
+        &self,
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        isolation_request: &IsolationRequest,
+        artifacts: &ArtifactStore,
+        secret_lease: &mut SecretLease,
+        secret_scope: &SecretScope,
+        permission_decision: &PermissionDecision,
+        now_ms: i64,
+        controller_private_root: &Path,
+        cancellation: &ProcessCancellationToken,
+    ) -> Result<(RawToolResult, SecretCleanupProof), ToolError> {
+        Self::validate_secret_dispatch_authority(
+            journal,
+            action,
+            secret_lease,
+            secret_scope,
+            permission_decision,
+        )?;
+        let mut prepared = self.prepare_execution(action, isolation_request)?;
+        if cancellation.is_cancelled() {
+            return Err(ToolError::RecoveryBlocked(
+                "secret process execution cancelled before dispatch".to_owned(),
+            ));
+        }
+        let mut secret_file = secret_lease.inject_temporary_file(
+            secret_scope,
+            &permission_decision.effective,
+            now_ms,
+            controller_private_root,
+        )?;
+        let secret_path = secret_file.path().to_str().ok_or_else(|| {
+            ToolError::Authority("ephemeral secret path is not valid UTF-8".to_owned())
+        })?;
+        prepared
+            .environment
+            .insert(EPHEMERAL_SECRET_FILE_ENV.to_owned(), secret_path.to_owned());
+        journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
+        journal.record_process_lease(action, None, None, "pending_spawn")?;
+
+        let execution = secret_lease.with_value(
+            secret_scope,
+            &permission_decision.effective,
+            now_ms,
+            |secret_bytes| {
+                self.execute_secret_dispatched(
+                    journal,
+                    action,
+                    artifacts,
+                    prepared,
+                    secret_bytes,
+                    cancellation,
+                )
+            },
+        )?;
+        match execution {
+            Ok(result) => {
+                secret_file.close()?;
+                Ok((
+                    result,
+                    SecretCleanupProof {
+                        process_lease_reaped: true,
+                        ephemeral_injection_removed: true,
+                    },
+                ))
+            }
+            Err(error) => {
+                secret_file.close()?;
+                Err(error)
+            }
+        }
+    }
+
+    fn validate_secret_dispatch_authority(
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        secret_lease: &SecretLease,
+        secret_scope: &SecretScope,
+        permission_decision: &PermissionDecision,
+    ) -> Result<(), ToolError> {
         journal.verify_authorized(action)?;
         journal.verify_dispatch_approval(action)?;
         action.verify_permission_decision(permission_decision)?;
@@ -1369,47 +1546,7 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
                 "{EPHEMERAL_SECRET_FILE_ENV} is Controller-owned on secret execution paths"
             )));
         }
-
-        let mut prepared = self.prepare_execution(action, isolation_request)?;
-        let mut secret_file = secret_lease.inject_temporary_file(
-            secret_scope,
-            &permission_decision.effective,
-            now_ms,
-            controller_private_root,
-        )?;
-        let secret_path = secret_file.path().to_str().ok_or_else(|| {
-            ToolError::Authority("ephemeral secret path is not valid UTF-8".to_owned())
-        })?;
-        prepared
-            .environment
-            .insert(EPHEMERAL_SECRET_FILE_ENV.to_owned(), secret_path.to_owned());
-        journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
-        journal.record_process_lease(action, None, None, "pending_spawn")?;
-
-        let execution = secret_lease.with_value(
-            secret_scope,
-            &permission_decision.effective,
-            now_ms,
-            |secret_bytes| {
-                self.execute_secret_dispatched(journal, action, artifacts, prepared, secret_bytes)
-            },
-        )?;
-        match execution {
-            Ok(result) => {
-                secret_file.close()?;
-                Ok((
-                    result,
-                    SecretCleanupProof {
-                        process_lease_reaped: true,
-                        ephemeral_injection_removed: true,
-                    },
-                ))
-            }
-            Err(error) => {
-                secret_file.close()?;
-                Err(error)
-            }
-        }
+        Ok(())
     }
 
     fn prepare_execution(
@@ -1477,6 +1614,7 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         action: &AuthorizedAction,
         artifacts: &ArtifactStore,
         prepared: PreparedExecution,
+        cancellation: &ProcessCancellationToken,
     ) -> Result<RawToolResult, ToolError> {
         let mut command = Command::new(&prepared.isolated.executable);
         command
@@ -1489,35 +1627,8 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             .stderr(Stdio::piped())
             .process_group(0);
 
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                journal.record_process_lease(action, None, None, "reaped")?;
-                Self::reconcile_proven_no_child(journal, action)?;
-                return Err(ToolError::Io(error));
-            }
-        };
-        let pgid = child.id();
-        recovery_test_hook("after_process_spawn_before_identity_lease");
-        let Some(leader_identity) = process_group_leader_identity(pgid)? else {
-            terminate_process_group(&mut child, pgid)?;
-            if wait_group_absent(pgid, Duration::from_millis(500))? {
-                journal.record_process_lease(action, Some(pgid), None, "reaped")?;
-            }
-            journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
-            return Err(ToolError::RecoveryBlocked(
-                "spawned process leader identity could not be proven".to_owned(),
-            ));
-        };
-        if let Err(error) =
-            journal.record_process_lease(action, Some(pgid), Some(&leader_identity), "active")
-        {
-            terminate_process_group(&mut child, pgid)?;
-            if !wait_group_absent(pgid, Duration::from_millis(500))? {
-                let _ = journal.transition(action, ActionState::Dispatched, ActionState::Unknown);
-            }
-            return Err(error);
-        }
+        let (mut child, pgid, leader_identity) =
+            Self::spawn_owned_process(journal, action, &mut command)?;
         let output_count = Arc::new(AtomicU64::new(0));
         let stdout_handle = spawn_reader(
             child.stdout.take(),
@@ -1530,12 +1641,16 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             Arc::clone(&output_count),
         );
         let start = Instant::now();
-        let (status, limited) = self.monitor_child(
+        let (status, limited, cancelled) = self.monitor_child(
             &mut child,
-            pgid,
-            action,
-            prepared.baseline_disk,
-            &output_count,
+            ProcessMonitorContext {
+                pgid,
+                leader_identity: &leader_identity,
+                action,
+                baseline_disk: prepared.baseline_disk,
+                output_count: &output_count,
+                cancellation: Some(cancellation),
+            },
         )?;
 
         let reaped = wait_group_absent(pgid, Duration::from_millis(500))?;
@@ -1544,6 +1659,17 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             return Err(ToolError::RecoveryBlocked(format!(
                 "process group {pgid} still has members after cleanup"
             )));
+        }
+
+        if cancelled {
+            return Self::finish_cancelled_dispatch(
+                journal,
+                action,
+                pgid,
+                &leader_identity,
+                stdout_handle,
+                stderr_handle,
+            );
         }
 
         if limited.is_some() && action.command.subprocess_limit > 0 {
@@ -1586,6 +1712,7 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         artifacts: &ArtifactStore,
         prepared: PreparedExecution,
         secret_bytes: &[u8],
+        cancellation: &ProcessCancellationToken,
     ) -> Result<RawToolResult, ToolError> {
         let mut command = Command::new(&prepared.isolated.executable);
         command
@@ -1598,35 +1725,8 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             .stderr(Stdio::piped())
             .process_group(0);
 
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                journal.record_process_lease(action, None, None, "reaped")?;
-                Self::reconcile_proven_no_child(journal, action)?;
-                return Err(ToolError::Io(error));
-            }
-        };
-        let pgid = child.id();
-        recovery_test_hook("after_process_spawn_before_identity_lease");
-        let Some(leader_identity) = process_group_leader_identity(pgid)? else {
-            terminate_process_group(&mut child, pgid)?;
-            if wait_group_absent(pgid, Duration::from_millis(500))? {
-                journal.record_process_lease(action, Some(pgid), None, "reaped")?;
-            }
-            journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
-            return Err(ToolError::RecoveryBlocked(
-                "spawned process leader identity could not be proven".to_owned(),
-            ));
-        };
-        if let Err(error) =
-            journal.record_process_lease(action, Some(pgid), Some(&leader_identity), "active")
-        {
-            terminate_process_group(&mut child, pgid)?;
-            if !wait_group_absent(pgid, Duration::from_millis(500))? {
-                let _ = journal.transition(action, ActionState::Dispatched, ActionState::Unknown);
-            }
-            return Err(error);
-        }
+        let (mut child, pgid, leader_identity) =
+            Self::spawn_owned_process(journal, action, &mut command)?;
         let output_count = Arc::new(AtomicU64::new(0));
         let stdout_handle = spawn_reader(
             child.stdout.take(),
@@ -1639,12 +1739,16 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             Arc::clone(&output_count),
         );
         let start = Instant::now();
-        let (status, limited) = self.monitor_child(
+        let (status, limited, cancelled) = self.monitor_child(
             &mut child,
-            pgid,
-            action,
-            prepared.baseline_disk,
-            &output_count,
+            ProcessMonitorContext {
+                pgid,
+                leader_identity: &leader_identity,
+                action,
+                baseline_disk: prepared.baseline_disk,
+                output_count: &output_count,
+                cancellation: Some(cancellation),
+            },
         )?;
         let reaped = wait_group_absent(pgid, Duration::from_millis(500))?;
         if !reaped {
@@ -1654,6 +1758,16 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             )));
         }
         journal.record_process_lease(action, Some(pgid), Some(&leader_identity), "reaped")?;
+
+        if cancelled {
+            return Self::finish_cancelled_secret_dispatch(
+                journal,
+                action,
+                stdout_handle,
+                stderr_handle,
+                secret_bytes,
+            );
+        }
 
         if limited.is_some() && action.command.subprocess_limit > 0 {
             journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
@@ -1690,40 +1804,125 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         Ok(result)
     }
 
+    fn finish_cancelled_secret_dispatch(
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        stdout_handle: Option<ReaderHandle>,
+        stderr_handle: Option<ReaderHandle>,
+        secret_bytes: &[u8],
+    ) -> Result<RawToolResult, ToolError> {
+        journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
+        let mut raw_stdout = receive_reader(stdout_handle, Duration::from_millis(500))?;
+        let mut raw_stderr = receive_reader(stderr_handle, Duration::from_millis(500))?;
+        let redactor = Redactor::v1();
+        let stdout_redaction = redactor.redact_bytes(&raw_stdout, &[secret_bytes]);
+        let stderr_redaction = redactor.redact_bytes(&raw_stderr, &[secret_bytes]);
+        raw_stdout.fill(0);
+        raw_stderr.fill(0);
+        stdout_redaction?;
+        stderr_redaction?;
+        Err(ToolError::RecoveryBlocked(
+            "secret process execution cancelled after dispatch; action outcome requires reconciliation"
+                .to_owned(),
+        ))
+    }
+
     fn monitor_child(
         &self,
         child: &mut Child,
-        pgid: u32,
-        action: &AuthorizedAction,
-        baseline_disk: u64,
-        output_count: &AtomicU64,
-    ) -> Result<(std::process::ExitStatus, Option<ResourceLimitKind>), ToolError> {
+        context: ProcessMonitorContext<'_>,
+    ) -> Result<(std::process::ExitStatus, Option<ResourceLimitKind>, bool), ToolError> {
         let start = Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
-                return Ok((status, None));
+                return Ok((status, None, false));
+            }
+            if context
+                .cancellation
+                .is_some_and(ProcessCancellationToken::is_cancelled)
+            {
+                let status =
+                    terminate_owned_process_group(child, context.pgid, context.leader_identity)?;
+                return Ok((status, None, true));
             }
             let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let limited = if elapsed_ms > action.command.timeout_ms {
+            let limited = if elapsed_ms > context.action.command.timeout_ms {
                 Some(ResourceLimitKind::Timeout)
-            } else if output_count.load(Ordering::Relaxed) > action.command.output_limit_bytes {
+            } else if context.output_count.load(Ordering::Relaxed)
+                > context.action.command.output_limit_bytes
+            {
                 Some(ResourceLimitKind::OutputBytes)
-            } else if directory_size(&action.command.working_directory)?
-                .saturating_sub(baseline_disk)
-                > action.command.disk_write_limit_bytes
+            } else if directory_size(&context.action.command.working_directory)?
+                .saturating_sub(context.baseline_disk)
+                > context.action.command.disk_write_limit_bytes
             {
                 Some(ResourceLimitKind::DiskBytes)
-            } else if descendant_count(pgid)? > action.command.subprocess_limit {
+            } else if descendant_count(context.pgid)? > context.action.command.subprocess_limit {
                 Some(ResourceLimitKind::Subprocesses)
             } else {
                 None
             };
             if let Some(limit) = limited {
-                terminate_process_group(child, pgid)?;
-                return Ok((child.wait()?, Some(limit)));
+                terminate_process_group(child, context.pgid)?;
+                return Ok((child.wait()?, Some(limit), false));
             }
             thread::sleep(self.poll_interval);
         }
+    }
+
+    fn finish_cancelled_dispatch(
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        pgid: u32,
+        leader_identity: &str,
+        stdout_handle: Option<ReaderHandle>,
+        stderr_handle: Option<ReaderHandle>,
+    ) -> Result<RawToolResult, ToolError> {
+        journal.record_process_lease(action, Some(pgid), Some(leader_identity), "reaped")?;
+        journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
+        let _ = receive_reader(stdout_handle, Duration::from_millis(500))?;
+        let _ = receive_reader(stderr_handle, Duration::from_millis(500))?;
+        Err(ToolError::RecoveryBlocked(
+            "process execution cancelled after dispatch; action outcome requires reconciliation"
+                .to_owned(),
+        ))
+    }
+
+    fn spawn_owned_process(
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        command: &mut Command,
+    ) -> Result<(Child, u32, String), ToolError> {
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                journal.record_process_lease(action, None, None, "reaped")?;
+                Self::reconcile_proven_no_child(journal, action)?;
+                return Err(ToolError::Io(error));
+            }
+        };
+        let pgid = child.id();
+        recovery_test_hook("after_process_spawn_before_identity_lease");
+        let Some(leader_identity) = process_group_leader_identity(pgid)? else {
+            terminate_process_group(&mut child, pgid)?;
+            if wait_group_absent(pgid, Duration::from_millis(500))? {
+                journal.record_process_lease(action, Some(pgid), None, "reaped")?;
+            }
+            journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
+            return Err(ToolError::RecoveryBlocked(
+                "spawned process leader identity could not be proven".to_owned(),
+            ));
+        };
+        if let Err(error) =
+            journal.record_process_lease(action, Some(pgid), Some(&leader_identity), "active")
+        {
+            terminate_process_group(&mut child, pgid)?;
+            if !wait_group_absent(pgid, Duration::from_millis(500))? {
+                let _ = journal.transition(action, ActionState::Dispatched, ActionState::Unknown);
+            }
+            return Err(error);
+        }
+        Ok((child, pgid, leader_identity))
     }
 
     fn reconcile_proven_no_child(
@@ -2053,6 +2252,41 @@ pub fn reap_owned_process_group(pgid: u32, expected_identity: &str) -> Result<()
                 )))
             }
         }
+    }
+}
+
+fn terminate_owned_process_group(
+    child: &mut Child,
+    pgid: u32,
+    expected_identity: &str,
+) -> Result<std::process::ExitStatus, ToolError> {
+    match process_group_leader_identity(pgid)? {
+        Some(current) if current == expected_identity => {}
+        Some(_) => {
+            return Err(ToolError::RecoveryBlocked(format!(
+                "process group leader identity changed for {pgid}; refusing cancellation kill"
+            )));
+        }
+        None => {
+            if let Some(status) = child.try_wait()?
+                && wait_group_absent(pgid, Duration::from_millis(50))?
+            {
+                return Ok(status);
+            }
+            return Err(ToolError::RecoveryBlocked(format!(
+                "process group {pgid} lost its recorded leader identity before cancellation"
+            )));
+        }
+    }
+
+    terminate_process_group(child, pgid)?;
+    let status = child.wait()?;
+    if wait_group_absent(pgid, Duration::from_millis(500))? {
+        Ok(status)
+    } else {
+        Err(ToolError::RecoveryBlocked(format!(
+            "owned process group {pgid} remains after cancellation kill"
+        )))
     }
 }
 

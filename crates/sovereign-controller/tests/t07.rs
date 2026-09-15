@@ -37,18 +37,23 @@ use sovereign_state::{
     ActionTransition, NewActionRecord, NewCheckpointIntegrityRecord, NewJournalEvent,
     StateRecordUpdate, StateStore,
 };
-use sovereign_tools::{EPHEMERAL_SECRET_FILE_ENV, PermissionClass, ToolManifest, ToolSchemaV1};
+use sovereign_tools::{
+    EPHEMERAL_SECRET_FILE_ENV, PermissionClass, ToolManifest, ToolSchemaV1,
+    process_group_leader_identity,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SOURCE: &str =
     "export function SettingsForm() {\n  return <button type=\"submit\">Save</button>;\n}\n";
@@ -734,6 +739,8 @@ fn compiled_worktree_fixture(label: &str) -> CompiledFixture {
 }
 
 fn compiled_worktree_graph_fixture(label: &str, tasks: &[Value]) -> CompiledFixture {
+    let mut policy = global_policy();
+    policy["resources"]["max_model_calls"] = json!(tasks.len().max(2));
     compiled_fixture_inner(
         label,
         false,
@@ -748,7 +755,7 @@ fn compiled_worktree_graph_fixture(label: &str, tasks: &[Value]) -> CompiledFixt
                 .to_owned(),
         ),
         None,
-        None,
+        Some(policy),
     )
 }
 
@@ -2613,6 +2620,308 @@ fn m6_secret_process_redacts_binary_sentinel_closes_lease_and_stops_at_verifying
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn m6_inflight_secret_cancellation_reaps_closes_and_recovers_as_unknown_without_leakage() {
+    let (mut fixture, secret_ref) = compiled_secret_fixture("m6-secret-cancel-inflight");
+    let state =
+        StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m6_local_secret_execution());
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
+    let compilation = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("compiled secret fixture already activated"));
+    let activation = controller
+        .activate(compilation, &fixture.registry)
+        .unwrap_or_else(|error| panic!("activate secret fixture: {error}"));
+    let task_id = activation.task_ids[0].clone();
+    let manifest = secret_tool_manifest();
+    let ready = controller
+        .derive_ready_lease(&fixture.registry, &task_id, readiness(), &manifest)
+        .unwrap_or_else(|error| panic!("secret readiness: {error}"));
+    let cancellation = controller
+        .task_cancellation_handle(&task_id)
+        .unwrap_or_else(|error| panic!("task cancellation handle: {error}"));
+
+    let sentinel = b"T07-CANCELLED-SECRET-\xff-\x00-SENTINEL".to_vec();
+    let mut broker = SecretBroker::new();
+    broker
+        .register_provider(Arc::new(FakeSecretProvider::new(
+            SecretProviderKind::ExternalBroker,
+            [("cancel-key".to_owned(), sentinel.clone())],
+        )))
+        .unwrap_or_else(|error| panic!("register fake secret provider: {error}"));
+    broker
+        .register_secret(
+            secret_ref.clone(),
+            ControllerSecretLocator::FakeKey {
+                provider: SecretProviderKind::ExternalBroker,
+                key: "cancel-key".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("register exact secret handle: {error}"));
+
+    let parts = runtime_parts(&fixture);
+    let isolation = PassthroughIsolation {
+        capabilities: MacSandboxExecBackend::detect()
+            .unwrap_or_else(|error| panic!("seatbelt capability source: {error}")),
+    };
+    let private_root = fixture.repo.base.join("controller-private-secrets");
+    let runtime = SecretProcessRuntime {
+        registry: &fixture.registry,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &manifest,
+        secret_broker: &broker,
+        controller_private_root: &private_root,
+    };
+    let marker = fixture.repo.root.join("secret-cancel.started");
+    let command = CommandSpec {
+        executable: PathBuf::from("/usr/bin/python3"),
+        args: vec![
+            "-I".to_owned(),
+            "-c".to_owned(),
+            "import os,sys,time; p=os.environ['SOVEREIGN_SECRET_FILE']; b=open(p,'rb').read(); open('secret-cancel.started','wb').write(b'1'); sys.stdout.buffer.write(b); sys.stdout.flush(); sys.stderr.buffer.write(b); sys.stderr.flush(); time.sleep(30)".to_owned(),
+        ],
+        working_directory: fixture.repo.root.clone(),
+        environment: BTreeMap::new(),
+        mode: CommandMode::Direct,
+        declared_risk: CommandRisk::RepositoryMutation,
+        timeout_ms: 30_000,
+        output_limit_bytes: 64 * 1024,
+        disk_write_limit_bytes: 64 * 1024,
+        subprocess_limit: 1,
+    };
+    let cancel_handle = cancellation.clone();
+    let marker_for_thread = marker.clone();
+    let canceller = thread::spawn(move || {
+        let started = Instant::now();
+        while !marker_for_thread.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "secret process never reached the in-flight marker"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        cancel_handle
+            .cancel()
+            .unwrap_or_else(|error| panic!("cancel in-flight secret task: {error}"));
+    });
+
+    let error = controller
+        .execute_secret_process(ready, &runtime, &secret_ref.secret_ref_id, command)
+        .err()
+        .unwrap_or_else(|| panic!("cancelled secret process unexpectedly succeeded"));
+    canceller
+        .join()
+        .unwrap_or_else(|_| panic!("secret cancellation thread panicked"));
+    let action_id = match error {
+        ControllerError::UnknownAction(action_id) => action_id,
+        other => panic!("cancelled dispatched secret action must be Unknown, got {other}"),
+    };
+    assert_eq!(
+        controller
+            .state()
+            .action_record(&action_id)
+            .unwrap_or_else(|read_error| panic!("cancelled action record: {read_error}"))
+            .map(|record| record.state),
+        Some("unknown".to_owned())
+    );
+    let lifecycle_raw = controller
+        .state()
+        .get_state("controller.secret_action_lifecycle", &action_id)
+        .unwrap_or_else(|read_error| panic!("cancelled secret lifecycle: {read_error}"))
+        .unwrap_or_else(|| panic!("cancelled secret lifecycle missing"));
+    let lifecycle: Value = serde_json::from_str(&lifecycle_raw)
+        .unwrap_or_else(|decode_error| panic!("decode cancelled lifecycle: {decode_error}"));
+    assert_eq!(lifecycle["state"], json!("cancelled_post_dispatch_unknown"));
+    assert_eq!(lifecycle["result_digest"], Value::Null);
+    let process_raw = controller
+        .state()
+        .get_state("controller.process_lease", &action_id)
+        .unwrap_or_else(|read_error| panic!("cancelled process lease: {read_error}"))
+        .unwrap_or_else(|| panic!("cancelled process lease missing"));
+    let process: Value = serde_json::from_str(&process_raw)
+        .unwrap_or_else(|decode_error| panic!("decode process lease: {decode_error}"));
+    assert_eq!(process["state"], json!("reaped"));
+    let pgid = process["process_group_id"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_else(|| panic!("cancelled process PGID missing"));
+    assert!(process["leader_identity"].as_str().is_some());
+    assert_eq!(
+        process_group_leader_identity(pgid).unwrap_or_else(|observe_error| panic!(
+            "observe cancelled secret group: {observe_error}"
+        )),
+        None
+    );
+    assert!(
+        !private_root.exists()
+            || fs::read_dir(&private_root)
+                .unwrap_or_else(|read_error| panic!("private secret root: {read_error}"))
+                .next()
+                .is_none(),
+        "cancelled secret temporary injection must be removed before terminal lifecycle"
+    );
+    assert_runtime_persistence_excludes_secret(
+        &fixture.repo,
+        &parts.artifacts,
+        &sentinel,
+        &sentinel,
+        &sentinel,
+    );
+
+    drop(controller);
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|open_error| panic!("reopen cancelled secret state: {open_error}"));
+    let (recovered, recovery) = RecoveryManager::recover_with_permission_context(
+        state,
+        &fixture.registry,
+        PermissionContext::m6_local_secret_execution(),
+    )
+    .unwrap_or_else(|recovery_error| panic!("recover cancelled secret action: {recovery_error}"));
+    assert!(recovery.mutation_blocked);
+    assert!(recovery.unknown_action_ids.contains(&action_id));
+    assert_eq!(
+        recovered
+            .state()
+            .action_record(&action_id)
+            .unwrap_or_else(|read_error| panic!("recovered cancelled action: {read_error}"))
+            .map(|record| record.state),
+        Some("unknown".to_owned())
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn m6_cancelled_predispatch_secret_lifecycle_replays_from_post_checkpoint_journal() {
+    let (mut fixture, secret_ref) =
+        compiled_secret_fixture("m6-secret-cancel-predispatch-correlation");
+    let state =
+        StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m6_local_secret_execution());
+    let compilation = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("compiled secret fixture already activated"));
+    let activation = controller
+        .activate(compilation, &fixture.registry)
+        .unwrap_or_else(|error| panic!("activate secret fixture: {error}"));
+    let task_id = activation.task_ids[0].clone();
+    let task_contract_digest = controller
+        .task_contract_digest(&task_id)
+        .unwrap_or_else(|| panic!("secret task contract digest"))
+        .to_owned();
+    let manifest = latest_checkpoint_manifest(controller.state());
+    let execution_epoch = controller
+        .state()
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("secret cancellation epoch: {error}"));
+    drop(controller);
+
+    let action_id = "action.m6-secret-cancelled-predispatch".to_owned();
+    let payload_digest = sha256_prefixed(b"m6-secret-cancelled-predispatch-payload");
+    let mut state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen cancellation state: {error}"));
+    state
+        .insert_action_record(NewActionRecord {
+            action_id: &action_id,
+            state: "prepared",
+            payload_digest: &payload_digest,
+            policy_digest: &manifest.policy_digest,
+            execution_epoch,
+            event_id: "event.m6-secret-cancelled-predispatch.prepared",
+            event_kind: "prepared",
+            payload_json: "{}",
+        })
+        .unwrap_or_else(|error| panic!("insert cancelled secret action: {error}"));
+    state
+        .transition_action_with_event(ActionTransition {
+            action_id: &action_id,
+            expected_state: "prepared",
+            next_state: "authorized",
+            expected_epoch: execution_epoch,
+            event_id: "event.m6-secret-cancelled-predispatch.authorized",
+            event_kind: "authorized",
+            payload_json: "{}",
+            result_digest: None,
+        })
+        .unwrap_or_else(|error| panic!("authorize cancelled secret action: {error}"));
+    let marker = json!({
+        "schema_version": 1,
+        "plan_id": manifest.plan_id,
+        "plan_revision": manifest.plan_revision,
+        "task_id": task_id,
+        "task_contract_digest": task_contract_digest,
+        "action_id": action_id,
+        "permission_decision_digest": sha256_prefixed(b"m6-secret-cancelled-predispatch-permission"),
+        "execution_epoch": execution_epoch,
+        "secret_ref_binding_digest": secret_ref
+            .binding_digest()
+            .unwrap_or_else(|error| panic!("secret ref binding digest: {error}")),
+        "provider": "external_broker",
+        "injection": "temporary_file",
+        "target": EPHEMERAL_SECRET_FILE_ENV,
+        "expires_at_ms": 1_900_000_000_000_i64,
+        "action_payload_digest": payload_digest,
+        "state": "cancelled_pre_dispatch",
+        "result_digest": Value::Null,
+    });
+    let marker_json = serde_json::to_string(&marker)
+        .unwrap_or_else(|error| panic!("encode cancelled lifecycle: {error}"));
+    let marker_digest = sha256_prefixed(marker_json.as_bytes());
+    let payload = json!({
+        "plan_id": manifest.plan_id,
+        "plan_revision": manifest.plan_revision,
+        "plan_digest": manifest.plan_digest,
+        "secret_action_lifecycle": marker,
+        "record_digest": marker_digest,
+    })
+    .to_string();
+    state
+        .put_state_records_with_events(
+            &[StateRecordUpdate {
+                namespace: "controller.secret_action_lifecycle",
+                key: &action_id,
+                value_json: &marker_json,
+            }],
+            &[NewJournalEvent {
+                event_id: "event.m6-secret-cancelled-predispatch.lifecycle",
+                entity_type: "controller",
+                entity_id: &action_id,
+                event_kind: "secret_action_cancelled_predispatch",
+                payload_json: &payload,
+            }],
+        )
+        .unwrap_or_else(|error| panic!("persist cancelled lifecycle: {error}"));
+    drop(state);
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen cancelled lifecycle state: {error}"));
+    let (recovered, recovery) = RecoveryManager::recover_with_permission_context(
+        state,
+        &fixture.registry,
+        PermissionContext::m6_local_secret_execution(),
+    )
+    .unwrap_or_else(|error| panic!("cancelled predispatch correlation must recover: {error}"));
+    assert!(!recovery.mutation_blocked);
+    assert_eq!(
+        recovered
+            .state()
+            .action_record(&action_id)
+            .unwrap_or_else(|error| panic!("recovered cancelled action: {error}"))
+            .map(|record| record.state),
+        Some("authorized".to_owned())
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn m6_runtime_secret_failure_never_reaches_persistence_context_or_local_model_request() {
     let (mut fixture, secret_ref) = compiled_secret_fixture("m6-secret-runtime-persistence");
     let state =
@@ -3066,6 +3375,192 @@ fn m6_recovery_blocks_all_incomplete_secret_lifecycle_crash_windows() {
         Some(0),
         "CleanupProven",
     );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn m6_pending_cleanup_recovery_reaps_exact_active_process_before_lifecycle_fence() {
+    let (mut fixture, secret_ref) = compiled_secret_fixture("m6-secret-pending-cleanup-reap-first");
+    let state =
+        StateStore::open(&fixture.repo.state_path).unwrap_or_else(|error| panic!("state: {error}"));
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m6_local_secret_execution());
+    let compilation = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("compiled secret fixture already activated"));
+    let activation = controller
+        .activate(compilation, &fixture.registry)
+        .unwrap_or_else(|error| panic!("activate secret fixture: {error}"));
+    let task_id = activation.task_ids[0].clone();
+    let task_contract_digest = controller
+        .task_contract_digest(&task_id)
+        .unwrap_or_else(|| panic!("secret task contract digest"))
+        .to_owned();
+    let manifest = latest_checkpoint_manifest(controller.state());
+    let execution_epoch = controller
+        .state()
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("pending cleanup epoch: {error}"));
+    drop(controller);
+
+    let action_id = "action.m6-secret-pending-cleanup-active-process".to_owned();
+    let payload_digest = sha256_prefixed(b"m6-secret-pending-cleanup-active-process-payload");
+    let mut state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen pending cleanup state: {error}"));
+    let result_store = ArtifactStore::open(fixture.repo.base.join("cas"))
+        .unwrap_or_else(|error| panic!("pending cleanup result store: {error}"));
+    let result = result_store
+        .put(&mut state, b"sanitized pending cleanup result")
+        .unwrap_or_else(|error| panic!("pending cleanup result artifact: {error}"));
+    state
+        .insert_action_record(NewActionRecord {
+            action_id: &action_id,
+            state: "prepared",
+            payload_digest: &payload_digest,
+            policy_digest: &manifest.policy_digest,
+            execution_epoch,
+            event_id: "event.m6-secret-pending-cleanup.prepared",
+            event_kind: "prepared",
+            payload_json: "{}",
+        })
+        .unwrap_or_else(|error| panic!("insert pending cleanup action: {error}"));
+    state
+        .transition_action_with_event(ActionTransition {
+            action_id: &action_id,
+            expected_state: "prepared",
+            next_state: "observed",
+            expected_epoch: execution_epoch,
+            event_id: "event.m6-secret-pending-cleanup.observed",
+            event_kind: "observed",
+            payload_json: "{}",
+            result_digest: Some(&result.digest),
+        })
+        .unwrap_or_else(|error| panic!("observe pending cleanup action: {error}"));
+    let marker = json!({
+        "schema_version": 1,
+        "plan_id": manifest.plan_id,
+        "plan_revision": manifest.plan_revision,
+        "task_id": task_id,
+        "task_contract_digest": task_contract_digest,
+        "action_id": action_id,
+        "permission_decision_digest": sha256_prefixed(b"m6-secret-pending-cleanup-permission"),
+        "execution_epoch": execution_epoch,
+        "secret_ref_binding_digest": secret_ref
+            .binding_digest()
+            .unwrap_or_else(|error| panic!("secret ref binding digest: {error}")),
+        "provider": "external_broker",
+        "injection": "temporary_file",
+        "target": EPHEMERAL_SECRET_FILE_ENV,
+        "expires_at_ms": 1_900_000_000_000_i64,
+        "action_payload_digest": payload_digest,
+        "state": "pending_cleanup",
+        "result_digest": Value::Null,
+    });
+    let marker_json = serde_json::to_string(&marker)
+        .unwrap_or_else(|error| panic!("encode pending lifecycle: {error}"));
+    let marker_digest = sha256_prefixed(marker_json.as_bytes());
+    let lifecycle_payload = json!({
+        "plan_id": manifest.plan_id,
+        "plan_revision": manifest.plan_revision,
+        "plan_digest": manifest.plan_digest,
+        "secret_action_lifecycle": marker,
+        "record_digest": marker_digest,
+    })
+    .to_string();
+    state
+        .put_state_records_with_events(
+            &[StateRecordUpdate {
+                namespace: "controller.secret_action_lifecycle",
+                key: &action_id,
+                value_json: &marker_json,
+            }],
+            &[NewJournalEvent {
+                event_id: "event.m6-secret-pending-cleanup.lifecycle",
+                entity_type: "controller",
+                entity_id: &action_id,
+                event_kind: "secret_action_pending_cleanup",
+                payload_json: &lifecycle_payload,
+            }],
+        )
+        .unwrap_or_else(|error| panic!("persist pending lifecycle: {error}"));
+
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("while :; do sleep 1; done")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn pending cleanup child: {error}"));
+    let pgid = child.id();
+    let identity_started = Instant::now();
+    let leader_identity = loop {
+        if let Some(identity) = process_group_leader_identity(pgid)
+            .unwrap_or_else(|error| panic!("observe pending cleanup leader: {error}"))
+        {
+            break identity;
+        }
+        assert!(
+            identity_started.elapsed() < Duration::from_secs(1),
+            "pending cleanup child never exposed a stable leader identity"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    state
+        .put_state(
+            "controller.process_lease",
+            &action_id,
+            &json!({
+                "schema_version": 1,
+                "lease_id": format!("process.{action_id}"),
+                "task_id": task_id,
+                "attempt_id": "attempt.m6-secret-pending-cleanup",
+                "action_id": action_id,
+                "process_group_id": pgid,
+                "leader_identity": leader_identity,
+                "state": "active",
+            })
+            .to_string(),
+        )
+        .unwrap_or_else(|error| panic!("persist active process lease: {error}"));
+    drop(state);
+    let waiter = thread::spawn(move || child.wait());
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen recovery state: {error}"));
+    let error = RecoveryManager::recover_with_permission_context(
+        state,
+        &fixture.registry,
+        PermissionContext::m6_local_secret_execution(),
+    )
+    .err()
+    .unwrap_or_else(|| panic!("PendingCleanup lifecycle unexpectedly recovered"));
+    assert!(
+        error.to_string().contains("secret action recovery blocked")
+            && error.to_string().contains("PendingCleanup"),
+        "unexpected pending cleanup recovery error: {error}"
+    );
+    waiter
+        .join()
+        .unwrap_or_else(|_| panic!("pending cleanup child waiter panicked"))
+        .unwrap_or_else(|wait_error| panic!("wait pending cleanup child: {wait_error}"));
+    assert_eq!(
+        process_group_leader_identity(pgid).unwrap_or_else(|observe_error| panic!(
+            "observe reaped recovery group: {observe_error}"
+        )),
+        None
+    );
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|open_error| panic!("reopen reaped process state: {open_error}"));
+    let process_raw = state
+        .get_state("controller.process_lease", &action_id)
+        .unwrap_or_else(|read_error| panic!("read recovery process lease: {read_error}"))
+        .unwrap_or_else(|| panic!("recovery process lease missing"));
+    let process: Value = serde_json::from_str(&process_raw)
+        .unwrap_or_else(|decode_error| panic!("decode recovery process lease: {decode_error}"));
+    assert_eq!(process["state"], json!("reaped_recovery"));
 }
 
 #[test]

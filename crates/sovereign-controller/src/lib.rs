@@ -25,13 +25,14 @@ use sovereign_plan::{
     smallest_replan_scope_tasks,
 };
 use sovereign_policy::{
-    APPROVAL_CLAIM_SCHEMA_VERSION, AdmissionStatus, Capability, CapabilityLayers, CapabilitySet,
-    CommandMode, CommandPolicy, CommandRisk, CommandSpec, ConditionalLeaseContextV1,
-    HeavyLeaseClass, IsolationRequest, LeaseStateV1, M6ResourceGovernorSnapshotV1, ModelCallBudget,
-    PermissionDecision, PlanHeavyLeaseClass, PolicyError, ReconciliationClass,
-    ReconciliationPolicy, ResourceLeaseOwnerV1, ResourceLeaseRequestV1, ResourceLeaseV1,
-    ResourcePolicyEventV1, ResourcePressureEventV1, SecretBroker, SecretInjection,
-    SecretProviderKind, SecretRef, SecretScope, TaskCapabilityGrant, TaskResourceBudgetV1,
+    APPROVAL_CLAIM_SCHEMA_VERSION, AUTONOMY_BUDGET_SCHEMA_VERSION, AdmissionStatus,
+    AutonomyBudgetV1, Capability, CapabilityLayers, CapabilitySet, CommandMode, CommandPolicy,
+    CommandRisk, CommandSpec, ConditionalLeaseContextV1, HeavyLeaseClass, IsolationRequest,
+    LeaseStateV1, M6ResourceGovernorSnapshotV1, ModelCallBudget, PermissionDecision,
+    PlanHeavyLeaseClass, PolicyError, ReconciliationClass, ReconciliationPolicy,
+    ResourceLeaseOwnerV1, ResourceLeaseRequestV1, ResourceLeaseV1, ResourcePolicyEventV1,
+    ResourcePressureEventV1, SecretBroker, SecretInjection, SecretProviderKind, SecretRef,
+    SecretScope, TaskCapabilityGrant, TaskResourceBudgetV1,
 };
 use sovereign_repo::{
     ChangeSet, ChangeSetCompositionInput, ComposeChangeSetsOutcome, CompositionConflictEvidence,
@@ -40,13 +41,13 @@ use sovereign_repo::{
 };
 use sovereign_state::{
     CheckpointIntegrityRecord, JournalEvent, NewCheckpointIntegrityRecord, NewJournalEvent,
-    StateError, StateRecordUpdate, StateStore,
+    SecurityAuditEventV1, SecurityAuditHead, StateError, StateRecordUpdate, StateStore,
 };
 use sovereign_tools::{
     APPROVAL_CLAIM_NAMESPACE, ActionJournal, ActionState, ApprovalClaim, AuthorizedAction,
-    EPHEMERAL_SECRET_FILE_ENV, PermissionClass, ProcessRunner, RawToolResult, ReconciliationMode,
-    ToolError, ToolManifest, ToolSchemaV1, filter_authorized_tool_schemas,
-    reap_owned_process_group,
+    EPHEMERAL_SECRET_FILE_ENV, PermissionClass, ProcessCancellationToken, ProcessRunner,
+    RawToolResult, ReconciliationMode, ToolError, ToolManifest, ToolSchemaV1,
+    filter_authorized_tool_schemas, reap_owned_process_group,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -54,7 +55,8 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod resources;
 mod roles;
@@ -91,12 +93,21 @@ const MAX_LITERAL_BYTES: usize = 4_096;
 const EVIDENCE_SATISFACTION_SCHEMA_VERSION: u32 = 1;
 const VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION: u32 = 1;
 const TASK_CARRY_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
-pub const CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const LEGACY_CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 1;
+pub const CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const RECOVERY_PROCESS_LEASE_SCHEMA_VERSION: u32 = 1;
 pub const EXECUTION_CONTROL_SCHEMA_VERSION: u32 = 1;
 pub const GOAL_INTENT_SCHEMA_VERSION: u32 = 1;
 pub const APPROVAL_REQUEST_SCHEMA_VERSION: u32 = 1;
+pub const SECURITY_AUDIT_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+pub const AUTONOMY_ACTION_CHARGE_SCHEMA_VERSION: u32 = 1;
+pub const ROLLBACK_RECORD_SCHEMA_VERSION: u32 = 1;
+pub const ROLLBACK_VERIFICATION_SCHEMA_VERSION: u32 = 1;
+pub const CANCELLATION_RECORD_SCHEMA_VERSION: u32 = 1;
 const APPROVAL_REQUEST_NAMESPACE: &str = "controller.approval_request";
+const AUTONOMY_ACTION_CHARGE_NAMESPACE: &str = "controller.autonomy_action_charge";
+const ROLLBACK_RECORD_NAMESPACE: &str = "controller.rollback";
+const CANCELLATION_REQUEST_NAMESPACE: &str = "controller.cancellation_request";
 const ACTION_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 const ACTION_RECONCILIATION_NAMESPACE: &str = "controller.action_reconciliation";
 const LEGACY_ACTION_INTENT_SCHEMA_VERSION: u32 = 2;
@@ -331,6 +342,325 @@ struct PersistedActionReconciliationBindingV1 {
     policy_digest: String,
     execution_epoch: i64,
     policy: ReconciliationPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutonomyActionChargeV1 {
+    schema_version: u32,
+    action_id: String,
+    plan_id: String,
+    plan_revision: u32,
+    task_id: String,
+    task_contract_digest: String,
+    payload_digest: String,
+    execution_epoch: i64,
+    tool_actions_charged: u32,
+    subprocesses_charged: u32,
+    wall_ms_reserved: u64,
+    output_bytes_reserved: u64,
+    disk_write_bytes_reserved: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackStatusV1 {
+    Prepared,
+    Verified,
+    Failed,
+    Unknown,
+}
+
+/// Durable v1 record correlating an inverse action to the exact committed mutation it compensates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackRecordV1 {
+    pub schema_version: u32,
+    pub rollback_id: String,
+    pub original_action_id: String,
+    pub original_result_digest: String,
+    pub rollback_action_id: String,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub execution_epoch: i64,
+    pub mode: String,
+    pub path: String,
+    pub original_source_digest: String,
+    pub original_post_digest: String,
+    pub verification_evaluator: String,
+    pub status: RollbackStatusV1,
+    pub verification_evidence_id: Option<String>,
+    pub verification_artifact_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RollbackVerificationV1 {
+    pub schema_version: u32,
+    pub rollback_id: String,
+    pub rollback_action_id: String,
+    pub evaluator: String,
+    pub path: String,
+    pub expected_digest: String,
+    pub observed_digest: String,
+    pub expected_mode: u32,
+    pub observed_mode: u32,
+    pub passed: bool,
+}
+
+/// Marker interface for the Controller-owned rollback executor. Rollback actions still flow through
+/// ordinary authorization, approval, budget, `ActionJournal`, reconciliation, and verification.
+pub struct RollbackExecutor;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CancellationScopeKindV1 {
+    Goal,
+    Plan,
+    Task,
+    Attempt,
+    Action,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancellationScopeV1 {
+    pub scope_id: String,
+    pub kind: CancellationScopeKindV1,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub goal_id: String,
+    pub task_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub action_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancellationRecordV1 {
+    pub schema_version: u32,
+    pub cancellation_id: String,
+    pub scope: CancellationScopeV1,
+    pub requested_at_ms: i64,
+    pub reason_digest: String,
+}
+
+#[derive(Debug, Clone)]
+struct CancellationNode {
+    scope: CancellationScopeV1,
+    parent_scope_id: Option<String>,
+    token: ProcessCancellationToken,
+    directly_cancelled: bool,
+}
+
+#[derive(Debug, Default)]
+struct CancellationTreeState {
+    nodes: BTreeMap<String, CancellationNode>,
+}
+
+/// Controller-owned monotonic cancellation hierarchy. Cancelling one node propagates to every
+/// registered descendant while a child cancellation never widens to its ancestors.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationTree {
+    inner: Arc<Mutex<CancellationTreeState>>,
+}
+
+/// Cloneable non-authoritative signal for one already-registered cancellation scope.
+#[derive(Debug, Clone)]
+pub struct CancellationHandle {
+    tree: CancellationTree,
+    scope_id: String,
+}
+
+impl CancellationTree {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CancellationTreeState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Registers one root scope or returns the existing exactly matching node.
+    ///
+    /// # Errors
+    /// Returns a fail-closed error for empty or conflicting scope identity.
+    pub fn register_root(
+        &self,
+        scope: CancellationScopeV1,
+    ) -> Result<CancellationHandle, ControllerError> {
+        self.register(scope, None)
+    }
+
+    /// Registers one child scope. A child created beneath a cancelled ancestor is cancelled
+    /// immediately, closing the pending-spawn race between cancellation and dispatch setup.
+    ///
+    /// # Errors
+    /// Returns a fail-closed error when the parent is absent or identity conflicts.
+    pub fn register_child(
+        &self,
+        scope: CancellationScopeV1,
+        parent_scope_id: &str,
+    ) -> Result<CancellationHandle, ControllerError> {
+        self.register(scope, Some(parent_scope_id.to_owned()))
+    }
+
+    fn register(
+        &self,
+        scope: CancellationScopeV1,
+        parent_scope_id: Option<String>,
+    ) -> Result<CancellationHandle, ControllerError> {
+        if scope.scope_id.trim().is_empty()
+            || scope.plan_id.trim().is_empty()
+            || scope.goal_id.trim().is_empty()
+        {
+            return Err(ControllerError::InvalidPlan(
+                "cancellation scope identity is empty".to_owned(),
+            ));
+        }
+        let mut state = self.lock();
+        if let Some(existing) = state.nodes.get(&scope.scope_id) {
+            if existing.scope != scope || existing.parent_scope_id != parent_scope_id {
+                return Err(ControllerError::InvalidPlan(
+                    "cancellation scope identity was rebound".to_owned(),
+                ));
+            }
+            return Ok(CancellationHandle {
+                tree: self.clone(),
+                scope_id: scope.scope_id,
+            });
+        }
+        let inherited_cancelled = match parent_scope_id.as_deref() {
+            Some(parent) => {
+                if !state.nodes.contains_key(parent) {
+                    return Err(ControllerError::InvalidPlan(
+                        "cancellation child parent is not registered".to_owned(),
+                    ));
+                }
+                cancellation_scope_is_cancelled(&state, parent)
+            }
+            None => false,
+        };
+        let token = ProcessCancellationToken::new();
+        if inherited_cancelled {
+            token.cancel();
+        }
+        state.nodes.insert(
+            scope.scope_id.clone(),
+            CancellationNode {
+                scope: scope.clone(),
+                parent_scope_id,
+                token,
+                directly_cancelled: false,
+            },
+        );
+        Ok(CancellationHandle {
+            tree: self.clone(),
+            scope_id: scope.scope_id,
+        })
+    }
+
+    /// Cancels the exact scope and every currently registered descendant.
+    ///
+    /// # Errors
+    /// Returns a fail-closed error when the scope is unknown.
+    pub fn cancel(&self, scope_id: &str) -> Result<(), ControllerError> {
+        let mut state = self.lock();
+        let Some(node) = state.nodes.get_mut(scope_id) else {
+            return Err(ControllerError::InvalidPlan(
+                "unknown cancellation scope".to_owned(),
+            ));
+        };
+        node.directly_cancelled = true;
+        let descendants = state
+            .nodes
+            .keys()
+            .filter(|candidate| {
+                *candidate == scope_id
+                    || cancellation_scope_descends_from(&state, candidate, scope_id)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for descendant in descendants {
+            if let Some(node) = state.nodes.get(&descendant) {
+                node.token.cancel();
+            }
+        }
+        Ok(())
+    }
+}
+
+impl CancellationHandle {
+    /// Cancels this scope and every registered descendant.
+    ///
+    /// # Errors
+    /// Returns a fail-closed Controller error if the registered scope disappeared.
+    pub fn cancel(&self) -> Result<(), ControllerError> {
+        self.tree.cancel(&self.scope_id)
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        let state = self.tree.lock();
+        cancellation_scope_is_cancelled(&state, &self.scope_id)
+    }
+
+    fn process_token(&self) -> Result<ProcessCancellationToken, ControllerError> {
+        self.tree
+            .lock()
+            .nodes
+            .get(&self.scope_id)
+            .map(|node| node.token.clone())
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan("cancellation scope disappeared".to_owned())
+            })
+    }
+
+    fn cancellation_origin(&self) -> Option<CancellationScopeV1> {
+        let state = self.tree.lock();
+        let mut current = Some(self.scope_id.as_str());
+        while let Some(scope_id) = current {
+            let node = state.nodes.get(scope_id)?;
+            if node.directly_cancelled {
+                return Some(node.scope.clone());
+            }
+            current = node.parent_scope_id.as_deref();
+        }
+        None
+    }
+}
+
+fn cancellation_scope_is_cancelled(state: &CancellationTreeState, scope_id: &str) -> bool {
+    state
+        .nodes
+        .get(scope_id)
+        .is_some_and(|node| node.token.is_cancelled())
+}
+
+fn cancellation_scope_descends_from(
+    state: &CancellationTreeState,
+    candidate_scope_id: &str,
+    ancestor_scope_id: &str,
+) -> bool {
+    let mut current = state
+        .nodes
+        .get(candidate_scope_id)
+        .and_then(|node| node.parent_scope_id.as_deref());
+    let mut hops = 0usize;
+    while let Some(scope_id) = current {
+        if scope_id == ancestor_scope_id {
+            return true;
+        }
+        hops = hops.saturating_add(1);
+        if hops > state.nodes.len() {
+            return false;
+        }
+        current = state
+            .nodes
+            .get(scope_id)
+            .and_then(|node| node.parent_scope_id.as_deref());
+    }
+    false
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -602,6 +932,8 @@ enum SecretActionLifecycleStateV1 {
     PendingCleanup,
     CleanupProven,
     LeaseClosed,
+    CancelledPreDispatch,
+    CancelledPostDispatchUnknown,
     Complete,
 }
 
@@ -611,6 +943,8 @@ impl SecretActionLifecycleStateV1 {
             Self::PendingCleanup => "secret_action_pending_cleanup",
             Self::CleanupProven => "secret_action_cleanup_proven",
             Self::LeaseClosed => "secret_action_lease_closed",
+            Self::CancelledPreDispatch => "secret_action_cancelled_predispatch",
+            Self::CancelledPostDispatchUnknown => "secret_action_cancelled_postdispatch_unknown",
             Self::Complete => "secret_action_complete",
         }
     }
@@ -618,8 +952,12 @@ impl SecretActionLifecycleStateV1 {
     const fn can_advance_to(self, next: Self) -> bool {
         matches!(
             (self, next),
-            (Self::PendingCleanup, Self::CleanupProven)
-                | (Self::CleanupProven, Self::LeaseClosed)
+            (
+                Self::PendingCleanup,
+                Self::CleanupProven
+                    | Self::CancelledPreDispatch
+                    | Self::CancelledPostDispatchUnknown
+            ) | (Self::CleanupProven, Self::LeaseClosed)
                 | (Self::LeaseClosed, Self::Complete)
         )
     }
@@ -955,9 +1293,101 @@ pub struct CheckpointManifest {
     pub action_records: Vec<CheckpointActionRecord>,
     pub process_leases: Vec<RecoveryProcessLease>,
     #[serde(default)]
+    pub security_audit_head: Option<SecurityAuditCheckpointV1>,
+    #[serde(default)]
+    pub autonomy_budget_digests: BTreeMap<String, String>,
+    #[serde(default)]
+    pub goal_autonomy_budget: Option<AutonomyBudgetV1>,
+    #[serde(default)]
+    pub goal_autonomy_budget_digest: Option<String>,
+    #[serde(default)]
     pub execution_control: ExecutionControlV1,
     pub action_journal_sequence: i64,
     pub execution_epoch: i64,
+}
+
+/// Checkpoint binding for the tamper-evident security audit chain. The schema remains optional in
+/// manifest v1 solely so pre-M6-T06 checkpoints can be recovered when the durable audit chain is
+/// still at genesis. Once any audit event exists, an absent binding is corruption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecurityAuditCheckpointV1 {
+    pub schema_version: u32,
+    pub event_count: i64,
+    pub head_digest: String,
+}
+
+impl From<SecurityAuditHead> for SecurityAuditCheckpointV1 {
+    fn from(head: SecurityAuditHead) -> Self {
+        Self {
+            schema_version: SECURITY_AUDIT_CHECKPOINT_SCHEMA_VERSION,
+            event_count: head.event_count,
+            head_digest: head.head_digest,
+        }
+    }
+}
+
+impl SecurityAuditCheckpointV1 {
+    fn as_state_head(&self) -> Result<SecurityAuditHead, ControllerError> {
+        if self.schema_version != SECURITY_AUDIT_CHECKPOINT_SCHEMA_VERSION
+            || self.event_count < 0
+            || self.head_digest.trim().is_empty()
+        {
+            return Err(ControllerError::InvalidPlan(
+                "checkpoint security-audit binding is malformed".to_owned(),
+            ));
+        }
+        Ok(SecurityAuditHead {
+            event_count: self.event_count,
+            head_digest: self.head_digest.clone(),
+        })
+    }
+}
+
+/// Deterministic corruption gate used during crash recovery and immediately before high-risk
+/// mutation. It composes existing authoritative `StateStore` checks rather than inventing another
+/// recovery database or allowing model/memory state to repair canonical truth.
+pub struct RecoveryIntegrityGate;
+
+impl RecoveryIntegrityGate {
+    /// Validates `SQLite` plus the live security-audit chain before a side effect may dispatch.
+    ///
+    /// # Errors
+    /// Returns a fail-closed Controller error for `SQLite` or audit-chain corruption.
+    pub fn verify_before_high_risk_mutation(
+        state: &mut StateStore,
+    ) -> Result<SecurityAuditHead, ControllerError> {
+        state.recovery_integrity_check()?;
+        Ok(state.security_audit_log().verify_chain()?)
+    }
+
+    /// Verifies that the checkpoint-bound audit head is an exact prefix of current durable audit
+    /// history. A legacy checkpoint without this field is accepted only while the audit chain is
+    /// still empty/genesis.
+    ///
+    /// # Errors
+    /// Returns a fail-closed Controller error for an unbound non-genesis chain or prefix mismatch.
+    pub fn verify_checkpoint(
+        state: &mut StateStore,
+        expected: Option<&SecurityAuditCheckpointV1>,
+    ) -> Result<SecurityAuditHead, ControllerError> {
+        state.recovery_integrity_check()?;
+        let current = state.security_audit_log().verify_chain()?;
+        match expected {
+            Some(expected) => {
+                let expected = expected.as_state_head()?;
+                state.security_audit_log().verify_prefix(&expected)?;
+            }
+            None if current.event_count == 0 => {}
+            None => {
+                return Err(ControllerError::InvalidPlan(
+                    "legacy checkpoint has no security-audit binding for non-genesis audit history"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(current)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1077,6 +1507,8 @@ struct TaskRuntime {
     state: TaskState,
     attempts_started: u32,
     model_calls_used: u32,
+    #[serde(default)]
+    autonomy_budget: Option<AutonomyBudgetV1>,
     failure_counts: BTreeMap<String, u32>,
     retry_exhausted: bool,
     #[serde(default)]
@@ -1172,13 +1604,63 @@ struct ActivePlan {
     baseline_diff_digest: String,
     baseline_diff_content: String,
     validity: PlanValidity,
+    goal_autonomy_budget: AutonomyBudgetV1,
     tasks: BTreeMap<String, TaskRuntime>,
     attempts: BTreeMap<String, AttemptRuntime>,
+}
+
+fn cancellation_scope(
+    active: &ActivePlan,
+    kind: CancellationScopeKindV1,
+    task_id: Option<&str>,
+    attempt_id: Option<&str>,
+    action_id: Option<&str>,
+) -> CancellationScopeV1 {
+    let scope_id = match kind {
+        CancellationScopeKindV1::Goal => {
+            format!("cancel:goal:{}:r{}", active.goal_id, active.revision)
+        }
+        CancellationScopeKindV1::Plan => {
+            format!("cancel:plan:{}:r{}", active.plan_id, active.revision)
+        }
+        CancellationScopeKindV1::Task => format!(
+            "cancel:plan:{}:r{}:task:{}",
+            active.plan_id,
+            active.revision,
+            task_id.unwrap_or_default()
+        ),
+        CancellationScopeKindV1::Attempt => format!(
+            "cancel:plan:{}:r{}:task:{}:attempt:{}",
+            active.plan_id,
+            active.revision,
+            task_id.unwrap_or_default(),
+            attempt_id.unwrap_or_default()
+        ),
+        CancellationScopeKindV1::Action => format!(
+            "cancel:plan:{}:r{}:task:{}:attempt:{}:action:{}",
+            active.plan_id,
+            active.revision,
+            task_id.unwrap_or_default(),
+            attempt_id.unwrap_or_default(),
+            action_id.unwrap_or_default()
+        ),
+    };
+    CancellationScopeV1 {
+        scope_id,
+        kind,
+        plan_id: active.plan_id.clone(),
+        plan_revision: active.revision,
+        goal_id: active.goal_id.clone(),
+        task_id: task_id.map(str::to_owned),
+        attempt_id: attempt_id.map(str::to_owned),
+        action_id: action_id.map(str::to_owned),
+    }
 }
 
 pub struct Controller {
     state: StateStore,
     active: Option<ActivePlan>,
+    cancellations: CancellationTree,
     resources: ControllerResourceCoordinator,
     resource_probe: Box<dyn ResourcePressureProbe>,
     permission_context: PermissionContext,
@@ -1191,6 +1673,7 @@ impl Controller {
         Self {
             state,
             active: None,
+            cancellations: CancellationTree::default(),
             resources: ControllerResourceCoordinator::default(),
             resource_probe: Box::<MacOsResourceProbe>::default(),
             permission_context: PermissionContext::m1_local_autonomous(),
@@ -1206,11 +1689,193 @@ impl Controller {
         Self {
             state,
             active: None,
+            cancellations: CancellationTree::default(),
             resources: ControllerResourceCoordinator::default(),
             resource_probe: Box::<MacOsResourceProbe>::default(),
             permission_context,
             trusted_recovery_intent_digests: BTreeMap::new(),
         }
+    }
+
+    /// Returns a cloneable cancellation handle for one active task. The handle itself cannot
+    /// dispatch work or mutate durable authority; it only propagates a monotonic cancellation bit
+    /// through the Controller-owned tree.
+    ///
+    /// # Errors
+    /// Returns a fail-closed error for an unknown/inactive task or cancellation identity conflict.
+    pub fn task_cancellation_handle(
+        &self,
+        task_id: &str,
+    ) -> Result<CancellationHandle, ControllerError> {
+        let active = self.active_ref()?;
+        if !active.tasks.contains_key(task_id) {
+            return Err(ControllerError::InvalidPlan(format!(
+                "unknown cancellation task {task_id}"
+            )));
+        }
+        let goal = cancellation_scope(active, CancellationScopeKindV1::Goal, None, None, None);
+        let goal_handle = self.cancellations.register_root(goal.clone())?;
+        let plan = cancellation_scope(active, CancellationScopeKindV1::Plan, None, None, None);
+        let plan_handle = self
+            .cancellations
+            .register_child(plan.clone(), &goal_handle.scope_id)?;
+        let task = cancellation_scope(
+            active,
+            CancellationScopeKindV1::Task,
+            Some(task_id),
+            None,
+            None,
+        );
+        let handle = self
+            .cancellations
+            .register_child(task, &plan_handle.scope_id)?;
+        if self.cancellation_blocks_task(task_id)? {
+            handle.cancel()?;
+        }
+        Ok(handle)
+    }
+
+    /// Durably requests cancellation of one active task and all descendants.
+    ///
+    /// # Errors
+    /// Returns a fail-closed state/identity error; a successful request is checkpointed before
+    /// later dispatch can resume.
+    pub fn request_task_cancellation(
+        &mut self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<CancellationRecordV1, ControllerError> {
+        let handle = self.task_cancellation_handle(task_id)?;
+        handle.cancel()?;
+        let scope = handle.cancellation_origin().ok_or_else(|| {
+            ControllerError::InvalidPlan("task cancellation origin disappeared".to_owned())
+        })?;
+        self.persist_cancellation_request(&scope, reason)
+    }
+
+    fn attempt_cancellation_handle(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> Result<CancellationHandle, ControllerError> {
+        let task = self.task_cancellation_handle(task_id)?;
+        let active = self.active_ref()?;
+        let scope = cancellation_scope(
+            active,
+            CancellationScopeKindV1::Attempt,
+            Some(task_id),
+            Some(attempt_id),
+            None,
+        );
+        self.cancellations.register_child(scope, &task.scope_id)
+    }
+
+    fn action_cancellation_handle(
+        &self,
+        action: &AuthorizedAction,
+    ) -> Result<CancellationHandle, ControllerError> {
+        let attempt = self.attempt_cancellation_handle(&action.task_id, &action.attempt_id)?;
+        let active = self.active_ref()?;
+        let scope = cancellation_scope(
+            active,
+            CancellationScopeKindV1::Action,
+            Some(&action.task_id),
+            Some(&action.attempt_id),
+            Some(&action.action_id),
+        );
+        self.cancellations.register_child(scope, &attempt.scope_id)
+    }
+
+    fn persist_cancellation_request(
+        &mut self,
+        scope: &CancellationScopeV1,
+        reason: &str,
+    ) -> Result<CancellationRecordV1, ControllerError> {
+        let key = revision_scoped_key(&scope.plan_id, scope.plan_revision, &scope.scope_id);
+        if let Some(raw) = self.state.get_state(CANCELLATION_REQUEST_NAMESPACE, &key)? {
+            let existing: CancellationRecordV1 = serde_json::from_str(&raw)?;
+            if existing.schema_version != CANCELLATION_RECORD_SCHEMA_VERSION
+                || existing.scope != *scope
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "durable cancellation request identity drifted".to_owned(),
+                ));
+            }
+            return Ok(existing);
+        }
+        let reason_digest = sha256_prefixed(reason.as_bytes());
+        let cancellation_id = sha256_prefixed(
+            format!(
+                "controller.cancellation.v1\0{}\0{}\0{}",
+                scope.plan_id, scope.plan_revision, scope.scope_id
+            )
+            .as_bytes(),
+        );
+        let record = CancellationRecordV1 {
+            schema_version: CANCELLATION_RECORD_SCHEMA_VERSION,
+            cancellation_id,
+            scope: scope.clone(),
+            requested_at_ms: unix_millis()?,
+            reason_digest,
+        };
+        let value_json = serde_json::to_string(&record)?;
+        let record_digest = sha256_prefixed(value_json.as_bytes());
+        self.persist_runtime_records_with_events(
+            &[(
+                (CANCELLATION_REQUEST_NAMESPACE).to_owned(),
+                key.clone(),
+                value_json,
+            )],
+            &[(
+                "cancellation_requested".to_owned(),
+                scope.scope_id.clone(),
+                json!({
+                    "record_key": key,
+                    "record_digest": record_digest,
+                    "cancellation_id": record.cancellation_id,
+                    "scope": scope,
+                }),
+            )],
+        )?;
+        self.checkpoint_now()?;
+        Ok(record)
+    }
+
+    fn persist_observed_cancellation(
+        &mut self,
+        handle: &CancellationHandle,
+    ) -> Result<Option<CancellationRecordV1>, ControllerError> {
+        let Some(origin) = handle.cancellation_origin() else {
+            return Ok(None);
+        };
+        self.persist_cancellation_request(&origin, "controller-observed-cancellation")
+            .map(Some)
+    }
+
+    fn cancellation_blocks_task(&self, task_id: &str) -> Result<bool, ControllerError> {
+        let active = self.active_ref()?;
+        for record in self.state.state_records(CANCELLATION_REQUEST_NAMESPACE)? {
+            if !key_belongs_to_revision(&record.key, &active.plan_id, active.revision) {
+                continue;
+            }
+            let cancellation: CancellationRecordV1 = serde_json::from_str(&record.value_json)?;
+            if cancellation.schema_version != CANCELLATION_RECORD_SCHEMA_VERSION
+                || cancellation.scope.plan_id != active.plan_id
+                || cancellation.scope.plan_revision != active.revision
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "durable cancellation request is misbound".to_owned(),
+                ));
+            }
+            if matches!(
+                cancellation.scope.kind,
+                CancellationScopeKindV1::Goal | CancellationScopeKindV1::Plan
+            ) || cancellation.scope.task_id.as_deref() == Some(task_id)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Replaces the Controller-owned read-only pressure source.
@@ -2138,11 +2803,188 @@ impl Controller {
         manifest: &ToolManifest,
         permission_decision: &PermissionDecision,
     ) -> Result<(), ControllerError> {
+        RecoveryIntegrityGate::verify_before_high_risk_mutation(&mut self.state)?;
+        if self.cancellation_blocks_task(&action.task_id)? {
+            return Err(ControllerError::NotReady(
+                "durable cancellation blocks action dispatch".to_owned(),
+            ));
+        }
+        let cancellation = self.action_cancellation_handle(action)?;
+        if cancellation.is_cancelled() {
+            self.persist_observed_cancellation(&cancellation)?;
+            return Err(ControllerError::NotReady(
+                "cancellation blocks action dispatch".to_owned(),
+            ));
+        }
+        if self.any_unknown_action()?
+            || has_unresolved_process_lease(&self.state)?
+            || has_unresolved_rollback(&self.state, Some(&action.action_id))?
+        {
+            return Err(ControllerError::NotReady(
+                "high-risk mutation is blocked by unresolved action/process/rollback authority"
+                    .to_owned(),
+            ));
+        }
         self.ensure_action_authorized(action, manifest, permission_decision)?;
         self.persist_action_reconciliation_binding(action)?;
         self.require_dispatch_approval(action)?;
+        self.charge_autonomy_action_once(action)?;
+        self.append_dispatch_security_audit(action, manifest, permission_decision)?;
         self.checkpoint_now()?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn charge_autonomy_action_once(
+        &mut self,
+        action: &AuthorizedAction,
+    ) -> Result<(), ControllerError> {
+        let (plan_id, plan_revision, task_contract_digest, mut budget, mut goal_autonomy_budget) = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&action.task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("autonomy charge task disappeared".to_owned())
+            })?;
+            if active.plan_id != action.plan_id || active.revision != action.plan_revision {
+                return Err(ControllerError::NotReady(
+                    "autonomy action charge is stale for the active plan revision".to_owned(),
+                ));
+            }
+            (
+                active.plan_id.clone(),
+                active.revision,
+                task.task_contract_digest.clone(),
+                task.autonomy_budget.clone().ok_or_else(|| {
+                    ControllerError::NotReady(
+                        "task has no durable autonomy budget; legacy unmetered execution is blocked"
+                            .to_owned(),
+                    )
+                })?,
+                active.goal_autonomy_budget.clone(),
+            )
+        };
+        budget.validate()?;
+        goal_autonomy_budget.validate()?;
+        let charge_key = revision_scoped_key(&plan_id, plan_revision, &action.action_id);
+        let expected = AutonomyActionChargeV1 {
+            schema_version: AUTONOMY_ACTION_CHARGE_SCHEMA_VERSION,
+            action_id: action.action_id.clone(),
+            plan_id: plan_id.clone(),
+            plan_revision,
+            task_id: action.task_id.clone(),
+            task_contract_digest: task_contract_digest.clone(),
+            payload_digest: action.payload_digest(),
+            execution_epoch: action.execution_epoch,
+            tool_actions_charged: 1,
+            subprocesses_charged: 1,
+            wall_ms_reserved: action.command.timeout_ms,
+            output_bytes_reserved: action.command.output_limit_bytes,
+            disk_write_bytes_reserved: action.command.disk_write_limit_bytes,
+        };
+        if let Some(existing) = self
+            .state
+            .get_state(AUTONOMY_ACTION_CHARGE_NAMESPACE, &charge_key)?
+        {
+            let existing: AutonomyActionChargeV1 = serde_json::from_str(&existing)?;
+            if existing != expected {
+                return Err(ControllerError::InvalidPlan(
+                    "durable autonomy action charge drifted from exact action authority".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        budget.charge_tool_action(action.command.timeout_ms)?;
+        budget.charge_process_spawn()?;
+        budget.charge_wall_ms(action.command.timeout_ms)?;
+        budget.charge_output_bytes(action.command.output_limit_bytes)?;
+        budget.charge_disk_write_bytes(action.command.disk_write_limit_bytes)?;
+        goal_autonomy_budget.charge_tool_action(action.command.timeout_ms)?;
+        goal_autonomy_budget.charge_process_spawn()?;
+        goal_autonomy_budget.charge_wall_ms(action.command.timeout_ms)?;
+        goal_autonomy_budget.charge_output_bytes(action.command.output_limit_bytes)?;
+        goal_autonomy_budget.charge_disk_write_bytes(action.command.disk_write_limit_bytes)?;
+        let budget_digest = digest_json(&serde_json::to_value(&budget)?)?;
+        let goal_budget_digest = digest_json(&serde_json::to_value(&goal_autonomy_budget)?)?;
+        {
+            let active = self.active_mut()?;
+            let task = active.tasks.get_mut(&action.task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("autonomy charge task disappeared".to_owned())
+            })?;
+            task.autonomy_budget = Some(budget.clone());
+            active.goal_autonomy_budget = goal_autonomy_budget.clone();
+        }
+        let task_json =
+            serde_json::to_string(self.active_ref()?.tasks.get(&action.task_id).ok_or_else(
+                || ControllerError::InvalidPlan("autonomy task disappeared".to_owned()),
+            )?)?;
+        self.persist_runtime_records_with_events(
+            &[
+                (
+                    "controller.task".to_owned(),
+                    action.task_id.clone(),
+                    task_json,
+                ),
+                (
+                    AUTONOMY_ACTION_CHARGE_NAMESPACE.to_owned(),
+                    charge_key,
+                    serde_json::to_string(&expected)?,
+                ),
+            ],
+            &[(
+                "autonomy_action_charged".to_owned(),
+                action.task_id.clone(),
+                json!({
+                    "action_id": action.action_id,
+                    "payload_digest": expected.payload_digest,
+                    "execution_epoch": action.execution_epoch,
+                    "tool_actions_charged": 1,
+                    "subprocesses_charged": 1,
+                    "wall_ms_reserved": action.command.timeout_ms,
+                    "output_bytes_reserved": action.command.output_limit_bytes,
+                    "disk_write_bytes_reserved": action.command.disk_write_limit_bytes,
+                    "autonomy_budget_digest": budget_digest,
+                    "goal_autonomy_budget": goal_autonomy_budget,
+                    "goal_autonomy_budget_digest": goal_budget_digest,
+                }),
+            )],
+        )?;
+        Ok(())
+    }
+
+    fn append_dispatch_security_audit(
+        &mut self,
+        action: &AuthorizedAction,
+        manifest: &ToolManifest,
+        permission_decision: &PermissionDecision,
+    ) -> Result<SecurityAuditHead, ControllerError> {
+        let approval_provenance_digest = self
+            .state
+            .get_state(APPROVAL_CLAIM_NAMESPACE, &action.action_id)?
+            .map(|raw| sha256_prefixed(raw.as_bytes()));
+        let evidence_provenance_digest = self
+            .state
+            .get_state("controller.action_intent", &action.action_id)?
+            .or(self
+                .state
+                .get_state(ACTION_RECONCILIATION_NAMESPACE, &action.action_id)?)
+            .map(|raw| sha256_prefixed(raw.as_bytes()));
+        let event = SecurityAuditEventV1 {
+            actor_id: "controller".to_owned(),
+            plan_id: Some(action.plan_id.clone()),
+            task_id: Some(action.task_id.clone()),
+            attempt_id: Some(action.attempt_id.clone()),
+            action_id: Some(action.action_id.clone()),
+            execution_epoch: Some(action.execution_epoch),
+            decision: "allow".to_owned(),
+            action: "dispatch_authorized".to_owned(),
+            policy_digest: action.policy_digest.clone(),
+            config_digest: permission_decision.digest(),
+            tool_digest: manifest.content_digest.clone(),
+            approval_provenance_digest,
+            evidence_provenance_digest,
+            occurred_at_ms: unix_millis()?,
+            result: "authorized".to_owned(),
+        };
+        Ok(self.state.security_audit_log().append(&event)?)
     }
 
     /// Applies a user decision to one exact durable Controller approval request.
@@ -3588,6 +4430,7 @@ impl Controller {
         let plan = &plan_document;
         let plan_id = required_str(plan, "/plan_id")?.to_owned();
         let goal_id = required_str(plan, "/goal/goal_id")?.to_owned();
+        let goal_autonomy_budget = goal_autonomy_budget_from_plan(plan, 0)?;
         let revision = required_u32(plan, "/revision")?;
         let repositories = required_array(plan, "/repositories")?;
         if repositories.len() != 1 {
@@ -3629,6 +4472,7 @@ impl Controller {
                         state: TaskState::Planned,
                         attempts_started: 0,
                         model_calls_used: 0,
+                        autonomy_budget: Some(autonomy_budget_from_task(task, 0)?),
                         failure_counts: BTreeMap::new(),
                         retry_exhausted: false,
                         resource_deferrals_used: 0,
@@ -3683,6 +4527,7 @@ impl Controller {
             baseline_diff_digest: baseline_diff.digest,
             baseline_diff_content: baseline_diff.content,
             validity: PlanValidity::Current,
+            goal_autonomy_budget,
             tasks,
             attempts: BTreeMap::new(),
         });
@@ -3780,6 +4625,7 @@ impl Controller {
             )
         };
         if required_str(&next_plan, "/plan_id")? != previous_plan_id
+            || required_str(&next_plan, "/goal/goal_id")? != goal_id
             || required_u32(&next_plan, "/revision")? != previous_revision.saturating_add(1)
             || next_plan.get("supersedes_revision").and_then(Value::as_u64)
                 != Some(u64::from(previous_revision))
@@ -3866,9 +4712,12 @@ impl Controller {
             baseline_diff_digest: self.active_ref()?.baseline_diff_digest.clone(),
             baseline_diff_content: self.active_ref()?.baseline_diff_content.clone(),
             validity: PlanValidity::Invalidated,
+            goal_autonomy_budget: self.active_ref()?.goal_autonomy_budget.clone(),
             tasks: self.active_ref()?.tasks.clone(),
             attempts: self.active_ref()?.attempts.clone(),
         };
+        let next_goal_autonomy_budget =
+            rebase_goal_autonomy_budget(&next_plan, &previous_active.goal_autonomy_budget)?;
         let runtime_build = build_superseding_runtime(
             &self.state,
             registry,
@@ -3900,6 +4749,7 @@ impl Controller {
             baseline_diff_digest: current_diff.digest.clone(),
             baseline_diff_content: current_diff.content.clone(),
             validity: PlanValidity::Current,
+            goal_autonomy_budget: next_goal_autonomy_budget.clone(),
             tasks: runtime_build.tasks,
             attempts: BTreeMap::new(),
         };
@@ -4077,6 +4927,8 @@ impl Controller {
             "repository_snapshot_digest": current_snapshot_digest,
             "baseline_diff_digest": next_active.baseline_diff_digest,
             "plan_validity": PlanValidity::Current,
+            "goal_autonomy_budget": next_goal_autonomy_budget,
+            "goal_autonomy_budget_digest": digest_json(&serde_json::to_value(&next_active.goal_autonomy_budget)?)?,
         });
         let activation_json = serde_json::to_string(&activation_payload)?;
         let event_seed = sha256_prefixed(
@@ -4134,6 +4986,18 @@ impl Controller {
         tool_manifest: &ToolManifest,
     ) -> Result<ReadyLease, ControllerError> {
         self.require_execution_not_paused()?;
+        if self.cancellation_blocks_task(task_id)? {
+            return Err(ControllerError::NotReady(
+                "task is durably cancelled".to_owned(),
+            ));
+        }
+        let cancellation = self.task_cancellation_handle(task_id)?;
+        if cancellation.is_cancelled() {
+            self.persist_observed_cancellation(&cancellation)?;
+            return Err(ControllerError::NotReady(
+                "task cancellation blocks readiness".to_owned(),
+            ));
+        }
         require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         self.require_current_baseline(registry)?;
         self.ensure_task_worktree(registry, task_id)?;
@@ -5300,9 +6164,17 @@ impl Controller {
         let action_id = action.action_id.clone();
 
         let runner = ProcessRunner::new(command_policy, isolation_backend);
+        let cancellation = self.action_cancellation_handle(&action)?;
+        let process_cancellation = cancellation.process_token()?;
         let raw = {
             let mut journal = ActionJournal::new(&mut self.state);
-            runner.run(&mut journal, &action, isolation_request, artifacts)
+            runner.run_cancellable(
+                &mut journal,
+                &action,
+                isolation_request,
+                artifacts,
+                &process_cancellation,
+            )
         };
         match raw {
             Ok(result) => {
@@ -5323,6 +6195,25 @@ impl Controller {
                 Ok(result)
             }
             Err(error) => {
+                if cancellation.is_cancelled() {
+                    self.persist_observed_cancellation(&cancellation)?;
+                    if self
+                        .state
+                        .action_record(&action_id)?
+                        .is_some_and(|record| record.state == ActionState::Unknown.as_str())
+                    {
+                        return Err(ControllerError::UnknownAction(action_id));
+                    }
+                    if self.heavy_process_absence_is_proven(lease, &action_id)? {
+                        self.release_build_heavy_proven_absent(
+                            lease,
+                            "resource_build_heavy_cancelled_reaped",
+                        )?;
+                    }
+                    return Err(ControllerError::NotReady(
+                        "BUILD_HEAVY execution cancelled before dispatch".to_owned(),
+                    ));
+                }
                 if self.heavy_process_absence_is_proven(lease, &action_id)? {
                     self.release_build_heavy_proven_absent(
                         lease,
@@ -5725,6 +6616,15 @@ impl Controller {
             ));
         }
         self.prepare_action_for_dispatch(&action, runtime.tool_manifest, &permission_decision)?;
+        let cancellation = self.action_cancellation_handle(&action)?;
+        if cancellation.is_cancelled() {
+            self.persist_observed_cancellation(&cancellation)?;
+            self.mark_cancelled_without_dispatch(&attempt_id, &lease.task_id)?;
+            return Err(ControllerError::NotReady(
+                "secret process execution cancelled before secret resolution".to_owned(),
+            ));
+        }
+        let process_cancellation = cancellation.process_token()?;
         let secret_scope = SecretScope {
             plan_id: action.plan_id.clone(),
             plan_revision: action.plan_revision,
@@ -5804,7 +6704,7 @@ impl Controller {
         let runner = ProcessRunner::new(runtime.command_policy, runtime.isolation_backend);
         let observed = {
             let mut journal = ActionJournal::new(&mut self.state);
-            runner.run_with_secret_lease_observed(
+            runner.run_with_secret_lease_observed_cancellable(
                 &mut journal,
                 &action,
                 &isolation_request,
@@ -5814,20 +6714,59 @@ impl Controller {
                 &permission_decision,
                 unix_millis()?,
                 runtime.controller_private_root,
+                &process_cancellation,
             )
         };
         let (result, cleanup_proof) = match observed {
             Ok(observed) => observed,
             Err(error) => {
-                let _ = secret_lease.close(&secret_scope);
                 let record = self.state.action_record(&action.action_id)?;
+                if cancellation.is_cancelled() {
+                    self.persist_observed_cancellation(&cancellation)?;
+                }
                 if record
                     .as_ref()
                     .is_some_and(|record| record.state == ActionState::Unknown.as_str())
                 {
+                    if cancellation.is_cancelled() {
+                        // Tools returns a cancelled dispatched secret action only after the exact
+                        // owned process group is reaped and its temporary secret-file guard has
+                        // closed. Requiring SecretLease::close to succeed here therefore proves the
+                        // temporary injection cleanup and destroys the in-memory secret before the
+                        // terminal lifecycle marker is written. The action itself deliberately
+                        // remains Unknown so reconciliation/mutation fencing is preserved.
+                        secret_lease.close(&secret_scope)?;
+                        self.advance_secret_action_lifecycle(
+                            &action.action_id,
+                            SecretActionLifecycleStateV1::PendingCleanup,
+                            SecretActionLifecycleStateV1::CancelledPostDispatchUnknown,
+                            None,
+                        )?;
+                    } else {
+                        let _ = secret_lease.close(&secret_scope);
+                    }
                     self.mark_unknown(&attempt_id, &lease.task_id, &action.action_id)?;
                     return Err(ControllerError::UnknownAction(action.action_id));
                 }
+                if cancellation.is_cancelled()
+                    && record
+                        .as_ref()
+                        .is_some_and(|record| record.state == ActionState::Authorized.as_str())
+                {
+                    secret_lease.close(&secret_scope)?;
+                    self.advance_secret_action_lifecycle(
+                        &action.action_id,
+                        SecretActionLifecycleStateV1::PendingCleanup,
+                        SecretActionLifecycleStateV1::CancelledPreDispatch,
+                        None,
+                    )?;
+                    self.mark_cancelled_without_dispatch(&attempt_id, &lease.task_id)?;
+                    self.checkpoint_now()?;
+                    return Err(ControllerError::NotReady(
+                        "secret process execution cancelled before dispatch".to_owned(),
+                    ));
+                }
+                let _ = secret_lease.close(&secret_scope);
                 if record.as_ref().is_some_and(|record| {
                     matches!(record.state.as_str(), "dispatched" | "observed")
                 }) {
@@ -6580,6 +7519,257 @@ impl Controller {
         }
     }
 
+    /// Executes the deterministic `patch_reverse` contract for one exact committed Controller
+    /// action. The inverse action receives fresh authorization/budget/audit/journal treatment and
+    /// is not considered complete until its postcondition is persisted as typed verification.
+    ///
+    /// # Errors
+    /// Fails closed for stale/missing worktree ownership, unsupported rollback mode, precondition
+    /// drift, authorization/budget failure, unknown dispatch outcome, or verification failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn rollback_patch_reverse<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        original_action_id: &str,
+        runtime: &ExecutionRuntime<'_, I>,
+    ) -> Result<RollbackRecordV1, ControllerError> {
+        self.require_execution_not_paused()?;
+        RecoveryIntegrityGate::verify_before_high_risk_mutation(&mut self.state)?;
+        let original_action = self
+            .state
+            .action_record(original_action_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady("rollback origin action is missing".to_owned())
+            })?;
+        let original_result_digest = original_action.result_digest.clone().ok_or_else(|| {
+            ControllerError::NotReady("rollback origin action has no committed result".to_owned())
+        })?;
+        if original_action.state != ActionState::Committed.as_str() {
+            return Err(ControllerError::NotReady(
+                "rollback origin action is not durably committed".to_owned(),
+            ));
+        }
+        let raw_intent = self
+            .state
+            .get_state("controller.action_intent", original_action_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady("rollback origin intent is missing".to_owned())
+            })?;
+        let raw_intent: PersistedActionIntent = serde_json::from_str(&raw_intent)?;
+        let primary_root = runtime
+            .registry
+            .repository(&raw_intent.repository_id)
+            .ok_or_else(|| ControllerError::NotReady("rollback repository is missing".to_owned()))?
+            .root
+            .clone();
+        let intent = normalize_persisted_action_intent(raw_intent, &primary_root)?;
+        let (plan_id, plan_revision, task_contract_digest, rollback_evaluator) = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&intent.task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("rollback task disappeared".to_owned())
+            })?;
+            if intent.plan_id != active.plan_id
+                || intent.plan_revision != active.revision
+                || intent.plan_digest != active.plan_digest
+                || intent.task_contract_digest != task.task_contract_digest
+                || intent.execution_epoch != original_action.execution_epoch
+            {
+                return Err(ControllerError::NotReady(
+                    "rollback origin intent is stale for the active authority".to_owned(),
+                ));
+            }
+            if task.task.pointer("/rollback/mode").and_then(Value::as_str) != Some("patch_reverse")
+            {
+                return Err(ControllerError::Policy(PolicyError::Denied(
+                    "active task does not authorize patch_reverse rollback".to_owned(),
+                )));
+            }
+            let evaluator = task
+                .task
+                .pointer("/rollback/verification_steps/0/evaluator")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "patch_reverse rollback lacks typed verification evaluator".to_owned(),
+                    )
+                })?
+                .to_owned();
+            (
+                active.plan_id.clone(),
+                active.revision,
+                task.task_contract_digest.clone(),
+                evaluator,
+            )
+        };
+        let execution_root = self.task_execution_root(&intent.task_id)?;
+        if execution_root.canonicalize()? != intent.execution_root.canonicalize()? {
+            return Err(ControllerError::NotReady(
+                "rollback execution root no longer matches original Controller-owned view"
+                    .to_owned(),
+            ));
+        }
+        if let Some(expected_lease) = intent.worktree_lease_id.as_deref() {
+            let task = self
+                .active_ref()?
+                .tasks
+                .get(&intent.task_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan("rollback task disappeared".to_owned())
+                })?;
+            if task
+                .worktree_lease
+                .as_ref()
+                .map(|lease| lease.lease_id.as_str())
+                != Some(expected_lease)
+                || task.worktree_state != Some(WorktreeLifecycle::Materialized)
+            {
+                return Err(ControllerError::NotReady(
+                    "rollback original worktree ownership is missing or released".to_owned(),
+                ));
+            }
+        }
+        let source = self.task_execution_read(
+            runtime.registry,
+            &intent.task_id,
+            Path::new(&intent.path),
+            Some(&intent.expected_post_digest),
+        )?;
+        if source.content.matches(&intent.new_literal).count() != 1 {
+            return Err(ControllerError::NotReady(
+                "rollback precondition no longer contains the exact Controller-owned postimage literal"
+                    .to_owned(),
+            ));
+        }
+        let metadata = fs::symlink_metadata(execution_root.join(&intent.path))?;
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || permission_mode(&metadata) != intent.expected_target_mode
+        {
+            return Err(ControllerError::NotReady(
+                "rollback target identity/mode drifted from the committed postimage".to_owned(),
+            ));
+        }
+        let reverse = ValidatedReplace {
+            proposal: ReplaceLiteral {
+                kind: ReplaceLiteralKind::ReplaceLiteral,
+                repository_id: intent.repository_id.clone(),
+                path: intent.path.clone(),
+                expected_source_digest: intent.expected_post_digest.clone(),
+                old_literal: intent.new_literal.clone(),
+                new_literal: intent.old_literal.clone(),
+                expected_occurrences: 1,
+            },
+            expected_post_digest: intent.expected_source_digest.clone(),
+            expected_target_mode: intent.expected_target_mode,
+        };
+        let permission_decision =
+            self.permission_decision_for_task(&intent.task_id, runtime.tool_manifest)?;
+        let mut isolation_request = runtime.isolation_request.clone();
+        isolation_request
+            .repository_root
+            .clone_from(&execution_root);
+        let rollback_id_seed = sha256_prefixed(
+            format!(
+                "rollback\0{original_action_id}\0{plan_id}\0{plan_revision}\0{task_contract_digest}"
+            )
+            .as_bytes(),
+        );
+        let rollback_id = format!("rollback.{}", &rollback_id_seed[7..31]);
+        let rollback_action = self.lower_rollback_replace_action(
+            &rollback_id,
+            &intent,
+            &reverse,
+            runtime,
+            &isolation_request,
+            &execution_root,
+            &permission_decision,
+        )?;
+        let mut record = RollbackRecordV1 {
+            schema_version: ROLLBACK_RECORD_SCHEMA_VERSION,
+            rollback_id: rollback_id.clone(),
+            original_action_id: original_action_id.to_owned(),
+            original_result_digest,
+            rollback_action_id: rollback_action.action_id.clone(),
+            plan_id,
+            plan_revision,
+            task_id: intent.task_id.clone(),
+            attempt_id: intent.attempt_id.clone(),
+            execution_epoch: rollback_action.execution_epoch,
+            mode: "patch_reverse".to_owned(),
+            path: intent.path.clone(),
+            original_source_digest: intent.expected_source_digest.clone(),
+            original_post_digest: intent.expected_post_digest.clone(),
+            verification_evaluator: rollback_evaluator,
+            status: RollbackStatusV1::Prepared,
+            verification_evidence_id: None,
+            verification_artifact_digest: None,
+        };
+        self.persist_rollback_record(&record, "rollback_prepared")?;
+        self.persist_action_intent(&rollback_action, &reverse, runtime.artifacts.root())?;
+        self.prepare_action_for_dispatch(
+            &rollback_action,
+            runtime.tool_manifest,
+            &permission_decision,
+        )?;
+        let runner = ProcessRunner::new(runtime.command_policy, runtime.isolation_backend);
+        let cancellation = self.action_cancellation_handle(&rollback_action)?;
+        let process_cancellation = cancellation.process_token()?;
+        let raw = {
+            let mut journal = ActionJournal::new(&mut self.state);
+            runner.run_cancellable(
+                &mut journal,
+                &rollback_action,
+                &isolation_request,
+                runtime.artifacts,
+                &process_cancellation,
+            )
+        };
+        let result = match raw {
+            Ok(result) => result,
+            Err(error) => {
+                if cancellation.is_cancelled() {
+                    self.persist_observed_cancellation(&cancellation)?;
+                }
+                if self
+                    .state
+                    .action_record(&rollback_action.action_id)?
+                    .is_some_and(|action| action.state == ActionState::Unknown.as_str())
+                {
+                    record.status = RollbackStatusV1::Unknown;
+                    self.persist_rollback_record(&record, "rollback_unknown")?;
+                    self.checkpoint_now()?;
+                    return Err(ControllerError::UnknownAction(rollback_action.action_id));
+                }
+                record.status = RollbackStatusV1::Failed;
+                self.persist_rollback_record(
+                    &record,
+                    if cancellation.is_cancelled() {
+                        "rollback_cancelled_before_dispatch"
+                    } else {
+                        "rollback_execution_failed"
+                    },
+                )?;
+                self.checkpoint_now()?;
+                if cancellation.is_cancelled() {
+                    return Err(ControllerError::NotReady(
+                        "rollback cancelled before side effects crossed dispatch".to_owned(),
+                    ));
+                }
+                return Err(ControllerError::Tool(error));
+            }
+        };
+        self.checkpoint_now()?;
+        if result.exit_code != Some(0) || result.terminated_for_limit.is_some() {
+            record.status = RollbackStatusV1::Failed;
+            self.persist_rollback_record(&record, "rollback_execution_failed")?;
+            self.checkpoint_now()?;
+            return Err(ControllerError::NotReady(
+                "rollback process did not complete successfully".to_owned(),
+            ));
+        }
+        self.verify_and_finalize_rollback(&mut record, runtime.artifacts)?;
+        Ok(record)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn execute_replace_inner<I: sovereign_policy::ExecutionIsolationBackend>(
         &mut self,
@@ -6611,13 +7801,30 @@ impl Controller {
             Err(error) => return Err(error),
         }
         let attempt_id = self.start_attempt_with_origin(lease, runtime.registry, repair_origin)?;
+        let cancellation = self.attempt_cancellation_handle(&lease.task_id, &attempt_id)?;
+        if cancellation.is_cancelled() {
+            self.persist_observed_cancellation(&cancellation)?;
+            self.mark_cancelled_without_dispatch(&attempt_id, &lease.task_id)?;
+            self.unload_model_for_ready_lease(lease, runtime.backend)?;
+            return Err(ControllerError::NotReady(
+                "task cancelled before model dispatch".to_owned(),
+            ));
+        }
         let proposal_result = Self::request_model_proposal(
             runtime.backend,
             context,
             &lease.task_id,
             model_deadline_ms,
+            &cancellation,
         );
         self.unload_model_for_ready_lease(lease, runtime.backend)?;
+        if cancellation.is_cancelled() {
+            self.persist_observed_cancellation(&cancellation)?;
+            self.mark_cancelled_without_dispatch(&attempt_id, &lease.task_id)?;
+            return Err(ControllerError::NotReady(
+                "task cancelled during model dispatch".to_owned(),
+            ));
+        }
         let proposal = match proposal_result {
             Ok(value) => value,
             Err(error) => {
@@ -6703,13 +7910,36 @@ impl Controller {
         self.rebind_ready_checkpoint(lease)?;
         self.validate_ready_lease(lease, runtime.registry, runtime.tool_manifest)?;
         let runner = ProcessRunner::new(runtime.command_policy, runtime.isolation_backend);
+        let cancellation = self.action_cancellation_handle(&action)?;
+        let process_cancellation = cancellation.process_token()?;
         let raw = {
             let mut journal = ActionJournal::new(&mut self.state);
-            runner.run(&mut journal, &action, &isolation_request, runtime.artifacts)
+            runner.run_cancellable(
+                &mut journal,
+                &action,
+                &isolation_request,
+                runtime.artifacts,
+                &process_cancellation,
+            )
         };
         let result = match raw {
             Ok(result) => result,
             Err(error) => {
+                if cancellation.is_cancelled() {
+                    self.persist_observed_cancellation(&cancellation)?;
+                    let record = self.state.action_record(&action.action_id)?;
+                    if record
+                        .as_ref()
+                        .is_some_and(|record| record.state == ActionState::Unknown.as_str())
+                    {
+                        self.mark_unknown(attempt_id, &lease.task_id, &action.action_id)?;
+                        return Err(ControllerError::UnknownAction(action.action_id));
+                    }
+                    self.mark_cancelled_without_dispatch(attempt_id, &lease.task_id)?;
+                    return Err(ControllerError::NotReady(
+                        "tool action cancelled before side effects crossed dispatch".to_owned(),
+                    ));
+                }
                 let record = self.state.action_record(&action.action_id)?;
                 if record
                     .as_ref()
@@ -7588,7 +8818,7 @@ impl Controller {
         model_budget: &mut ModelCallBudget,
         requested_deadline_ms: u64,
     ) -> Result<(), ControllerError> {
-        let (used, limit) = {
+        let (used, limit, mut autonomy_budget, mut goal_autonomy_budget) = {
             let active = self.active_ref()?;
             let task = active
                 .tasks
@@ -7597,14 +8827,30 @@ impl Controller {
             (
                 task.model_calls_used,
                 required_u32(&task.task, "/resource_budget/max_model_calls")?,
+                task.autonomy_budget.clone().ok_or_else(|| {
+                    ControllerError::NotReady(
+                        "task has no durable autonomy budget; legacy unmetered execution is blocked"
+                            .to_owned(),
+                    )
+                })?,
+                active.goal_autonomy_budget.clone(),
             )
         };
+        autonomy_budget.validate()?;
+        goal_autonomy_budget.validate()?;
+        if autonomy_budget.used_model_calls != used || autonomy_budget.max_model_calls != limit {
+            return Err(ControllerError::InvalidPlan(
+                "task model-call compatibility counter diverges from durable autonomy budget"
+                    .to_owned(),
+            ));
+        }
         if used >= limit {
             return Err(ControllerError::Policy(PolicyError::Denied(format!(
                 "task model-call budget exhausted: used={used}, limit={limit}"
             ))));
         }
-        model_budget
+        let mut caller_budget = *model_budget;
+        caller_budget
             .consume_call(requested_deadline_ms)
             .map_err(|error| match error {
                 PolicyError::ResourceDenied(message) => {
@@ -7615,14 +8861,21 @@ impl Controller {
                 }
                 other => ControllerError::Policy(other),
             })?;
+        autonomy_budget.charge_model_call(requested_deadline_ms)?;
+        goal_autonomy_budget.charge_model_call(requested_deadline_ms)?;
+        *model_budget = caller_budget;
         {
             let active = self.active_mut()?;
             let task = active
                 .tasks
                 .get_mut(task_id)
                 .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?;
-            task.model_calls_used = task.model_calls_used.saturating_add(1);
+            task.model_calls_used = autonomy_budget.used_model_calls;
+            task.autonomy_budget = Some(autonomy_budget.clone());
+            active.goal_autonomy_budget = goal_autonomy_budget.clone();
         }
+        let budget_digest = digest_json(&serde_json::to_value(&autonomy_budget)?)?;
+        let goal_budget_digest = digest_json(&serde_json::to_value(&goal_autonomy_budget)?)?;
         let task_json = serde_json::to_string(
             self.active_ref()?
                 .tasks
@@ -7634,7 +8887,14 @@ impl Controller {
             &[(
                 "task_model_call_consumed".to_owned(),
                 task_id.to_owned(),
-                json!({"used": used.saturating_add(1), "limit": limit}),
+                json!({
+                    "used": autonomy_budget.used_model_calls,
+                    "limit": limit,
+                    "autonomy_budget_digest": budget_digest,
+                    "goal_autonomy_budget": goal_autonomy_budget,
+                    "goal_autonomy_budget_digest": goal_budget_digest,
+                    "requested_deadline_ms": requested_deadline_ms,
+                }),
             )],
         )?;
         self.checkpoint_now()?;
@@ -7756,6 +9016,7 @@ impl Controller {
         context: &ContextPacket,
         task_id: &str,
         model_deadline_ms: u64,
+        cancellation: &CancellationHandle,
     ) -> Result<ModelProposalV1, ControllerError> {
         let request = ModelRequest {
             schema_version: MODEL_SCHEMA_VERSION,
@@ -7782,7 +9043,44 @@ impl Controller {
             deadline_ms: model_deadline_ms,
             temperature_milli: 0,
         };
-        let response = backend.complete(&request)?;
+        if cancellation.is_cancelled() {
+            return Err(ControllerError::NotReady(
+                "model request cancelled before provider dispatch".to_owned(),
+            ));
+        }
+        let response = std::thread::scope(|scope| -> Result<_, ControllerError> {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            scope.spawn(move || {
+                let _ = sender.send(backend.complete(&request));
+            });
+            loop {
+                if cancellation.is_cancelled() {
+                    let unload = backend.unload();
+                    let _ = receiver.recv();
+                    unload?;
+                    return Err(ControllerError::NotReady(
+                        "model request cancelled during provider dispatch".to_owned(),
+                    ));
+                }
+                match receiver.recv_timeout(Duration::from_millis(10)) {
+                    Ok(result) => {
+                        if cancellation.is_cancelled() {
+                            backend.unload()?;
+                            return Err(ControllerError::NotReady(
+                                "model request cancelled before response acceptance".to_owned(),
+                            ));
+                        }
+                        return result.map_err(ControllerError::Model);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(ControllerError::NotReady(
+                            "model provider worker disconnected without a result".to_owned(),
+                        ));
+                    }
+                }
+            }
+        })?;
         if response.finish_reason != ModelFinishReason::Stop || !response.tool_calls.is_empty() {
             return Err(ControllerError::ProposalRejected(
                 "proposal must finish normally without model tool calls".to_owned(),
@@ -8010,6 +9308,218 @@ impl Controller {
             )?,
             reconciliation_mode: Self::reconciliation_mode_for_manifest(runtime.tool_manifest)?,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_rollback_replace_action<I: sovereign_policy::ExecutionIsolationBackend>(
+        &self,
+        rollback_id: &str,
+        original_intent: &PersistedActionIntent,
+        validated: &ValidatedReplace,
+        runtime: &ExecutionRuntime<'_, I>,
+        isolation_request: &IsolationRequest,
+        execution_root: &Path,
+        decision: &PermissionDecision,
+    ) -> Result<AuthorizedAction, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(&original_intent.task_id)
+            .ok_or_else(|| ControllerError::InvalidPlan("rollback task disappeared".to_owned()))?;
+        decision.validate()?;
+        if decision.task_id != original_intent.task_id
+            || decision.task_contract_digest != task.task_contract_digest
+            || runtime.tool_manifest.tool_id != decision.tool_id
+            || runtime.tool_manifest.version != decision.tool_version
+            || runtime.tool_manifest.content_digest != decision.tool_digest
+            || !runtime
+                .tool_manifest
+                .permission_ceiling
+                .contains(&PermissionClass::RepositoryWrite)
+        {
+            return Err(ControllerError::InvalidPlan(
+                "rollback tool manifest does not match active task authority".to_owned(),
+            ));
+        }
+        if !isolation_request.allow_repository_write
+            || !isolation_request.network_offline
+            || isolation_request.repository_root.canonicalize()? != execution_root.canonicalize()?
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "patch_reverse requires exact offline repository-write isolation".to_owned(),
+            )));
+        }
+        let python = runtime
+            .command_policy
+            .pinned_executable(runtime.python_executable)?;
+        let destination = execution_root.join(&validated.proposal.path);
+        let command = CommandSpec {
+            executable: python.path.clone(),
+            args: vec![
+                "-I".to_owned(),
+                "-c".to_owned(),
+                ATOMIC_REPLACE_HELPER.to_owned(),
+                destination.display().to_string(),
+                validated.proposal.expected_source_digest.clone(),
+                validated.proposal.old_literal.clone(),
+                validated.proposal.new_literal.clone(),
+            ],
+            working_directory: execution_root.to_path_buf(),
+            environment: BTreeMap::new(),
+            mode: CommandMode::Direct,
+            declared_risk: CommandRisk::RepositoryMutation,
+            timeout_ms: 5_000,
+            output_limit_bytes: 64 * 1_024,
+            disk_write_limit_bytes: 2 * 1_024 * 1_024,
+            subprocess_limit: 0,
+        };
+        let action_seed = digest_json(&json!({
+            "rollback_id": rollback_id,
+            "original_action_id": original_intent.action_id,
+            "plan": active.plan_digest,
+            "task": task.task_contract_digest,
+            "proposal": validated.proposal,
+        }))?;
+        let action_id = format!("rollback-action.{}", &action_seed[7..31]);
+        let expires_at_ms =
+            self.approval_bound_action_expiry(&action_id, unix_millis()?.saturating_add(60_000))?;
+        Ok(AuthorizedAction {
+            action_id,
+            plan_id: active.plan_id.clone(),
+            plan_revision: active.revision,
+            task_id: original_intent.task_id.clone(),
+            attempt_id: original_intent.attempt_id.clone(),
+            tool_id: decision.tool_id.clone(),
+            tool_version: decision.tool_version.clone(),
+            tool_digest: decision.tool_digest.clone(),
+            executable_digest: python.sha256.clone(),
+            repository_id: active.repository_id.clone(),
+            destination_digest: Some(validated.proposal.expected_source_digest.clone()),
+            permission_class: PermissionClass::RepositoryWrite,
+            execution_epoch: self.state.current_execution_epoch()?,
+            policy_digest: active.policy_digest.clone(),
+            permission_decision_digest: decision.digest(),
+            isolation_policy_digest: isolation_request.digest()?,
+            nonce: format!("nonce.{}", &action_seed[31..51]),
+            expires_at_ms,
+            command,
+            individually_authorized_environment: BTreeSet::new(),
+            approval_required: self.approval_required_for_task_permission(
+                &original_intent.task_id,
+                PermissionClass::RepositoryWrite,
+            )?,
+            reconciliation_mode: Self::reconciliation_mode_for_manifest(runtime.tool_manifest)?,
+        })
+    }
+
+    fn persist_rollback_record(
+        &mut self,
+        record: &RollbackRecordV1,
+        event_kind: &str,
+    ) -> Result<(), ControllerError> {
+        if record.schema_version != ROLLBACK_RECORD_SCHEMA_VERSION
+            || record.rollback_id.trim().is_empty()
+            || record.rollback_action_id.trim().is_empty()
+            || !is_sha256_digest(&record.original_source_digest)
+            || !is_sha256_digest(&record.original_post_digest)
+            || !is_sha256_hex_digest(&record.original_result_digest)
+        {
+            return Err(ControllerError::InvalidPlan(
+                "rollback record is malformed".to_owned(),
+            ));
+        }
+        let key = revision_scoped_key(&record.plan_id, record.plan_revision, &record.rollback_id);
+        let value_json = serde_json::to_string(record)?;
+        let record_digest = sha256_prefixed(value_json.as_bytes());
+        self.persist_runtime_records_with_events(
+            &[(ROLLBACK_RECORD_NAMESPACE.to_owned(), key, value_json)],
+            &[(
+                event_kind.to_owned(),
+                record.task_id.clone(),
+                json!({
+                    "rollback_id": record.rollback_id,
+                    "original_action_id": record.original_action_id,
+                    "rollback_action_id": record.rollback_action_id,
+                    "status": record.status,
+                    "record_digest": record_digest,
+                }),
+            )],
+        )
+    }
+
+    fn verify_and_finalize_rollback(
+        &mut self,
+        record: &mut RollbackRecordV1,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), ControllerError> {
+        let execution_root = self.task_execution_root(&record.task_id)?;
+        let target = execution_root.join(&record.path);
+        let metadata = fs::symlink_metadata(&target)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(ControllerError::NotReady(
+                "rollback verification target is not a regular file".to_owned(),
+            ));
+        }
+        let observed_digest = sha256_prefixed(&fs::read(&target)?);
+        let observed_mode = permission_mode(&metadata);
+        let original_intent_raw = self
+            .state
+            .get_state("controller.action_intent", &record.original_action_id)?
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan("rollback origin intent disappeared".to_owned())
+            })?;
+        let original_intent: PersistedActionIntent = serde_json::from_str(&original_intent_raw)?;
+        let expected_mode = original_intent.expected_target_mode;
+        let verification = RollbackVerificationV1 {
+            schema_version: ROLLBACK_VERIFICATION_SCHEMA_VERSION,
+            rollback_id: record.rollback_id.clone(),
+            rollback_action_id: record.rollback_action_id.clone(),
+            evaluator: record.verification_evaluator.clone(),
+            path: record.path.clone(),
+            expected_digest: record.original_source_digest.clone(),
+            observed_digest,
+            expected_mode,
+            observed_mode,
+            passed: false,
+        };
+        let mut verification = verification;
+        verification.passed = verification.observed_digest == verification.expected_digest
+            && verification.observed_mode == verification.expected_mode;
+        let bytes = serde_json::to_vec(&verification)?;
+        let artifact = artifacts.put(&mut self.state, &bytes)?;
+        let evidence_id = format!(
+            "evidence.rollback.{}",
+            digest_fragment(&artifact.digest, 16)
+        );
+        self.state
+            .add_artifact_reference(&evidence_id, &artifact.digest)?;
+        record.verification_evidence_id = Some(evidence_id.clone());
+        record.verification_artifact_digest = Some(artifact.digest.clone());
+        if !verification.passed {
+            record.status = RollbackStatusV1::Failed;
+            self.persist_rollback_record(record, "rollback_verification_failed")?;
+            self.checkpoint_now()?;
+            return Err(ControllerError::NotReady(
+                "rollback postcondition verification failed".to_owned(),
+            ));
+        }
+        record.status = RollbackStatusV1::Verified;
+        self.persist_rollback_record(record, "rollback_verified")?;
+        if self
+            .active_ref()?
+            .tasks
+            .get(&record.task_id)
+            .is_some_and(|task| task.state == TaskState::Succeeded)
+        {
+            self.transition_task(
+                &record.task_id,
+                TaskState::RepairPending,
+                "task_rollback_verified",
+            )?;
+        } else {
+            self.checkpoint_now()?;
+        }
+        Ok(())
     }
 
     fn persist_action_intent(
@@ -8856,6 +10366,35 @@ impl Controller {
         Ok(())
     }
 
+    fn mark_cancelled_without_dispatch(
+        &mut self,
+        attempt_id: &str,
+        task_id: &str,
+    ) -> Result<(), ControllerError> {
+        if self
+            .active_ref()?
+            .attempts
+            .get(attempt_id)
+            .is_some_and(|attempt| attempt.state == AttemptState::Executing)
+        {
+            self.transition_attempt(attempt_id, AttemptState::Interrupted, "attempt_cancelled")?;
+        }
+        if self.task_state(task_id) == Some(TaskState::Running) {
+            self.transition_task(
+                task_id,
+                TaskState::FailedTerminal,
+                "task_cancelled_terminal",
+            )?;
+        }
+        self.append_controller_event(
+            "cancellation_observed_before_side_effect",
+            task_id,
+            &json!({"attempt_id": attempt_id}),
+        )?;
+        self.checkpoint_now()?;
+        Ok(())
+    }
+
     fn record_verified_output_bindings(
         &mut self,
         verification: &VerificationResultV1,
@@ -9477,7 +11016,8 @@ impl Controller {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn checkpoint_manifest(&self) -> Result<CheckpointManifest, ControllerError> {
+    fn checkpoint_manifest(&mut self) -> Result<CheckpointManifest, ControllerError> {
+        let security_audit_head = self.state.security_audit_log().verify_chain()?;
         let active = self.active_ref()?;
         let task_records = active
             .tasks
@@ -9504,6 +11044,9 @@ impl Controller {
             APPROVAL_REQUEST_NAMESPACE,
             APPROVAL_CLAIM_NAMESPACE,
             ACTION_RECONCILIATION_NAMESPACE,
+            AUTONOMY_ACTION_CHARGE_NAMESPACE,
+            ROLLBACK_RECORD_NAMESPACE,
+            CANCELLATION_REQUEST_NAMESPACE,
             TASK_CAPABILITY_GRANT_NAMESPACE,
             RESOURCE_PRESSURE_NAMESPACE,
             RESOURCE_LEASE_NAMESPACE,
@@ -9563,6 +11106,33 @@ impl Controller {
             .into_iter()
             .map(|record| serde_json::from_str::<RecoveryProcessLease>(&record.value_json))
             .collect::<Result<Vec<_>, _>>()?;
+        let autonomy_budget_digests = active
+            .tasks
+            .iter()
+            .map(|(task_id, runtime)| {
+                let budget = runtime.autonomy_budget.as_ref().ok_or_else(|| {
+                    ControllerError::NotReady(format!(
+                        "task {task_id} has no durable autonomy budget for checkpoint v2"
+                    ))
+                })?;
+                budget.validate()?;
+                Ok((
+                    task_id.clone(),
+                    digest_json(&serde_json::to_value(budget)?)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+        active.goal_autonomy_budget.validate()?;
+        let normalized_goal_budget =
+            rebase_goal_autonomy_budget(&active.plan_document, &active.goal_autonomy_budget)?;
+        if normalized_goal_budget != active.goal_autonomy_budget {
+            return Err(ControllerError::InvalidPlan(
+                "active goal autonomy budget ceilings diverge from governed plan policy".to_owned(),
+            ));
+        }
+        let goal_autonomy_budget = active.goal_autonomy_budget.clone();
+        let goal_autonomy_budget_digest =
+            digest_json(&serde_json::to_value(&goal_autonomy_budget)?)?;
         let repository_snapshot_digest = snapshot_digest(&active.baseline)?;
         Ok(CheckpointManifest {
             schema_version: CHECKPOINT_MANIFEST_SCHEMA_VERSION,
@@ -9586,6 +11156,10 @@ impl Controller {
             evidence_binding_digests,
             action_records,
             process_leases,
+            security_audit_head: Some(security_audit_head.into()),
+            autonomy_budget_digests,
+            goal_autonomy_budget: Some(goal_autonomy_budget),
+            goal_autonomy_budget_digest: Some(goal_autonomy_budget_digest),
             execution_control: self.execution_control()?,
             action_journal_sequence: self.state.latest_journal_sequence()?,
             execution_epoch: self.state.current_execution_epoch()?,
@@ -10479,6 +12053,8 @@ fn validate_post_checkpoint_secret_action_correlation(
                 "secret_action_pending_cleanup"
                     | "secret_action_cleanup_proven"
                     | "secret_action_lease_closed"
+                    | "secret_action_cancelled_predispatch"
+                    | "secret_action_cancelled_postdispatch_unknown"
                     | "secret_action_complete"
             )
         {
@@ -10551,6 +12127,8 @@ fn current_secret_action_lifecycles(
                 "secret_action_pending_cleanup"
                     | "secret_action_cleanup_proven"
                     | "secret_action_lease_closed"
+                    | "secret_action_cancelled_predispatch"
+                    | "secret_action_cancelled_postdispatch_unknown"
                     | "secret_action_complete"
             )
         {
@@ -10608,8 +12186,12 @@ fn require_no_unresolved_secret_action_lifecycles(
     allowed_action_id: Option<&str>,
 ) -> Result<(), ControllerError> {
     for marker in current_secret_action_lifecycles(state)? {
-        if marker.state != SecretActionLifecycleStateV1::Complete
-            && allowed_action_id != Some(marker.action_id.as_str())
+        if !matches!(
+            marker.state,
+            SecretActionLifecycleStateV1::Complete
+                | SecretActionLifecycleStateV1::CancelledPreDispatch
+                | SecretActionLifecycleStateV1::CancelledPostDispatchUnknown
+        ) && allowed_action_id != Some(marker.action_id.as_str())
         {
             return Err(ControllerError::NotReady(format!(
                 "secret action lifecycle blocked: {} remains {:?}; no later readiness, mutation, replan, supersession, or recovery authority is available until durable completion",
@@ -10626,7 +12208,12 @@ fn require_recoverable_secret_action_lifecycles(
 ) -> Result<(), ControllerError> {
     let markers = current_secret_action_lifecycles(state)?;
     for marker in markers {
-        if marker.state != SecretActionLifecycleStateV1::Complete {
+        if !matches!(
+            marker.state,
+            SecretActionLifecycleStateV1::Complete
+                | SecretActionLifecycleStateV1::CancelledPreDispatch
+                | SecretActionLifecycleStateV1::CancelledPostDispatchUnknown
+        ) {
             return Err(ControllerError::NotReady(format!(
                 "secret action recovery blocked: {} remains {:?}; durable cleanup, lease closure, and commit proof are incomplete",
                 marker.action_id, marker.state
@@ -10638,10 +12225,38 @@ fn require_recoverable_secret_action_lifecycles(
         validate_secret_action_marker_against_active_plan(&marker, active)?;
         let action = state.action_record(&marker.action_id)?.ok_or_else(|| {
             ControllerError::InvalidPlan(format!(
-                "complete secret action lifecycle {} has no durable action record",
+                "terminal secret action lifecycle {} has no durable action record",
                 marker.action_id
             ))
         })?;
+        if marker.state == SecretActionLifecycleStateV1::CancelledPreDispatch {
+            if action.state != ActionState::Authorized.as_str()
+                || action.payload_digest != marker.action_payload_digest
+                || action.policy_digest != active.policy_digest
+                || action.execution_epoch != marker.execution_epoch
+                || action.result_digest.is_some()
+            {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "cancelled pre-dispatch secret lifecycle {} does not correlate to the exact non-dispatched action binding",
+                    marker.action_id
+                )));
+            }
+            continue;
+        }
+        if marker.state == SecretActionLifecycleStateV1::CancelledPostDispatchUnknown {
+            if action.state != ActionState::Unknown.as_str()
+                || action.payload_digest != marker.action_payload_digest
+                || action.policy_digest != active.policy_digest
+                || action.execution_epoch != marker.execution_epoch
+                || action.result_digest.is_some()
+            {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "cancelled post-dispatch secret lifecycle {} does not correlate to the exact unknown action binding",
+                    marker.action_id
+                )));
+            }
+            continue;
+        }
         let result_digest = marker.result_digest.as_deref().ok_or_else(|| {
             ControllerError::InvalidPlan(
                 "complete secret action lifecycle lacks its sanitized result digest".to_owned(),
@@ -10728,7 +12343,7 @@ impl RecoveryManager {
     /// authority cannot be reconciled.
     #[allow(clippy::too_many_lines)]
     pub fn recover_with_permission_context(
-        state: StateStore,
+        mut state: StateStore,
         registry: &ProjectRegistry,
         permission_context: PermissionContext,
     ) -> Result<(Controller, RecoverySummary), ControllerError> {
@@ -10742,9 +12357,18 @@ impl RecoveryManager {
         let (trusted_checkpoint, manifest) =
             load_latest_recoverable_manifest(&state, &latest_valid)?;
         validate_checkpoint_manifest(&manifest, &trusted_checkpoint)?;
+        RecoveryIntegrityGate::verify_checkpoint(
+            &mut state,
+            manifest.security_audit_head.as_ref(),
+        )?;
         validate_checkpoint_immutable_bindings(&state, &manifest)?;
         let fallback_checkpoint_used = trusted_checkpoint.generation != physical_latest.generation;
         let supersession = validate_post_checkpoint_supersession(
+            &state,
+            &manifest,
+            trusted_checkpoint.action_sequence,
+        )?;
+        let recovered_goal_autonomy_budget = replay_post_checkpoint_goal_autonomy_budget(
             &state,
             &manifest,
             trusted_checkpoint.action_sequence,
@@ -10753,6 +12377,13 @@ impl RecoveryManager {
             || (manifest.plan_id.as_str(), manifest.plan_revision),
             |validated| (validated.plan_id.as_str(), validated.revision),
         );
+        validate_post_checkpoint_cancellation_correlation(
+            &state,
+            &manifest,
+            trusted_checkpoint.action_sequence,
+            recovery_plan_id,
+            recovery_revision,
+        )?;
         validate_post_checkpoint_secret_action_correlation(
             &state,
             &manifest,
@@ -10806,7 +12437,20 @@ impl RecoveryManager {
                 "durable execution epoch {execution_epoch_before} is below trusted recovery floor {execution_epoch_floor}"
             )));
         }
-        let active = reconstruct_active_plan(&state, registry, &manifest, supersession.as_ref())?;
+        let mut active = reconstruct_active_plan(
+            &state,
+            registry,
+            &manifest,
+            supersession.as_ref(),
+            recovered_goal_autonomy_budget,
+        )?;
+        bootstrap_legacy_autonomy_budgets(&mut active, &manifest)?;
+        // Reaping an already-dispatched, durably identity-bound process group is cleanup, not new
+        // mutation authority. Perform that cleanup before rejecting an incomplete secret lifecycle
+        // so a PendingCleanup crash cannot strand the exact owned child merely because recovery is
+        // otherwise correctly fenced from continuing the action.
+        let (unresolved_process_lease_ids, unresolved_process_actions) =
+            reap_recovery_process_leases(&mut state)?;
         require_recoverable_secret_action_lifecycles(&state, &active)?;
         let trusted_recovery_intent_digests = manifest
             .evidence_binding_digests
@@ -10820,14 +12464,13 @@ impl RecoveryManager {
         let mut controller = Controller {
             state,
             active: Some(active),
+            cancellations: CancellationTree::default(),
             resources,
             resource_probe: Box::<MacOsResourceProbe>::default(),
             permission_context,
             trusted_recovery_intent_digests,
         };
 
-        let (unresolved_process_lease_ids, unresolved_process_actions) =
-            reap_recovery_process_leases(&mut controller.state)?;
         reconcile_recovered_resources_before_epoch(&mut controller, execution_epoch_before)?;
 
         let recovery_worktrees = reconcile_recovered_worktrees(&mut controller, registry)?;
@@ -10887,6 +12530,7 @@ impl RecoveryManager {
         for action_id in verification_actions {
             controller.resume_recovery_verification(registry, &action_id)?;
         }
+        reconcile_recovered_rollbacks(&mut controller)?;
         unknown_action_ids = controller
             .state
             .action_records()?
@@ -10897,6 +12541,7 @@ impl RecoveryManager {
         let execution_epoch_after = controller.state.current_execution_epoch()?;
         let mutation_blocked = !unknown_action_ids.is_empty()
             || !unresolved_process_lease_ids.is_empty()
+            || has_unresolved_rollback(&controller.state, None)?
             || controller.active_ref()?.tasks.values().any(|task| {
                 task.state == TaskState::ReconcilingUnknown
                     || task.worktree_state == Some(WorktreeLifecycle::Conflict)
@@ -10960,8 +12605,10 @@ fn validate_checkpoint_manifest(
     manifest: &CheckpointManifest,
     checkpoint: &CheckpointIntegrityRecord,
 ) -> Result<(), ControllerError> {
-    if manifest.schema_version != CHECKPOINT_MANIFEST_SCHEMA_VERSION
-        || manifest.action_journal_sequence != checkpoint.action_sequence
+    if !matches!(
+        manifest.schema_version,
+        LEGACY_CHECKPOINT_MANIFEST_SCHEMA_VERSION | CHECKPOINT_MANIFEST_SCHEMA_VERSION
+    ) || manifest.action_journal_sequence != checkpoint.action_sequence
         || manifest.compiler_plan_digest != manifest.plan_digest
         || digest_json(&manifest.plan_document)? != manifest.plan_digest
         || snapshot_digest(&manifest.repository_snapshot)? != manifest.repository_snapshot_digest
@@ -10991,6 +12638,71 @@ fn validate_checkpoint_manifest(
                 "checkpoint task contract {task_id} is misbound"
             )));
         }
+        if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+            let budget = runtime.autonomy_budget.as_ref().ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "checkpoint v2 task {task_id} is missing autonomy budget"
+                ))
+            })?;
+            budget.validate()?;
+            if runtime.model_calls_used != budget.used_model_calls {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "checkpoint v2 task {task_id} model-call compatibility counter diverges from autonomy budget"
+                )));
+            }
+            let expected_digest =
+                manifest
+                    .autonomy_budget_digests
+                    .get(task_id)
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan(format!(
+                            "checkpoint v2 task {task_id} is missing autonomy-budget digest"
+                        ))
+                    })?;
+            if digest_json(&serde_json::to_value(budget)?)? != *expected_digest {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "checkpoint v2 task {task_id} autonomy-budget digest mismatch"
+                )));
+            }
+        }
+    }
+    if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+        let goal_budget = manifest.goal_autonomy_budget.as_ref().ok_or_else(|| {
+            ControllerError::InvalidPlan("checkpoint v2 is missing goal autonomy budget".to_owned())
+        })?;
+        goal_budget.validate()?;
+        let goal_budget_digest =
+            manifest
+                .goal_autonomy_budget_digest
+                .as_deref()
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "checkpoint v2 is missing goal autonomy budget digest".to_owned(),
+                    )
+                })?;
+        if digest_json(&serde_json::to_value(goal_budget)?)? != goal_budget_digest
+            || rebase_goal_autonomy_budget(&manifest.plan_document, goal_budget)? != *goal_budget
+        {
+            return Err(ControllerError::InvalidPlan(
+                "checkpoint v2 goal autonomy budget is misbound to governed plan policy".to_owned(),
+            ));
+        }
+        if manifest.security_audit_head.is_none()
+            || manifest.autonomy_budget_digests.len() != manifest.task_records.len()
+        {
+            return Err(ControllerError::InvalidPlan(
+                "checkpoint v2 is missing security-audit or task autonomy-budget bindings"
+                    .to_owned(),
+            ));
+        }
+    } else if manifest.security_audit_head.is_some()
+        || !manifest.autonomy_budget_digests.is_empty()
+        || manifest.goal_autonomy_budget.is_some()
+        || manifest.goal_autonomy_budget_digest.is_some()
+    {
+        return Err(ControllerError::InvalidPlan(
+            "legacy checkpoint v1 may not claim v2 security/autonomy bindings".to_owned(),
+        ));
     }
     Ok(())
 }
@@ -11012,6 +12724,9 @@ fn validate_checkpoint_immutable_bindings(
                 | "controller.worktree_conflict"
                 | APPROVAL_CLAIM_NAMESPACE
                 | ACTION_RECONCILIATION_NAMESPACE
+                | AUTONOMY_ACTION_CHARGE_NAMESPACE
+                | ROLLBACK_RECORD_NAMESPACE
+                | CANCELLATION_REQUEST_NAMESPACE
         ) {
             continue;
         }
@@ -11297,6 +13012,65 @@ fn validate_post_checkpoint_supersession(
     }))
 }
 
+fn replay_post_checkpoint_goal_autonomy_budget(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+) -> Result<AutonomyBudgetV1, ControllerError> {
+    let mut budget = if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+        let budget = manifest.goal_autonomy_budget.clone().ok_or_else(|| {
+            ControllerError::InvalidPlan("checkpoint v2 is missing goal autonomy budget".to_owned())
+        })?;
+        budget.validate()?;
+        let expected_digest = manifest
+            .goal_autonomy_budget_digest
+            .as_deref()
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "checkpoint v2 is missing goal autonomy budget digest".to_owned(),
+                )
+            })?;
+        if digest_json(&serde_json::to_value(&budget)?)? != expected_digest {
+            return Err(ControllerError::InvalidPlan(
+                "checkpoint v2 goal autonomy budget digest mismatch".to_owned(),
+            ));
+        }
+        budget
+    } else {
+        goal_autonomy_budget_from_plan(&manifest.plan_document, 0)?
+    };
+
+    for event in state.journal_after(checkpoint_sequence)? {
+        if event.entity_type != "controller" {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        let Some(next_value) = payload.get("goal_autonomy_budget") else {
+            if matches!(
+                event.event_kind.as_str(),
+                "task_model_call_consumed" | "autonomy_action_charged" | "plan_revision_activated"
+            ) {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "post-checkpoint metered event {} lacks goal autonomy budget binding",
+                    event.event_kind
+                )));
+            }
+            continue;
+        };
+        let next: AutonomyBudgetV1 = serde_json::from_value(next_value.clone())?;
+        next.validate()?;
+        let expected_digest = required_str(&payload, "/goal_autonomy_budget_digest")?;
+        if digest_json(&serde_json::to_value(&next)?)? != expected_digest {
+            return Err(ControllerError::InvalidPlan(
+                "post-checkpoint goal autonomy budget digest mismatch".to_owned(),
+            ));
+        }
+        ensure_goal_budget_progression(&budget, &next)?;
+        budget = next;
+    }
+    Ok(budget)
+}
+
 fn validate_post_checkpoint_runtime_correlation(
     state: &StateStore,
     manifest: &CheckpointManifest,
@@ -11422,6 +13196,78 @@ fn validate_post_checkpoint_task_grant_correlation(
         return Err(ControllerError::InvalidPlan(
             "current task capability grants do not equal checkpoint plus journal replay".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_post_checkpoint_cancellation_correlation(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+    plan_id: &str,
+    plan_revision: u32,
+) -> Result<(), ControllerError> {
+    let binding_prefix = format!("{CANCELLATION_REQUEST_NAMESPACE}:");
+    let mut replayed = if plan_id == manifest.plan_id && plan_revision == manifest.plan_revision {
+        manifest
+            .evidence_binding_digests
+            .iter()
+            .filter_map(|(binding_key, digest)| {
+                binding_key
+                    .strip_prefix(&binding_prefix)
+                    .filter(|key| key_belongs_to_revision(key, plan_id, plan_revision))
+                    .map(|key| (key.to_owned(), digest.clone()))
+            })
+            .collect::<BTreeMap<_, _>>()
+    } else {
+        BTreeMap::new()
+    };
+
+    for event in state.journal_after(checkpoint_sequence)? {
+        if event.entity_type != "controller" || event.event_kind != "cancellation_requested" {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        let event_plan_id = required_str(&payload, "/plan_id")?;
+        let event_revision = required_u32(&payload, "/plan_revision")?;
+        if event_plan_id != plan_id || event_revision != plan_revision {
+            continue;
+        }
+        let record_key = required_str(&payload, "/record_key")?;
+        if !key_belongs_to_revision(record_key, plan_id, plan_revision) {
+            return Err(ControllerError::InvalidPlan(
+                "post-checkpoint cancellation event targets a stale plan revision".to_owned(),
+            ));
+        }
+        let record_digest = required_str(&payload, "/record_digest")?;
+        replayed.insert(record_key.to_owned(), record_digest.to_owned());
+    }
+
+    let current = state
+        .state_records(CANCELLATION_REQUEST_NAMESPACE)?
+        .into_iter()
+        .filter(|record| key_belongs_to_revision(&record.key, plan_id, plan_revision))
+        .map(|record| (record.key, sha256_prefixed(record.value_json.as_bytes())))
+        .collect::<BTreeMap<_, _>>();
+    if replayed != current {
+        return Err(ControllerError::InvalidPlan(
+            "current cancellation state does not equal checkpoint plus ordered journal replay"
+                .to_owned(),
+        ));
+    }
+    for record in state.state_records(CANCELLATION_REQUEST_NAMESPACE)? {
+        if !key_belongs_to_revision(&record.key, plan_id, plan_revision) {
+            continue;
+        }
+        let cancellation: CancellationRecordV1 = serde_json::from_str(&record.value_json)?;
+        if cancellation.schema_version != CANCELLATION_RECORD_SCHEMA_VERSION
+            || cancellation.scope.plan_id != plan_id
+            || cancellation.scope.plan_revision != plan_revision
+        {
+            return Err(ControllerError::InvalidPlan(
+                "durable cancellation record is misbound to recovery scope".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -11794,6 +13640,7 @@ fn reconstruct_active_plan(
     registry: &ProjectRegistry,
     manifest: &CheckpointManifest,
     supersession: Option<&ValidatedSupersession>,
+    goal_autonomy_budget: AutonomyBudgetV1,
 ) -> Result<ActivePlan, ControllerError> {
     let raw_plan = state
         .get_state("controller.plan", "active")?
@@ -11923,6 +13770,13 @@ fn reconstruct_active_plan(
             .get("policy")
             .ok_or_else(|| ControllerError::InvalidPlan("plan policy is missing".to_owned()))?,
     )?;
+    let normalized_goal_budget =
+        rebase_goal_autonomy_budget(&plan_document, &goal_autonomy_budget)?;
+    if normalized_goal_budget != goal_autonomy_budget {
+        return Err(ControllerError::InvalidPlan(
+            "recovered goal autonomy budget ceilings differ from active governed policy".to_owned(),
+        ));
+    }
     Ok(ActivePlan {
         plan_document,
         compiler_plan_digest: active_plan_digest.to_owned(),
@@ -11938,6 +13792,7 @@ fn reconstruct_active_plan(
         baseline_diff_digest: baseline.diff_digest,
         baseline_diff_content: baseline.diff_content,
         validity,
+        goal_autonomy_budget,
         tasks,
         attempts,
     })
@@ -13289,7 +15144,7 @@ fn legal_task_transition(from: TaskState, to: TaskState) -> bool {
         ) | (
             TaskState::Verifying,
             TaskState::Succeeded | TaskState::RepairPending | TaskState::FailedTerminal
-        )
+        ) | (TaskState::Succeeded, TaskState::RepairPending)
     )
 }
 
@@ -13603,6 +15458,7 @@ fn fresh_task_runtime(task: &Value) -> Result<TaskRuntime, ControllerError> {
         state: TaskState::Planned,
         attempts_started: 0,
         model_calls_used: 0,
+        autonomy_budget: Some(initial_task_autonomy_budget(task, 0)?),
         failure_counts: BTreeMap::new(),
         retry_exhausted: false,
         resource_deferrals_used: 0,
@@ -13619,6 +15475,59 @@ fn fresh_task_runtime(task: &Value) -> Result<TaskRuntime, ControllerError> {
         task_contract_digest: digest_json(task)?,
         task: task.clone(),
     })
+}
+
+fn initial_task_autonomy_budget(
+    task: &Value,
+    used_model_calls: u32,
+) -> Result<AutonomyBudgetV1, ControllerError> {
+    // Unit-only synthetic task fixtures predate Plan IR resource budgets. Production and
+    // integration builds never take this branch: validated Plan IR must carry the complete
+    // resource_budget object and malformed production tasks still fail closed below.
+    #[cfg(test)]
+    if [
+        "/resource_budget/max_wall_seconds",
+        "/resource_budget/max_model_calls",
+        "/resource_budget/max_model_call_seconds",
+        "/resource_budget/max_tool_actions",
+        "/resource_budget/max_single_tool_action_seconds",
+        "/resource_budget/max_output_bytes",
+        "/resource_budget/max_disk_write_mb",
+        "/resource_budget/max_network_bytes",
+        "/resource_budget/max_subprocesses",
+        "/resource_budget/max_child_cpu_seconds",
+    ]
+    .iter()
+    .any(|pointer| task.pointer(pointer).and_then(Value::as_u64).is_none())
+    {
+        let max_subprocesses = task
+            .pointer("/resource_budget/max_subprocesses")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(8);
+        return Ok(AutonomyBudgetV1 {
+            schema_version: AUTONOMY_BUDGET_SCHEMA_VERSION,
+            max_wall_ms: 60_000,
+            max_model_calls: used_model_calls.max(8),
+            max_model_call_ms: 30_000,
+            max_tool_actions: 16,
+            max_single_tool_action_ms: 10_000,
+            max_output_bytes: 4 * 1024 * 1024,
+            max_disk_write_bytes: 16 * 1024 * 1024,
+            max_network_bytes: 0,
+            max_subprocesses,
+            max_child_cpu_ms: 60_000,
+            used_wall_ms: 0,
+            used_model_calls,
+            used_tool_actions: 0,
+            used_output_bytes: 0,
+            used_disk_write_bytes: 0,
+            used_network_bytes: 0,
+            used_subprocesses: 0,
+            used_child_cpu_ms: 0,
+        });
+    }
+    autonomy_budget_from_task(task, used_model_calls)
 }
 
 fn acceptance_permits_cross_revision_carry(task: &Value) -> Result<bool, ControllerError> {
@@ -13706,6 +15615,99 @@ fn has_unresolved_process_lease(state: &StateStore) -> Result<bool, ControllerEr
         }
     }
     Ok(false)
+}
+
+fn rollback_records(state: &StateStore) -> Result<Vec<RollbackRecordV1>, ControllerError> {
+    state
+        .state_records(ROLLBACK_RECORD_NAMESPACE)?
+        .into_iter()
+        .map(|record| {
+            let rollback: RollbackRecordV1 = serde_json::from_str(&record.value_json)?;
+            if rollback.schema_version != ROLLBACK_RECORD_SCHEMA_VERSION {
+                return Err(ControllerError::InvalidPlan(
+                    "unsupported durable rollback record schema".to_owned(),
+                ));
+            }
+            Ok(rollback)
+        })
+        .collect()
+}
+
+fn has_unresolved_rollback(
+    state: &StateStore,
+    allowed_prepared_action_id: Option<&str>,
+) -> Result<bool, ControllerError> {
+    for rollback in rollback_records(state)? {
+        match rollback.status {
+            RollbackStatusV1::Verified | RollbackStatusV1::Failed => {}
+            RollbackStatusV1::Prepared
+                if allowed_prepared_action_id == Some(rollback.rollback_action_id.as_str()) => {}
+            RollbackStatusV1::Prepared | RollbackStatusV1::Unknown => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+fn reconcile_recovered_rollbacks(controller: &mut Controller) -> Result<(), ControllerError> {
+    for mut rollback in rollback_records(&controller.state)? {
+        if matches!(
+            rollback.status,
+            RollbackStatusV1::Verified | RollbackStatusV1::Failed
+        ) {
+            continue;
+        }
+        let Some(action) = controller
+            .state
+            .action_record(&rollback.rollback_action_id)?
+        else {
+            // Crash before ordinary action authorization: retain Prepared and block unrelated
+            // mutation. A later explicit rollback request may resume this exact action.
+            continue;
+        };
+        match action.state.as_str() {
+            "committed" => {
+                if action.result_digest.is_none() {
+                    return Err(ControllerError::InvalidPlan(
+                        "committed rollback action lacks result digest".to_owned(),
+                    ));
+                }
+                let raw_intent = controller
+                    .state
+                    .get_state("controller.action_intent", &rollback.rollback_action_id)?
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan(
+                            "committed rollback action lacks durable intent".to_owned(),
+                        )
+                    })?;
+                let intent: PersistedActionIntent = serde_json::from_str(&raw_intent)?;
+                let artifacts = ArtifactStore::open(&intent.artifact_store_root)?;
+                controller.verify_and_finalize_rollback(&mut rollback, &artifacts)?;
+            }
+            "unknown" => {
+                if rollback.status != RollbackStatusV1::Unknown {
+                    rollback.status = RollbackStatusV1::Unknown;
+                    controller.persist_rollback_record(&rollback, "rollback_recovery_unknown")?;
+                    controller.checkpoint_now()?;
+                }
+            }
+            "failed" => {
+                rollback.status = RollbackStatusV1::Failed;
+                controller.persist_rollback_record(&rollback, "rollback_recovery_failed")?;
+                controller.checkpoint_now()?;
+            }
+            "prepared" | "authorized" => {
+                // The side effect has not crossed the dispatch boundary. Keep the exact prepared
+                // rollback fenced until an explicit resume; never dispatch from recovery itself.
+            }
+            state => {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "rollback action {} has unsupported durable state {state}",
+                    rollback.rollback_action_id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn lineage_records_for_supersession(
@@ -13818,6 +15820,10 @@ fn build_superseding_runtime(
             }
             runtime.attempts_started = previous_runtime.attempts_started;
             runtime.model_calls_used = previous_runtime.model_calls_used;
+            runtime.autonomy_budget = Some(previous_runtime.autonomy_budget.clone().map_or_else(
+                || initial_task_autonomy_budget(task, previous_runtime.model_calls_used),
+                Ok,
+            )?);
             runtime.failure_counts = previous_runtime.failure_counts.clone();
             runtime.retry_exhausted = previous_runtime.retry_exhausted;
             runtime.resource_deferrals_used = previous_runtime.resource_deferrals_used;
@@ -14876,6 +16882,190 @@ fn required_u32(value: &Value, pointer: &str) -> Result<u32, ControllerError> {
         .map_err(|_| ControllerError::InvalidPlan(format!("integer out of range {pointer}")))
 }
 
+fn required_u64(value: &Value, pointer: &str) -> Result<u64, ControllerError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| ControllerError::InvalidPlan(format!("missing integer {pointer}")))
+}
+
+fn checked_budget_scale(value: u64, scale: u64, label: &str) -> Result<u64, ControllerError> {
+    value.checked_mul(scale).ok_or_else(|| {
+        ControllerError::InvalidPlan(format!("resource budget {label} overflows durable counter"))
+    })
+}
+
+fn autonomy_budget_from_task(
+    task: &Value,
+    used_model_calls: u32,
+) -> Result<AutonomyBudgetV1, ControllerError> {
+    autonomy_budget_from_pointer(task, "/resource_budget", used_model_calls)
+}
+
+fn goal_autonomy_budget_from_plan(
+    plan: &Value,
+    used_model_calls: u32,
+) -> Result<AutonomyBudgetV1, ControllerError> {
+    autonomy_budget_from_pointer(plan, "/policy/resources", used_model_calls)
+}
+
+fn autonomy_budget_from_pointer(
+    value: &Value,
+    prefix: &str,
+    used_model_calls: u32,
+) -> Result<AutonomyBudgetV1, ControllerError> {
+    let field = |name: &str| format!("{prefix}/{name}");
+    let budget = AutonomyBudgetV1 {
+        schema_version: AUTONOMY_BUDGET_SCHEMA_VERSION,
+        max_wall_ms: checked_budget_scale(
+            required_u64(value, &field("max_wall_seconds"))?,
+            1_000,
+            "max_wall_seconds",
+        )?,
+        max_model_calls: required_u32(value, &field("max_model_calls"))?,
+        max_model_call_ms: checked_budget_scale(
+            required_u64(value, &field("max_model_call_seconds"))?,
+            1_000,
+            "max_model_call_seconds",
+        )?,
+        max_tool_actions: required_u32(value, &field("max_tool_actions"))?,
+        max_single_tool_action_ms: checked_budget_scale(
+            required_u64(value, &field("max_single_tool_action_seconds"))?,
+            1_000,
+            "max_single_tool_action_seconds",
+        )?,
+        max_output_bytes: required_u64(value, &field("max_output_bytes"))?,
+        max_disk_write_bytes: checked_budget_scale(
+            required_u64(value, &field("max_disk_write_mb"))?,
+            1024 * 1024,
+            "max_disk_write_mb",
+        )?,
+        max_network_bytes: required_u64(value, &field("max_network_bytes"))?,
+        max_subprocesses: required_u32(value, &field("max_subprocesses"))?,
+        max_child_cpu_ms: checked_budget_scale(
+            required_u64(value, &field("max_child_cpu_seconds"))?,
+            1_000,
+            "max_child_cpu_seconds",
+        )?,
+        used_wall_ms: 0,
+        used_model_calls,
+        used_tool_actions: 0,
+        used_output_bytes: 0,
+        used_disk_write_bytes: 0,
+        used_network_bytes: 0,
+        used_subprocesses: 0,
+        used_child_cpu_ms: 0,
+    };
+    budget.validate()?;
+    Ok(budget)
+}
+
+fn rebase_goal_autonomy_budget(
+    plan: &Value,
+    previous: &AutonomyBudgetV1,
+) -> Result<AutonomyBudgetV1, ControllerError> {
+    previous.validate()?;
+    let mut next = goal_autonomy_budget_from_plan(plan, previous.used_model_calls)?;
+    ensure_goal_budget_limits_do_not_increase(previous, &next)?;
+    next.used_wall_ms = previous.used_wall_ms;
+    next.used_tool_actions = previous.used_tool_actions;
+    next.used_output_bytes = previous.used_output_bytes;
+    next.used_disk_write_bytes = previous.used_disk_write_bytes;
+    next.used_network_bytes = previous.used_network_bytes;
+    next.used_subprocesses = previous.used_subprocesses;
+    next.used_child_cpu_ms = previous.used_child_cpu_ms;
+    next.validate()?;
+    Ok(next)
+}
+
+fn ensure_goal_budget_limits_do_not_increase(
+    previous: &AutonomyBudgetV1,
+    next: &AutonomyBudgetV1,
+) -> Result<(), ControllerError> {
+    let increased = next.max_wall_ms > previous.max_wall_ms
+        || next.max_model_calls > previous.max_model_calls
+        || next.max_model_call_ms > previous.max_model_call_ms
+        || next.max_tool_actions > previous.max_tool_actions
+        || next.max_single_tool_action_ms > previous.max_single_tool_action_ms
+        || next.max_output_bytes > previous.max_output_bytes
+        || next.max_disk_write_bytes > previous.max_disk_write_bytes
+        || next.max_network_bytes > previous.max_network_bytes
+        || next.max_subprocesses > previous.max_subprocesses
+        || next.max_child_cpu_ms > previous.max_child_cpu_ms;
+    if increased {
+        return Err(ControllerError::InvalidPlan(
+            "superseding plan may not increase governed goal autonomy ceilings".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_goal_budget_progression(
+    previous: &AutonomyBudgetV1,
+    next: &AutonomyBudgetV1,
+) -> Result<(), ControllerError> {
+    previous.validate()?;
+    next.validate()?;
+    ensure_goal_budget_limits_do_not_increase(previous, next)?;
+    let regressed = next.used_wall_ms < previous.used_wall_ms
+        || next.used_model_calls < previous.used_model_calls
+        || next.used_tool_actions < previous.used_tool_actions
+        || next.used_output_bytes < previous.used_output_bytes
+        || next.used_disk_write_bytes < previous.used_disk_write_bytes
+        || next.used_network_bytes < previous.used_network_bytes
+        || next.used_subprocesses < previous.used_subprocesses
+        || next.used_child_cpu_ms < previous.used_child_cpu_ms;
+    if regressed {
+        return Err(ControllerError::InvalidPlan(
+            "goal autonomy counters regressed across durable journal replay".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn bootstrap_legacy_autonomy_budgets(
+    active: &mut ActivePlan,
+    manifest: &CheckpointManifest,
+) -> Result<(), ControllerError> {
+    if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+        for (task_id, runtime) in &active.tasks {
+            let budget = runtime.autonomy_budget.as_ref().ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "checkpoint v2 recovered task {task_id} lost its autonomy budget"
+                ))
+            })?;
+            budget.validate()?;
+            if budget.used_model_calls != runtime.model_calls_used {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "checkpoint v2 recovered task {task_id} has divergent model counters"
+                )));
+            }
+        }
+        return Ok(());
+    }
+
+    let has_prior_metered_activity = !manifest.attempt_records.is_empty()
+        || !manifest.action_records.is_empty()
+        || manifest
+            .process_leases
+            .iter()
+            .any(|lease| !process_lease_is_terminal(lease))
+        || active
+            .tasks
+            .values()
+            .any(|runtime| runtime.attempts_started != 0 || runtime.model_calls_used != 0);
+    if has_prior_metered_activity {
+        return Err(ControllerError::NotReady(
+            "legacy checkpoint contains unmetered autonomy history; mutation remains blocked instead of resetting counters"
+                .to_owned(),
+        ));
+    }
+    for runtime in active.tasks.values_mut() {
+        runtime.autonomy_budget = Some(autonomy_budget_from_task(&runtime.task, 0)?);
+    }
+    Ok(())
+}
+
 fn required_array<'a>(value: &'a Value, pointer: &str) -> Result<&'a Vec<Value>, ControllerError> {
     value
         .pointer(pointer)
@@ -14896,19 +17086,21 @@ fn unix_millis() -> Result<i64, ControllerError> {
 mod tests {
     use super::{
         ACTION_INTENT_SCHEMA_VERSION, APPROVAL_REQUEST_NAMESPACE, ActivePlan, ApprovalDecisionV1,
-        ApprovalRequestStatusV1, Controller, ControllerError, ExactRequirementProbe,
-        FailureClassification, FailureClassificationKind, LEGACY_ACTION_INTENT_SCHEMA_VERSION,
-        PlanValidity, ReadyLease, RecoveryProcessLease, ResourceResidencyStateV1,
-        ResourceResidencyV1, TaskCarryExecutionProvenanceV1, TaskCarryFingerprintV1, TaskRuntime,
-        TaskState, VerificationResultV1, VerifiedOutputBindingV1, WorktreeLifecycle,
+        ApprovalRequestStatusV1, CancellationScopeKindV1, CancellationScopeV1, CancellationTree,
+        Controller, ControllerError, ExactRequirementProbe, FailureClassification,
+        FailureClassificationKind, LEGACY_ACTION_INTENT_SCHEMA_VERSION, PlanValidity, ReadyLease,
+        RecoveryIntegrityGate, RecoveryProcessLease, ResourceResidencyStateV1, ResourceResidencyV1,
+        TaskCarryExecutionProvenanceV1, TaskCarryFingerprintV1, TaskRuntime, TaskState,
+        VerificationResultV1, VerifiedOutputBindingV1, WorktreeLifecycle,
         acceptance_permits_cross_revision_carry, build_superseding_runtime,
         compilation_inputs_are_fresh_for_carry, compiled_acceptance_contract,
         dependency_bindings_permit_cross_revision_carry, digest_json, exact_requirement_probe,
         explicit_replace_relation, fresh_task_runtime, has_unresolved_process_lease,
-        inject_build_parallel_job_cap, lineage_records_for_supersession,
-        normalize_persisted_action_intent, normalized_failure_signature, output_binding_key,
-        plan_instruction_fingerprint_digest, process_lease_is_terminal, ready_lease_digest,
-        repair_allowed, revision_record_key, revision_scoped_key, scope_lineage_id,
+        initial_task_autonomy_budget, inject_build_parallel_job_cap,
+        lineage_records_for_supersession, normalize_persisted_action_intent,
+        normalized_failure_signature, output_binding_key, plan_instruction_fingerprint_digest,
+        process_lease_is_terminal, ready_lease_digest, rebase_goal_autonomy_budget, repair_allowed,
+        revision_record_key, revision_scoped_key, scope_lineage_id,
     };
     use serde_json::{Value, json};
     use sovereign_evidence::ArtifactStore;
@@ -14918,16 +17110,16 @@ mod tests {
     };
     use sovereign_plan::{PlanRevisionDiff, ReplanScope};
     use sovereign_policy::{
-        AdmissionStatus, CapabilityLayers, CapabilitySet, CommandMode, CommandRisk, CommandSpec,
-        ConditionalLeaseContextV1, HeavyLeaseClass, OsMemoryPressure, PermissionDecision,
-        PlanHeavyLeaseClass, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ReconciliationPolicy,
-        ResourceLeaseOwnerV1, ResourceLeaseRequestV1, ResourcePressureSnapshotV1,
-        TaskResourceBudgetV1, ThermalPressure,
+        AUTONOMY_BUDGET_SCHEMA_VERSION, AdmissionStatus, AutonomyBudgetV1, CapabilityLayers,
+        CapabilitySet, CommandMode, CommandRisk, CommandSpec, ConditionalLeaseContextV1,
+        HeavyLeaseClass, OsMemoryPressure, PermissionDecision, PlanHeavyLeaseClass,
+        RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ReconciliationPolicy, ResourceLeaseOwnerV1,
+        ResourceLeaseRequestV1, ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
     };
     use sovereign_repo::{
         ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot, WorktreeLease,
     };
-    use sovereign_state::StateStore;
+    use sovereign_state::{SecurityAuditEventV1, StateStore};
     use sovereign_tools::{
         APPROVAL_CLAIM_NAMESPACE, ApprovalClaim, AuthorizedAction, PermissionClass,
         ReconciliationMode, ToolManifest,
@@ -14936,6 +17128,167 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_goal_autonomy_budget() -> AutonomyBudgetV1 {
+        AutonomyBudgetV1 {
+            schema_version: AUTONOMY_BUDGET_SCHEMA_VERSION,
+            max_wall_ms: 60_000,
+            max_model_calls: 10,
+            max_model_call_ms: 10_000,
+            max_tool_actions: 10,
+            max_single_tool_action_ms: 10_000,
+            max_output_bytes: 1_000_000,
+            max_disk_write_bytes: 1_048_576,
+            max_network_bytes: 1_000_000,
+            max_subprocesses: 10,
+            max_child_cpu_ms: 60_000,
+            used_wall_ms: 0,
+            used_model_calls: 0,
+            used_tool_actions: 0,
+            used_output_bytes: 0,
+            used_disk_write_bytes: 0,
+            used_network_bytes: 0,
+            used_subprocesses: 0,
+            used_child_cpu_ms: 0,
+        }
+    }
+
+    fn test_goal_resource_policy() -> Value {
+        json!({
+            "max_wall_seconds": 60,
+            "max_model_calls": 10,
+            "max_model_call_seconds": 10,
+            "max_tool_actions": 10,
+            "max_single_tool_action_seconds": 10,
+            "max_peak_rss_mb": 4096,
+            "max_output_bytes": 1_000_000,
+            "max_retained_raw_bytes": 1_000_000,
+            "max_disk_write_mb": 1,
+            "max_network_bytes": 1_000_000,
+            "max_subprocesses": 10,
+            "max_child_cpu_seconds": 60,
+            "heavy_leases": ["MODEL", "BUILD_HEAVY"]
+        })
+    }
+
+    #[test]
+    fn audit_budget_recovery_goal_budget_rebase_preserves_consumption_and_rejects_refill() {
+        let mut previous = test_goal_autonomy_budget();
+        previous.used_wall_ms = 9_000;
+        previous.used_model_calls = 3;
+        previous.used_tool_actions = 4;
+        previous.used_output_bytes = 128;
+        previous.used_disk_write_bytes = 256;
+        previous.used_network_bytes = 512;
+        previous.used_subprocesses = 2;
+        previous.used_child_cpu_ms = 7_000;
+        previous
+            .validate()
+            .unwrap_or_else(|error| panic!("previous goal budget: {error}"));
+
+        let plan = json!({"policy": {"resources": test_goal_resource_policy()}});
+        let rebased = rebase_goal_autonomy_budget(&plan, &previous)
+            .unwrap_or_else(|error| panic!("rebase goal budget: {error}"));
+        assert_eq!(rebased.used_wall_ms, previous.used_wall_ms);
+        assert_eq!(rebased.used_model_calls, previous.used_model_calls);
+        assert_eq!(rebased.used_tool_actions, previous.used_tool_actions);
+        assert_eq!(rebased.used_output_bytes, previous.used_output_bytes);
+        assert_eq!(
+            rebased.used_disk_write_bytes,
+            previous.used_disk_write_bytes
+        );
+        assert_eq!(rebased.used_network_bytes, previous.used_network_bytes);
+        assert_eq!(rebased.used_subprocesses, previous.used_subprocesses);
+        assert_eq!(rebased.used_child_cpu_ms, previous.used_child_cpu_ms);
+
+        let mut widened = plan.clone();
+        widened["policy"]["resources"]["max_model_calls"] = json!(11);
+        assert!(rebase_goal_autonomy_budget(&widened, &previous).is_err());
+
+        let mut below_consumed = plan;
+        below_consumed["policy"]["resources"]["max_model_calls"] = json!(2);
+        assert!(rebase_goal_autonomy_budget(&below_consumed, &previous).is_err());
+    }
+
+    #[test]
+    fn audit_budget_recovery_cancellation_tree_propagates_and_never_refills() {
+        fn scope(
+            scope_id: &str,
+            kind: CancellationScopeKindV1,
+            task_id: Option<&str>,
+        ) -> CancellationScopeV1 {
+            CancellationScopeV1 {
+                scope_id: scope_id.to_owned(),
+                kind,
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 1,
+                goal_id: "goal.fixture".to_owned(),
+                task_id: task_id.map(str::to_owned),
+                attempt_id: None,
+                action_id: None,
+            }
+        }
+
+        let tree = CancellationTree::default();
+        let goal = tree
+            .register_root(scope("goal", CancellationScopeKindV1::Goal, None))
+            .unwrap_or_else(|error| panic!("register goal: {error}"));
+        let task = tree
+            .register_child(
+                scope("task", CancellationScopeKindV1::Task, Some("task.A")),
+                "goal",
+            )
+            .unwrap_or_else(|error| panic!("register task: {error}"));
+        assert!(!goal.is_cancelled());
+        assert!(!task.is_cancelled());
+
+        goal.cancel()
+            .unwrap_or_else(|error| panic!("cancel goal: {error}"));
+        assert!(goal.is_cancelled());
+        assert!(task.is_cancelled());
+
+        let late = tree
+            .register_child(
+                scope("task.late", CancellationScopeKindV1::Task, Some("task.B")),
+                "goal",
+            )
+            .unwrap_or_else(|error| panic!("register late child: {error}"));
+        assert!(late.is_cancelled());
+    }
+
+    #[test]
+    fn audit_budget_recovery_integrity_gate_requires_audit_binding_after_first_event() {
+        let (base, mut state) = temp_state("audit-integrity-gate");
+        let event = SecurityAuditEventV1 {
+            actor_id: "controller".to_owned(),
+            plan_id: Some("plan.fixture".to_owned()),
+            task_id: Some("task.A".to_owned()),
+            attempt_id: Some("attempt.1".to_owned()),
+            action_id: Some("action.1".to_owned()),
+            execution_epoch: Some(1),
+            decision: "authorized".to_owned(),
+            action: "dispatch".to_owned(),
+            policy_digest: format!("sha256:{}", "1".repeat(64)),
+            config_digest: format!("sha256:{}", "2".repeat(64)),
+            tool_digest: format!("sha256:{}", "3".repeat(64)),
+            approval_provenance_digest: Some(format!("sha256:{}", "4".repeat(64))),
+            evidence_provenance_digest: Some(format!("sha256:{}", "5".repeat(64))),
+            occurred_at_ms: 1,
+            result: "dispatched".to_owned(),
+        };
+        state
+            .security_audit_log()
+            .append(&event)
+            .unwrap_or_else(|error| panic!("append audit event: {error}"));
+
+        let head = RecoveryIntegrityGate::verify_before_high_risk_mutation(&mut state)
+            .unwrap_or_else(|error| panic!("verify live gate: {error}"));
+        assert_eq!(head.event_count, 1);
+        assert!(RecoveryIntegrityGate::verify_checkpoint(&mut state, None).is_err());
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     #[test]
     fn same_failure_circuit_breaker_requires_both_counters_below_limits() {
@@ -15274,6 +17627,7 @@ mod tests {
                 "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
             baseline_diff_content: String::new(),
             validity: PlanValidity::Current,
+            goal_autonomy_budget: test_goal_autonomy_budget(),
             tasks: BTreeMap::new(),
             attempts: BTreeMap::new(),
         };
@@ -15320,6 +17674,7 @@ mod tests {
         let mut active = active_fixture(&base, 1, &plan_digest);
         active.plan_document = json!({
             "policy": {
+                "resources": test_goal_resource_policy(),
                 "approval": {
                     "exact_action_binding": true,
                     "reapprove_on_payload_change": true,
@@ -15946,7 +18301,7 @@ mod tests {
 
     fn active_fixture(root: &std::path::Path, revision: u32, plan_digest: &str) -> ActivePlan {
         ActivePlan {
-            plan_document: json!({}),
+            plan_document: json!({"policy": {"resources": test_goal_resource_policy()}}),
             compiler_plan_digest: plan_digest.to_owned(),
             plan_id: "plan.fixture".to_owned(),
             goal_id: "goal.fixture".to_owned(),
@@ -15963,6 +18318,7 @@ mod tests {
                 "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
             baseline_diff_content: String::new(),
             validity: PlanValidity::Current,
+            goal_autonomy_budget: test_goal_autonomy_budget(),
             tasks: BTreeMap::new(),
             attempts: BTreeMap::new(),
         }
@@ -16139,6 +18495,10 @@ mod tests {
                 state: TaskState::Succeeded,
                 attempts_started: 1,
                 model_calls_used: 1,
+                autonomy_budget: Some(
+                    initial_task_autonomy_budget(&upstream_task, 1)
+                        .unwrap_or_else(|error| panic!("upstream autonomy budget: {error}")),
+                ),
                 failure_counts: BTreeMap::new(),
                 retry_exhausted: false,
                 resource_deferrals_used: 0,
@@ -16164,6 +18524,10 @@ mod tests {
                 state: TaskState::Planned,
                 attempts_started: 0,
                 model_calls_used: 0,
+                autonomy_budget: Some(
+                    initial_task_autonomy_budget(&downstream_task, 0)
+                        .unwrap_or_else(|error| panic!("downstream autonomy budget: {error}")),
+                ),
                 failure_counts: BTreeMap::new(),
                 retry_exhausted: false,
                 resource_deferrals_used: 0,
@@ -16256,6 +18620,7 @@ mod tests {
         let plan_one_digest = format!("sha256:{}", "1".repeat(64));
         let plan_two_digest = format!("sha256:{}", "2".repeat(64));
         let next_plan = json!({
+            "policy": {"resources": test_goal_resource_policy()},
             "depth": {"mode": "D3"},
             "repositories": [{"instructions": []}],
             "tasks": [task_a.clone(), task_b.clone()]
@@ -16417,6 +18782,7 @@ mod tests {
 
         let mut previous = active_fixture(&repository_root, 1, &plan_one_digest);
         previous.plan_document = json!({
+            "policy": {"resources": test_goal_resource_policy()},
             "depth": {"mode": "D3"},
             "repositories": [{"instructions": []}],
             "tasks": [task_a.clone()]
@@ -16636,6 +19002,10 @@ mod tests {
                     state: TaskState::Succeeded,
                     attempts_started: 1,
                     model_calls_used: 1,
+                    autonomy_budget: Some(
+                        initial_task_autonomy_budget(task_value, 1)
+                            .unwrap_or_else(|error| panic!("carry autonomy budget: {error}")),
+                    ),
                     failure_counts: BTreeMap::new(),
                     retry_exhausted: false,
                     resource_deferrals_used: 0,

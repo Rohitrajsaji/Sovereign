@@ -9,13 +9,15 @@ use sovereign_state::StateStore;
 use sovereign_tools::{
     ACTION_RECEIPT_SCHEMA_VERSION, APPROVAL_CLAIM_NAMESPACE, ActionJournal, ActionReceipt,
     ActionState, ApprovalClaim, AtomicReplaceGuard, AuthorizedAction, CapabilityLayers,
-    CapabilitySet, PermissionClass, PermissionDecision, ProcessRunner, RawToolResult,
-    Reconciliation, ReconciliationMode, ReconciliationPolicy, ResourceLimitKind,
+    CapabilitySet, PermissionClass, PermissionDecision, ProcessCancellationToken, ProcessRunner,
+    RawToolResult, Reconciliation, ReconciliationMode, ReconciliationPolicy, ResourceLimitKind,
     SecretCleanupProof, ToolManifest, ToolSchemaV1, filter_authorized_tool_schemas,
+    process_group_leader_identity, reap_owned_process_group,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -487,6 +489,220 @@ fn secret_lease_runner_stops_observed_until_controller_closes_lease_and_commits(
         );
     }
     assert_tree_excludes_bytes(&temp.0, sentinel);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cancellable_secret_runner_reaps_exact_group_and_never_persists_secret() {
+    let (temp, repo, home, mut store) = fixture("secret-lease-cancelled");
+    let artifact_store = artifacts(&temp);
+    let sentinel = b"secret-cancellation-must-never-persist";
+    let marker = repo.join("secret-cancel.started");
+    let script = "IFS= read -r secret < \"$SOVEREIGN_SECRET_FILE\"; printf 'stdout:%s\\n' \"$secret\"; printf 'stderr:%s\\n' \"$secret\" >&2; printf started > secret-cancel.started; while :; do :; done";
+    let mut action = shell_action(
+        "action_secret_lease_cancelled",
+        &repo,
+        script,
+        Limits {
+            timeout_ms: 10_000,
+            output_bytes: 8 * 1024,
+            disk_bytes: 8 * 1024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::UnsafeSideEffect,
+    );
+    action.permission_class = PermissionClass::RepositoryWrite;
+    let request = isolation(&repo, &home, true);
+    bind_isolation(&mut action, &request);
+    let decision = permission_decision(&action);
+    action.permission_decision_digest = decision.digest();
+
+    let secret_ref = SecretRef {
+        secret_ref_id: "secret.fixture.tools.cancel".to_owned(),
+        provider: SecretProviderKind::ExternalBroker,
+        purpose: "exercise cancellable Controller-owned tools lifecycle".to_owned(),
+        injection: SecretInjection::TemporaryFile,
+        target: "SOVEREIGN_SECRET_FILE".to_owned(),
+    };
+    action.destination_digest = Some(
+        secret_ref
+            .binding_digest()
+            .unwrap_or_else(|error| panic!("SecretRef binding digest: {error}")),
+    );
+    let mut broker = SecretBroker::new();
+    broker
+        .register_provider(Arc::new(FakeSecretProvider::new(
+            SecretProviderKind::ExternalBroker,
+            [("tools-cancel-fixture".to_owned(), sentinel.to_vec())],
+        )))
+        .unwrap_or_else(|error| panic!("register fake secret provider: {error}"));
+    broker
+        .register_secret(
+            secret_ref.clone(),
+            ControllerSecretLocator::FakeKey {
+                provider: SecretProviderKind::ExternalBroker,
+                key: "tools-cancel-fixture".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("register secret: {error}"));
+    let scope = SecretScope {
+        plan_id: action.plan_id.clone(),
+        plan_revision: action.plan_revision,
+        task_id: action.task_id.clone(),
+        task_contract_digest: decision.task_contract_digest.clone(),
+        action_id: action.action_id.clone(),
+        permission_decision_digest: action.permission_decision_digest.clone(),
+        execution_epoch: action.execution_epoch,
+    };
+    let now = now_ms();
+    let mut lease = broker
+        .resolve(
+            &secret_ref,
+            scope.clone(),
+            &decision.effective,
+            now,
+            now + 10_000,
+        )
+        .unwrap_or_else(|error| panic!("resolve secret lease: {error}"));
+    let private_root = temp.0.join("controller-private-secrets");
+    let command_policy = shell_policy();
+    let runner = ProcessRunner::new(&command_policy, &PassthroughIsolation);
+    let cancellation = ProcessCancellationToken::new();
+    let cancellation_worker = cancellation.clone();
+    let marker_worker = marker.clone();
+    let canceller = thread::spawn(move || {
+        for _ in 0..200 {
+            if marker_worker.exists() {
+                cancellation_worker.cancel();
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        cancellation_worker.cancel();
+        false
+    });
+
+    let error = {
+        let mut journal = ActionJournal::new(&mut store);
+        authorize(&mut journal, &action, &manifest())
+            .unwrap_or_else(|error| panic!("authorize: {error}"));
+        let Err(error) = runner.run_with_secret_lease_observed_cancellable(
+            &mut journal,
+            &action,
+            &request,
+            &artifact_store,
+            &mut lease,
+            &scope,
+            &decision,
+            now,
+            &private_root,
+            &cancellation,
+        ) else {
+            panic!("cancelled secret process must not report success");
+        };
+        assert_eq!(
+            journal
+                .record(&action.action_id)
+                .unwrap_or_else(|read_error| panic!("action record: {read_error}"))
+                .map(|record| record.state),
+            Some("unknown".to_owned())
+        );
+        assert_eq!(
+            journal
+                .reconcile_unknown(&action, None)
+                .unwrap_or_else(|reconcile_error| panic!("reconcile unknown: {reconcile_error}")),
+            Reconciliation::BlockedUnsafeUnknown
+        );
+        assert_eq!(
+            journal
+                .record(&action.action_id)
+                .unwrap_or_else(|read_error| panic!("reconciled record: {read_error}"))
+                .map(|record| record.state),
+            Some("unknown".to_owned())
+        );
+        error
+    };
+    assert!(
+        canceller
+            .join()
+            .unwrap_or_else(|_| panic!("secret canceller thread panicked")),
+        "secret child never reached the in-flight marker before cancellation"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("secret process execution cancelled after dispatch")
+    );
+    assert!(
+        !lease.is_closed(),
+        "Controller still owns SecretLease closure"
+    );
+
+    let process_lease: serde_json::Value = serde_json::from_str(
+        &store
+            .get_state("controller.process_lease", &action.action_id)
+            .unwrap_or_else(|read_error| panic!("process lease: {read_error}"))
+            .unwrap_or_else(|| panic!("missing process lease")),
+    )
+    .unwrap_or_else(|decode_error| panic!("decode process lease: {decode_error}"));
+    assert_eq!(process_lease["state"], "reaped");
+    let pgid = process_lease["process_group_id"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_else(|| panic!("process lease pgid"));
+    assert!(
+        process_lease["leader_identity"]
+            .as_str()
+            .is_some_and(|identity| !identity.is_empty())
+    );
+    assert_eq!(
+        process_group_leader_identity(pgid).unwrap_or_else(|observe_error| panic!(
+            "observe cancelled secret group: {observe_error}"
+        )),
+        None
+    );
+    assert_tree_excludes_bytes(&temp.0, sentinel);
+    lease
+        .close(&scope)
+        .unwrap_or_else(|close_error| panic!("Controller lease close: {close_error}"));
+    assert!(lease.is_closed());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn mismatched_process_leader_identity_cannot_authorize_reap() {
+    let mut child = Command::new("/bin/sleep")
+        .arg("30")
+        .process_group(0)
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn owned test process: {error}"));
+    let pgid = child.id();
+    let identity = process_group_leader_identity(pgid)
+        .unwrap_or_else(|error| panic!("read process identity: {error}"))
+        .unwrap_or_else(|| panic!("missing live process identity"));
+    let stale_identity = format!("stale-persisted-identity:{identity}");
+    let Err(error) = reap_owned_process_group(pgid, &stale_identity) else {
+        panic!("stale persisted process identity must not authorize reap");
+    };
+    assert!(error.to_string().contains("identity changed"));
+    assert!(
+        child
+            .try_wait()
+            .unwrap_or_else(|wait_error| panic!("observe live child: {wait_error}"))
+            .is_none(),
+        "mismatched identity must not kill or reattach the live process"
+    );
+    assert_eq!(
+        process_group_leader_identity(pgid)
+            .unwrap_or_else(|observe_error| panic!("re-read process identity: {observe_error}")),
+        Some(identity)
+    );
+    child
+        .kill()
+        .unwrap_or_else(|kill_error| panic!("cleanup test child: {kill_error}"));
+    let _ = child
+        .wait()
+        .unwrap_or_else(|wait_error| panic!("reap test child: {wait_error}"));
 }
 
 #[test]
@@ -1262,6 +1478,104 @@ fn timeout_kills_and_reaps_the_entire_process_group() {
         Some(ResourceLimitKind::Timeout)
     );
     assert!(result.process_group_reaped);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn cancellation_kills_and_reaps_the_exact_owned_process_group() {
+    let (temp, repo, home, mut store) = fixture("cancel-owned-process");
+    let artifact_store = artifacts(&temp);
+    let marker = repo.join("cancel.started");
+    let mut action = shell_action(
+        "action_cancel_owned_process",
+        &repo,
+        "echo started > cancel.started; while :; do :; done",
+        Limits {
+            timeout_ms: 10_000,
+            output_bytes: 16 * 1024,
+            disk_bytes: 16 * 1024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::UnsafeSideEffect,
+    );
+    action.permission_class = PermissionClass::RepositoryWrite;
+    let command_policy = shell_policy();
+    let backend =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("sandbox: {error}"));
+    let runner = ProcessRunner::new(&command_policy, &backend);
+    let request = isolation(&repo, &home, true);
+    bind_isolation(&mut action, &request);
+    let cancellation = ProcessCancellationToken::new();
+    let cancellation_worker = cancellation.clone();
+    let marker_worker = marker.clone();
+    let canceller = thread::spawn(move || {
+        for _ in 0..200 {
+            if marker_worker.exists() {
+                cancellation_worker.cancel();
+                return true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        cancellation_worker.cancel();
+        false
+    });
+    let started = std::time::Instant::now();
+    let error = {
+        let mut journal = ActionJournal::new(&mut store);
+        authorize(&mut journal, &action, &manifest())
+            .unwrap_or_else(|error| panic!("authorize: {error}"));
+        let Err(error) = runner.run_cancellable(
+            &mut journal,
+            &action,
+            &request,
+            &artifact_store,
+            &cancellation,
+        ) else {
+            panic!("cancelled process must not report success");
+        };
+        assert_eq!(
+            journal
+                .record(&action.action_id)
+                .unwrap_or_else(|error| panic!("action record: {error}"))
+                .map(|record| record.state),
+            Some("unknown".to_owned())
+        );
+        error
+    };
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert!(
+        canceller
+            .join()
+            .unwrap_or_else(|_| panic!("canceller thread panicked")),
+        "child never reached in-flight marker before cancellation"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("cancelled after dispatch; action outcome requires reconciliation")
+    );
+    let process_lease: serde_json::Value = serde_json::from_str(
+        &store
+            .get_state("controller.process_lease", &action.action_id)
+            .unwrap_or_else(|error| panic!("process lease: {error}"))
+            .unwrap_or_else(|| panic!("missing process lease")),
+    )
+    .unwrap_or_else(|error| panic!("decode process lease: {error}"));
+    assert_eq!(process_lease["state"], "reaped");
+    let pgid = process_lease["process_group_id"]
+        .as_u64()
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or_else(|| panic!("process lease pgid"));
+    assert!(
+        process_lease["leader_identity"]
+            .as_str()
+            .is_some_and(|identity| !identity.is_empty())
+    );
+    assert_eq!(
+        process_group_leader_identity(pgid)
+            .unwrap_or_else(|error| panic!("observe cancelled process group: {error}")),
+        None
+    );
 }
 
 #[cfg(target_os = "macos")]

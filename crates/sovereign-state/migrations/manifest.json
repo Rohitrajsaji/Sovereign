@@ -1,6 +1,6 @@
 {
   "schema": "sovereign-state-migrations-v1",
-  "current_version": 6,
+  "current_version": 7,
   "migrations": [
     {
       "version": 1,
@@ -97,6 +97,19 @@
         "memory_projection_repairs_no_delete",
         "memory_projection_outbox_after_insert",
         "memory_projection_outbox_after_searchable_update"
+      ]
+    },
+    {
+      "version": 7,
+      "name": "security_audit",
+      "path": "0007_security_audit.sql",
+      "transactional": true,
+      "creates": [
+        "security_audit_events",
+        "security_audit_head",
+        "security_audit_events_no_update",
+        "security_audit_events_no_delete",
+        "security_audit_head_no_delete"
       ]
     }
   ]

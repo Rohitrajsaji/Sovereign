@@ -526,6 +526,34 @@ fn build_heavy_resource_record(state: &StateStore) -> (String, Value) {
         .unwrap_or_else(|| panic!("BUILD_HEAVY resource lease row missing"))
 }
 
+fn latest_checkpoint_goal_budget(state: &StateStore) -> (Value, String) {
+    let latest = state
+        .latest_checkpoint_integrity()
+        .unwrap_or_else(|error| panic!("latest checkpoint: {error}"))
+        .unwrap_or_else(|| panic!("checkpoint missing"));
+    let state_parent = state
+        .path()
+        .parent()
+        .unwrap_or_else(|| panic!("state parent missing"));
+    let store = ArtifactStore::open(state_parent.join("checkpoint-cas"))
+        .unwrap_or_else(|error| panic!("checkpoint store: {error}"));
+    let mut file = store
+        .open_artifact(state, &latest.payload_digest)
+        .unwrap_or_else(|error| panic!("open checkpoint manifest: {error}"));
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut bytes)
+        .unwrap_or_else(|error| panic!("read checkpoint manifest: {error}"));
+    let manifest: Value = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|error| panic!("decode checkpoint manifest: {error}"));
+    let budget = manifest["goal_autonomy_budget"].clone();
+    assert!(!budget.is_null(), "checkpoint goal autonomy budget missing");
+    let digest = manifest["goal_autonomy_budget_digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("checkpoint goal autonomy budget digest missing"))
+        .to_owned();
+    (budget, digest)
+}
+
 #[allow(clippy::too_many_lines)]
 fn install_uncheckpointed_supersession(
     state: &mut StateStore,
@@ -575,6 +603,17 @@ fn install_uncheckpointed_supersession(
 
     let task = next_document["tasks"][0].clone();
     let task_contract_digest = canonical_value_digest(&task);
+    let previous_task_runtime_raw = state
+        .get_state("controller.task", task_id)
+        .unwrap_or_else(|error| panic!("read revision N task runtime: {error}"))
+        .unwrap_or_else(|| panic!("revision N task runtime missing"));
+    let previous_task_runtime: Value = serde_json::from_str(&previous_task_runtime_raw)
+        .unwrap_or_else(|error| panic!("revision N task runtime json: {error}"));
+    let autonomy_budget = previous_task_runtime["autonomy_budget"].clone();
+    assert!(
+        !autonomy_budget.is_null(),
+        "revision N task autonomy budget missing"
+    );
     let task_runtime = json!({
         "state": "planned",
         "attempts_started": 0,
@@ -585,6 +624,7 @@ fn install_uncheckpointed_supersession(
         "resource_retry_exhausted": false,
         "resource_deferred_from": Value::Null,
         "task_contract_digest": task_contract_digest,
+        "autonomy_budget": autonomy_budget,
         "task": task
     });
     let task_runtime_values = BTreeMap::from([(task_id.to_owned(), task_runtime.clone())]);
@@ -621,6 +661,7 @@ fn install_uncheckpointed_supersession(
         "validator_passed": true
     });
     let compilation_evidence_digest = canonical_value_digest(&compilation_evidence);
+    let (goal_autonomy_budget, goal_autonomy_budget_digest) = latest_checkpoint_goal_budget(state);
     let baseline_raw = state
         .get_state("controller.repository_baseline", "active")
         .unwrap_or_else(|error| panic!("read baseline: {error}"))
@@ -700,6 +741,8 @@ fn install_uncheckpointed_supersession(
         "execution_epoch": epoch,
         "repository_snapshot_digest": repository_snapshot_digest,
         "baseline_diff_digest": baseline_diff_digest,
+        "goal_autonomy_budget": goal_autonomy_budget,
+        "goal_autonomy_budget_digest": goal_autonomy_budget_digest,
         "plan_validity": "current"
     });
     let activation_json = activation_payload.to_string();
@@ -961,7 +1004,10 @@ fn run_build_heavy_child(case: &str, base: &Path, root: &Path, prepared: &Prepar
         environment: BTreeMap::default(),
         mode: CommandMode::Direct,
         declared_risk: CommandRisk::RepositoryMutation,
-        timeout_ms: 60_000,
+        // Stay within the governed 30-second single-tool-action ceiling. The crash fixtures kill
+        // the child at a deterministic pre-timeout point, so a longer timeout is neither needed
+        // nor legitimate authority.
+        timeout_ms: 30_000,
         output_limit_bytes: 16 * 1_024,
         disk_write_limit_bytes: 16 * 1_024,
         subprocess_limit: build_lease.subprocess_cap(),

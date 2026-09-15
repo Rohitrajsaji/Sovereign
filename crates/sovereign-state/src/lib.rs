@@ -20,9 +20,12 @@ const MEMORY_SQL: &str = include_str!("../migrations/0004_memory.sql");
 const MEMORY_RETRIEVAL_SQL: &str = include_str!("../migrations/0005_memory_retrieval.sql");
 const MEMORY_PROJECTION_OUTBOX_SQL: &str =
     include_str!("../migrations/0006_memory_projection_outbox.sql");
+const SECURITY_AUDIT_SQL: &str = include_str!("../migrations/0007_security_audit.sql");
+const SECURITY_AUDIT_GENESIS_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Current durable schema version implemented by this crate.
-pub const CURRENT_SCHEMA_VERSION: i64 = 6;
+pub const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 /// One numbered, transactional durable-state migration.
 #[derive(Debug, Clone, Copy)]
@@ -72,6 +75,11 @@ pub const MIGRATIONS: &[Migration] = &[
         version: 6,
         name: "memory_projection_outbox",
         sql: MEMORY_PROJECTION_OUTBOX_SQL,
+    },
+    Migration {
+        version: 7,
+        name: "security_audit",
+        sql: SECURITY_AUDIT_SQL,
     },
 ];
 
@@ -254,6 +262,169 @@ pub struct NewCheckpointIntegrityRecord<'a> {
     pub action_sequence: i64,
 }
 
+/// Versioned security/audit fact persisted without model reasoning or chain-of-thought.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityAuditEventV1 {
+    pub actor_id: String,
+    pub plan_id: Option<String>,
+    pub task_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub action_id: Option<String>,
+    pub execution_epoch: Option<i64>,
+    pub decision: String,
+    pub action: String,
+    pub policy_digest: String,
+    pub config_digest: String,
+    pub tool_digest: String,
+    pub approval_provenance_digest: Option<String>,
+    pub evidence_provenance_digest: Option<String>,
+    pub occurred_at_ms: i64,
+    pub result: String,
+}
+
+/// Durable security-audit chain head used to detect truncation as well as row tampering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityAuditHead {
+    pub event_count: i64,
+    pub head_digest: String,
+}
+
+/// Typed access to the tamper-evident audit log inside the canonical [`StateStore`] database.
+pub struct SecurityAuditLog<'a> {
+    connection: &'a mut Connection,
+}
+
+impl SecurityAuditLog<'_> {
+    /// Appends one v1 audit fact after verifying the current durable chain in the same transaction.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Integrity`] for an invalid event or an already-corrupt chain, and
+    /// [`StateError::Sqlite`] for persistence failures.
+    pub fn append(
+        &mut self,
+        event: &SecurityAuditEventV1,
+    ) -> Result<SecurityAuditHead, StateError> {
+        validate_security_audit_event(event)?;
+        let transaction = self.connection.transaction()?;
+        let head = verify_security_audit_chain(&transaction)?;
+        let sequence = head
+            .event_count
+            .checked_add(1)
+            .ok_or_else(|| StateError::Integrity("security audit sequence overflow".to_owned()))?;
+        let event_digest = security_audit_digest(sequence, &head.head_digest, event);
+
+        transaction.execute(
+            "INSERT INTO security_audit_events(\
+                sequence, event_version, actor_id, plan_id, task_id, attempt_id, action_id, \
+                execution_epoch, decision, action, policy_digest, config_digest, tool_digest, \
+                approval_provenance_digest, evidence_provenance_digest, occurred_at_ms, result, \
+                previous_digest, event_digest\
+             ) VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            rusqlite::params![
+                sequence,
+                event.actor_id.as_str(),
+                event.plan_id.as_deref(),
+                event.task_id.as_deref(),
+                event.attempt_id.as_deref(),
+                event.action_id.as_deref(),
+                event.execution_epoch,
+                event.decision.as_str(),
+                event.action.as_str(),
+                event.policy_digest.as_str(),
+                event.config_digest.as_str(),
+                event.tool_digest.as_str(),
+                event.approval_provenance_digest.as_deref(),
+                event.evidence_provenance_digest.as_deref(),
+                event.occurred_at_ms,
+                event.result.as_str(),
+                head.head_digest.as_str(),
+                event_digest.as_str(),
+            ],
+        )?;
+        let updated = transaction.execute(
+            "UPDATE security_audit_head SET event_count=?1, head_digest=?2 \
+             WHERE singleton=1 AND event_count=?3 AND head_digest=?4",
+            (
+                sequence,
+                event_digest.as_str(),
+                head.event_count,
+                head.head_digest.as_str(),
+            ),
+        )?;
+        if updated != 1 {
+            return Err(StateError::Integrity(
+                "security audit head changed while appending".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(SecurityAuditHead {
+            event_count: sequence,
+            head_digest: event_digest,
+        })
+    }
+
+    /// Returns the stored durable audit head without asserting chain integrity.
+    ///
+    /// # Errors
+    /// Returns [`StateError`] when the durable head is missing or unreadable.
+    pub fn head(&self) -> Result<SecurityAuditHead, StateError> {
+        security_audit_head(self.connection)
+    }
+
+    /// Verifies every row, parent link, contiguous sequence and the durable tail count/digest.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Integrity`] for mutation, reorder, deletion/truncation, a missing
+    /// tail, or head mismatch; returns [`StateError::Sqlite`] on read failure.
+    pub fn verify_chain(&self) -> Result<SecurityAuditHead, StateError> {
+        verify_security_audit_chain(self.connection)
+    }
+
+    /// Verifies that a previously checkpointed audit head is an exact prefix of the current
+    /// durable chain. This permits legitimate post-checkpoint audit appends while still detecting
+    /// truncation, replacement, or forked history before recovery authorizes another mutation.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Integrity`] when the expected head is malformed, is ahead of the
+    /// current durable chain, or its sequence now resolves to a different digest.
+    pub fn verify_prefix(&self, expected: &SecurityAuditHead) -> Result<(), StateError> {
+        if expected.event_count < 0 || expected.head_digest.trim().is_empty() {
+            return Err(StateError::Integrity(
+                "checkpoint security audit head is malformed".to_owned(),
+            ));
+        }
+        let current = verify_security_audit_chain(self.connection)?;
+        if expected.event_count > current.event_count {
+            return Err(StateError::Integrity(format!(
+                "checkpoint security audit head count {} exceeds durable count {}",
+                expected.event_count, current.event_count
+            )));
+        }
+        if expected.event_count == 0 {
+            if expected.head_digest != SECURITY_AUDIT_GENESIS_DIGEST {
+                return Err(StateError::Integrity(
+                    "checkpoint security audit genesis digest mismatch".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        let observed: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT event_digest FROM security_audit_events WHERE sequence=?1",
+                [expected.event_count],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if observed.as_deref() != Some(expected.head_digest.as_str()) {
+            return Err(StateError::Integrity(
+                "checkpoint security audit head is not a prefix of durable history".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// `SQLite`-backed authoritative state repository.
 pub struct StateStore {
     path: PathBuf,
@@ -300,6 +471,14 @@ impl StateStore {
             [],
             |row| row.get(0),
         )?)
+    }
+
+    /// Borrows the canonical database as a typed tamper-evident security audit log.
+    #[must_use]
+    pub fn security_audit_log(&mut self) -> SecurityAuditLog<'_> {
+        SecurityAuditLog {
+            connection: &mut self.connection,
+        }
     }
 
     /// Executes a caller-owned transaction.  Any returned error rolls the
@@ -1442,6 +1621,242 @@ fn validate_order(migrations: &[Migration]) -> Result<(), StateError> {
         previous = migration.version;
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct PersistedSecurityAuditEvent {
+    sequence: i64,
+    event_version: i64,
+    event: SecurityAuditEventV1,
+    previous_digest: String,
+    event_digest: String,
+}
+
+fn validate_security_audit_event(event: &SecurityAuditEventV1) -> Result<(), StateError> {
+    require_audit_value("actor_id", &event.actor_id)?;
+    for (label, value) in [
+        ("plan_id", event.plan_id.as_deref()),
+        ("task_id", event.task_id.as_deref()),
+        ("attempt_id", event.attempt_id.as_deref()),
+        ("action_id", event.action_id.as_deref()),
+        (
+            "approval_provenance_digest",
+            event.approval_provenance_digest.as_deref(),
+        ),
+        (
+            "evidence_provenance_digest",
+            event.evidence_provenance_digest.as_deref(),
+        ),
+    ] {
+        if let Some(value) = value {
+            require_audit_value(label, value)?;
+        }
+    }
+    if event.execution_epoch.is_some_and(|epoch| epoch < 0) {
+        return Err(StateError::Integrity(
+            "security audit execution_epoch must be non-negative".to_owned(),
+        ));
+    }
+    if event.occurred_at_ms < 0 {
+        return Err(StateError::Integrity(
+            "security audit occurred_at_ms must be non-negative".to_owned(),
+        ));
+    }
+    require_audit_value("decision", &event.decision)?;
+    require_audit_value("action", &event.action)?;
+    require_audit_value("policy_digest", &event.policy_digest)?;
+    require_audit_value("config_digest", &event.config_digest)?;
+    require_audit_value("tool_digest", &event.tool_digest)?;
+    require_audit_value("result", &event.result)?;
+    Ok(())
+}
+
+fn require_audit_value(label: &str, value: &str) -> Result<(), StateError> {
+    if value.trim().is_empty() {
+        return Err(StateError::Integrity(format!(
+            "security audit {label} must not be blank"
+        )));
+    }
+    Ok(())
+}
+
+fn security_audit_head(connection: &Connection) -> Result<SecurityAuditHead, StateError> {
+    connection
+        .query_row(
+            "SELECT event_count, head_digest FROM security_audit_head WHERE singleton=1",
+            [],
+            |row| {
+                Ok(SecurityAuditHead {
+                    event_count: row.get(0)?,
+                    head_digest: row.get(1)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StateError::Integrity("security audit head is missing".to_owned()))
+}
+
+fn verify_security_audit_chain(connection: &Connection) -> Result<SecurityAuditHead, StateError> {
+    let head = security_audit_head(connection)?;
+    if head.event_count < 0 {
+        return Err(StateError::Integrity(
+            "security audit head has negative event count".to_owned(),
+        ));
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT sequence, event_version, actor_id, plan_id, task_id, attempt_id, action_id, \
+                execution_epoch, decision, action, policy_digest, config_digest, tool_digest, \
+                approval_provenance_digest, evidence_provenance_digest, occurred_at_ms, result, \
+                previous_digest, event_digest \
+         FROM security_audit_events ORDER BY sequence ASC",
+    )?;
+    let rows = statement.query_map([], security_audit_from_row)?;
+    let mut expected_sequence = 1_i64;
+    let mut observed_count = 0_i64;
+    let mut previous_digest = SECURITY_AUDIT_GENESIS_DIGEST.to_owned();
+
+    for row in rows {
+        let row = row?;
+        if row.sequence != expected_sequence {
+            return Err(StateError::Integrity(format!(
+                "security audit sequence discontinuity: expected {expected_sequence}, got {}",
+                row.sequence
+            )));
+        }
+        if row.event_version != 1 {
+            return Err(StateError::Integrity(format!(
+                "security audit event {} has unsupported version {}",
+                row.sequence, row.event_version
+            )));
+        }
+        validate_security_audit_event(&row.event)?;
+        if row.previous_digest != previous_digest {
+            return Err(StateError::Integrity(format!(
+                "security audit event {} parent digest mismatch",
+                row.sequence
+            )));
+        }
+        let computed = security_audit_digest(row.sequence, &row.previous_digest, &row.event);
+        if computed != row.event_digest {
+            return Err(StateError::Integrity(format!(
+                "security audit event {} digest mismatch",
+                row.sequence
+            )));
+        }
+
+        observed_count = observed_count
+            .checked_add(1)
+            .ok_or_else(|| StateError::Integrity("security audit row count overflow".to_owned()))?;
+        expected_sequence = expected_sequence
+            .checked_add(1)
+            .ok_or_else(|| StateError::Integrity("security audit sequence overflow".to_owned()))?;
+        previous_digest = row.event_digest;
+    }
+
+    if observed_count != head.event_count {
+        return Err(StateError::Integrity(format!(
+            "security audit tail count mismatch: durable={}, observed={observed_count}",
+            head.event_count
+        )));
+    }
+    if previous_digest != head.head_digest {
+        return Err(StateError::Integrity(
+            "security audit durable head digest does not match event tail".to_owned(),
+        ));
+    }
+    Ok(head)
+}
+
+fn security_audit_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PersistedSecurityAuditEvent> {
+    Ok(PersistedSecurityAuditEvent {
+        sequence: row.get(0)?,
+        event_version: row.get(1)?,
+        event: SecurityAuditEventV1 {
+            actor_id: row.get(2)?,
+            plan_id: row.get(3)?,
+            task_id: row.get(4)?,
+            attempt_id: row.get(5)?,
+            action_id: row.get(6)?,
+            execution_epoch: row.get(7)?,
+            decision: row.get(8)?,
+            action: row.get(9)?,
+            policy_digest: row.get(10)?,
+            config_digest: row.get(11)?,
+            tool_digest: row.get(12)?,
+            approval_provenance_digest: row.get(13)?,
+            evidence_provenance_digest: row.get(14)?,
+            occurred_at_ms: row.get(15)?,
+            result: row.get(16)?,
+        },
+        previous_digest: row.get(17)?,
+        event_digest: row.get(18)?,
+    })
+}
+
+fn security_audit_digest(
+    sequence: i64,
+    previous_digest: &str,
+    event: &SecurityAuditEventV1,
+) -> String {
+    let mut hasher = Sha256::new();
+    hash_audit_text(&mut hasher, "domain", Some("sovereign-security-audit-v1"));
+    hash_audit_i64(&mut hasher, "event_version", Some(1));
+    hash_audit_i64(&mut hasher, "sequence", Some(sequence));
+    hash_audit_text(&mut hasher, "previous_digest", Some(previous_digest));
+    hash_audit_text(&mut hasher, "actor_id", Some(&event.actor_id));
+    hash_audit_text(&mut hasher, "plan_id", event.plan_id.as_deref());
+    hash_audit_text(&mut hasher, "task_id", event.task_id.as_deref());
+    hash_audit_text(&mut hasher, "attempt_id", event.attempt_id.as_deref());
+    hash_audit_text(&mut hasher, "action_id", event.action_id.as_deref());
+    hash_audit_i64(&mut hasher, "execution_epoch", event.execution_epoch);
+    hash_audit_text(&mut hasher, "decision", Some(&event.decision));
+    hash_audit_text(&mut hasher, "action", Some(&event.action));
+    hash_audit_text(&mut hasher, "policy_digest", Some(&event.policy_digest));
+    hash_audit_text(&mut hasher, "config_digest", Some(&event.config_digest));
+    hash_audit_text(&mut hasher, "tool_digest", Some(&event.tool_digest));
+    hash_audit_text(
+        &mut hasher,
+        "approval_provenance_digest",
+        event.approval_provenance_digest.as_deref(),
+    );
+    hash_audit_text(
+        &mut hasher,
+        "evidence_provenance_digest",
+        event.evidence_provenance_digest.as_deref(),
+    );
+    hash_audit_i64(&mut hasher, "occurred_at_ms", Some(event.occurred_at_ms));
+    hash_audit_text(&mut hasher, "result", Some(&event.result));
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn hash_audit_text(hasher: &mut Sha256, label: &str, value: Option<&str>) {
+    hash_audit_bytes(hasher, label.as_bytes());
+    match value {
+        Some(value) => {
+            hasher.update([1_u8]);
+            hash_audit_bytes(hasher, value.as_bytes());
+        }
+        None => hasher.update([0_u8]),
+    }
+}
+
+fn hash_audit_i64(hasher: &mut Sha256, label: &str, value: Option<i64>) {
+    hash_audit_bytes(hasher, label.as_bytes());
+    match value {
+        Some(value) => {
+            hasher.update([1_u8]);
+            hasher.update(value.to_be_bytes());
+        }
+        None => hasher.update([0_u8]),
+    }
+}
+
+fn hash_audit_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(bytes);
 }
 
 fn checkpoint_hash(

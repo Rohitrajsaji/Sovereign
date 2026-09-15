@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "task_id": "M6-T06",
+  "title": "Implement tamper-evident audit, autonomy budgets, rollback execution, and recovery integrity gates",
+  "status": "completed",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "46b21a7c2f4d773819088471a63d5dcffbea2b36",
+  "completed_at": "2026-09-15T18:10:42Z",
+  "verified_at": "2026-09-15T18:10:42Z",
+  "dependencies": [
+    "M1-T08",
+    "M6-T02",
+    "M6-T04"
+  ],
+  "interfaces": [
+    "SecurityAuditLog",
+    "AutonomyBudget",
+    "CancellationTree",
+    "RollbackExecutor",
+    "RecoveryIntegrityGate"
+  ],
+  "objective": "Deterministic operational resilience with tamper-evident audit provenance, non-refilling outer autonomy budgets, cancellation/process ownership, authorized verified rollback, and fail-closed crash recovery integrity.",
+  "frozen_tree": {
+    "head": "46b21a7c2f4d773819088471a63d5dcffbea2b36",
+    "dirty_path_count": 16,
+    "source_hashes_match_final_audit": true
+  },
+  "source_hashes": {
+    "crates/sovereign-controller/src/lib.rs": "sha256:a68a0f4f430f130366118be24dc7f88f75a655739c4897ea21f134f30f6596d2",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:5fe057dcf458f9c9d51be5b2f8c7d1a304df59b8e56c7bba5444955bba67516b",
+    "crates/sovereign-eval/tests/crash_resume.rs": "sha256:0d96ada4c5ed2adcde83468c6fb4bb674563266dd473db635d4a58a67c8d56d2",
+    "crates/sovereign-model/src/lib.rs": "sha256:971095bb4a9ac0b1e9fbc87119056c6ec7d7eea1aefaf2be280002dfd2b9a97f",
+    "crates/sovereign-model/tests/backend.rs": "sha256:c019cd632989dcc67d3396e17d014df0fcbbd0b1d6d4246ba8c0b0ca0e63ae73",
+    "crates/sovereign-policy/src/lib.rs": "sha256:780838de5c75311849b745bc1479f71e6d6c9b78957f91d9e74b844bceb48afa",
+    "crates/sovereign-policy/src/resources.rs": "sha256:ceecde569c6f9eba38ca288e385dc09d79e9b2dcb48ab82e0a3d7f0a577db2d0",
+    "crates/sovereign-state/migrations/manifest.json": "sha256:f917e2596b3a1c0b180111b9e31758139d6cfdb7dce9047d80fc75fe601489f8",
+    "crates/sovereign-state/src/lib.rs": "sha256:6ebc615b4354d256e9aa78c31d2c24e0bd0516e88fc645bfd00b0a395e37e1b9",
+    "crates/sovereign-tools/src/lib.rs": "sha256:c8e182f36548141dcc00e4f317fbdb970955eb5ef0683806a14a75503ee03c8b",
+    "crates/sovereign-tools/tests/runner.rs": "sha256:2f102f4d50120bdc38121cdd9cb7e9bfb8e5ad218009cc49ae32be7dac2c8213",
+    "crates/sovereign-controller/tests/m6_t06_resilience.rs": "sha256:f7c57731837d164deba332bec00be773c72ea87890dbcc06305c0f2bd93352b6",
+    "crates/sovereign-eval/tests/security_resilience.rs": "sha256:0fc438b3a79732a0e17de9ec52de31df60af67e88aaba71ae1deccaeb9ee70a4",
+    "crates/sovereign-policy/tests/autonomy.rs": "sha256:47c9dadaf1580ced5465bd7b4e8a3dffc1548e54bc7de7952a82ce7c339b2654",
+    "crates/sovereign-state/migrations/0007_security_audit.sql": "sha256:50e360a2cffbec779577f7a20d43109f9f8c50273a7229e8e556071936f3667b",
+    "crates/sovereign-state/tests/audit_budget_recovery.rs": "sha256:b0a65f52d3de1ef7eafee97e6023689fa6f8730fa3ab493c10b41cce0aea1d05"
+  },
+  "security_audit_contract": {
+    "state_schema_version": 7,
+    "canonical_store": "existing StateStore SQLite only",
+    "second_audit_database": false,
+    "append_only_hash_chain": true,
+    "checkpoint_semantics": "checkpoint audit head must verify as an exact prefix of the current live chain; live tail equality is not required",
+    "provenance_bound": [
+      "action",
+      "execution_epoch",
+      "policy_digest",
+      "config_digest",
+      "tool_digest",
+      "approval_digest",
+      "evidence_provenance_digest"
+    ],
+    "chain_of_thought_stored": false
+  },
+  "autonomy_budget_contract": {
+    "scope_levels": [
+      "goal/plan",
+      "task",
+      "model call",
+      "tool action",
+      "browser loop",
+      "process tree"
+    ],
+    "narrowest_remaining_budget_wins": true,
+    "goal_counters_survive_revision_and_recovery": true,
+    "same_lineage_replan_counter_survives_reopen": true,
+    "no_refill_on": [
+      "restart",
+      "replan",
+      "revision",
+      "approval retry",
+      "provider retry",
+      "tool retry",
+      "browser retry"
+    ],
+    "transient_resource_pressure_consumes_attempt_budget": false,
+    "durable_action_charge_namespace": "controller.autonomy_action_charge"
+  },
+  "cancellation_contract": {
+    "downward_monotonic_tree": true,
+    "late_child_inherits_cancelled_ancestor": true,
+    "model_inflight_interrupt": "Controller calls backend.unload after the model call is charged and rejects any post-cancel result",
+    "process_ownership": "exact process group plus PID-reuse-resistant leader identity",
+    "pid_only_authority": false,
+    "secret_cancelled_postdispatch_state": "CancelledPostDispatchUnknown",
+    "secret_action_remains_unknown_and_mutation_fenced": true
+  },
+  "rollback_contract": {
+    "rollback_is_separate_authorized_action": true,
+    "requires_current_preconditions": true,
+    "requires_typed_postcondition_verification": true,
+    "unknown_is_not_failure": true,
+    "blind_replay_after_unknown": false,
+    "post_dispatch_crash_dispatched_count": "remains one in recovery-hook regression",
+    "original_result_digest_format": "bare lowercase 64-hex"
+  },
+  "recovery_integrity_contract": {
+    "authoritative_sources": [
+      "SQLite",
+      "CAS",
+      "Git/current repository state"
+    ],
+    "repair_from_model_memory": false,
+    "cas_digest_mismatch_blocks_use": true,
+    "sqlite_audit_checkpoint_action_journal_inconsistency_blocks_mutation": true,
+    "checkpoint_ancestry_fallback": "newest valid trusted ancestor permitted when correlation remains valid; counters do not refill",
+    "security_audit_verified_before_high_risk_mutation": true
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --offline --test m6_t06_resilience",
+      "result": "passed",
+      "detail": "4/4 default resilience tests"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --features recovery-test-hooks --test m6_t06_resilience --offline",
+      "result": "passed",
+      "detail": "6/6 including rollback post-dispatch crash/Unknown/no blind redispatch"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --offline --test security_resilience",
+      "result": "passed",
+      "detail": "5/5"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-state --offline --test audit_budget_recovery",
+      "result": "passed",
+      "detail": "5/5"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller -p sovereign-state --offline -- audit_budget_recovery",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-policy --offline --test autonomy",
+      "result": "passed",
+      "detail": "4/4 independently rerun by final auditor"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --test crash_resume --offline",
+      "result": "passed",
+      "detail": "30/30"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-model --offline",
+      "result": "passed",
+      "detail": "11/11"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-tools --offline --test runner",
+      "result": "passed",
+      "detail": "24/24"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --lib --offline",
+      "result": "passed",
+      "detail": "39/39"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --test t07 --offline",
+      "result": "passed",
+      "detail": "52/52"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test --workspace --all-targets --offline",
+      "result": "passed",
+      "detail": "all non-ignored tests passed on the exact frozen M6-T06 tree"
+    },
+    {
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "independent_audit": {
+    "worker": "worker-50",
+    "prime_session": "2026-09-12-d47439c6",
+    "final_result": "CLOSABLE",
+    "final_verdict": "M6-T06 frozen task: CLOSABLE",
+    "final_blockers": [],
+    "exact_tree_reverified": true,
+    "notes": "Fresh read-only whole-task audit re-read frozen interfaces/tests/acceptance and architecture, re-matched exact HEAD/status/all 16 hashes, independently reran focused resilience/audit/autonomy/plan/model/tools checks, and found no closure blocker."
+  },
+  "state_authority": {
+    "controller_sole_execution_authority": true,
+    "memory_learning_retrieval_external_model_resource_probe_worker_skill_tool_cancellation_are_non_authoritative": true,
+    "second_authority_db_created": false
+  },
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "real_qwen_runtime_on_current_tree": "deferred to mandatory final-release current-tree qualification; not claimed by M6-T06",
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  }
+}

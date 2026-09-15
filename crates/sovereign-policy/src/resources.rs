@@ -4,10 +4,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+use crate::PolicyError;
+
 pub const HARDWARE_PROFILE_SCHEMA_VERSION: u32 = 1;
 pub const RESOURCE_LEASE_SCHEMA_VERSION: u32 = 1;
 pub const RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION: u32 = 1;
 pub const M6_RESOURCE_GOVERNOR_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub const AUTONOMY_BUDGET_SCHEMA_VERSION: u32 = 1;
 
 const MIB_PER_GIB: u64 = 1_024;
 
@@ -465,6 +468,247 @@ pub struct TaskResourceBudgetV1 {
     pub max_peak_rss_mib: u64,
     pub max_subprocesses: u32,
     pub heavy_leases: BTreeSet<PlanHeavyLeaseClass>,
+}
+
+/// Durable outer autonomy counters derived from governed Plan IR resource ceilings.
+///
+/// The Controller persists this value and charges it before dispatch. Inner model/tool/browser
+/// retry loops may be stricter, but they cannot refill or outrun these counters. Browser actions
+/// intentionally consume the same outer tool-action counter because Plan IR v1.2 defines one
+/// governed `max_tool_actions` ceiling rather than a separate browser-granted authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutonomyBudgetV1 {
+    pub schema_version: u32,
+    pub max_wall_ms: u64,
+    pub max_model_calls: u32,
+    pub max_model_call_ms: u64,
+    pub max_tool_actions: u32,
+    pub max_single_tool_action_ms: u64,
+    pub max_output_bytes: u64,
+    pub max_disk_write_bytes: u64,
+    pub max_network_bytes: u64,
+    pub max_subprocesses: u32,
+    pub max_child_cpu_ms: u64,
+    pub used_wall_ms: u64,
+    pub used_model_calls: u32,
+    pub used_tool_actions: u32,
+    pub used_output_bytes: u64,
+    pub used_disk_write_bytes: u64,
+    pub used_network_bytes: u64,
+    pub used_subprocesses: u32,
+    pub used_child_cpu_ms: u64,
+}
+
+impl AutonomyBudgetV1 {
+    /// Validates a restored budget without mutating or repairing it.
+    ///
+    /// # Errors
+    /// Returns a deterministic denial when the schema/limits are invalid or a persisted consumed
+    /// counter exceeds its governed ceiling. Recovery must never reset an over-budget counter.
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        if self.schema_version != AUTONOMY_BUDGET_SCHEMA_VERSION {
+            return Err(PolicyError::Denied(format!(
+                "unsupported autonomy budget schema {}",
+                self.schema_version
+            )));
+        }
+        if self.max_wall_ms == 0
+            || self.max_model_call_ms == 0
+            || self.max_single_tool_action_ms == 0
+        {
+            return Err(PolicyError::Denied(
+                "autonomy budget time ceilings must be non-zero".to_owned(),
+            ));
+        }
+        ensure_budget_within("wall_ms", self.used_wall_ms, self.max_wall_ms)?;
+        ensure_budget_within(
+            "model_calls",
+            u64::from(self.used_model_calls),
+            u64::from(self.max_model_calls),
+        )?;
+        ensure_budget_within(
+            "tool_actions",
+            u64::from(self.used_tool_actions),
+            u64::from(self.max_tool_actions),
+        )?;
+        ensure_budget_within(
+            "output_bytes",
+            self.used_output_bytes,
+            self.max_output_bytes,
+        )?;
+        ensure_budget_within(
+            "disk_write_bytes",
+            self.used_disk_write_bytes,
+            self.max_disk_write_bytes,
+        )?;
+        ensure_budget_within(
+            "network_bytes",
+            self.used_network_bytes,
+            self.max_network_bytes,
+        )?;
+        ensure_budget_within(
+            "subprocesses",
+            u64::from(self.used_subprocesses),
+            u64::from(self.max_subprocesses),
+        )?;
+        ensure_budget_within(
+            "child_cpu_ms",
+            self.used_child_cpu_ms,
+            self.max_child_cpu_ms,
+        )?;
+        Ok(())
+    }
+
+    /// Charges one Controller-owned model dispatch before provider invocation.
+    ///
+    /// # Errors
+    /// Denies zero/over-ceiling deadlines or an exhausted model-call counter without mutation.
+    pub fn charge_model_call(&mut self, requested_deadline_ms: u64) -> Result<(), PolicyError> {
+        if requested_deadline_ms == 0 || requested_deadline_ms > self.max_model_call_ms {
+            return Err(PolicyError::Denied(format!(
+                "model call deadline {requested_deadline_ms} exceeds autonomy ceiling {}",
+                self.max_model_call_ms
+            )));
+        }
+        charge_u32(
+            "model_calls",
+            &mut self.used_model_calls,
+            self.max_model_calls,
+            1,
+        )
+    }
+
+    /// Charges one outer tool action. Adapter/provider retries must call this before dispatch.
+    ///
+    /// # Errors
+    /// Denies zero/over-ceiling action deadlines or an exhausted tool-action counter.
+    pub fn charge_tool_action(&mut self, requested_deadline_ms: u64) -> Result<(), PolicyError> {
+        if requested_deadline_ms == 0 || requested_deadline_ms > self.max_single_tool_action_ms {
+            return Err(PolicyError::Denied(format!(
+                "tool action deadline {requested_deadline_ms} exceeds autonomy ceiling {}",
+                self.max_single_tool_action_ms
+            )));
+        }
+        charge_u32(
+            "tool_actions",
+            &mut self.used_tool_actions,
+            self.max_tool_actions,
+            1,
+        )
+    }
+
+    /// Charges one browser loop action against the same governed Plan IR tool-action ceiling.
+    ///
+    /// # Errors
+    /// Returns the same fail-closed errors as [`Self::charge_tool_action`].
+    pub fn charge_browser_action(&mut self, requested_deadline_ms: u64) -> Result<(), PolicyError> {
+        self.charge_tool_action(requested_deadline_ms)
+    }
+
+    /// Charges one child/process creation before spawn.
+    ///
+    /// # Errors
+    /// Denies when the outer subprocess ceiling is exhausted.
+    pub fn charge_process_spawn(&mut self) -> Result<(), PolicyError> {
+        charge_u32(
+            "subprocesses",
+            &mut self.used_subprocesses,
+            self.max_subprocesses,
+            1,
+        )
+    }
+
+    /// Charges elapsed Controller wall time using a monotonic caller measurement.
+    ///
+    /// # Errors
+    /// Denies overflow or exhaustion without changing the prior consumed value.
+    pub fn charge_wall_ms(&mut self, delta_ms: u64) -> Result<(), PolicyError> {
+        charge_u64(
+            "wall_ms",
+            &mut self.used_wall_ms,
+            self.max_wall_ms,
+            delta_ms,
+        )
+    }
+
+    /// Charges observed process/tool output bytes.
+    ///
+    /// # Errors
+    /// Denies overflow or exhaustion without changing the prior consumed value.
+    pub fn charge_output_bytes(&mut self, bytes: u64) -> Result<(), PolicyError> {
+        charge_u64(
+            "output_bytes",
+            &mut self.used_output_bytes,
+            self.max_output_bytes,
+            bytes,
+        )
+    }
+
+    /// Charges filesystem bytes written by Controller-owned actions.
+    ///
+    /// # Errors
+    /// Denies overflow or exhaustion without changing the prior consumed value.
+    pub fn charge_disk_write_bytes(&mut self, bytes: u64) -> Result<(), PolicyError> {
+        charge_u64(
+            "disk_write_bytes",
+            &mut self.used_disk_write_bytes,
+            self.max_disk_write_bytes,
+            bytes,
+        )
+    }
+
+    /// Charges network transfer bytes.
+    ///
+    /// # Errors
+    /// Denies overflow or exhaustion without changing the prior consumed value.
+    pub fn charge_network_bytes(&mut self, bytes: u64) -> Result<(), PolicyError> {
+        charge_u64(
+            "network_bytes",
+            &mut self.used_network_bytes,
+            self.max_network_bytes,
+            bytes,
+        )
+    }
+
+    /// Charges aggregate child CPU time in milliseconds.
+    ///
+    /// # Errors
+    /// Denies overflow or exhaustion without changing the prior consumed value.
+    pub fn charge_child_cpu_ms(&mut self, delta_ms: u64) -> Result<(), PolicyError> {
+        charge_u64(
+            "child_cpu_ms",
+            &mut self.used_child_cpu_ms,
+            self.max_child_cpu_ms,
+            delta_ms,
+        )
+    }
+}
+
+fn ensure_budget_within(label: &str, used: u64, limit: u64) -> Result<(), PolicyError> {
+    if used > limit {
+        return Err(PolicyError::Denied(format!(
+            "autonomy budget {label} exceeded: used={used}, limit={limit}"
+        )));
+    }
+    Ok(())
+}
+
+fn charge_u64(label: &str, used: &mut u64, limit: u64, amount: u64) -> Result<(), PolicyError> {
+    let next = used
+        .checked_add(amount)
+        .ok_or_else(|| PolicyError::Denied(format!("autonomy budget {label} counter overflow")))?;
+    ensure_budget_within(label, next, limit)?;
+    *used = next;
+    Ok(())
+}
+
+fn charge_u32(label: &str, used: &mut u32, limit: u32, amount: u32) -> Result<(), PolicyError> {
+    let next = used
+        .checked_add(amount)
+        .ok_or_else(|| PolicyError::Denied(format!("autonomy budget {label} counter overflow")))?;
+    ensure_budget_within(label, u64::from(next), u64::from(limit))?;
+    *used = next;
+    Ok(())
 }
 
 impl TaskResourceBudgetV1 {

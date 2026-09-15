@@ -6,14 +6,14 @@
 mod resources;
 
 pub use resources::{
-    AdmissionStatus, ConditionalLeaseContextV1, HARDWARE_PROFILE_SCHEMA_VERSION, HardwareProfileV1,
-    HeavyLeaseClass, HeavyLeasePairPolicyV1, LeasePairRule, LeaseStateV1,
-    M6_RESOURCE_GOVERNOR_SNAPSHOT_SCHEMA_VERSION, M6ResourceGovernor, M6ResourceGovernorSnapshotV1,
-    OsMemoryPressure, PlanHeavyLeaseClass, PressureBand, RESOURCE_LEASE_SCHEMA_VERSION,
-    RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ResourceAdmissionDecisionV1,
-    ResourceCapabilityCycleSnapshotV1, ResourceGovernorRestoreError, ResourceLeaseOwnerV1,
-    ResourceLeaseRequestV1, ResourceLeaseV1, ResourcePolicyEventV1, ResourcePressureEventV1,
-    ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
+    AUTONOMY_BUDGET_SCHEMA_VERSION, AdmissionStatus, AutonomyBudgetV1, ConditionalLeaseContextV1,
+    HARDWARE_PROFILE_SCHEMA_VERSION, HardwareProfileV1, HeavyLeaseClass, HeavyLeasePairPolicyV1,
+    LeasePairRule, LeaseStateV1, M6_RESOURCE_GOVERNOR_SNAPSHOT_SCHEMA_VERSION, M6ResourceGovernor,
+    M6ResourceGovernorSnapshotV1, OsMemoryPressure, PlanHeavyLeaseClass, PressureBand,
+    RESOURCE_LEASE_SCHEMA_VERSION, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
+    ResourceAdmissionDecisionV1, ResourceCapabilityCycleSnapshotV1, ResourceGovernorRestoreError,
+    ResourceLeaseOwnerV1, ResourceLeaseRequestV1, ResourceLeaseV1, ResourcePolicyEventV1,
+    ResourcePressureEventV1, ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
 };
 
 use serde::{Deserialize, Serialize};

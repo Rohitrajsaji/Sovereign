@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,6 +24,7 @@ pub const M1_HARD_INPUT_CONTEXT_TOKENS: u32 = 16_384;
 const DEFAULT_MAX_HTTP_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static TRANSPORT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_LOCAL_MODEL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// Provider-neutral capabilities advertised before a plan requests a model lease.
@@ -457,6 +458,7 @@ struct LocalState {
     lease: Option<ModelLease>,
     profile: Option<ModelLoadProfile>,
     child: Option<Child>,
+    active_transports: Vec<(u64, TcpStream)>,
 }
 
 /// First real local provider: a loopback OpenAI-compatible llama.cpp-style server.
@@ -493,13 +495,72 @@ impl LocalOpenAiBackend {
                 lease: None,
                 profile: None,
                 child: None,
+                active_transports: Vec::new(),
             }),
         })
     }
 
-    fn loaded_profile(&self) -> Result<ModelLoadProfile, ModelError> {
+    fn loaded_snapshot(&self) -> Result<(ModelLoadProfile, String), ModelError> {
         let state = lock(&self.state, "local backend state")?;
-        state.profile.ok_or(ModelError::NotLoaded)
+        let profile = state.profile.ok_or(ModelError::NotLoaded)?;
+        let lease_id = state
+            .lease
+            .as_ref()
+            .map(|lease| lease.lease_id.clone())
+            .ok_or(ModelError::NotLoaded)?;
+        Ok((profile, lease_id))
+    }
+
+    fn register_transport(&self, lease_id: &str, stream: &TcpStream) -> Result<u64, ModelError> {
+        let registration = stream.try_clone().map_err(ModelError::Io)?;
+        let mut state = lock(&self.state, "local backend state")?;
+        if state.lease.as_ref().map(|lease| lease.lease_id.as_str()) != Some(lease_id) {
+            return Err(ModelError::NotLoaded);
+        }
+        let transport_id = TRANSPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        state.active_transports.push((transport_id, registration));
+        Ok(transport_id)
+    }
+
+    fn unregister_transport(&self, transport_id: u64) -> Result<(), ModelError> {
+        let mut state = lock(&self.state, "local backend state")?;
+        if let Some(position) = state
+            .active_transports
+            .iter()
+            .position(|(candidate, _)| *candidate == transport_id)
+        {
+            state.active_transports.swap_remove(position);
+        }
+        Ok(())
+    }
+
+    fn http_request_until(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&[u8]>,
+        deadline: Instant,
+        max_response_bytes: u64,
+        lease_id: &str,
+    ) -> Result<HttpResponse, ModelError> {
+        let address = SocketAddr::new(self.config.host, self.config.port);
+        let mut stream =
+            TcpStream::connect_timeout(&address, remaining(deadline)?).map_err(map_io_deadline)?;
+        let transport_id = self.register_transport(lease_id, &stream)?;
+        let result = http_request_on_stream_until(
+            &mut stream,
+            address,
+            method,
+            path,
+            body,
+            deadline,
+            max_response_bytes,
+        );
+        let unregister_result = self.unregister_transport(transport_id);
+        match (result, unregister_result) {
+            (Ok(response), Ok(())) => Ok(response),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     fn provider_health(&self, timeout: Duration) -> Result<BackendHealth, ModelError> {
@@ -618,15 +679,20 @@ impl LocalOpenAiBackend {
         body
     }
 
-    fn tokenize_until(&self, content: &str, deadline: Instant) -> Result<u32, ModelError> {
+    fn tokenize_until(
+        &self,
+        content: &str,
+        deadline: Instant,
+        lease_id: &str,
+    ) -> Result<u32, ModelError> {
         let body = serde_json::to_vec(&json!({"content": content, "add_special": false}))?;
-        let response = http_request_until(
-            SocketAddr::new(self.config.host, self.config.port),
+        let response = self.http_request_until(
             "POST",
             "/tokenize",
             Some(&body),
             deadline,
             self.config.max_http_response_bytes,
+            lease_id,
         )?;
         if !(200..300).contains(&response.status) {
             return Err(ModelError::ProviderStatus {
@@ -642,15 +708,16 @@ impl LocalOpenAiBackend {
         request: &ModelRequest,
         profile: ModelLoadProfile,
         deadline: Instant,
+        lease_id: &str,
     ) -> Result<ModelTokenAdmission, ModelError> {
         let template_body = serde_json::to_vec(&Self::template_body(request))?;
-        let template_response = http_request_until(
-            SocketAddr::new(self.config.host, self.config.port),
+        let template_response = self.http_request_until(
             "POST",
             "/apply-template",
             Some(&template_body),
             deadline,
             self.config.max_http_response_bytes,
+            lease_id,
         )?;
         if !(200..300).contains(&template_response.status) {
             return Err(ModelError::ProviderStatus {
@@ -665,12 +732,12 @@ impl LocalOpenAiBackend {
             .ok_or_else(|| {
                 ModelError::InvalidResponse("apply-template response missing prompt".to_owned())
             })?;
-        let rendered_input_tokens = self.tokenize_until(prompt, deadline)?;
+        let rendered_input_tokens = self.tokenize_until(prompt, deadline, lease_id)?;
         let structured_output_tokens = match &request.output_contract {
             ModelOutputContract::Text => 0,
             contract @ ModelOutputContract::JsonSchema { .. } => {
                 let contract_json = serde_json::to_string(contract)?;
-                self.tokenize_until(&contract_json, deadline)?
+                self.tokenize_until(&contract_json, deadline, lease_id)?
             }
         };
         let admitted_input_tokens = rendered_input_tokens
@@ -717,7 +784,7 @@ impl LocalOpenAiBackend {
         &self,
         request: &ModelRequest,
     ) -> Result<ModelTokenAdmission, ModelError> {
-        let profile = self.loaded_profile()?;
+        let (profile, lease_id) = self.loaded_snapshot()?;
         request.validate(&self.config.capabilities, profile)?;
         let timeout = Duration::from_millis(
             request
@@ -726,7 +793,7 @@ impl LocalOpenAiBackend {
                 .min(self.config.request_timeout_ms),
         );
         let deadline = Instant::now() + timeout;
-        self.token_admission_until(request, profile, deadline)
+        self.token_admission_until(request, profile, deadline, &lease_id)
     }
 
     fn parse_completion(
@@ -838,19 +905,55 @@ impl LocalOpenAiBackend {
         Ok(child)
     }
 
+    fn cancel_active_transports(state: &mut LocalState) -> Result<(), ModelError> {
+        let mut first_error = None;
+        for (_, stream) in state.active_transports.drain(..) {
+            if let Err(error) = stream.shutdown(Shutdown::Both)
+                && error.kind() != std::io::ErrorKind::NotConnected
+                && first_error.is_none()
+            {
+                first_error = Some(ModelError::Io(error));
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     fn cleanup_state(state: &mut LocalState) -> Result<(), ModelError> {
-        if let Some(child) = state.child.as_mut()
-            && child.try_wait()?.is_none()
+        let mut first_error = None;
+        if let Some(child) = state.child.take()
+            && let Err(error) = Self::cleanup_child(child)
         {
-            child.kill()?;
-            let _ = child.wait()?;
+            first_error = Some(error);
         }
-        state.child = None;
         state.profile = None;
-        if let Some(lease) = state.lease.take() {
-            release_global_lease(&lease.lease_id)?;
+        if let Some(lease) = state.lease.take()
+            && let Err(error) = release_global_lease(&lease.lease_id)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn cleanup_child(mut child: Child) -> Result<(), ModelError> {
+        match child.try_wait() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                let kill = child.kill();
+                let wait = child.wait();
+                match (kill, wait) {
+                    (_, Ok(_)) => Ok(()),
+                    (Err(error), Err(_)) | (Ok(()), Err(error)) => Err(ModelError::Io(error)),
+                }
+            }
+            Err(observe_error) => {
+                let _ = child.kill();
+                match child.wait() {
+                    Ok(_) => Ok(()),
+                    Err(_) => Err(ModelError::Io(observe_error)),
+                }
+            }
+        }
     }
 }
 
@@ -933,7 +1036,7 @@ impl ModelBackend for LocalOpenAiBackend {
     }
 
     fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
-        let profile = self.loaded_profile()?;
+        let (profile, lease_id) = self.loaded_snapshot()?;
         request.validate(&self.config.capabilities, profile)?;
         let process_id = lock(&self.state, "local backend state")?
             .lease
@@ -948,15 +1051,15 @@ impl ModelBackend for LocalOpenAiBackend {
         );
         let started = Instant::now();
         let deadline = started + timeout;
-        self.token_admission_until(request, profile, deadline)?;
+        self.token_admission_until(request, profile, deadline, &lease_id)?;
         let body = serde_json::to_vec(&self.completion_body(request))?;
-        let result = http_request_until(
-            SocketAddr::new(self.config.host, self.config.port),
+        let result = self.http_request_until(
             "POST",
             "/v1/chat/completions",
             Some(&body),
             deadline,
             self.config.max_http_response_bytes,
+            &lease_id,
         );
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let peak_rss_kb = sampler.and_then(RssSampler::stop);
@@ -971,13 +1074,13 @@ impl ModelBackend for LocalOpenAiBackend {
     }
 
     fn count_tokens(&self, content: &str) -> Result<u32, ModelError> {
-        let profile = self.loaded_profile()?;
+        let (profile, lease_id) = self.loaded_snapshot()?;
         let timeout = Duration::from_millis(
             profile
                 .provider_call_timeout_ms
                 .min(self.config.request_timeout_ms),
         );
-        self.tokenize_until(content, Instant::now() + timeout)
+        self.tokenize_until(content, Instant::now() + timeout, &lease_id)
     }
 
     fn health(&self) -> Result<BackendHealth, ModelError> {
@@ -1001,13 +1104,16 @@ impl ModelBackend for LocalOpenAiBackend {
 
     fn unload(&self) -> Result<(), ModelError> {
         let mut state = lock(&self.state, "local backend state")?;
-        Self::cleanup_state(&mut state)
+        let cancellation = Self::cancel_active_transports(&mut state);
+        let cleanup = Self::cleanup_state(&mut state);
+        cancellation.and(cleanup)
     }
 }
 
 impl Drop for LocalOpenAiBackend {
     fn drop(&mut self) {
         if let Ok(state) = self.state.get_mut() {
+            let _ = Self::cancel_active_transports(state);
             let _ = Self::cleanup_state(state);
         }
     }
@@ -1215,6 +1321,26 @@ fn http_request_until(
 ) -> Result<HttpResponse, ModelError> {
     let mut stream =
         TcpStream::connect_timeout(&address, remaining(deadline)?).map_err(map_io_deadline)?;
+    http_request_on_stream_until(
+        &mut stream,
+        address,
+        method,
+        path,
+        body,
+        deadline,
+        max_response_bytes,
+    )
+}
+
+fn http_request_on_stream_until(
+    stream: &mut TcpStream,
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    body: Option<&[u8]>,
+    deadline: Instant,
+    max_response_bytes: u64,
+) -> Result<HttpResponse, ModelError> {
     let payload = body.unwrap_or_default();
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
