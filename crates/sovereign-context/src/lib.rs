@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sovereign_evidence::ToolEvidence;
+pub use sovereign_policy::{TrustLabel, TrustLevel, TrustSource};
 use sovereign_repo::{ExactDiffEvidence, ExactFileEvidence, ExactSearchHit, InstructionDocument};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -75,7 +76,10 @@ pub enum EvidenceKind {
     HiddenReasoning,
 }
 
-/// Provenance trust class. This labels evidence; it never grants authority.
+/// Legacy coarse provenance class retained for compatibility and routing metrics.
+///
+/// Security-sensitive ingress trust is carried separately by [`TrustLabel`]. Neither field grants
+/// authority; policy, permissions and Controller state live outside model-visible context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustClass {
@@ -111,6 +115,7 @@ pub struct EvidenceItem {
     pub locator: Option<String>,
     pub provenance: String,
     pub trust_class: TrustClass,
+    pub trust_label: TrustLabel,
     pub routing_reason: String,
     pub token_cost: u32,
     pub text: String,
@@ -137,6 +142,7 @@ impl EvidenceItem {
         text: impl Into<String>,
     ) -> Self {
         let text = text.into();
+        let trust_label = legacy_trust_label(kind, trust_class);
         Self {
             evidence_id: evidence_id.into(),
             section,
@@ -149,6 +155,7 @@ impl EvidenceItem {
             locator: None,
             provenance: provenance.into(),
             trust_class,
+            trust_label,
             routing_reason: routing_reason.into(),
             token_cost: 0,
             text,
@@ -189,6 +196,15 @@ impl EvidenceItem {
         self
     }
 
+    /// Replaces the descriptive ingress trust label. Context construction still normalizes any
+    /// caller-provided governed/controller label outside mandatory C0, so this cannot mint policy
+    /// authority.
+    #[must_use]
+    pub const fn with_trust_label(mut self, trust_label: TrustLabel) -> Self {
+        self.trust_label = trust_label;
+        self
+    }
+
     #[must_use]
     pub fn with_expansion_handle(mut self, handle: ExpansionHandle) -> Self {
         self.expansion_handle = Some(handle);
@@ -220,6 +236,7 @@ impl EvidenceItem {
         )
         .with_repository(evidence.repository_id.clone())
         .with_locator(format!("path:{}", evidence.relative_path.display()))
+        .with_trust_label(untrusted_label(TrustSource::Source))
     }
 
     /// Converts one bounded exact-search hit into C1 evidence.
@@ -248,6 +265,7 @@ impl EvidenceItem {
         )
         .with_repository(hit.repository_id.clone())
         .with_locator(format!("line:{}", hit.line_number))
+        .with_trust_label(untrusted_label(TrustSource::Source))
     }
 
     /// Converts scoped repository instructions to C1 evidence.
@@ -277,6 +295,7 @@ impl EvidenceItem {
         )
         .with_repository(repository_id.to_owned())
         .with_locator(format!("path:{}", instruction.relative_path.display()))
+        .with_trust_label(untrusted_label(TrustSource::RepositoryInstruction))
     }
 
     /// Converts the exact current tracked diff into C1 evidence.
@@ -296,6 +315,7 @@ impl EvidenceItem {
         )
         .with_repository(diff.repository_id.clone())
         .with_implicated(true)
+        .with_trust_label(untrusted_label(TrustSource::Source))
     }
 
     /// Converts retained M1 `ToolEvidence` into its compact synopsis only. Raw
@@ -333,6 +353,7 @@ impl EvidenceItem {
             total_length: evidence.post_ingress_bytes,
         })
         .with_implicated(evidence.failure_signature.is_some())
+        .with_trust_label(untrusted_label(TrustSource::ToolOutput))
     }
 }
 
@@ -605,16 +626,23 @@ impl<C: TokenCounter> ContextPlanner<C> {
         let mut candidates = input
             .candidates
             .into_iter()
+            .map(normalize_candidate_trust)
             .filter(|item| {
                 item.kind != EvidenceKind::ToolSchema
                     && item.relevant
                     && allowed_in_mode(mode, item)
             })
-            .chain(input.authorized_tool_schemas.into_iter().filter(|item| {
-                item.kind == EvidenceKind::ToolSchema
-                    && item.relevant
-                    && allowed_in_mode(mode, item)
-            }))
+            .chain(
+                input
+                    .authorized_tool_schemas
+                    .into_iter()
+                    .map(normalize_candidate_trust)
+                    .filter(|item| {
+                        item.kind == EvidenceKind::ToolSchema
+                            && item.relevant
+                            && allowed_in_mode(mode, item)
+                    }),
+            )
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
             (left.section, left.kind, &left.evidence_id).cmp(&(
@@ -865,6 +893,60 @@ fn required_item(
         "mandatory_c0",
         text,
     )
+    .with_trust_label(TrustLabel::controller())
+}
+
+fn legacy_trust_label(kind: EvidenceKind, trust_class: TrustClass) -> TrustLabel {
+    match trust_class {
+        TrustClass::Controller => TrustLabel::controller(),
+        TrustClass::Verification => TrustLabel::verification(),
+        TrustClass::Repository => {
+            if kind == EvidenceKind::Instruction {
+                untrusted_label(TrustSource::RepositoryInstruction)
+            } else {
+                untrusted_label(TrustSource::Source)
+            }
+        }
+        TrustClass::Tool => {
+            if kind == EvidenceKind::ToolSchema {
+                untrusted_label(TrustSource::ToolMetadata)
+            } else {
+                untrusted_label(TrustSource::ToolOutput)
+            }
+        }
+        TrustClass::Derived => TrustLabel::observed_derived(),
+        TrustClass::Untrusted => untrusted_label(TrustSource::Source),
+    }
+}
+
+fn untrusted_label(source: TrustSource) -> TrustLabel {
+    TrustLabel::untrusted(source).unwrap_or_else(|_| TrustLabel::observed_derived())
+}
+
+/// Mandatory C0 is constructed by this planner and is the only model-visible context lane that may
+/// retain Controller/governed trust. Every caller-supplied candidate is evidence only. Invalid or
+/// self-promoted labels are deterministically demoted rather than interpreted as policy.
+fn normalize_candidate_trust(mut item: EvidenceItem) -> EvidenceItem {
+    let invalid = item.trust_label.validate().is_err();
+    if invalid
+        || item.trust_class == TrustClass::Controller
+        || item.trust_label.level != TrustLevel::Untrusted
+        || matches!(
+            item.trust_label.source,
+            TrustSource::Controller | TrustSource::GovernedArtifact
+        )
+    {
+        item.trust_class = TrustClass::Untrusted;
+        item.trust_label = match item.kind {
+            EvidenceKind::Instruction => untrusted_label(TrustSource::RepositoryInstruction),
+            EvidenceKind::ToolSchema => untrusted_label(TrustSource::ToolMetadata),
+            EvidenceKind::ToolSynopsis
+            | EvidenceKind::FailureSynopsis
+            | EvidenceKind::RawToolLog => untrusted_label(TrustSource::ToolOutput),
+            _ => untrusted_label(TrustSource::Source),
+        };
+    }
+    item
 }
 
 fn allowed_in_mode(mode: ContextMode, item: &EvidenceItem) -> bool {
@@ -912,6 +994,10 @@ fn serialize_items(items: &[EvidenceItem]) -> String {
         output.push_str(kind_name(item.kind));
         output.push('|');
         output.push_str(&item.evidence_id);
+        output.push('|');
+        output.push_str(item.trust_label.source.as_str());
+        output.push('|');
+        output.push_str(item.trust_label.level.as_str());
         output.push_str("]]\n");
         output.push_str(&item.text);
     }

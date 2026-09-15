@@ -2,7 +2,8 @@ use super::roles::RoleId;
 use super::sha256_prefixed;
 use serde::{Deserialize, Serialize};
 use sovereign_context::{
-    ContextLevel, EvidenceItem, EvidenceKind, PacketSection, TokenCounter, TrustClass,
+    ContextLevel, EvidenceItem, EvidenceKind, PacketSection, TokenCounter, TrustClass, TrustLabel,
+    TrustSource,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -26,6 +27,11 @@ pub const DEFAULT_MAX_DISCOVERED_MANIFESTS: usize = 4_096;
 const MAX_MANIFEST_COLLECTION_ITEMS: usize = 64;
 const MAX_MANIFEST_TEXT_BYTES: usize = 4_096;
 const MAX_VERIFICATION_GUIDANCE_ITEMS: usize = 32;
+
+fn untrusted_skill_label() -> TrustLabel {
+    TrustLabel::untrusted(TrustSource::Skill)
+        .unwrap_or_else(|_| unreachable!("skill is a fixed untrusted evidence origin"))
+}
 
 /// Typed `SkillManifest` v1 metadata. It contains discovery hints and exact body provenance, but
 /// deliberately contains no credentials, permission grants, or execution authority.
@@ -571,6 +577,7 @@ impl LoadedSkill {
             self.body.clone(),
         )
         .with_locator(format!("path:{}", self.body_path))
+        .with_trust_label(untrusted_skill_label())
     }
 }
 
@@ -1171,6 +1178,7 @@ mod tests {
                 "bounded selected skill metadata",
                 text,
             )
+            .with_trust_label(untrusted_skill_label())
         };
         let packet = |text: String| {
             ContextPlanner::default()

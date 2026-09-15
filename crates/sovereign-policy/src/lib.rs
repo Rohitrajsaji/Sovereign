@@ -36,6 +36,384 @@ pub const CAPABILITY_SET_SCHEMA_VERSION: u32 = 1;
 pub const PERMISSION_DECISION_SCHEMA_VERSION: u32 = 1;
 pub const APPROVAL_CLAIM_SCHEMA_VERSION: u32 = 1;
 pub const RECONCILIATION_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const TRUST_LABEL_SCHEMA_VERSION: u32 = 1;
+pub const POLICY_VIOLATION_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+
+/// Security-relevant provenance for one piece of model-visible evidence.
+///
+/// A source tag is descriptive provenance only. It never grants a capability, changes policy, or
+/// authorizes a Controller transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustSource {
+    Controller,
+    GovernedArtifact,
+    Verification,
+    Source,
+    RepositoryInstruction,
+    ToolOutput,
+    ToolMetadata,
+    Web,
+    Browser,
+    Download,
+    Memory,
+    Model,
+    ExternalModel,
+    Skill,
+    Derived,
+}
+
+impl TrustSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Controller => "controller",
+            Self::GovernedArtifact => "governed_artifact",
+            Self::Verification => "verification",
+            Self::Source => "source",
+            Self::RepositoryInstruction => "repository_instruction",
+            Self::ToolOutput => "tool_output",
+            Self::ToolMetadata => "tool_metadata",
+            Self::Web => "web",
+            Self::Browser => "browser",
+            Self::Download => "download",
+            Self::Memory => "memory",
+            Self::Model => "model",
+            Self::ExternalModel => "external_model",
+            Self::Skill => "skill",
+            Self::Derived => "derived",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_untrusted_origin(self) -> bool {
+        matches!(
+            self,
+            Self::Source
+                | Self::RepositoryInstruction
+                | Self::ToolOutput
+                | Self::ToolMetadata
+                | Self::Web
+                | Self::Browser
+                | Self::Download
+                | Self::Memory
+                | Self::Model
+                | Self::ExternalModel
+                | Self::Skill
+        )
+    }
+}
+
+/// Control-plane trust state. This is intentionally distinct from capability/permission state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrustLevel {
+    Governed,
+    Validated,
+    Observed,
+    Untrusted,
+}
+
+impl TrustLevel {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Governed => "governed",
+            Self::Validated => "validated",
+            Self::Observed => "observed",
+            Self::Untrusted => "untrusted",
+        }
+    }
+}
+
+/// Typed trust label v1 attached to evidence at ingress.
+///
+/// The valid combinations are deliberately narrow: only Controller/governed-artifact origins may
+/// be `Governed`, only verification may be `Validated`, derived facts may be `Observed`, and every
+/// repository/web/tool/memory/model/skill origin is always `Untrusted` until a Controller-owned
+/// governed artifact is created separately. Merely editing this label never changes authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrustLabel {
+    pub schema_version: u32,
+    pub source: TrustSource,
+    pub level: TrustLevel,
+}
+
+impl TrustLabel {
+    #[must_use]
+    pub const fn controller() -> Self {
+        Self {
+            schema_version: TRUST_LABEL_SCHEMA_VERSION,
+            source: TrustSource::Controller,
+            level: TrustLevel::Governed,
+        }
+    }
+
+    #[must_use]
+    pub const fn governed_artifact() -> Self {
+        Self {
+            schema_version: TRUST_LABEL_SCHEMA_VERSION,
+            source: TrustSource::GovernedArtifact,
+            level: TrustLevel::Governed,
+        }
+    }
+
+    #[must_use]
+    pub const fn verification() -> Self {
+        Self {
+            schema_version: TRUST_LABEL_SCHEMA_VERSION,
+            source: TrustSource::Verification,
+            level: TrustLevel::Validated,
+        }
+    }
+
+    #[must_use]
+    pub const fn observed_derived() -> Self {
+        Self {
+            schema_version: TRUST_LABEL_SCHEMA_VERSION,
+            source: TrustSource::Derived,
+            level: TrustLevel::Observed,
+        }
+    }
+
+    /// Labels evidence from a source that architecture treats as untrusted data.
+    ///
+    /// # Errors
+    /// Returns a denial if a caller tries to use this constructor for a governed/validated source.
+    pub fn untrusted(source: TrustSource) -> Result<Self, PolicyError> {
+        if !source.is_untrusted_origin() {
+            return Err(PolicyError::Denied(
+                "untrusted TrustLabel requires an untrusted evidence origin".to_owned(),
+            ));
+        }
+        Ok(Self {
+            schema_version: TRUST_LABEL_SCHEMA_VERSION,
+            source,
+            level: TrustLevel::Untrusted,
+        })
+    }
+
+    /// Validates that provenance cannot self-promote its control trust.
+    ///
+    /// # Errors
+    /// Returns a denial for unsupported schema versions or invalid source/level combinations.
+    pub fn validate(self) -> Result<(), PolicyError> {
+        if self.schema_version != TRUST_LABEL_SCHEMA_VERSION {
+            return Err(PolicyError::Denied(
+                "unsupported trust-label schema version".to_owned(),
+            ));
+        }
+        let valid = match self.source {
+            TrustSource::Controller | TrustSource::GovernedArtifact => {
+                self.level == TrustLevel::Governed
+            }
+            TrustSource::Verification => self.level == TrustLevel::Validated,
+            TrustSource::Derived => self.level == TrustLevel::Observed,
+            source if source.is_untrusted_origin() => self.level == TrustLevel::Untrusted,
+            _ => false,
+        };
+        if !valid {
+            return Err(PolicyError::Denied(
+                "trust-label source cannot self-promote its control trust".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn is_untrusted(self) -> bool {
+        self.level == TrustLevel::Untrusted
+    }
+
+    #[must_use]
+    pub fn digest(self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(TRUST_LABEL_SCHEMA_VERSION.to_be_bytes());
+        digest_policy_field(&mut hasher, self.source.as_str());
+        digest_policy_field(&mut hasher, self.level.as_str());
+        format!("sha256:{:x}", hasher.finalize())
+    }
+}
+
+/// Typed class of an attempted trust-boundary violation. These values describe a denied attempt;
+/// they are not commands and carry no execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyViolationKind {
+    PolicyMutation,
+    CapabilitySelfGrant,
+    VerificationSuppression,
+    AcceptanceMutation,
+    CompletionMutation,
+    ApprovalMasquerade,
+    ControllerMasquerade,
+    ToolMasquerade,
+    ToolRiskDowngrade,
+    FreeFormDispatch,
+}
+
+impl PolicyViolationKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PolicyMutation => "policy_mutation",
+            Self::CapabilitySelfGrant => "capability_self_grant",
+            Self::VerificationSuppression => "verification_suppression",
+            Self::AcceptanceMutation => "acceptance_mutation",
+            Self::CompletionMutation => "completion_mutation",
+            Self::ApprovalMasquerade => "approval_masquerade",
+            Self::ControllerMasquerade => "controller_masquerade",
+            Self::ToolMasquerade => "tool_masquerade",
+            Self::ToolRiskDowngrade => "tool_risk_downgrade",
+            Self::FreeFormDispatch => "free_form_dispatch",
+        }
+    }
+}
+
+/// Authority-bearing surface an untrusted input attempted to influence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectedPolicyEffect {
+    Policy,
+    CapabilitySet,
+    VerificationContract,
+    AcceptanceContract,
+    CompletionState,
+    ApprovalAuthority,
+    ToolAvailability,
+    ToolRisk,
+    Dispatch,
+}
+
+impl ProtectedPolicyEffect {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::CapabilitySet => "capability_set",
+            Self::VerificationContract => "verification_contract",
+            Self::AcceptanceContract => "acceptance_contract",
+            Self::CompletionState => "completion_state",
+            Self::ApprovalAuthority => "approval_authority",
+            Self::ToolAvailability => "tool_availability",
+            Self::ToolRisk => "tool_risk",
+            Self::Dispatch => "dispatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyViolationDecision {
+    Denied,
+}
+
+/// Sanitized, denial-only audit evidence for one prompt/tool-injection boundary violation.
+///
+/// Raw malicious text is intentionally absent. The record binds only digests, typed provenance,
+/// attempted capability names and the authoritative policy/permission state that remained in force.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyViolationEvidence {
+    pub schema_version: u32,
+    pub violation_id: String,
+    pub kind: PolicyViolationKind,
+    pub source_evidence_id: String,
+    pub source_content_digest: String,
+    pub source_trust: TrustLabel,
+    pub protected_effect: ProtectedPolicyEffect,
+    pub attempted_capabilities: BTreeSet<String>,
+    pub policy_digest: String,
+    pub permission_decision_digest: Option<String>,
+    pub decision: PolicyViolationDecision,
+    pub reason_code: String,
+}
+
+impl PolicyViolationEvidence {
+    /// Constructs a sanitized denial record after deterministic policy has rejected an attempt.
+    ///
+    /// # Errors
+    /// Returns a policy denial for malformed digests, untrusted provenance that self-promotes, or
+    /// unknown capability names.
+    #[allow(clippy::too_many_arguments)]
+    pub fn denied(
+        violation_id: impl Into<String>,
+        kind: PolicyViolationKind,
+        source_evidence_id: impl Into<String>,
+        source_content_digest: impl Into<String>,
+        source_trust: TrustLabel,
+        protected_effect: ProtectedPolicyEffect,
+        attempted_capabilities: impl IntoIterator<Item = String>,
+        policy_digest: impl Into<String>,
+        permission_decision_digest: Option<String>,
+        reason_code: impl Into<String>,
+    ) -> Result<Self, PolicyError> {
+        let evidence = Self {
+            schema_version: POLICY_VIOLATION_EVIDENCE_SCHEMA_VERSION,
+            violation_id: violation_id.into(),
+            kind,
+            source_evidence_id: source_evidence_id.into(),
+            source_content_digest: source_content_digest.into(),
+            source_trust,
+            protected_effect,
+            attempted_capabilities: attempted_capabilities.into_iter().collect(),
+            policy_digest: policy_digest.into(),
+            permission_decision_digest,
+            decision: PolicyViolationDecision::Denied,
+            reason_code: reason_code.into(),
+        };
+        evidence.validate()?;
+        Ok(evidence)
+    }
+
+    /// Revalidates the denial record without interpreting any source text as authority.
+    ///
+    /// # Errors
+    /// Returns a denial for malformed bindings or invalid trust/capability values.
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        self.source_trust.validate()?;
+        if self.schema_version != POLICY_VIOLATION_EVIDENCE_SCHEMA_VERSION
+            || self.violation_id.trim().is_empty()
+            || self.source_evidence_id.trim().is_empty()
+            || !is_sha256_binding(&self.source_content_digest)
+            || !is_sha256_binding(&self.policy_digest)
+            || self
+                .permission_decision_digest
+                .as_deref()
+                .is_some_and(|digest| !is_sha256_binding(digest))
+            || self.reason_code.trim().is_empty()
+            || self
+                .attempted_capabilities
+                .iter()
+                .any(|capability| Capability::from_plan_ir_str(capability).is_none())
+        {
+            return Err(PolicyError::Denied(
+                "policy-violation evidence has malformed denial bindings".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(POLICY_VIOLATION_EVIDENCE_SCHEMA_VERSION.to_be_bytes());
+        digest_policy_field(&mut hasher, &self.violation_id);
+        digest_policy_field(&mut hasher, self.kind.as_str());
+        digest_policy_field(&mut hasher, &self.source_evidence_id);
+        digest_policy_field(&mut hasher, &self.source_content_digest);
+        digest_policy_field(&mut hasher, &self.source_trust.digest());
+        digest_policy_field(&mut hasher, self.protected_effect.as_str());
+        for capability in &self.attempted_capabilities {
+            digest_policy_field(&mut hasher, capability);
+        }
+        digest_policy_field(&mut hasher, &self.policy_digest);
+        digest_policy_field(
+            &mut hasher,
+            self.permission_decision_digest.as_deref().unwrap_or("none"),
+        );
+        digest_policy_field(&mut hasher, "denied");
+        digest_policy_field(&mut hasher, &self.reason_code);
+        format!("sha256:{:x}", hasher.finalize())
+    }
+}
 
 /// Canonical Plan IR v1 capability vocabulary.
 ///

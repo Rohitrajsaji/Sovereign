@@ -1,6 +1,9 @@
 #![allow(clippy::missing_errors_doc, clippy::too_many_lines)]
 
-use crate::{ContextLevel, EvidenceItem, EvidenceKind, PacketSection, TrustClass, sha256_prefixed};
+use crate::{
+    ContextLevel, EvidenceItem, EvidenceKind, PacketSection, TrustClass, TrustSource,
+    sha256_prefixed, untrusted_label,
+};
 use serde::{Deserialize, Serialize};
 use sovereign_repo::{
     ExactRetriever, ExactSearchQuery, LexicalQuery, LexicalRetriever, ProjectRegistry, RepoError,
@@ -1228,6 +1231,7 @@ fn lexical_item(hit: &sovereign_repo::LexicalHit) -> EvidenceItem {
     )
     .with_repository(hit.repository_id.clone())
     .with_locator(format!("path:{}", hit.relative_path.display()))
+    .with_trust_label(untrusted_label(TrustSource::Source))
 }
 
 fn symbol_item(record: &sovereign_repo::SymbolRecord) -> EvidenceItem {
@@ -1265,6 +1269,7 @@ fn symbol_item(record: &sovereign_repo::SymbolRecord) -> EvidenceItem {
     )
     .with_repository(record.repository_id.clone())
     .with_locator(format!("path:{}", record.relative_path.display()))
+    .with_trust_label(untrusted_label(TrustSource::Source))
 }
 
 fn dependency_item(edge: &sovereign_repo::DependencyEdge) -> EvidenceItem {
@@ -1300,4 +1305,5 @@ fn dependency_item(edge: &sovereign_repo::DependencyEdge) -> EvidenceItem {
     )
     .with_repository(edge.repository_id.clone())
     .with_locator(format!("path:{}", edge.source_path.display()))
+    .with_trust_label(untrusted_label(TrustSource::Source))
 }

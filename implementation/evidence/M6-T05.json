@@ -1,0 +1,208 @@
+{
+  "schema_version": 1,
+  "task_id": "M6-T05",
+  "title": "Implement prompt/tool injection trust boundaries",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "7b212fc095ffd6f9c915a4928f3fd586f97e5c87",
+  "status": "completed",
+  "completed_at": "2026-09-15T03:01:41Z",
+  "verified_at": "2026-09-15T03:01:41Z",
+  "dependencies": [
+    "M5-T03",
+    "M6-T02"
+  ],
+  "interfaces": [
+    "TrustLabel",
+    "PolicyViolationEvidence"
+  ],
+  "trust_boundary_contract": {
+    "controller_remains_sole_execution_authority": true,
+    "trust_label_is_provenance_metadata_not_permission_authority": true,
+    "generic_candidates_cannot_self_promote_controller_governed": true,
+    "generic_candidates_cannot_self_promote_verification_validated": true,
+    "generic_candidates_cannot_self_promote_derived_observed": true,
+    "legacy_trust_class_cannot_bypass_canonical_trust_label": true,
+    "mandatory_c0_is_planner_owned_controller_governed": true,
+    "repository_instruction_plan_refs_remain_untrusted": true,
+    "untrusted_sources": [
+      "source",
+      "repository_instruction",
+      "tool_output",
+      "tool_metadata",
+      "web",
+      "browser",
+      "download",
+      "memory",
+      "model",
+      "external_model",
+      "skill"
+    ],
+    "fake_json_control_envelopes_are_inert_evidence": true,
+    "model_free_form_text_cannot_dispatch": true,
+    "strict_existing_typed_model_proposal_path_reused": true,
+    "second_model_proposal_parser_added": false,
+    "repository_instruction_cannot_widen_permissions_or_suppress_acceptance": true,
+    "memory_cannot_disable_required_verification": true,
+    "tool_manifest_cannot_lower_deterministic_risk": true,
+    "external_model_cannot_mark_success_approve_or_invoke_tools": true,
+    "m6_t07_external_gateway_implemented_early": false
+  },
+  "attack_fixture_report": [
+    {
+      "test": "malicious_agents_like_source_text_cannot_self_promote_or_mutate_authority",
+      "result": "passed"
+    },
+    {
+      "test": "web_prompt_injection_remains_untrusted_and_cannot_mutate_policy",
+      "result": "passed"
+    },
+    {
+      "test": "tool_output_asking_for_network_cannot_grant_network_capability",
+      "result": "passed"
+    },
+    {
+      "test": "memory_asking_to_disable_tests_cannot_suppress_verification",
+      "result": "passed"
+    },
+    {
+      "test": "fake_system_tool_approval_envelope_in_tool_output_cannot_masquerade_as_authority",
+      "result": "passed"
+    },
+    {
+      "test": "model_free_form_text_outside_typed_proposal_cannot_dispatch_action",
+      "result": "passed"
+    },
+    {
+      "test": "repository_instruction_cannot_widen_permissions_or_suppress_acceptance",
+      "result": "passed"
+    },
+    {
+      "test": "underdeclared_tool_manifest_cannot_lower_deterministic_write_network_risk",
+      "result": "passed"
+    },
+    {
+      "test": "external_model_success_or_tool_directive_is_untrusted_advice_only",
+      "result": "passed"
+    }
+  ],
+  "authority_snapshot_invariants": {
+    "policy_unchanged": true,
+    "permission_context_unchanged": true,
+    "task_capability_grants_unchanged": true,
+    "acceptance_criteria_unchanged": true,
+    "approval_requests_unchanged": true,
+    "approval_claims_unchanged": true,
+    "task_and_completion_state_unchanged": true,
+    "execution_epoch_unchanged": true,
+    "action_records_unchanged": true,
+    "journal_unchanged_except_explicit_denial_evidence": true
+  },
+  "prior_audit_blocker_repairs": {
+    "worker_46_original_verdict": "NOT CLOSABLE",
+    "generic_verification_and_derived_self_promotion_fixed": true,
+    "repository_instruction_observed_trust_fixed": true,
+    "worker_49_blocker_review": "CLOSABLE for both repaired blockers"
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --offline --test prompt_injection -- --nocapture",
+      "result": "passed",
+      "detail": "9/9 frozen prompt/tool injection attacks"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-context --offline --test context_packet caller_candidate_cannot_self_promote_to_controller_governed_trust -- --nocapture",
+      "result": "passed",
+      "detail": "forged Controller, Verification, and Derived candidates demoted to canonical Untrusted"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-plan --offline --test minimal_compiler repository_instruction_refs_remain_untrusted_in_compiled_plan -- --nocapture",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-plan --offline --test compiler_m3 compiler_m3_replan_preserves_plan_identity_and_unaffected_task_verbatim -- --nocapture",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-policy --offline trust_labels_reject_self_promotion_and_violation_evidence_is_denial_only -- --nocapture",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test --workspace --all-targets --offline",
+      "result": "passed",
+      "detail": "all non-ignored tests passed; only explicit final-release local-Qwen qualification/smoke tests ignored by design"
+    },
+    {
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "real_qwen_runtime_on_current_tree": "deferred to mandatory final-release current-final-tree qualification; not claimed by M6-T05",
+  "independent_audit": {
+    "worker": "worker-50",
+    "final_result": "CLOSABLE",
+    "final_verdict": "M6-T05 frozen task: CLOSABLE",
+    "final_blockers": [],
+    "notes": "Fresh whole-task read-only exact-tree audit matched HEAD/status/all 14 hashes before and after tests, rechecked the two worker-46 blockers plus the full trust/authority matrix, and found no remaining blocker."
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "source_hashes": {
+    "Cargo.lock": "sha256:bf59e454c304f29acbaf844a00415bf10943e7cc3bb738d335318b0a602815c6",
+    "crates/sovereign-context/Cargo.toml": "sha256:68ca696df02e2720343d914e253a5cfadde6802af194dd5a3284a128f696a396",
+    "crates/sovereign-context/src/lib.rs": "sha256:79c0f00d280e6fe917356a104437d4c429b0b99fbedae5197a16d650aa0c7204",
+    "crates/sovereign-context/src/memory.rs": "sha256:0aafd4cd5966dc0109ba0ec8a3055ddd25dfa52faadf9ab738b7cc907ce9b767",
+    "crates/sovereign-context/src/routing.rs": "sha256:59bda231dd26f8130d65f5d8f31f57c5241415d2d6243f5ae9e2db556dcd81fd",
+    "crates/sovereign-context/tests/context_packet.rs": "sha256:2b1e470ff3c7587e49b72a77fbe3bceca850a54fb630efe91457c9c9e3eccb4e",
+    "crates/sovereign-context/tests/memory_history.rs": "sha256:829fb8be76a847cbb3b1700e3b2b32ac407290a2ee8e35f5b53af2edfdc71c44",
+    "crates/sovereign-controller/src/skills.rs": "sha256:5aea2fedbc1af49cc5bd96e989e0d4d56fd9c46800b8e7098788acab0bec3f66",
+    "crates/sovereign-eval/tests/prompt_injection.rs": "sha256:ebe662916d4db8187c65f4f490e3148975d405559ff8cf16546a2565d180c098",
+    "crates/sovereign-plan/src/compiler.rs": "sha256:f2db948ef1ff789e5fd4f5a838875dbf3eef2b2768693acc71d4b7d26add4795",
+    "crates/sovereign-plan/tests/compiler_m3.rs": "sha256:fce04fc094c9e7a875887f464ebae26cb6fea06143aa247fa2b063084c98060d",
+    "crates/sovereign-plan/tests/minimal_compiler.rs": "sha256:bb52debf83bf9f57a7ea03dc69890ae0fc6fda23f35c3fe3178b4cbd4c5f7d9c",
+    "crates/sovereign-policy/src/lib.rs": "sha256:b2c7738f53ee2d0afe2717fa11791feee913f3b6ef2ea69893a627bfd139562c",
+    "crates/sovereign-policy/tests/kernel.rs": "sha256:b62dbce608f8b0ae1859e903d690f007bb4640d6058e03bc4ccfd62e2c24b6d9"
+  },
+  "frozen_tree": {
+    "head": "7b212fc095ffd6f9c915a4928f3fd586f97e5c87",
+    "tracked_modified_files": 13,
+    "untracked_files": 1
+  },
+  "state_authority": {
+    "new_database": false,
+    "new_memory_database": false,
+    "new_security_audit_database": false,
+    "controller_remains_sole_execution_authority": true
+  },
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false
+  }
+}

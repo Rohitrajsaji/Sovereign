@@ -1,6 +1,7 @@
 use crate::{
     ChannelResult, ContextLevel, EvidenceItem, EvidenceKind, ExpansionHandle, FailureHistoryKey,
-    HistoryProvider, PacketSection, RouteBoundFact, TrustClass, sha256_prefixed,
+    HistoryProvider, PacketSection, RouteBoundFact, TrustClass, TrustSource, sha256_prefixed,
+    untrusted_label,
 };
 use sovereign_memory::{
     FailureSignatureFilter, MemoryError, MemoryKind, MemoryManager, MemoryQuery,
@@ -158,7 +159,8 @@ fn evidence_item(synopsis: MemorySynopsis) -> EvidenceItem {
         "persistent memory recall is derived evidence only",
         synopsis.rendered,
     )
-    .with_locator(format!("memory_id:{}", synopsis.memory_id));
+    .with_locator(format!("memory_id:{}", synopsis.memory_id))
+    .with_trust_label(untrusted_label(TrustSource::Memory));
     if let Some(repository_id) = synopsis.repository_id {
         item = item.with_repository(repository_id);
     }

@@ -1,6 +1,7 @@
 use sovereign_context::{
     Channel, ChannelResult, ContextLevel, DiffResult, EvidenceKind, MemoryHistoryProvider,
     PacketSection, RetrievalBackend, RetrievalIntent, RetrievalRouter, StopCondition, TrustClass,
+    TrustLevel, TrustSource,
 };
 use sovereign_memory::{
     MemoryKind, MemoryLifecycle, MemoryManager, MemoryProvenance, MemoryScope, MemoryScopeKind,
@@ -200,6 +201,8 @@ fn memory_history_exact_episode_enters_context_as_derived_c3_evidence_only() {
     assert_eq!(item.level, ContextLevel::C3);
     assert_eq!(item.kind, EvidenceKind::FailureSynopsis);
     assert_eq!(item.trust_class, TrustClass::Derived);
+    assert_eq!(item.trust_label.source, TrustSource::Memory);
+    assert_eq!(item.trust_label.level, TrustLevel::Untrusted);
     assert_eq!(item.repository_id.as_deref(), Some("repo-a"));
     assert_eq!(item.source_digest, stored.content_digest);
     assert!(item.source_uri.starts_with("memory://"));
@@ -307,4 +310,6 @@ fn memory_history_preserves_role_visibility_fail_closed() {
     assert_eq!(backend.calls, 0);
     assert_eq!(outcome.evidence.len(), 1);
     assert_eq!(outcome.evidence[0].trust_class, TrustClass::Derived);
+    assert_eq!(outcome.evidence[0].trust_label.source, TrustSource::Memory);
+    assert_eq!(outcome.evidence[0].trust_label.level, TrustLevel::Untrusted);
 }

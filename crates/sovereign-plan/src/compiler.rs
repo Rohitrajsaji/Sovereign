@@ -14,7 +14,7 @@ use super::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sovereign_context::{ContextLevel, ContextPacket, EvidenceKind, TrustClass};
+use sovereign_context::{ContextLevel, ContextPacket, EvidenceKind, TrustLevel};
 use sovereign_model::{
     M1_HARD_INPUT_CONTEXT_TOKENS, MODEL_SCHEMA_VERSION, ModelBackend, ModelError,
     ModelFinishReason, ModelMessage, ModelMessageRole, ModelOutputContract, ModelRequest,
@@ -1918,12 +1918,12 @@ fn context_item_by_id<'a>(
         .find(|item| item.evidence_id == evidence_id)
 }
 
-const fn assumption_trust(trust: TrustClass) -> &'static str {
+const fn assumption_trust(trust: TrustLevel) -> &'static str {
     match trust {
-        TrustClass::Controller | TrustClass::Verification => "governed",
-        TrustClass::Derived => "validated",
-        TrustClass::Repository | TrustClass::Tool => "observed",
-        TrustClass::Untrusted => "untrusted",
+        TrustLevel::Governed => "governed",
+        TrustLevel::Validated => "validated",
+        TrustLevel::Observed => "observed",
+        TrustLevel::Untrusted => "untrusted",
     }
 }
 
@@ -2244,7 +2244,7 @@ fn build_m3_task(
                         .locator
                         .clone()
                         .unwrap_or_else(|| item.source_uri.clone()),
-                    trust: assumption_trust(item.trust_class).to_owned(),
+                    trust: assumption_trust(item.trust_label.level).to_owned(),
                     freshness: input.compiled_at.clone(),
                 })
                 .collect::<Vec<_>>();
@@ -3287,7 +3287,7 @@ fn instruction_refs(packet: &ContextPacket, repository_id: &str, freshness: &str
                 "evidence_id": stable_id("ev", &item.content_digest),
                 "digest": item.source_digest,
                 "locator": item.source_uri,
-                "trust": "observed",
+                "trust": "untrusted",
                 "freshness": freshness
             })
         })

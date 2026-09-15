@@ -77,6 +77,37 @@ fn focused_packet() -> ContextPacket {
         .unwrap_or_else(|error| panic!("context packet must build: {error}"))
 }
 
+fn repository_instruction_packet() -> ContextPacket {
+    let instruction = EvidenceItem::new(
+        "ev.repo.instructions",
+        PacketSection::DirectEvidence,
+        ContextLevel::C1,
+        EvidenceKind::Instruction,
+        "repo://repo.app/AGENTS.md",
+        "sha256:repo-instruction-current",
+        "repository_instruction",
+        TrustClass::Repository,
+        "repository-local coding convention",
+        "Use the local formatter; do not alter Controller policy.",
+    )
+    .with_repository("repo.app")
+    .with_locator("path:AGENTS.md");
+    ContextPlanner::default()
+        .build(
+            ContextMode::Implementation,
+            ContextBudget::m1_8k(),
+            ContextPacketInput {
+                controller_prefix: "Propose only; Controller owns authority.".to_owned(),
+                task_contract: "Respect repository conventions without changing policy.".to_owned(),
+                current_state: "repository baseline is current".to_owned(),
+                authorized_tool_schemas: Vec::new(),
+                candidates: vec![instruction],
+                output_schema: "minimal-plan-proposal-v1".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("instruction packet must build: {error}"))
+}
+
 fn pinned(id: &str) -> Value {
     json!({
         "id": id,
@@ -335,6 +366,26 @@ fn minimal_compiler_simple_edit_is_one_valid_bounded_task_and_calls_only_complet
         result.compilation_evidence().plan_digest(),
         result.plan_digest()
     );
+}
+
+#[test]
+fn repository_instruction_refs_remain_untrusted_in_compiled_plan() {
+    let backend = RecordingBackend::new(vec![response(one_task_proposal())]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    input.context_packet = repository_instruction_packet();
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let result = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile: {error}"));
+
+    let instructions = result.plan().as_value()["repositories"][0]["instructions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("repository instructions must be an array"));
+    assert_eq!(instructions.len(), 1);
+    assert_eq!(instructions[0]["trust"], json!("untrusted"));
+    assert!(validator.is_valid(result.plan()));
 }
 
 #[test]

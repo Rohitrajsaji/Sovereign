@@ -772,6 +772,10 @@ fn compiler_m3_replan_preserves_plan_identity_and_unaffected_task_verbatim() {
         .iter()
         .find(|task| task["title"] == json!("Implement root"))
         .unwrap_or_else(|| panic!("root task"));
+    assert_eq!(
+        root["implementation_contract"]["assumptions"][0]["basis_evidence"][0]["trust"],
+        json!("untrusted")
+    );
     let root_id = root["task_id"]
         .as_str()
         .unwrap_or_else(|| panic!("root id"))

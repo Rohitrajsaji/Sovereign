@@ -3,8 +3,10 @@ use sovereign_policy::{
     CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, HeavyLeaseClass,
     HostPressureSnapshot, IsolationRequest, M1ResourceGovernor, MacSandboxExecBackend,
     MinimalNetworkPolicy, MinimalResourceLeaseAuthority, ModelCallBudget, NetworkDestination,
-    PathPolicy, PermissionDecision, PinnedExecutable, PressureBand, ResourceGovernor,
-    TaskCapabilityGrant, sanitized_environment,
+    PathPolicy, PermissionDecision, PinnedExecutable, PolicyViolationDecision,
+    PolicyViolationEvidence, PolicyViolationKind, PressureBand, ProtectedPolicyEffect,
+    ResourceGovernor, TRUST_LABEL_SCHEMA_VERSION, TaskCapabilityGrant, TrustLabel, TrustLevel,
+    TrustSource, sanitized_environment,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -75,6 +77,52 @@ fn canonical_plan_ir_capability_mapping_covers_all_twelve_values() {
         assert_eq!(Capability::from_plan_ir_str(wire_name), Some(capability));
     }
     assert_eq!(Capability::from_plan_ir_str("repository_write"), None);
+}
+
+#[test]
+fn trust_labels_reject_self_promotion_and_violation_evidence_is_denial_only() {
+    let source = TrustLabel::untrusted(TrustSource::Source)
+        .unwrap_or_else(|error| panic!("source label: {error}"));
+    assert!(source.is_untrusted());
+    assert!(source.validate().is_ok());
+    assert!(TrustLabel::untrusted(TrustSource::Controller).is_err());
+    let forged = TrustLabel {
+        schema_version: TRUST_LABEL_SCHEMA_VERSION,
+        source: TrustSource::Source,
+        level: TrustLevel::Governed,
+    };
+    assert!(forged.validate().is_err());
+
+    let denial = PolicyViolationEvidence::denied(
+        "violation.fixture",
+        PolicyViolationKind::CapabilitySelfGrant,
+        "evidence.fixture",
+        test_digest('1'),
+        source,
+        ProtectedPolicyEffect::CapabilitySet,
+        ["network_write".to_owned()],
+        test_digest('2'),
+        Some(test_digest('3')),
+        "untrusted_source_cannot_grant_network",
+    )
+    .unwrap_or_else(|error| panic!("denial evidence: {error}"));
+    assert_eq!(denial.decision, PolicyViolationDecision::Denied);
+    assert!(denial.validate().is_ok());
+    assert!(
+        PolicyViolationEvidence::denied(
+            "violation.unknown-capability",
+            PolicyViolationKind::CapabilitySelfGrant,
+            "evidence.fixture",
+            test_digest('4'),
+            source,
+            ProtectedPolicyEffect::CapabilitySet,
+            ["invented_superuser".to_owned()],
+            test_digest('5'),
+            None,
+            "unknown_capability_rejected",
+        )
+        .is_err()
+    );
 }
 
 #[test]
