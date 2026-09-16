@@ -1,6 +1,11 @@
-use sovereign_controller::Controller;
+mod control_api;
+
+use control_api::{ControlApiRequest, bind_loopback, serve_listener};
+use serde_json::Value;
+use sovereign_controller::{ApprovalDecisionV1, LocalControl};
 use sovereign_state::StateStore;
 use sovereign_types::ErrorCode;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -30,22 +35,19 @@ fn run(args: &[String], state_path: &Path) -> Result<String, String> {
         Some("--version" | "-V") => Ok(format!("sovereign {VERSION}")),
         Some("help" | "--help" | "-h") | None => Ok(help_text()),
         Some("doctor") => {
-            let state = StateStore::open(state_path).map_err(|error| error.to_string())?;
-            let controller = Controller::new(state);
-            let control = controller
-                .execution_control()
-                .map_err(|error| error.to_string())?;
+            let control = open_read_control(state_path)?;
+            let read_model = control.read_model().map_err(|error| error.to_string())?;
             Ok(format!(
                 "sovereign local control plane: ok\nstate={}\npaused={}",
                 state_path.display(),
-                control.paused
+                read_model.status.execution_control.paused
             ))
         }
         Some("goal") => {
             let goal = args.get(1..).unwrap_or_default().join(" ");
-            let mut controller = open_controller(state_path)?;
-            let intent = controller
-                .submit_goal_intent(&goal)
+            let mut control = open_read_control(state_path)?;
+            let intent = control
+                .submit_goal(&goal)
                 .map_err(|error| error.to_string())?;
             Ok(format!(
                 "goal_id={}\nstatus={}\nnote=queued durably for canonical PlanCompiler execution; no execution was bypassed",
@@ -53,23 +55,19 @@ fn run(args: &[String], state_path: &Path) -> Result<String, String> {
             ))
         }
         Some("status") => {
-            let controller = open_controller(state_path)?;
-            let view = controller
-                .durable_status()
-                .map_err(|error| error.to_string())?;
+            let control = open_read_control(state_path)?;
+            let view = control.read_model().map_err(|error| error.to_string())?;
             serde_json::to_string_pretty(&view).map_err(|error| error.to_string())
         }
         Some("evidence") => {
-            let controller = open_controller(state_path)?;
-            let view = controller
-                .durable_status()
-                .map_err(|error| error.to_string())?;
-            serde_json::to_string_pretty(&view.evidence).map_err(|error| error.to_string())
+            let control = open_read_control(state_path)?;
+            let view = control.read_model().map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&view.status.evidence).map_err(|error| error.to_string())
         }
         Some("pause") => {
             let reason = args.get(1..).unwrap_or_default().join(" ");
-            let mut controller = open_controller(state_path)?;
-            let control = controller
+            let mut local_control = open_local_control(state_path)?;
+            let control = local_control
                 .pause((!reason.trim().is_empty()).then_some(reason.as_str()))
                 .map_err(|error| error.to_string())?;
             Ok(format!(
@@ -85,16 +83,49 @@ fn run(args: &[String], state_path: &Path) -> Result<String, String> {
             if args.len() != 1 {
                 return Err("resume does not accept arguments".to_owned());
             }
-            let mut controller = open_controller(state_path)?;
-            let control = controller.resume().map_err(|error| error.to_string())?;
+            let mut local_control = open_local_control(state_path)?;
+            let control = local_control.resume().map_err(|error| error.to_string())?;
             Ok(format!("paused={}", control.paused))
         }
         Some("approvals") => {
-            let controller = open_controller(state_path)?;
-            let view = controller
-                .durable_status()
+            let control = open_read_control(state_path)?;
+            let view = control.read_model().map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&view.status.approval_requests)
+                .map_err(|error| error.to_string())
+        }
+        Some("approval") => {
+            if args.len() != 4 {
+                return Err("approval requires <request-id> <approve|deny> <principal>".to_owned());
+            }
+            let decision = match args[2].as_str() {
+                "approve" => ApprovalDecisionV1::Approve,
+                "deny" => ApprovalDecisionV1::Deny,
+                _ => return Err("approval decision must be `approve` or `deny`".to_owned()),
+            };
+            let mut control = open_local_control(state_path)?;
+            let request = control
+                .respond_to_approval(&args[1], decision, &args[3])
                 .map_err(|error| error.to_string())?;
-            serde_json::to_string_pretty(&view.approval_requests).map_err(|error| error.to_string())
+            serde_json::to_string_pretty(&request).map_err(|error| error.to_string())
+        }
+        Some("serve") => {
+            if args.len() > 2 {
+                return Err("serve accepts at most one loopback socket address".to_owned());
+            }
+            let address = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1:7777".to_owned())
+                .parse::<SocketAddr>()
+                .map_err(|error| format!("invalid serve address: {error}"))?;
+            let listener = bind_loopback(address)?;
+            let local_address = listener.local_addr().map_err(|error| error.to_string())?;
+            eprintln!("sovereign local control API listening on http://{local_address}");
+            let mut control = open_read_control(state_path)?;
+            serve_listener(&listener, |request| {
+                handle_control_request(&mut control, request)
+            })?;
+            Ok(String::new())
         }
         Some(command) => Err(format!(
             "unsupported command {command:?}; run `sovereign help` for the local CLI surface"
@@ -102,10 +133,55 @@ fn run(args: &[String], state_path: &Path) -> Result<String, String> {
     }
 }
 
-fn open_controller(state_path: &Path) -> Result<Controller, String> {
+fn open_local_control(state_path: &Path) -> Result<LocalControl, String> {
     StateStore::open(state_path)
-        .map(Controller::new)
         .map_err(|error| error.to_string())
+        .and_then(|state| LocalControl::reopen(state).map_err(|error| error.to_string()))
+}
+
+fn open_read_control(state_path: &Path) -> Result<LocalControl, String> {
+    StateStore::open(state_path)
+        .map(LocalControl::read_only)
+        .map_err(|error| error.to_string())
+}
+
+fn handle_control_request(
+    control: &mut LocalControl,
+    request: ControlApiRequest,
+) -> Result<Value, String> {
+    match request {
+        ControlApiRequest::ReadModel => control
+            .read_model()
+            .and_then(|view| serde_json::to_value(view).map_err(Into::into))
+            .map_err(|error| error.to_string()),
+        ControlApiRequest::SubmitGoal { goal } => control
+            .submit_goal(&goal)
+            .and_then(|intent| serde_json::to_value(intent).map_err(Into::into))
+            .map_err(|error| error.to_string()),
+        ControlApiRequest::Pause { reason } => control
+            .pause(reason.as_deref())
+            .and_then(|control| serde_json::to_value(control).map_err(Into::into))
+            .map_err(|error| error.to_string()),
+        ControlApiRequest::Resume => control
+            .resume()
+            .and_then(|control| serde_json::to_value(control).map_err(Into::into))
+            .map_err(|error| error.to_string()),
+        ControlApiRequest::RespondToApproval {
+            request_id,
+            decision,
+            principal,
+        } => {
+            let decision = match decision.as_str() {
+                "approve" => ApprovalDecisionV1::Approve,
+                "deny" => ApprovalDecisionV1::Deny,
+                _ => return Err("approval decision must be `approve` or `deny`".to_owned()),
+            };
+            control
+                .respond_to_approval(&request_id, decision, &principal)
+                .and_then(|request| serde_json::to_value(request).map_err(Into::into))
+                .map_err(|error| error.to_string())
+        }
+    }
 }
 
 fn help_text() -> String {
@@ -119,6 +195,8 @@ fn help_text() -> String {
         "  pause [reason]                Pause Controller readiness/mutation",
         "  resume                         Resume Controller readiness/mutation",
         "  approvals                      Render durable approval-request facts",
+        "  approval <id> <approve|deny> <principal>  Respond through Controller approval validation",
+        "  serve [127.0.0.1:port]         Serve the loopback-only local control API",
         "  doctor                         Check local state/control access",
         "  --version                      Print version",
         "",
@@ -129,11 +207,15 @@ fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::run;
-    use sovereign_controller::Controller;
+    use super::{handle_control_request, run};
+    use crate::control_api::{ControlApiRequest, bind_loopback, serve_one};
+    use sovereign_controller::{Controller, LocalControl};
     use sovereign_state::StateStore;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
     use std::path::PathBuf;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_state(name: &str) -> PathBuf {
@@ -201,5 +283,195 @@ mod tests {
         let output = run(&["approvals".to_owned()], &state_path)
             .unwrap_or_else(|error| panic!("approvals: {error}"));
         assert_eq!(output, "[]");
+    }
+
+    fn http_request(address: SocketAddr, request: &str) -> String {
+        let mut stream = TcpStream::connect(address)
+            .unwrap_or_else(|error| panic!("connect local control API: {error}"));
+        stream
+            .write_all(request.as_bytes())
+            .unwrap_or_else(|error| panic!("write local control request: {error}"));
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .unwrap_or_else(|error| panic!("read local control response: {error}"));
+        response
+    }
+
+    #[test]
+    fn loopback_api_read_model_matches_controller_and_is_read_only() {
+        let state_path = temp_state("api-read");
+        run(
+            &["goal".to_owned(), "Build inventory".to_owned()],
+            &state_path,
+        )
+        .unwrap_or_else(|error| panic!("seed goal: {error}"));
+
+        let before_store =
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("state before: {error}"));
+        let before_sequence = before_store
+            .latest_journal_sequence()
+            .unwrap_or_else(|error| panic!("journal before: {error}"));
+        drop(before_store);
+
+        let direct = LocalControl::read_only(
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("direct state: {error}")),
+        )
+        .read_model()
+        .unwrap_or_else(|error| panic!("direct status: {error}"));
+        let direct_json =
+            serde_json::to_value(direct).unwrap_or_else(|error| panic!("direct JSON: {error}"));
+
+        let listener = bind_loopback(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .unwrap_or_else(|error| panic!("bind API: {error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("API local address: {error}"));
+        let path = state_path.clone();
+        let server = thread::spawn(move || {
+            let mut control = LocalControl::read_only(
+                StateStore::open(&path).unwrap_or_else(|error| panic!("API state: {error}")),
+            );
+            serve_one(&listener, |request| {
+                handle_control_request(&mut control, request)
+            })
+            .unwrap_or_else(|error| panic!("serve one: {error}"));
+        });
+        let response = http_request(
+            address,
+            "GET /v1/status HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        );
+        server
+            .join()
+            .unwrap_or_else(|_| panic!("local control server thread panicked"));
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .unwrap_or_else(|| panic!("HTTP response missing body"));
+        let api_json: serde_json::Value =
+            serde_json::from_str(body).unwrap_or_else(|error| panic!("API JSON: {error}"));
+        assert_eq!(api_json, direct_json);
+
+        let after_store =
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("state after: {error}"));
+        assert_eq!(
+            after_store
+                .latest_journal_sequence()
+                .unwrap_or_else(|error| panic!("journal after: {error}")),
+            before_sequence
+        );
+    }
+
+    #[test]
+    fn local_control_requests_delegate_to_controller_mutations() {
+        let state_path = temp_state("api-mutations");
+        let mut control = LocalControl::reopen(
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("state: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("local control: {error}"));
+        handle_control_request(
+            &mut control,
+            ControlApiRequest::SubmitGoal {
+                goal: "Build inventory".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("goal request: {error}"));
+        handle_control_request(
+            &mut control,
+            ControlApiRequest::Pause {
+                reason: Some("operator requested".to_owned()),
+            },
+        )
+        .unwrap_or_else(|error| panic!("pause request: {error}"));
+
+        let controller = Controller::new(
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("observer state: {error}")),
+        );
+        assert!(
+            controller
+                .execution_control()
+                .unwrap_or_else(|error| panic!("read control: {error}"))
+                .paused
+        );
+        handle_control_request(&mut control, ControlApiRequest::Resume)
+            .unwrap_or_else(|error| panic!("resume request: {error}"));
+        let status = Controller::new(
+            StateStore::open(&state_path)
+                .unwrap_or_else(|error| panic!("observer state after resume: {error}")),
+        )
+        .durable_status()
+        .unwrap_or_else(|error| panic!("status: {error}"));
+        assert_eq!(status.goal_intents.len(), 1);
+        assert!(!status.execution_control.paused);
+    }
+
+    #[test]
+    fn rejected_raw_state_route_cannot_mutate_authoritative_journal() {
+        let state_path = temp_state("api-deny-raw-state");
+        let before_store =
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("state before: {error}"));
+        let before_sequence = before_store
+            .latest_journal_sequence()
+            .unwrap_or_else(|error| panic!("journal before: {error}"));
+        drop(before_store);
+
+        let listener = bind_loopback(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .unwrap_or_else(|error| panic!("bind API: {error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("API local address: {error}"));
+        let path = state_path.clone();
+        let server = thread::spawn(move || {
+            let mut control = LocalControl::reopen(
+                StateStore::open(&path).unwrap_or_else(|error| panic!("API state: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("API local control: {error}"));
+            serve_one(&listener, |request| {
+                handle_control_request(&mut control, request)
+            })
+            .unwrap_or_else(|error| panic!("serve one: {error}"));
+        });
+        let response = http_request(
+            address,
+            "POST /v1/state/controller.task HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        server
+            .join()
+            .unwrap_or_else(|_| panic!("local control server thread panicked"));
+        assert!(response.starts_with("HTTP/1.1 404 Not Found\r\n"));
+
+        let after_store =
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("state after: {error}"));
+        assert_eq!(
+            after_store
+                .latest_journal_sequence()
+                .unwrap_or_else(|error| panic!("journal after: {error}")),
+            before_sequence
+        );
+    }
+
+    #[test]
+    fn local_control_read_model_reconstructs_identically_after_restart() {
+        let state_path = temp_state("api-restart");
+        let mut first = LocalControl::reopen(
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("first state: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("first local control: {error}"));
+        first
+            .submit_goal("Build inventory")
+            .unwrap_or_else(|error| panic!("submit goal: {error}"));
+        first
+            .pause(Some("restart fixture"))
+            .unwrap_or_else(|error| panic!("pause: {error}"));
+        let before = first
+            .read_model()
+            .unwrap_or_else(|error| panic!("read before restart: {error}"));
+        drop(first);
+
+        let after = LocalControl::reopen(
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("reopen state: {error}")),
+        )
+        .and_then(|control| control.read_model())
+        .unwrap_or_else(|error| panic!("read after restart: {error}"));
+        assert_eq!(after, before);
     }
 }

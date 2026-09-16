@@ -65,10 +65,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod local_control;
 mod resources;
 mod roles;
 mod skills;
 
+pub use local_control::{
+    LOCAL_CONTROL_READ_MODEL_SCHEMA_VERSION, LocalControl, LocalControlCheckpointV1,
+    LocalControlReadModelV1, LocalControlRecoveryProjectionV1,
+};
 use resources::{
     ControllerResourceCoordinator, MODEL_RESIDENCY_KEY, RESOURCE_GOVERNOR_KEY,
     RESOURCE_GOVERNOR_NAMESPACE, RESOURCE_LEASE_NAMESPACE, RESOURCE_PRESSURE_NAMESPACE,
@@ -4243,6 +4248,7 @@ impl Controller {
         decision: ApprovalDecisionV1,
         decided_by: &str,
     ) -> Result<ApprovalRequestV1, ControllerError> {
+        validate_durable_action_lifecycle_states(&self.state)?;
         self.require_execution_not_paused()?;
         require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         let decided_by = decided_by.trim();
@@ -4685,6 +4691,7 @@ impl Controller {
     /// # Errors
     /// Returns an error for an empty goal or durable-state failure.
     pub fn submit_goal_intent(&mut self, goal: &str) -> Result<GoalIntentV1, ControllerError> {
+        validate_durable_action_lifecycle_states(&self.state)?;
         let goal = goal.trim();
         if goal.is_empty() {
             return Err(ControllerError::InvalidPlan(
@@ -4728,6 +4735,7 @@ impl Controller {
     /// # Errors
     /// Returns a durable-state/checkpoint error when the transition cannot be recorded safely.
     pub fn pause(&mut self, reason: Option<&str>) -> Result<ExecutionControlV1, ControllerError> {
+        validate_durable_action_lifecycle_states(&self.state)?;
         self.set_execution_paused(true, reason)
     }
 
@@ -4736,6 +4744,7 @@ impl Controller {
     /// # Errors
     /// Returns a durable-state/checkpoint error when the transition cannot be recorded safely.
     pub fn resume(&mut self) -> Result<ExecutionControlV1, ControllerError> {
+        validate_durable_action_lifecycle_states(&self.state)?;
         require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         self.set_execution_paused(false, None)
     }
@@ -4794,6 +4803,7 @@ impl Controller {
         &self,
         active_plan: Option<&Value>,
     ) -> Result<DurableStatusActiveProjection, ControllerError> {
+        let verifications = decode_verification_records(&self.state)?;
         let durable_scope = if let Some(durable) = active_plan {
             Some((
                 required_str(durable, "/plan_id")?.to_owned(),
@@ -4860,20 +4870,15 @@ impl Controller {
                 .map(|record| Ok(serde_json::from_str(&record.value_json)?))
                 .collect::<Result<Vec<_>, ControllerError>>()?
         };
-        let mut evidence = self
-            .state
-            .state_records("controller.verification")?
-            .into_iter()
-            .filter_map(|record| {
-                let value: Value = serde_json::from_str(&record.value_json).ok()?;
-                (value.get("plan_id").and_then(Value::as_str) == Some(plan_id.as_str())
-                    && value.get("plan_revision").and_then(Value::as_u64)
-                        == Some(u64::from(revision))
-                    && value.get("plan_digest").and_then(Value::as_str)
-                        == Some(plan_digest.as_str()))
-                .then_some(Ok(value))
-            })
-            .collect::<Result<Vec<_>, ControllerError>>()?;
+        let mut evidence = Vec::new();
+        for verification in verifications {
+            if verification.plan_id == plan_id
+                && verification.plan_revision == revision
+                && verification.plan_digest == plan_digest
+            {
+                evidence.push(serde_json::to_value(verification)?);
+            }
+        }
         for namespace in [
             "controller.evidence_satisfaction",
             "controller.evidence_item",
@@ -12931,6 +12936,68 @@ impl Controller {
     }
 }
 
+fn decode_verification_record(
+    record: &sovereign_state::PersistedStateRecord,
+) -> Result<VerificationResultV1, ControllerError> {
+    let verification: VerificationResultV1 = serde_json::from_str(&record.value_json)?;
+    if verification.schema_version != VERIFICATION_RESULT_SCHEMA_VERSION {
+        return Err(ControllerError::InvalidPlan(format!(
+            "unsupported durable verification schema version {}",
+            verification.schema_version
+        )));
+    }
+    let expected_key = revision_scoped_key(
+        &verification.plan_id,
+        verification.plan_revision,
+        &verification.verification_id,
+    );
+    if record.key != expected_key {
+        return Err(ControllerError::InvalidPlan(format!(
+            "durable verification record key {} does not match canonical key {expected_key}",
+            record.key
+        )));
+    }
+    Ok(verification)
+}
+
+fn decode_verification_records(
+    state: &StateStore,
+) -> Result<Vec<VerificationResultV1>, ControllerError> {
+    state
+        .state_records("controller.verification")?
+        .into_iter()
+        .map(|record| decode_verification_record(&record))
+        .collect()
+}
+
+fn validate_durable_action_lifecycle_state(state: &str) -> Result<(), ControllerError> {
+    let valid = [
+        ActionState::Prepared,
+        ActionState::Authorized,
+        ActionState::Dispatched,
+        ActionState::Observed,
+        ActionState::Committed,
+        ActionState::Unknown,
+        ActionState::Reconciled,
+        ActionState::Failed,
+    ]
+    .into_iter()
+    .any(|candidate| candidate.as_str() == state);
+    if valid {
+        return Ok(());
+    }
+    Err(ControllerError::InvalidPlan(format!(
+        "invalid durable action lifecycle state {state:?}"
+    )))
+}
+
+fn validate_durable_action_lifecycle_states(state: &StateStore) -> Result<(), ControllerError> {
+    for record in state.action_records()? {
+        validate_durable_action_lifecycle_state(&record.state)?;
+    }
+    Ok(())
+}
+
 fn task_carry_execution_provenance(
     active: &ActivePlan,
     task_id: &str,
@@ -13615,6 +13682,7 @@ impl RecoveryManager {
         registry: &ProjectRegistry,
         permission_context: PermissionContext,
     ) -> Result<(Controller, RecoverySummary), ControllerError> {
+        validate_durable_action_lifecycle_states(&state)?;
         state.recovery_integrity_check()?;
         let physical_latest = state.latest_checkpoint_integrity()?.ok_or_else(|| {
             ControllerError::InvalidPlan("recovery requires at least one checkpoint".to_owned())

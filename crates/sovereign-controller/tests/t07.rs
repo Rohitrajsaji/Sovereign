@@ -8,9 +8,10 @@ use sovereign_context::{
 };
 use sovereign_controller::{
     CheckpointActionRecord, CheckpointManifest, Controller, ControllerError, ExecutionRuntime,
-    ExecutionSuccess, FailureClassification, FailureClassificationKind, ModelProposalV1,
-    PermissionContext, PlanValidity, ReadinessInputs, RecoveryManager, ResourcePressureProbe,
-    RoleId, RoleRegistry, SchedulerView, SecretProcessRuntime, TaskState,
+    ExecutionSuccess, FailureClassification, FailureClassificationKind, LocalControl,
+    ModelProposalV1, PermissionContext, PlanValidity, ReadinessInputs, RecoveryManager,
+    ResourcePressureProbe, RoleId, RoleRegistry, SchedulerView, SecretProcessRuntime, TaskState,
+    VERIFICATION_RESULT_SCHEMA_VERSION, VerificationResultV1,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_memory::{MemoryKind, MemoryTrust, ProcedurePattern};
@@ -1557,6 +1558,117 @@ fn pause_is_durable_across_recovery_and_gates_readiness_until_resume() {
 }
 
 #[test]
+fn local_control_reopen_uses_controller_recovery_and_delegates_mutations() {
+    let mut fixture = compiled_fixture("local-control-reopen", true);
+    let (mut controller, _) = controller_for(&mut fixture);
+    controller
+        .pause(Some("local control restart fixture"))
+        .unwrap_or_else(|error| panic!("pause before reopen: {error}"));
+    let epoch_before = controller
+        .state()
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("epoch before reopen: {error}"));
+    drop(controller);
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen local control state: {error}"));
+    let mut control = LocalControl::reopen(state)
+        .unwrap_or_else(|error| panic!("local control recover: {error}"));
+    let recovered = control
+        .read_model()
+        .unwrap_or_else(|error| panic!("local control status: {error}"));
+    assert!(recovered.status.active_plan.is_some());
+    assert!(!recovered.status.tasks.is_empty());
+    assert!(recovered.status.execution_control.paused);
+    assert!(recovered.recovery.execution_epoch > epoch_before);
+    assert!(recovered.recovery.checkpoint.is_some());
+    assert!(!recovered.recovery.mutation_blocked);
+
+    control
+        .resume()
+        .unwrap_or_else(|error| panic!("local control resume: {error}"));
+    let goal = control
+        .submit_goal("Build inventory from the local control facade")
+        .unwrap_or_else(|error| panic!("local control goal: {error}"));
+    let after = control
+        .read_model()
+        .unwrap_or_else(|error| panic!("local control reread: {error}"));
+    assert!(!after.status.execution_control.paused);
+    assert!(
+        after
+            .status
+            .goal_intents
+            .iter()
+            .any(|intent| intent.goal_id == goal.goal_id)
+    );
+    let Err(error) = control.respond_to_approval(
+        "approval.missing",
+        sovereign_controller::ApprovalDecisionV1::Deny,
+        "test:operator",
+    ) else {
+        panic!("missing approval request unexpectedly accepted")
+    };
+    assert!(error.to_string().contains("unknown approval request"));
+}
+
+#[test]
+fn local_control_read_only_active_status_does_not_run_recovery_until_mutation() {
+    let mut fixture = compiled_fixture("local-control-read-only", true);
+    let (mut controller, _) = controller_for(&mut fixture);
+    controller
+        .pause(Some("read-only restart fixture"))
+        .unwrap_or_else(|error| panic!("pause before read-only reopen: {error}"));
+    let epoch_before = controller
+        .state()
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("epoch before read-only reopen: {error}"));
+    let journal_before = controller
+        .state()
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("journal before read-only reopen: {error}"));
+    drop(controller);
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("read-only local control state: {error}"));
+    let mut control = LocalControl::read_only(state);
+    let view = control
+        .read_model()
+        .unwrap_or_else(|error| panic!("read-only local control status: {error}"));
+    assert!(view.status.active_plan.is_some());
+    assert!(!view.status.tasks.is_empty());
+    assert!(!view.plan_revisions.is_empty());
+    assert!(view.status.execution_control.paused);
+    assert_eq!(view.recovery.execution_epoch, epoch_before);
+
+    let observer = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("observer after read-only status: {error}"));
+    assert_eq!(
+        observer
+            .latest_journal_sequence()
+            .unwrap_or_else(|error| panic!("journal after read-only status: {error}")),
+        journal_before,
+        "read-only local status unexpectedly ran recovery or mutated canonical state"
+    );
+    assert_eq!(
+        observer
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("epoch after read-only status: {error}")),
+        epoch_before,
+        "read-only local status unexpectedly advanced the execution epoch"
+    );
+    drop(observer);
+
+    control
+        .resume()
+        .unwrap_or_else(|error| panic!("mutation after read-only open: {error}"));
+    let after = control
+        .read_model()
+        .unwrap_or_else(|error| panic!("status after recovered mutation: {error}"));
+    assert!(!after.status.execution_control.paused);
+    assert!(after.recovery.execution_epoch > epoch_before);
+}
+
+#[test]
 fn durable_status_exposes_controller_state_and_evidence_without_mutation_authority() {
     let mut fixture = compiled_fixture("status-view", true);
     let requirement_id = first_evidence_requirement_id(&fixture);
@@ -1592,6 +1704,282 @@ fn durable_status_exposes_controller_state_and_evidence_without_mutation_authori
     assert!(view.actions.is_empty());
     assert!(!view.evidence.is_empty());
     assert!(view.approval_requests.is_empty());
+}
+
+#[test]
+fn durable_status_fails_closed_on_malformed_verification_rows() {
+    let mut fixture = compiled_fixture("status-malformed-verification", true);
+    let (controller, _) = controller_for(&mut fixture);
+    let mut second = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open second state: {error}"));
+    second
+        .put_state(
+            "controller.verification",
+            "malformed.fixture",
+            r#"{"plan_id":"unterminated""#,
+        )
+        .unwrap_or_else(|error| panic!("write malformed verification: {error}"));
+
+    let Err(error) = controller.durable_status() else {
+        panic!("malformed verification row was silently omitted from durable status")
+    };
+    assert!(
+        error.to_string().contains("EOF")
+            || error.to_string().contains("expected")
+            || error.to_string().contains("JSON"),
+        "unexpected fail-closed error: {error}"
+    );
+}
+
+#[test]
+fn durable_status_fails_closed_on_structurally_invalid_verification_rows() {
+    let mut fixture = compiled_fixture("status-invalid-verification-schema", true);
+    let (controller, _) = controller_for(&mut fixture);
+    let active = controller
+        .durable_status()
+        .unwrap_or_else(|error| panic!("read active status before corruption: {error}"))
+        .active_plan
+        .unwrap_or_else(|| panic!("compiled fixture must have an active plan"));
+    let plan_id = active["plan_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("active plan id missing"));
+    let revision = active["revision"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("active revision missing"));
+    let plan_digest = active["plan_digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("active plan digest missing"));
+    let mut second = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open second state: {error}"));
+    second
+        .put_state(
+            "controller.verification",
+            &format!("{plan_id}@r{revision}:verification.structurally-invalid"),
+            &json!({
+                "schema_version": VERIFICATION_RESULT_SCHEMA_VERSION,
+                "verification_id": "verification.structurally-invalid",
+                "plan_id": plan_id,
+                "plan_revision": revision,
+                "plan_digest": plan_digest
+            })
+            .to_string(),
+        )
+        .unwrap_or_else(|error| panic!("write structurally invalid verification: {error}"));
+
+    let Err(error) = controller.durable_status() else {
+        panic!("structurally invalid verification row was silently accepted")
+    };
+    assert!(
+        error.to_string().contains("missing field"),
+        "unexpected fail-closed error: {error}"
+    );
+}
+
+#[test]
+fn verification_rows_are_validated_without_an_active_plan() {
+    let repo = TestRepo::create("status-invalid-verification-no-active-plan");
+    let mut state = StateStore::open(&repo.state_path)
+        .unwrap_or_else(|error| panic!("open no-active state: {error}"));
+    state
+        .put_state(
+            "controller.verification",
+            "verification.invalid-no-active",
+            &json!({"schema_version": VERIFICATION_RESULT_SCHEMA_VERSION}).to_string(),
+        )
+        .unwrap_or_else(|error| panic!("write invalid no-active verification: {error}"));
+    drop(state);
+
+    let controller = Controller::new(
+        StateStore::open(&repo.state_path)
+            .unwrap_or_else(|error| panic!("reopen no-active controller: {error}")),
+    );
+    let Err(error) = controller.durable_status() else {
+        panic!("invalid verification row was skipped because no active plan exists")
+    };
+    assert!(
+        error.to_string().contains("missing field"),
+        "unexpected fail-closed status error: {error}"
+    );
+
+    let control = LocalControl::read_only(
+        StateStore::open(&repo.state_path)
+            .unwrap_or_else(|error| panic!("reopen no-active local control: {error}")),
+    );
+    let Err(error) = control.read_model() else {
+        panic!("local read model skipped invalid verification row without an active plan")
+    };
+    assert!(
+        error.to_string().contains("missing field"),
+        "unexpected fail-closed local-control error: {error}"
+    );
+}
+
+#[test]
+fn local_control_read_model_rejects_invalid_durable_action_lifecycle_state() {
+    let mut fixture = compiled_fixture("local-control-invalid-action-state", true);
+    let (controller, _) = controller_for(&mut fixture);
+    let epoch = controller
+        .state()
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("execution epoch: {error}"));
+    drop(controller);
+
+    let mut state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open state for invalid action: {error}"));
+    state
+        .insert_action_record(NewActionRecord {
+            action_id: "action.invalid-lifecycle",
+            state: "not-a-canonical-action-state",
+            payload_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            policy_digest:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            execution_epoch: epoch,
+            event_id: "event.invalid-lifecycle",
+            event_kind: "fixture_corruption",
+            payload_json: "{}",
+        })
+        .unwrap_or_else(|error| panic!("persist invalid action lifecycle fixture: {error}"));
+    drop(state);
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen invalid action lifecycle fixture: {error}"));
+    let control = LocalControl::read_only(state);
+    let Err(error) = control.read_model() else {
+        panic!("invalid durable action lifecycle state was projected as safe")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("invalid durable action lifecycle state"),
+        "unexpected fail-closed error: {error}"
+    );
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen invalid action for recovery manager: {error}"));
+    let Err(error) = RecoveryManager::recover(state, &fixture.registry) else {
+        panic!("RecoveryManager accepted invalid durable action lifecycle state")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("invalid durable action lifecycle state"),
+        "unexpected fail-closed RecoveryManager error: {error}"
+    );
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen invalid action for recovery: {error}"));
+    let Err(error) = LocalControl::reopen(state) else {
+        panic!("active-plan recovery accepted invalid durable action lifecycle state")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("invalid durable action lifecycle state"),
+        "unexpected fail-closed recovery error: {error}"
+    );
+}
+
+#[test]
+fn local_control_mutation_rejects_invalid_action_state_without_active_plan() {
+    let repo = TestRepo::create("local-control-invalid-action-state-no-active-plan");
+    let mut state = StateStore::open(&repo.state_path)
+        .unwrap_or_else(|error| panic!("open no-active state: {error}"));
+    let epoch = state
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("execution epoch: {error}"));
+    state
+        .insert_action_record(NewActionRecord {
+            action_id: "action.invalid-no-active",
+            state: "not-a-canonical-action-state",
+            payload_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            policy_digest:
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            execution_epoch: epoch,
+            event_id: "event.invalid-no-active",
+            event_kind: "fixture_corruption",
+            payload_json: "{}",
+        })
+        .unwrap_or_else(|error| panic!("persist invalid no-active action: {error}"));
+    let before_sequence = state
+        .latest_journal_sequence()
+        .unwrap_or_else(|error| panic!("journal before rejected mutation: {error}"));
+    drop(state);
+
+    let mut control = LocalControl::read_only(
+        StateStore::open(&repo.state_path)
+            .unwrap_or_else(|error| panic!("reopen invalid no-active action: {error}")),
+    );
+    let Err(error) = control.submit_goal("must not persist") else {
+        panic!("mutation proceeded despite invalid durable action lifecycle state")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("invalid durable action lifecycle state"),
+        "unexpected fail-closed mutation error: {error}"
+    );
+
+    let observer = StateStore::open(&repo.state_path)
+        .unwrap_or_else(|error| panic!("observe rejected mutation: {error}"));
+    assert_eq!(
+        observer
+            .latest_journal_sequence()
+            .unwrap_or_else(|error| panic!("journal after rejected mutation: {error}")),
+        before_sequence,
+        "rejected local-control mutation changed the journal"
+    );
+    assert!(
+        observer
+            .state_records("controller.goal_intent")
+            .unwrap_or_else(|error| panic!("goal intents after rejected mutation: {error}"))
+            .is_empty(),
+        "rejected local-control mutation persisted a goal intent"
+    );
+    drop(observer);
+
+    let mut controller = Controller::new(
+        StateStore::open(&repo.state_path)
+            .unwrap_or_else(|error| panic!("reopen controller for direct mutation: {error}")),
+    );
+    let Err(error) = controller.submit_goal_intent("must also fail directly") else {
+        panic!("Controller mutation bypassed invalid durable action lifecycle validation")
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("invalid durable action lifecycle state"),
+        "unexpected fail-closed Controller mutation error: {error}"
+    );
+}
+
+fn status_verification_fixture(
+    plan_id: &str,
+    plan_revision: u32,
+    plan_digest: &str,
+    label: &str,
+) -> VerificationResultV1 {
+    VerificationResultV1 {
+        schema_version: VERIFICATION_RESULT_SCHEMA_VERSION,
+        verification_id: format!("verification.{label}"),
+        plan_id: plan_id.to_owned(),
+        plan_revision,
+        plan_digest: plan_digest.to_owned(),
+        task_id: format!("task.{label}"),
+        task_contract_digest: format!("contract.{label}"),
+        attempt_id: format!("attempt.{label}"),
+        execution_epoch: i64::from(plan_revision),
+        evaluator: "fixture".to_owned(),
+        acceptance_contract_digest: format!("acceptance.{label}"),
+        diff_digest: format!("diff.{label}"),
+        post_snapshot_digest: format!("snapshot.{label}"),
+        expected_target_mode: 0o644,
+        observed_target_mode: 0o644,
+        evidence_ids: vec![format!("evidence.{label}-verification")],
+        passed: true,
+        failure_code: None,
+    }
 }
 
 #[test]
@@ -1677,26 +2065,26 @@ fn durable_status_uses_only_durable_active_revision_rows_after_reopen() {
         .put_state(
             "controller.verification",
             "verification.rev1",
-            &json!({
-                "plan_id": plan_id,
-                "plan_revision": 1,
-                "plan_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-                "marker": "rev1-verification"
-            })
-            .to_string(),
+            &serde_json::to_string(&status_verification_fixture(
+                plan_id,
+                1,
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+                "rev1",
+            ))
+            .unwrap_or_else(|error| panic!("encode historical verification: {error}")),
         )
         .unwrap_or_else(|error| panic!("write historical verification: {error}"));
     state
         .put_state(
             "controller.verification",
             &format!("{plan_id}@r2:verification.rev2"),
-            &json!({
-                "plan_id": plan_id,
-                "plan_revision": 2,
-                "plan_digest": current_digest,
-                "marker": "rev2-verification"
-            })
-            .to_string(),
+            &serde_json::to_string(&status_verification_fixture(
+                plan_id,
+                2,
+                current_digest,
+                "rev2",
+            ))
+            .unwrap_or_else(|error| panic!("encode current verification: {error}")),
         )
         .unwrap_or_else(|error| panic!("write current verification: {error}"));
     state
@@ -1721,11 +2109,10 @@ fn durable_status_uses_only_durable_active_revision_rows_after_reopen() {
     assert_eq!(view.tasks, vec![json!({"marker": "rev2-task"})]);
     assert_eq!(view.attempts, vec![json!({"marker": "rev2-attempt"})]);
     assert_eq!(view.evidence.len(), 2);
-    assert!(
-        view.evidence
-            .iter()
-            .all(|value| !value.to_string().contains("rev1"))
-    );
+    assert!(view.evidence.iter().all(|value| {
+        value.get("plan_revision") != Some(&json!(1))
+            && value.get("marker") != Some(&json!("rev1-evidence"))
+    }));
 }
 
 #[test]
