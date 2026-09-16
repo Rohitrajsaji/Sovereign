@@ -975,6 +975,38 @@ impl StateStore {
         event_id: &str,
         payload_json: &str,
     ) -> Result<i64, StateError> {
+        self.recover_nonterminal_action_as_unknown(
+            action_id,
+            &["dispatched"],
+            event_id,
+            payload_json,
+        )
+    }
+
+    /// Crash-recovery transition for an action whose externally observed outcome did not reach a
+    /// durable terminal state. This is intentionally recovery-only and preserves the original
+    /// action execution epoch while converting only the explicitly allowed nonterminal states to
+    /// `unknown` before the Controller advances its recovery epoch.
+    ///
+    /// # Errors
+    /// Returns an integrity error unless the action is in one of `allowed_states` in the current
+    /// execution epoch.
+    pub fn recover_nonterminal_action_as_unknown(
+        &mut self,
+        action_id: &str,
+        allowed_states: &[&str],
+        event_id: &str,
+        payload_json: &str,
+    ) -> Result<i64, StateError> {
+        if allowed_states.is_empty()
+            || allowed_states
+                .iter()
+                .any(|state| !matches!(*state, "dispatched" | "observed"))
+        {
+            return Err(StateError::Integrity(
+                "recovery nonterminal action states must be dispatched and/or observed".to_owned(),
+            ));
+        }
         let now = UnixMillis::now()?.as_millis();
         self.transaction(|tx| {
             let controller_epoch: i64 = tx.query_row(
@@ -994,9 +1026,9 @@ impl StateStore {
                     "unknown recovery action {action_id}"
                 )));
             };
-            if state != "dispatched" || action_epoch != controller_epoch {
+            if !allowed_states.contains(&state.as_str()) || action_epoch != controller_epoch {
                 return Err(StateError::Integrity(format!(
-                    "recovery dispatch state mismatch for {action_id}: state={state} action_epoch={action_epoch} controller_epoch={controller_epoch}"
+                    "recovery nonterminal state mismatch for {action_id}: state={state} action_epoch={action_epoch} controller_epoch={controller_epoch}"
                 )));
             }
             tx.execute(

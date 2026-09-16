@@ -11,12 +11,14 @@ use sovereign_context::{
     ContextLevel, ContextPacket, ContextPlanner, EvidenceItem, EvidenceKind, PacketSection,
     RepairPacket, RepairPacketInput, TrustClass,
 };
-use sovereign_evidence::{ArtifactStore, EvidenceError};
+use sovereign_evidence::{ArtifactStore, EvidenceError, Redactor};
 use sovereign_memory::{
     ControllerEpisodeOutcomeProof, ControllerEpisodeProof, EpisodeCapture, EpisodeCaptureResult,
     EpisodeRecorder, MemoryError, MemoryScope, MemoryScopeKind, ProcedurePattern,
 };
 use sovereign_model::{
+    EXTERNAL_INTELLIGENCE_SCHEMA_VERSION, ExternalIntelligenceErrorKind,
+    ExternalIntelligenceProvider, ExternalIntelligenceRequest, ExternalIntelligenceUsage,
     MODEL_SCHEMA_VERSION, ModelBackend, ModelError, ModelFinishReason, ModelLoadProfile,
     ModelMessage, ModelMessageRole, ModelOutputContract, ModelRequest, ModelResidencyProof,
 };
@@ -27,12 +29,16 @@ use sovereign_plan::{
 use sovereign_policy::{
     APPROVAL_CLAIM_SCHEMA_VERSION, AUTONOMY_BUDGET_SCHEMA_VERSION, AdmissionStatus,
     AutonomyBudgetV1, Capability, CapabilityLayers, CapabilitySet, CommandMode, CommandPolicy,
-    CommandRisk, CommandSpec, ConditionalLeaseContextV1, HeavyLeaseClass, IsolationRequest,
-    LeaseStateV1, M6ResourceGovernorSnapshotV1, ModelCallBudget, PermissionDecision,
-    PlanHeavyLeaseClass, PolicyError, ReconciliationClass, ReconciliationPolicy,
-    ResourceLeaseOwnerV1, ResourceLeaseRequestV1, ResourceLeaseV1, ResourcePolicyEventV1,
-    ResourcePressureEventV1, SecretBroker, SecretInjection, SecretProviderKind, SecretRef,
-    SecretScope, TaskCapabilityGrant, TaskResourceBudgetV1,
+    CommandRisk, CommandSpec, ConditionalLeaseContextV1,
+    EXTERNAL_ESCALATION_MANIFEST_SCHEMA_VERSION, EXTERNAL_PAYLOAD_POLICY_SCHEMA_VERSION,
+    ExternalDataClass, ExternalEscalationManifest, ExternalEvidenceBinding, ExternalPayloadPolicy,
+    ExternalRepositoryExport, ExternalSensitiveDataAccess, ExternalToolAuthority, HeavyLeaseClass,
+    IsolationRequest, LeaseStateV1, M6ResourceGovernorSnapshotV1, ModelCallBudget,
+    PermissionDecision, PlanHeavyLeaseClass, PolicyError, ReconciliationClass,
+    ReconciliationPolicy, ResourceLeaseOwnerV1, ResourceLeaseRequestV1, ResourceLeaseV1,
+    ResourcePolicyEventV1, ResourcePressureEventV1, SecretBroker, SecretInjection,
+    SecretProviderKind, SecretRef, SecretScope, TaskCapabilityGrant, TaskResourceBudgetV1,
+    TrustSource,
 };
 use sovereign_repo::{
     ChangeSet, ChangeSetCompositionInput, ComposeChangeSetsOutcome, CompositionConflictEvidence,
@@ -40,8 +46,9 @@ use sovereign_repo::{
     RepositoryIntelligence, RepositorySnapshot, WorktreeBaseline, WorktreeLease,
 };
 use sovereign_state::{
-    CheckpointIntegrityRecord, JournalEvent, NewCheckpointIntegrityRecord, NewJournalEvent,
-    SecurityAuditEventV1, SecurityAuditHead, StateError, StateRecordUpdate, StateStore,
+    ActionTransition, CheckpointIntegrityRecord, JournalEvent, NewActionRecord,
+    NewCheckpointIntegrityRecord, NewJournalEvent, SecurityAuditEventV1, SecurityAuditHead,
+    StateError, StateRecordUpdate, StateStore,
 };
 use sovereign_tools::{
     APPROVAL_CLAIM_NAMESPACE, ActionJournal, ActionState, ApprovalClaim, AuthorizedAction,
@@ -112,6 +119,9 @@ const ACTION_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 const ACTION_RECONCILIATION_NAMESPACE: &str = "controller.action_reconciliation";
 const LEGACY_ACTION_INTENT_SCHEMA_VERSION: u32 = 2;
 const ACTION_INTENT_SCHEMA_VERSION: u32 = 3;
+const EXTERNAL_PACKET_SCHEMA_VERSION: u32 = 1;
+const EXTERNAL_MAX_OUTPUT_TOKENS: u32 = 1_024;
+const EXTERNAL_MAX_EVIDENCE_ITEMS: usize = 16;
 const MAX_PROPOSAL_EVIDENCE_IDS: usize = 16;
 const MAX_PROPOSAL_EVIDENCE_ID_BYTES: usize = 512;
 const ATOMIC_REPLACE_HELPER: &str = r"import hashlib, os, pathlib, sys
@@ -294,6 +304,103 @@ pub enum ApprovalDecisionV1 {
     Deny,
 }
 
+/// Controller-governed behavior when optional external intelligence is absent or unavailable.
+/// No variant enables a hidden provider fallback or grants execution authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalUnavailableDisposition {
+    Blocked,
+    Deferred,
+    HumanRequired,
+}
+
+/// One explicit, typed evidence selection for an external-intelligence request.
+///
+/// The Controller exports only `evidence.text`; expansion handles/CAS objects are never followed by
+/// the gateway. `data_class` is checked against both the evidence kind/provenance and active Plan IR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalEvidenceSelection {
+    pub data_class: ExternalDataClass,
+    pub evidence: EvidenceItem,
+}
+
+/// Result of one Controller-owned external-intelligence attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalIntelligenceOutcome {
+    Advisory {
+        action_id: String,
+        manifest_digest: String,
+        evidence: EvidenceItem,
+    },
+    AwaitingApproval {
+        action_id: String,
+        request: ApprovalRequestV1,
+    },
+    Blocked {
+        reason: String,
+    },
+    Deferred {
+        reason: String,
+    },
+    HumanRequired {
+        reason: String,
+    },
+}
+
+/// Optional tool-free L7 provider boundary. The gateway contains no durable authority of its own;
+/// every dispatch is authorized, metered, audited and journaled by [`Controller`].
+pub struct ExternalIntelligenceGateway<'a> {
+    provider: Option<&'a dyn ExternalIntelligenceProvider>,
+    unavailable_disposition: ExternalUnavailableDisposition,
+}
+
+impl<'a> ExternalIntelligenceGateway<'a> {
+    #[must_use]
+    pub const fn disabled(disposition: ExternalUnavailableDisposition) -> Self {
+        Self {
+            provider: None,
+            unavailable_disposition: disposition,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_provider(
+        provider: &'a dyn ExternalIntelligenceProvider,
+        unavailable_disposition: ExternalUnavailableDisposition,
+    ) -> Self {
+        Self {
+            provider: Some(provider),
+            unavailable_disposition,
+        }
+    }
+
+    /// Requests one bounded advisory escalation. `resume_action_id` is supplied only when resuming
+    /// an exact manifest-bound approval previously returned by this method.
+    ///
+    /// # Errors
+    /// Fails closed for missing authority, malformed/minimization-unsafe evidence, stale approval,
+    /// exhausted Controller budgets, persistence corruption, or invalid provider output.
+    pub fn request(
+        &self,
+        controller: &mut Controller,
+        task_id: &str,
+        purpose: &str,
+        selections: &[ExternalEvidenceSelection],
+        resume_action_id: Option<&str>,
+        model_budget: &mut ModelCallBudget,
+    ) -> Result<ExternalIntelligenceOutcome, ControllerError> {
+        controller.request_external_intelligence(
+            self.provider,
+            self.unavailable_disposition,
+            task_id,
+            purpose,
+            selections,
+            resume_action_id,
+            model_budget,
+        )
+    }
+}
+
 /// Controller-owned, durable request for one exact approval-sensitive action.
 ///
 /// This record intentionally contains no free-form approval text and no resolved secret data.
@@ -324,6 +431,48 @@ pub struct ApprovalRequestV1 {
     pub decided_by: Option<String>,
     pub decided_at_ms: Option<i64>,
     pub claim_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ImmutableApprovalBindingV1 {
+    action_id: String,
+    plan_id: String,
+    plan_revision: u32,
+    task_id: String,
+    permission_class: PermissionClass,
+    payload_digest: String,
+    destination_digest: Option<String>,
+    executable_digest: String,
+    policy_digest: String,
+    execution_epoch: i64,
+    nonce: String,
+    action_expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ExternalPacketItemV1 {
+    evidence_id: String,
+    data_class: ExternalDataClass,
+    source_digest: String,
+    content_digest: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct ExternalPacketV1 {
+    schema_version: u32,
+    evidence: Vec<ExternalPacketItemV1>,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedExternalPacketV1 {
+    payload: String,
+    payload_digest: String,
+    selected_evidence: Vec<ExternalEvidenceBinding>,
+    data_classes: BTreeSet<ExternalDataClass>,
+    redaction_event_ids: BTreeSet<String>,
+    redaction_result_digest: String,
+    estimated_tokens: u32,
 }
 
 /// Controller-owned durable reconciliation binding for one exact authorized action.
@@ -858,6 +1007,22 @@ impl PermissionContext {
             role_ceiling: granted.clone(),
             persisted_grants: granted,
             persisted_grant_issuer: "user:local-secret-execution-profile".to_owned(),
+        }
+    }
+
+    /// Explicit opt-in profile for advisory external intelligence. It intentionally grants no
+    /// repository write, process execution, secret, browser, or ordinary network capability.
+    /// The active Plan IR and exact persisted task grant must independently permit the same
+    /// capability before a Controller-owned external gateway may dispatch.
+    #[must_use]
+    pub fn m6_external_intelligence() -> Self {
+        let granted = BTreeSet::from([PermissionClass::ExternalIntelligence]);
+        Self {
+            controller_ceiling: granted.clone(),
+            project_ceiling: granted.clone(),
+            role_ceiling: granted.clone(),
+            persisted_grants: granted,
+            persisted_grant_issuer: "user:external-intelligence-profile".to_owned(),
         }
     }
 
@@ -1977,6 +2142,1080 @@ impl Controller {
         Ok(epoch)
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn external_payload_policy_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<ExternalPayloadPolicy, ControllerError> {
+        let active = self.active_ref()?;
+        if active.validity != PlanValidity::Current {
+            return Err(ControllerError::NotReady(
+                "external intelligence requires the current active plan".to_owned(),
+            ));
+        }
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::InvalidPlan(format!("unknown task {task_id}")))?;
+        let global = active
+            .plan_document
+            .pointer("/policy/external_intelligence")
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "active plan is missing global external-intelligence policy".to_owned(),
+                )
+            })?;
+        let task_policy = task
+            .task
+            .pointer("/action_policy/external_intelligence")
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "active task is missing external-intelligence policy".to_owned(),
+                )
+            })?;
+
+        if global.get("output_trust").and_then(Value::as_str) != Some("untrusted_external_model")
+            || global.get("tool_authority").and_then(Value::as_str) != Some("none")
+            || task_policy.get("tool_authority").and_then(Value::as_str) != Some("none")
+        {
+            return Err(ControllerError::InvalidPlan(
+                "external intelligence lost untrusted-output or zero-tool-authority invariants"
+                    .to_owned(),
+            ));
+        }
+
+        let global_providers = global
+            .get("allowed_providers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "global external provider allowlist is malformed".to_owned(),
+                )
+            })?
+            .iter()
+            .map(|provider| {
+                provider.as_str().map(str::to_owned).ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "global external provider identity is not a string".to_owned(),
+                    )
+                })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let task_providers = task_policy
+            .get("allowed_providers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "task external provider allowlist is malformed".to_owned(),
+                )
+            })?
+            .iter()
+            .map(|provider| {
+                provider.as_str().map(str::to_owned).ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "task external provider identity is not a string".to_owned(),
+                    )
+                })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if !task_providers.is_subset(&global_providers) {
+            return Err(ControllerError::InvalidPlan(
+                "task external provider scope exceeds global policy".to_owned(),
+            ));
+        }
+
+        let allowed_data_classes = task_policy
+            .get("allowed_data_classes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "task external data-class allowlist is malformed".to_owned(),
+                )
+            })?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .and_then(ExternalDataClass::from_plan_ir_str)
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan(
+                            "task external data-class identity is unsupported".to_owned(),
+                        )
+                    })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+
+        let repository_export = match task_policy
+            .get("whole_repository_export")
+            .and_then(Value::as_str)
+        {
+            Some("deny") => ExternalRepositoryExport::Deny,
+            Some("explicit_grant_only")
+                if global.get("raw_repository_export").and_then(Value::as_str)
+                    == Some("explicit_grant_only") =>
+            {
+                ExternalRepositoryExport::ExplicitGrantOnly
+            }
+            _ => {
+                return Err(ControllerError::InvalidPlan(
+                    "task external repository export exceeds global policy".to_owned(),
+                ));
+            }
+        };
+        let resolved_secrets = if global
+            .get("allow_resolved_secrets")
+            .and_then(Value::as_bool)
+            == Some(false)
+            && task_policy.get("resolved_secrets").and_then(Value::as_bool) == Some(false)
+        {
+            ExternalSensitiveDataAccess::Deny
+        } else {
+            ExternalSensitiveDataAccess::Allow
+        };
+        let raw_logs = if global.get("allow_raw_logs").and_then(Value::as_bool) == Some(false)
+            && task_policy.get("raw_logs").and_then(Value::as_bool) == Some(false)
+        {
+            ExternalSensitiveDataAccess::Deny
+        } else {
+            ExternalSensitiveDataAccess::Allow
+        };
+        let policy = ExternalPayloadPolicy {
+            schema_version: EXTERNAL_PAYLOAD_POLICY_SCHEMA_VERSION,
+            enabled: task_policy.get("allowed").and_then(Value::as_bool) == Some(true),
+            requires_explicit_grant: global
+                .get("requires_explicit_grant")
+                .and_then(Value::as_bool)
+                == Some(true),
+            allowed_providers: task_providers,
+            allowed_data_classes,
+            resolved_secrets,
+            repository_export,
+            raw_logs,
+            tool_authority: ExternalToolAuthority::None,
+            max_payload_bytes: task_policy
+                .get("max_payload_bytes")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "task external payload-byte ceiling is malformed".to_owned(),
+                    )
+                })?,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
+    fn require_external_intelligence_authority(
+        &self,
+        task_id: &str,
+    ) -> Result<ExternalPayloadPolicy, ControllerError> {
+        let policy = self.external_payload_policy_for_task(task_id)?;
+        if !policy.enabled {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "external intelligence is disabled for the active task".to_owned(),
+            )));
+        }
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::InvalidPlan(format!("unknown task {task_id}")))?;
+        let global_requested = capability_set_from_json_array(required_array(
+            &active.plan_document,
+            "/policy/capability_ceiling",
+        )?)?;
+        let task_requested =
+            capability_set_from_json_array(required_array(&task.task, "/permissions")?)?;
+        let grant = self.load_task_capability_grant(active, task_id, task)?;
+        let exact_grant = grant.capabilities_for_scope(
+            &active.plan_id,
+            active.revision,
+            task_id,
+            &task.task_contract_digest,
+            &active.policy_digest,
+        )?;
+        let capability = Capability::ExternalIntelligence;
+        if !self
+            .permission_context
+            .controller_capabilities()
+            .contains(capability)
+            || !self
+                .permission_context
+                .project_capabilities()
+                .contains(capability)
+            || !self
+                .permission_context
+                .role_capabilities()
+                .contains(capability)
+            || !self
+                .permission_context
+                .persisted_grant_capabilities()
+                .contains(capability)
+            || !global_requested.contains(capability)
+            || !task_requested.contains(capability)
+            || !exact_grant.contains(capability)
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "external intelligence is not present in every configured authority ceiling and exact task grant"
+                    .to_owned(),
+            )));
+        }
+        Ok(policy)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn request_external_intelligence(
+        &mut self,
+        provider: Option<&dyn ExternalIntelligenceProvider>,
+        unavailable_disposition: ExternalUnavailableDisposition,
+        task_id: &str,
+        purpose: &str,
+        selections: &[ExternalEvidenceSelection],
+        resume_action_id: Option<&str>,
+        model_budget: &mut ModelCallBudget,
+    ) -> Result<ExternalIntelligenceOutcome, ControllerError> {
+        self.require_execution_not_paused()?;
+        if self.any_unresolved_action()? {
+            return Err(ControllerError::NotReady(
+                "external intelligence is blocked while an action outcome is unresolved".to_owned(),
+            ));
+        }
+        let effective_policy = self.external_payload_policy_for_task(task_id)?;
+        if !effective_policy.enabled {
+            return Ok(external_unavailable_outcome(
+                unavailable_disposition,
+                "external intelligence is disabled for the active task",
+            ));
+        }
+        let effective_policy = self.require_external_intelligence_authority(task_id)?;
+        let Some(provider) = provider else {
+            return Ok(external_unavailable_outcome(
+                unavailable_disposition,
+                "no external-intelligence provider is configured",
+            ));
+        };
+        let purpose = purpose.trim();
+        if purpose.is_empty() {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "external-intelligence purpose must not be empty".to_owned(),
+            )));
+        }
+        let provider_id = provider.provider_id().trim();
+        if provider_id.is_empty() || !effective_policy.allowed_providers.contains(provider_id) {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "external provider is not in the exact active allowlist".to_owned(),
+            )));
+        }
+
+        let prepared = prepare_external_packet(selections)?;
+        let payload_bytes = u64::try_from(prepared.payload.len()).map_err(|_| {
+            ControllerError::Policy(PolicyError::Denied(
+                "external packet byte length exceeds supported range".to_owned(),
+            ))
+        })?;
+        effective_policy.authorize_packet(provider_id, &prepared.data_classes, payload_bytes)?;
+
+        let now_ms = unix_millis()?;
+        let deadline_ms = self.task_model_deadline_ms(task_id)?;
+        let (plan_id, plan_revision, task_contract_digest, policy_digest, execution_epoch) = {
+            let active = self.active_ref()?;
+            let task = active
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan(format!("unknown task {task_id}")))?;
+            (
+                active.plan_id.clone(),
+                active.revision,
+                task.task_contract_digest.clone(),
+                active.policy_digest.clone(),
+                self.state.current_execution_epoch()?,
+            )
+        };
+
+        let resumed_request = match resume_action_id {
+            Some(action_id) => Some(self.external_approval_request_for_action(action_id)?),
+            None => None,
+        };
+        let (nonce, expires_at_ms) = if let Some(request) = &resumed_request {
+            if request.task_id != task_id {
+                return Err(ControllerError::NotReady(
+                    "external approval resume task does not match the requested task".to_owned(),
+                ));
+            }
+            if now_ms >= request.action_expires_at_ms {
+                return Err(ControllerError::NotReady(
+                    "external approval-bound action expired before resume".to_owned(),
+                ));
+            }
+            (request.nonce.clone(), request.action_expires_at_ms)
+        } else {
+            let nonce_seed = sha256_prefixed(
+                format!(
+                    "external-intelligence-nonce\0{plan_id}\0{plan_revision}\0{task_id}\0{provider_id}\0{purpose}\0{now_ms}\0{}",
+                    self.state.latest_journal_sequence()?
+                )
+                .as_bytes(),
+            );
+            let expiry = now_ms.saturating_add(self.approval_max_ttl_ms()?);
+            (format!("ext.{}", digest_fragment(&nonce_seed, 24)), expiry)
+        };
+
+        let manifest = ExternalEscalationManifest {
+            schema_version: EXTERNAL_ESCALATION_MANIFEST_SCHEMA_VERSION,
+            provider_id: provider_id.to_owned(),
+            model_id: provider.model_id().to_owned(),
+            model_version: provider.model_version().to_owned(),
+            purpose: purpose.to_owned(),
+            plan_id: plan_id.clone(),
+            plan_revision,
+            task_id: task_id.to_owned(),
+            task_contract_digest,
+            policy_digest: policy_digest.clone(),
+            execution_epoch,
+            selected_evidence: prepared.selected_evidence.clone(),
+            data_classes: prepared.data_classes.clone(),
+            redaction_event_ids: prepared.redaction_event_ids.clone(),
+            redaction_result_digest: prepared.redaction_result_digest.clone(),
+            payload_digest: prepared.payload_digest.clone(),
+            payload_bytes,
+            estimated_tokens: prepared.estimated_tokens,
+            deadline_ms,
+            expires_at_ms,
+            nonce: nonce.clone(),
+        };
+        let manifest_digest = manifest.digest()?;
+        let executable_digest = external_provider_identity_digest(provider);
+        let destination_digest = Some(sha256_prefixed(
+            format!("external-destination\0{provider_id}\0{purpose}").as_bytes(),
+        ));
+        let action_id = if let Some(action_id) = resume_action_id {
+            action_id.to_owned()
+        } else {
+            format!(
+                "external.{}",
+                digest_fragment(
+                    &sha256_prefixed(
+                        format!("{manifest_digest}\0{execution_epoch}\0{nonce}").as_bytes()
+                    ),
+                    32,
+                )
+            )
+        };
+        let approval_binding = ImmutableApprovalBindingV1 {
+            action_id: action_id.clone(),
+            plan_id,
+            plan_revision,
+            task_id: task_id.to_owned(),
+            permission_class: PermissionClass::ExternalIntelligence,
+            payload_digest: manifest_digest.clone(),
+            destination_digest,
+            executable_digest,
+            policy_digest,
+            execution_epoch,
+            nonce,
+            action_expires_at_ms: expires_at_ms,
+        };
+
+        if let Some(request) = resumed_request {
+            Self::validate_external_approval_resume(&approval_binding, &request)?;
+        } else {
+            self.authorize_external_action(&approval_binding, &manifest)?;
+        }
+
+        if self
+            .approval_required_for_task_permission(task_id, PermissionClass::ExternalIntelligence)?
+        {
+            if resume_action_id.is_none() {
+                let request = self.persist_approval_request_for_binding(&approval_binding)?;
+                return Ok(ExternalIntelligenceOutcome::AwaitingApproval { action_id, request });
+            }
+            self.require_external_approval_claim(&approval_binding)?;
+        } else if resume_action_id.is_some() {
+            return Err(ControllerError::NotReady(
+                "external action resume was supplied but active Plan IR does not require approval"
+                    .to_owned(),
+            ));
+        }
+
+        self.consume_task_model_call(task_id, model_budget, deadline_ms)?;
+        let remaining_network = self.external_network_remaining(task_id)?;
+        if remaining_network < 2 {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "external intelligence has no remaining network-byte budget".to_owned(),
+            )));
+        }
+        let max_response_bytes = remaining_network / 2;
+        let request = ExternalIntelligenceRequest {
+            schema_version: EXTERNAL_INTELLIGENCE_SCHEMA_VERSION,
+            request_id: action_id.clone(),
+            purpose: purpose.to_owned(),
+            payload: prepared.payload,
+            max_output_tokens: EXTERNAL_MAX_OUTPUT_TOKENS,
+            max_response_bytes,
+            deadline_ms,
+        };
+        request.validate().map_err(|error| {
+            ControllerError::InvalidPlan(format!(
+                "Controller built invalid external-intelligence request: {error}"
+            ))
+        })?;
+        let request_bytes = u64::try_from(serde_json::to_vec(&request)?.len()).map_err(|_| {
+            ControllerError::Policy(PolicyError::Denied(
+                "external request byte length exceeds supported range".to_owned(),
+            ))
+        })?;
+        if request_bytes.saturating_add(max_response_bytes) > remaining_network {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "external request plus bounded response exceeds remaining network-byte budget"
+                    .to_owned(),
+            )));
+        }
+        self.charge_external_network_bytes(task_id, &action_id, "request", request_bytes)?;
+        self.transition_external_action(
+            &action_id,
+            ActionState::Authorized,
+            ActionState::Dispatched,
+            "external_intelligence_dispatched",
+            &manifest_digest,
+            None,
+        )?;
+        let pre_provider = (|| -> Result<(), ControllerError> {
+            let approval_digest =
+                self.external_approval_claim_digest_if_present(&approval_binding)?;
+            let evidence_provenance_digest = digest_json(&json!({
+                "selected_evidence": manifest.selected_evidence,
+                "redaction_event_ids": manifest.redaction_event_ids,
+                "redaction_result_digest": manifest.redaction_result_digest,
+            }))?;
+            self.state
+                .security_audit_log()
+                .append(&SecurityAuditEventV1 {
+                    actor_id: "controller".to_owned(),
+                    plan_id: Some(manifest.plan_id.clone()),
+                    task_id: Some(task_id.to_owned()),
+                    attempt_id: None,
+                    action_id: Some(action_id.clone()),
+                    execution_epoch: Some(execution_epoch),
+                    decision: "allow".to_owned(),
+                    action: "external_intelligence_dispatch_authorized".to_owned(),
+                    policy_digest: manifest.policy_digest.clone(),
+                    config_digest: manifest_digest.clone(),
+                    tool_digest: external_provider_identity_digest(provider),
+                    approval_provenance_digest: approval_digest,
+                    evidence_provenance_digest: Some(evidence_provenance_digest),
+                    occurred_at_ms: unix_millis()?,
+                    result: "dispatch_authorized".to_owned(),
+                })?;
+            self.persist_runtime_records_with_events(
+                &[],
+                &[(
+                    "external_intelligence_provider_call_started".to_owned(),
+                    task_id.to_owned(),
+                    json!({
+                        "action_id": action_id,
+                        "manifest_digest": manifest_digest,
+                        "request_bytes": request_bytes,
+                        "max_response_bytes": max_response_bytes,
+                    }),
+                )],
+            )?;
+            self.checkpoint_now()?;
+            Ok(())
+        })();
+        if let Err(error) = pre_provider {
+            return self.external_post_dispatch_failed(
+                &action_id,
+                &manifest_digest,
+                "external_intelligence_predispatch_failed",
+                error,
+            );
+        }
+
+        match provider.complete_external(&request) {
+            Ok(response) => {
+                if let Err(error) = self.charge_external_transport_usage(
+                    task_id,
+                    &action_id,
+                    request_bytes,
+                    max_response_bytes,
+                    response.usage,
+                ) {
+                    return self.external_post_dispatch_unknown(
+                        &action_id,
+                        ActionState::Dispatched,
+                        &manifest_digest,
+                        "external_intelligence_accounting_unknown",
+                        error,
+                    );
+                }
+                if let Err(error) = response.validate_for(&request) {
+                    return self.external_post_dispatch_failed(
+                        &action_id,
+                        &manifest_digest,
+                        "external_intelligence_invalid_response",
+                        ControllerError::InvalidPlan(format!(
+                            "external provider returned invalid response: {error}"
+                        )),
+                    );
+                }
+                if response.provider_id != provider.provider_id()
+                    || response.model_id != provider.model_id()
+                    || response.model_version != provider.model_version()
+                {
+                    return self.external_post_dispatch_failed(
+                        &action_id,
+                        &manifest_digest,
+                        "external_intelligence_identity_drift",
+                        ControllerError::InvalidPlan(
+                            "external provider response identity drifted from exact manifest"
+                                .to_owned(),
+                        ),
+                    );
+                }
+                let response_bytes = match serde_json::to_vec(&response) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        return self.external_post_dispatch_unknown(
+                            &action_id,
+                            ActionState::Dispatched,
+                            &manifest_digest,
+                            "external_intelligence_response_serialization_unknown",
+                            ControllerError::Json(error),
+                        );
+                    }
+                };
+                let response_artifact =
+                    match checkpoint_artifact_store(self.state.path()).and_then(|store| {
+                        store
+                            .put(&mut self.state, &response_bytes)
+                            .map_err(ControllerError::from)
+                    }) {
+                        Ok(artifact) => artifact,
+                        Err(error) => {
+                            return self.external_post_dispatch_unknown(
+                                &action_id,
+                                ActionState::Dispatched,
+                                &manifest_digest,
+                                "external_intelligence_result_persistence_unknown",
+                                error,
+                            );
+                        }
+                    };
+                if let Err(error) = self.state.add_artifact_reference(
+                    &format!("external.response.{action_id}"),
+                    &response_artifact.digest,
+                ) {
+                    return self.external_post_dispatch_unknown(
+                        &action_id,
+                        ActionState::Dispatched,
+                        &manifest_digest,
+                        "external_intelligence_result_reference_unknown",
+                        ControllerError::State(error),
+                    );
+                }
+                self.transition_external_action(
+                    &action_id,
+                    ActionState::Dispatched,
+                    ActionState::Observed,
+                    "external_intelligence_observed",
+                    &manifest_digest,
+                    Some(&response_artifact.digest),
+                )?;
+                let evidence = match EvidenceItem::from_external_model(
+                    &request,
+                    &response,
+                    "optional external intelligence is advisory evidence only",
+                ) {
+                    Ok(evidence) => evidence,
+                    Err(error) => {
+                        return self.external_post_observed_unknown(
+                            &action_id,
+                            &manifest_digest,
+                            "external_intelligence_advisory_import_unknown",
+                            ControllerError::InvalidPlan(format!(
+                                "external response could not be imported as advisory evidence: {error}"
+                            )),
+                        );
+                    }
+                };
+                if let Err(error) = self.persist_external_advisory_evidence(
+                    task_id,
+                    &action_id,
+                    &manifest_digest,
+                    &response_artifact.digest,
+                    &evidence,
+                ) {
+                    return self.external_post_observed_unknown(
+                        &action_id,
+                        &manifest_digest,
+                        "external_intelligence_advisory_persistence_unknown",
+                        error,
+                    );
+                }
+                self.transition_external_action(
+                    &action_id,
+                    ActionState::Observed,
+                    ActionState::Committed,
+                    "external_intelligence_committed",
+                    &manifest_digest,
+                    Some(&response_artifact.digest),
+                )?;
+                self.checkpoint_now()?;
+                Ok(ExternalIntelligenceOutcome::Advisory {
+                    action_id,
+                    manifest_digest,
+                    evidence,
+                })
+            }
+            Err(error) => {
+                if let Err(accounting_error) = self.charge_external_transport_usage(
+                    task_id,
+                    &action_id,
+                    request_bytes,
+                    max_response_bytes,
+                    error.usage,
+                ) {
+                    return self.external_post_dispatch_unknown(
+                        &action_id,
+                        ActionState::Dispatched,
+                        &manifest_digest,
+                        "external_intelligence_failure_accounting_unknown",
+                        accounting_error,
+                    );
+                }
+                self.transition_external_action(
+                    &action_id,
+                    ActionState::Dispatched,
+                    ActionState::Failed,
+                    "external_intelligence_failed",
+                    &manifest_digest,
+                    None,
+                )?;
+                self.checkpoint_now()?;
+                match error.kind {
+                    ExternalIntelligenceErrorKind::InvalidContract
+                    | ExternalIntelligenceErrorKind::InvalidResponse => {
+                        Err(ControllerError::InvalidPlan(format!(
+                            "external provider contract failure: {}",
+                            error.message
+                        )))
+                    }
+                    ExternalIntelligenceErrorKind::Unavailable
+                    | ExternalIntelligenceErrorKind::DeadlineExceeded
+                    | ExternalIntelligenceErrorKind::Transport
+                    | ExternalIntelligenceErrorKind::ProviderRejected => Ok(
+                        external_unavailable_outcome(unavailable_disposition, &error.message),
+                    ),
+                }
+            }
+        }
+    }
+
+    fn persist_external_advisory_evidence(
+        &mut self,
+        task_id: &str,
+        action_id: &str,
+        manifest_digest: &str,
+        response_artifact_digest: &str,
+        evidence: &EvidenceItem,
+    ) -> Result<(), ControllerError> {
+        let active = self.active_ref()?;
+        let key = revision_scoped_key(
+            &active.plan_id,
+            active.revision,
+            &format!("external-advisory:{action_id}"),
+        );
+        let value_json = serde_json::to_string(evidence)?;
+        let evidence_digest = digest_json(&serde_json::to_value(evidence)?)?;
+        self.persist_runtime_records_with_events(
+            &[("controller.evidence_item".to_owned(), key, value_json)],
+            &[(
+                "external_intelligence_advisory_recorded".to_owned(),
+                task_id.to_owned(),
+                json!({
+                    "action_id": action_id,
+                    "manifest_digest": manifest_digest,
+                    "response_artifact_digest": response_artifact_digest,
+                    "evidence_id": evidence.evidence_id,
+                    "evidence_digest": evidence_digest,
+                    "source_digest": evidence.source_digest,
+                    "content_digest": evidence.content_digest,
+                    "trust_source": "external_model",
+                    "trust_level": "untrusted",
+                }),
+            )],
+        )?;
+        Ok(())
+    }
+
+    fn external_post_dispatch_failed(
+        &mut self,
+        action_id: &str,
+        manifest_digest: &str,
+        event_kind: &str,
+        error: ControllerError,
+    ) -> Result<ExternalIntelligenceOutcome, ControllerError> {
+        self.transition_external_action(
+            action_id,
+            ActionState::Dispatched,
+            ActionState::Failed,
+            event_kind,
+            manifest_digest,
+            None,
+        )?;
+        self.checkpoint_now()?;
+        Err(error)
+    }
+
+    fn external_post_dispatch_unknown(
+        &mut self,
+        action_id: &str,
+        expected_state: ActionState,
+        manifest_digest: &str,
+        event_kind: &str,
+        error: ControllerError,
+    ) -> Result<ExternalIntelligenceOutcome, ControllerError> {
+        self.transition_external_action(
+            action_id,
+            expected_state,
+            ActionState::Unknown,
+            event_kind,
+            manifest_digest,
+            None,
+        )?;
+        self.checkpoint_now()?;
+        Err(error)
+    }
+
+    fn external_post_observed_unknown(
+        &mut self,
+        action_id: &str,
+        manifest_digest: &str,
+        event_kind: &str,
+        error: ControllerError,
+    ) -> Result<ExternalIntelligenceOutcome, ControllerError> {
+        self.external_post_dispatch_unknown(
+            action_id,
+            ActionState::Observed,
+            manifest_digest,
+            event_kind,
+            error,
+        )
+    }
+
+    fn external_network_remaining(&self, task_id: &str) -> Result<u64, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::InvalidPlan(format!("unknown task {task_id}")))?;
+        let task_budget = task.autonomy_budget.as_ref().ok_or_else(|| {
+            ControllerError::NotReady(
+                "task has no durable autonomy budget; external network is blocked".to_owned(),
+            )
+        })?;
+        task_budget.validate()?;
+        active.goal_autonomy_budget.validate()?;
+        Ok(task_budget
+            .max_network_bytes
+            .saturating_sub(task_budget.used_network_bytes)
+            .min(
+                active
+                    .goal_autonomy_budget
+                    .max_network_bytes
+                    .saturating_sub(active.goal_autonomy_budget.used_network_bytes),
+            ))
+    }
+
+    fn charge_external_transport_usage(
+        &mut self,
+        task_id: &str,
+        action_id: &str,
+        charged_request_bytes: u64,
+        max_response_bytes: u64,
+        usage: ExternalIntelligenceUsage,
+    ) -> Result<(), ControllerError> {
+        let additional_request = usage.request_bytes.saturating_sub(charged_request_bytes);
+        let bounded_response_bytes = usage.response_bytes.min(max_response_bytes);
+        let additional = additional_request.saturating_add(bounded_response_bytes);
+        self.charge_external_network_bytes(task_id, action_id, "transport", additional)?;
+        if usage.response_bytes > max_response_bytes {
+            return Err(ControllerError::InvalidPlan(format!(
+                "external provider reported response bytes {} above hard cap {max_response_bytes}",
+                usage.response_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn charge_external_network_bytes(
+        &mut self,
+        task_id: &str,
+        action_id: &str,
+        phase: &str,
+        bytes: u64,
+    ) -> Result<(), ControllerError> {
+        self.persist_external_network_charge(task_id, action_id, phase, bytes)?;
+        self.checkpoint_now()?;
+        Ok(())
+    }
+
+    fn persist_external_network_charge(
+        &mut self,
+        task_id: &str,
+        action_id: &str,
+        phase: &str,
+        bytes: u64,
+    ) -> Result<(), ControllerError> {
+        let (previous_task_budget, previous_goal_budget) = {
+            let active = self.active_ref()?;
+            let task = active
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan(format!("unknown task {task_id}")))?;
+            (
+                task.autonomy_budget.clone().ok_or_else(|| {
+                    ControllerError::NotReady(
+                        "task has no durable autonomy budget; external network is blocked"
+                            .to_owned(),
+                    )
+                })?,
+                active.goal_autonomy_budget.clone(),
+            )
+        };
+        let mut task_budget = previous_task_budget.clone();
+        let mut goal_budget = previous_goal_budget.clone();
+        task_budget.validate()?;
+        goal_budget.validate()?;
+        task_budget.charge_network_bytes(bytes)?;
+        goal_budget.charge_network_bytes(bytes)?;
+        {
+            let active = self.active_mut()?;
+            let task = active
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan(format!("unknown task {task_id}")))?;
+            task.autonomy_budget = Some(task_budget.clone());
+            active.goal_autonomy_budget = goal_budget.clone();
+        }
+        let persistence = (|| -> Result<(), ControllerError> {
+            let task_runtime =
+                serde_json::to_value(self.active_ref()?.tasks.get(task_id).ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!("unknown task {task_id}"))
+                })?)?;
+            let task_json =
+                serde_json::to_string(self.active_ref()?.tasks.get(task_id).ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!("unknown task {task_id}"))
+                })?)?;
+            self.persist_runtime_records_with_events(
+                &[("controller.task".to_owned(), task_id.to_owned(), task_json)],
+                &[(
+                    "external_network_budget_charged".to_owned(),
+                    task_id.to_owned(),
+                    json!({
+                        "action_id": action_id,
+                        "phase": phase,
+                        "bytes": bytes,
+                        "task_runtime": task_runtime,
+                        "autonomy_budget_digest": digest_json(&serde_json::to_value(&task_budget)?)?,
+                        "goal_autonomy_budget": goal_budget,
+                        "goal_autonomy_budget_digest": digest_json(&serde_json::to_value(&goal_budget)?)?,
+                    }),
+                )],
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = persistence {
+            let active = self.active_mut()?;
+            let task = active
+                .tasks
+                .get_mut(task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan(format!("unknown task {task_id}")))?;
+            task.autonomy_budget = Some(previous_task_budget);
+            active.goal_autonomy_budget = previous_goal_budget;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn authorize_external_action(
+        &mut self,
+        binding: &ImmutableApprovalBindingV1,
+        manifest: &ExternalEscalationManifest,
+    ) -> Result<(), ControllerError> {
+        let payload_json = serde_json::to_string(&json!({
+            "plan_id": binding.plan_id,
+            "plan_revision": binding.plan_revision,
+            "task_id": binding.task_id,
+            "permission_class": binding.permission_class.as_plan_ir_str(),
+            "manifest_digest": binding.payload_digest,
+            "provider_id_digest": sha256_prefixed(manifest.provider_id.as_bytes()),
+            "purpose_digest": sha256_prefixed(manifest.purpose.as_bytes()),
+            "execution_epoch": binding.execution_epoch,
+        }))?;
+        let event_id = format!(
+            "external-authorized.{}",
+            digest_fragment(&sha256_prefixed(binding.action_id.as_bytes()), 24)
+        );
+        self.state.insert_action_record(NewActionRecord {
+            action_id: &binding.action_id,
+            state: ActionState::Authorized.as_str(),
+            payload_digest: &binding.payload_digest,
+            policy_digest: &binding.policy_digest,
+            execution_epoch: binding.execution_epoch,
+            event_id: &event_id,
+            event_kind: "external_intelligence_authorized",
+            payload_json: &payload_json,
+        })?;
+        self.checkpoint_now()?;
+        Ok(())
+    }
+
+    fn transition_external_action(
+        &mut self,
+        action_id: &str,
+        expected: ActionState,
+        next: ActionState,
+        event_kind: &str,
+        manifest_digest: &str,
+        result_digest: Option<&str>,
+    ) -> Result<(), ControllerError> {
+        let epoch = self.state.current_execution_epoch()?;
+        let event_id = format!(
+            "external-transition.{}",
+            digest_fragment(
+                &sha256_prefixed(
+                    format!(
+                        "{action_id}\0{event_kind}\0{}",
+                        self.state.latest_journal_sequence()?
+                    )
+                    .as_bytes(),
+                ),
+                24,
+            )
+        );
+        let payload_json = serde_json::to_string(&json!({
+            "action_id": action_id,
+            "manifest_digest": manifest_digest,
+            "execution_epoch": epoch,
+            "result_digest": result_digest,
+        }))?;
+        self.state.transition_action_with_event(ActionTransition {
+            action_id,
+            expected_state: expected.as_str(),
+            next_state: next.as_str(),
+            expected_epoch: epoch,
+            event_id: &event_id,
+            event_kind,
+            payload_json: &payload_json,
+            result_digest,
+        })?;
+        Ok(())
+    }
+
+    fn external_approval_request_for_action(
+        &self,
+        action_id: &str,
+    ) -> Result<ApprovalRequestV1, ControllerError> {
+        let matching = self
+            .state
+            .state_records(APPROVAL_REQUEST_NAMESPACE)?
+            .into_iter()
+            .map(|record| serde_json::from_str::<ApprovalRequestV1>(&record.value_json))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|request| request.action_id == action_id)
+            .collect::<Vec<_>>();
+        let [request] = matching.as_slice() else {
+            return Err(ControllerError::NotReady(format!(
+                "external action {action_id} does not have exactly one durable approval request"
+            )));
+        };
+        self.validate_current_approval_request(request)?;
+        Ok(request.clone())
+    }
+
+    fn validate_external_approval_resume(
+        binding: &ImmutableApprovalBindingV1,
+        request: &ApprovalRequestV1,
+    ) -> Result<(), ControllerError> {
+        if request.action_id != binding.action_id
+            || request.plan_id != binding.plan_id
+            || request.plan_revision != binding.plan_revision
+            || request.task_id != binding.task_id
+            || request.permission_class != binding.permission_class.as_plan_ir_str()
+            || request.payload_digest != binding.payload_digest
+            || request.destination_digest != binding.destination_digest
+            || request.executable_digest != binding.executable_digest
+            || request.policy_digest != binding.policy_digest
+            || request.execution_epoch != binding.execution_epoch
+            || request.nonce != binding.nonce
+            || request.action_expires_at_ms != binding.action_expires_at_ms
+        {
+            return Err(ControllerError::NotReady(
+                "external approval no longer matches the exact provider/purpose/payload manifest"
+                    .to_owned(),
+            ));
+        }
+        match request.status {
+            ApprovalRequestStatusV1::Approved => Ok(()),
+            ApprovalRequestStatusV1::Pending => Err(ControllerError::AwaitingApproval {
+                action_id: binding.action_id.clone(),
+                request_id: request.request_id.clone(),
+            }),
+            ApprovalRequestStatusV1::Denied => Err(ControllerError::Policy(PolicyError::Denied(
+                "external-intelligence approval was denied".to_owned(),
+            ))),
+        }
+    }
+
+    fn require_external_approval_claim(
+        &self,
+        binding: &ImmutableApprovalBindingV1,
+    ) -> Result<ApprovalClaim, ControllerError> {
+        let raw = self
+            .state
+            .get_state(APPROVAL_CLAIM_NAMESPACE, &binding.action_id)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(
+                    "approved external action is missing its exact durable approval claim"
+                        .to_owned(),
+                )
+            })?;
+        let claim: ApprovalClaim = serde_json::from_str(&raw)?;
+        claim.validate(unix_millis()?)?;
+        if claim.action_id != binding.action_id
+            || claim.plan_id != binding.plan_id
+            || claim.plan_revision != binding.plan_revision
+            || claim.task_id != binding.task_id
+            || claim.permission_class != binding.permission_class.as_plan_ir_str()
+            || claim.payload_digest != binding.payload_digest
+            || claim.destination_digest != binding.destination_digest
+            || claim.executable_digest != binding.executable_digest
+            || claim.policy_digest != binding.policy_digest
+            || claim.execution_epoch != binding.execution_epoch
+            || claim.nonce != binding.nonce
+        {
+            return Err(ControllerError::NotReady(
+                "external approval claim does not match the exact manifest authority".to_owned(),
+            ));
+        }
+        Ok(claim)
+    }
+
+    fn external_approval_claim_digest_if_present(
+        &self,
+        binding: &ImmutableApprovalBindingV1,
+    ) -> Result<Option<String>, ControllerError> {
+        self.state
+            .get_state(APPROVAL_CLAIM_NAMESPACE, &binding.action_id)?
+            .map(|raw| {
+                let claim: ApprovalClaim = serde_json::from_str(&raw)?;
+                Ok(claim.digest())
+            })
+            .transpose()
+    }
+
     /// Converts only exact task-pinned schemas visible under the current permission decision into
     /// model-context evidence. This is the sole Controller bridge into
     /// `ContextPacketInput::authorized_tool_schemas`; provider-native tool calls remain disabled.
@@ -2816,7 +4055,7 @@ impl Controller {
                 "cancellation blocks action dispatch".to_owned(),
             ));
         }
-        if self.any_unknown_action()?
+        if self.any_unresolved_action()?
             || has_unresolved_process_lease(&self.state)?
             || has_unresolved_rollback(&self.state, Some(&action.action_id))?
         {
@@ -3180,6 +4419,37 @@ impl Controller {
                     .to_owned(),
             )));
         }
+        let binding = ImmutableApprovalBindingV1 {
+            action_id: action.action_id.clone(),
+            plan_id: action.plan_id.clone(),
+            plan_revision: action.plan_revision,
+            task_id: action.task_id.clone(),
+            permission_class: action.permission_class,
+            payload_digest: action.payload_digest(),
+            destination_digest: action.destination_digest.clone(),
+            executable_digest: action.executable_digest.clone(),
+            policy_digest: action.policy_digest.clone(),
+            execution_epoch: action.execution_epoch,
+            nonce: action.nonce.clone(),
+            action_expires_at_ms: action.expires_at_ms,
+        };
+        self.persist_approval_request_for_binding(&binding)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn persist_approval_request_for_binding(
+        &mut self,
+        binding: &ImmutableApprovalBindingV1,
+    ) -> Result<ApprovalRequestV1, ControllerError> {
+        let now_ms = unix_millis()?;
+        if !self
+            .approval_required_for_task_permission(&binding.task_id, binding.permission_class)?
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "Controller cannot request approval for a permission not required by active Plan IR policy"
+                    .to_owned(),
+            )));
+        }
         let (plan_id, plan_revision, policy_digest) = {
             let active = self.active_ref()?;
             (
@@ -3188,10 +4458,10 @@ impl Controller {
                 active.policy_digest.clone(),
             )
         };
-        if action.plan_id != plan_id
-            || action.plan_revision != plan_revision
-            || action.policy_digest != policy_digest
-            || action.execution_epoch != self.state.current_execution_epoch()?
+        if binding.plan_id != plan_id
+            || binding.plan_revision != plan_revision
+            || binding.policy_digest != policy_digest
+            || binding.execution_epoch != self.state.current_execution_epoch()?
         {
             return Err(ControllerError::NotReady(
                 "approval-sensitive action is stale for the active plan/epoch".to_owned(),
@@ -3199,7 +4469,7 @@ impl Controller {
         }
         let durable_action = self
             .state
-            .action_record(&action.action_id)?
+            .action_record(&binding.action_id)?
             .ok_or_else(|| {
                 ControllerError::NotReady(
                     "approval request requires durable pre-dispatch action authorization"
@@ -3207,17 +4477,17 @@ impl Controller {
                 )
             })?;
         if durable_action.state != ActionState::Authorized.as_str()
-            || durable_action.payload_digest != action.payload_digest()
-            || durable_action.policy_digest != action.policy_digest
-            || durable_action.execution_epoch != action.execution_epoch
+            || durable_action.payload_digest != binding.payload_digest
+            || durable_action.policy_digest != binding.policy_digest
+            || durable_action.execution_epoch != binding.execution_epoch
         {
             return Err(ControllerError::NotReady(
                 "durable pre-dispatch action authorization does not match approval request"
                     .to_owned(),
             ));
         }
-        let expires_at_ms = action
-            .expires_at_ms
+        let expires_at_ms = binding
+            .action_expires_at_ms
             .min(now_ms.saturating_add(self.approval_max_ttl_ms()?));
         if expires_at_ms <= now_ms {
             return Err(ControllerError::NotReady(
@@ -3227,28 +4497,26 @@ impl Controller {
         let request_seed = sha256_prefixed(
             format!(
                 "approval-request\0{}\0{}\0{}",
-                action.action_id,
-                action.payload_digest(),
-                action.execution_epoch
+                binding.action_id, binding.payload_digest, binding.execution_epoch
             )
             .as_bytes(),
         );
         let request = ApprovalRequestV1 {
             schema_version: APPROVAL_REQUEST_SCHEMA_VERSION,
             request_id: format!("approval.{}", digest_fragment(&request_seed, 24)),
-            action_id: action.action_id.clone(),
-            plan_id: action.plan_id.clone(),
-            plan_revision: action.plan_revision,
-            task_id: action.task_id.clone(),
-            permission_class: action.permission_class.as_plan_ir_str().to_owned(),
-            payload_digest: action.payload_digest(),
-            destination_digest: action.destination_digest.clone(),
-            executable_digest: action.executable_digest.clone(),
-            policy_digest: action.policy_digest.clone(),
-            execution_epoch: action.execution_epoch,
-            nonce: action.nonce.clone(),
+            action_id: binding.action_id.clone(),
+            plan_id: binding.plan_id.clone(),
+            plan_revision: binding.plan_revision,
+            task_id: binding.task_id.clone(),
+            permission_class: binding.permission_class.as_plan_ir_str().to_owned(),
+            payload_digest: binding.payload_digest.clone(),
+            destination_digest: binding.destination_digest.clone(),
+            executable_digest: binding.executable_digest.clone(),
+            policy_digest: binding.policy_digest.clone(),
+            execution_epoch: binding.execution_epoch,
+            nonce: binding.nonce.clone(),
             requested_at_ms: now_ms,
-            action_expires_at_ms: action.expires_at_ms,
+            action_expires_at_ms: binding.action_expires_at_ms,
             expires_at_ms,
             status: ApprovalRequestStatusV1::Pending,
             decided_by: None,
@@ -4577,7 +5845,7 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        if self.any_unknown_action()? || has_unresolved_process_lease(&self.state)? {
+        if self.any_unresolved_action()? || has_unresolved_process_lease(&self.state)? {
             return Err(ControllerError::NotReady(
                 "unknown action or active process lease must be reconciled before replanning"
                     .to_owned(),
@@ -8107,7 +9375,7 @@ impl Controller {
         let current_sequence = self.state.latest_journal_sequence()?;
         self.state
             .validate_checkpoint_integrity_floor(current_sequence)?;
-        if self.any_unknown_action()? {
+        if self.any_unresolved_action()? {
             return Err(ControllerError::NotReady(
                 "an action outcome remains unknown".to_owned(),
             ));
@@ -11642,12 +12910,12 @@ impl Controller {
         )
     }
 
-    fn any_unknown_action(&self) -> Result<bool, ControllerError> {
+    fn any_unresolved_action(&self) -> Result<bool, ControllerError> {
         Ok(self
             .state
             .action_records()?
             .iter()
-            .any(|record| record.state == "unknown"))
+            .any(|record| matches!(record.state.as_str(), "dispatched" | "observed" | "unknown")))
     }
 
     fn active_ref(&self) -> Result<&ActivePlan, ControllerError> {
@@ -12481,6 +13749,8 @@ impl RecoveryManager {
             &manifest,
             &recovery_worktrees,
         )?;
+        let conservatively_metered_external_actions =
+            recover_unknown_external_transport_budget(&mut controller, &unknown_action_ids)?;
         let (interrupted_attempt_ids, pending_recovery_action_ids, verification_actions) =
             normalize_recovered_runtime(&mut controller, &unknown_action_ids)?;
         require_checkpoint_bound_recovery_intents(
@@ -12513,6 +13783,7 @@ impl RecoveryManager {
                 "replayed_events": replayed_events,
                 "interrupted_attempt_ids": interrupted_attempt_ids,
                 "unknown_action_ids": unknown_action_ids,
+                "conservatively_metered_external_actions": conservatively_metered_external_actions,
                 "pending_recovery_action_ids": pending_recovery_action_ids,
                 "unresolved_process_lease_ids": unresolved_process_lease_ids,
                 "execution_epoch_before": execution_epoch_before,
@@ -13048,7 +14319,10 @@ fn replay_post_checkpoint_goal_autonomy_budget(
         let Some(next_value) = payload.get("goal_autonomy_budget") else {
             if matches!(
                 event.event_kind.as_str(),
-                "task_model_call_consumed" | "autonomy_action_charged" | "plan_revision_activated"
+                "task_model_call_consumed"
+                    | "autonomy_action_charged"
+                    | "external_network_budget_charged"
+                    | "plan_revision_activated"
             ) {
                 return Err(ControllerError::InvalidPlan(format!(
                     "post-checkpoint metered event {} lacks goal autonomy budget binding",
@@ -14029,16 +15303,22 @@ fn reconcile_recovery_actions(
     worktrees: &BTreeMap<String, WorktreeLease>,
 ) -> Result<Vec<String>, ControllerError> {
     for record in state.action_records()? {
-        if record.state == "dispatched" {
+        if matches!(record.state.as_str(), "dispatched" | "observed") {
             let event_id = recovery_event_id(
                 &record.action_id,
                 "unknown",
                 state.latest_journal_sequence()?,
             );
-            state.recover_dispatched_action_as_unknown(
+            let reason = if record.state == "observed" {
+                "restart_after_observed_before_terminal_commit"
+            } else {
+                "restart_after_dispatched_before_observed"
+            };
+            state.recover_nonterminal_action_as_unknown(
                 &record.action_id,
+                &[record.state.as_str()],
                 &event_id,
-                "{\"reason\":\"restart_after_dispatched_before_observed\"}",
+                &serde_json::to_string(&json!({"reason": reason}))?,
             )?;
         }
     }
@@ -14220,6 +15500,87 @@ fn reconcile_recovery_actions(
         }
     }
     Ok(unknown)
+}
+
+fn recover_unknown_external_transport_budget(
+    controller: &mut Controller,
+    unknown_action_ids: &[String],
+) -> Result<Vec<String>, ControllerError> {
+    if unknown_action_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let unknown = unknown_action_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let events = controller.state.journal()?;
+    let mut call_boundaries = BTreeMap::<String, (i64, String, u64)>::new();
+    let mut accounted_after_boundary = BTreeSet::new();
+
+    for event in &events {
+        if event.entity_type != "controller" {
+            continue;
+        }
+        match event.event_kind.as_str() {
+            "external_intelligence_provider_call_started" => {
+                let payload: Value = serde_json::from_str(&event.payload_json)?;
+                let action_id = required_str(&payload, "/action_id")?;
+                if !unknown.contains(action_id) {
+                    continue;
+                }
+                let max_response_bytes = required_u64(&payload, "/max_response_bytes")?;
+                if max_response_bytes == 0 {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "external provider call boundary for {action_id} has zero response reservation"
+                    )));
+                }
+                if call_boundaries
+                    .insert(
+                        action_id.to_owned(),
+                        (event.sequence, event.entity_id.clone(), max_response_bytes),
+                    )
+                    .is_some()
+                {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "external action {action_id} has multiple provider-call boundaries"
+                    )));
+                }
+            }
+            "external_network_budget_charged" => {
+                let payload: Value = serde_json::from_str(&event.payload_json)?;
+                let action_id = required_str(&payload, "/action_id")?;
+                if !unknown.contains(action_id) {
+                    continue;
+                }
+                let phase = required_str(&payload, "/phase")?;
+                if phase == "request" {
+                    continue;
+                }
+                let Some((boundary_sequence, _, _)) = call_boundaries.get(action_id) else {
+                    continue;
+                };
+                if event.sequence > *boundary_sequence {
+                    accounted_after_boundary.insert(action_id.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut metered = Vec::new();
+    for action_id in unknown_action_ids {
+        if accounted_after_boundary.contains(action_id) {
+            continue;
+        }
+        let Some((_, task_id, max_response_bytes)) = call_boundaries.get(action_id) else {
+            continue;
+        };
+        controller.persist_external_network_charge(
+            task_id,
+            action_id,
+            "recovery_unknown_response_reservation",
+            *max_response_bytes,
+        )?;
+        metered.push(action_id.clone());
+    }
+    Ok(metered)
 }
 
 type RecoveryRuntimeNormalization = (Vec<String>, Vec<String>, Vec<String>);
@@ -15298,6 +16659,166 @@ fn state_record_post_image_digests(
             )
         })
         .collect()
+}
+
+fn external_unavailable_outcome(
+    disposition: ExternalUnavailableDisposition,
+    reason: &str,
+) -> ExternalIntelligenceOutcome {
+    let reason = reason.to_owned();
+    match disposition {
+        ExternalUnavailableDisposition::Blocked => ExternalIntelligenceOutcome::Blocked { reason },
+        ExternalUnavailableDisposition::Deferred => {
+            ExternalIntelligenceOutcome::Deferred { reason }
+        }
+        ExternalUnavailableDisposition::HumanRequired => {
+            ExternalIntelligenceOutcome::HumanRequired { reason }
+        }
+    }
+}
+
+fn external_provider_identity_digest(provider: &dyn ExternalIntelligenceProvider) -> String {
+    sha256_prefixed(
+        format!(
+            "external-provider\0{}\0{}\0{}",
+            provider.provider_id(),
+            provider.model_id(),
+            provider.model_version()
+        )
+        .as_bytes(),
+    )
+}
+
+fn prepare_external_packet(
+    selections: &[ExternalEvidenceSelection],
+) -> Result<PreparedExternalPacketV1, ControllerError> {
+    if selections.is_empty() || selections.len() > EXTERNAL_MAX_EVIDENCE_ITEMS {
+        return Err(ControllerError::Policy(PolicyError::Denied(format!(
+            "external evidence selection must contain 1..={EXTERNAL_MAX_EVIDENCE_ITEMS} items"
+        ))));
+    }
+    let mut ordered = selections.to_vec();
+    ordered.sort_by(|left, right| {
+        (left.evidence.evidence_id.as_str(), left.data_class)
+            .cmp(&(right.evidence.evidence_id.as_str(), right.data_class))
+    });
+    let mut seen_ids = BTreeSet::new();
+    let mut packet_items = Vec::with_capacity(ordered.len());
+    let mut bindings = Vec::with_capacity(ordered.len());
+    let mut classes = BTreeSet::new();
+    let mut redaction_event_ids = BTreeSet::new();
+
+    for selection in ordered {
+        let evidence = &selection.evidence;
+        if evidence.evidence_id.trim().is_empty() || !seen_ids.insert(evidence.evidence_id.clone())
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "external evidence identities must be non-empty and unique".to_owned(),
+            )));
+        }
+        if matches!(
+            evidence.kind,
+            EvidenceKind::PriorAttemptTranscript
+                | EvidenceKind::RawToolLog
+                | EvidenceKind::FullRepository
+                | EvidenceKind::HiddenReasoning
+                | EvidenceKind::ExternalAdvisory
+        ) || !external_data_class_matches_evidence(selection.data_class, evidence)
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(format!(
+                "evidence {} is not eligible for external data class {}",
+                evidence.evidence_id,
+                selection.data_class.as_plan_ir_str()
+            ))));
+        }
+        if !is_sha256_digest(&evidence.source_digest) || !is_sha256_digest(&evidence.content_digest)
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(format!(
+                "external evidence {} lacks exact source/content digest provenance",
+                evidence.evidence_id
+            ))));
+        }
+        let redacted = Redactor::v1().redact(evidence.text.as_bytes(), &[])?;
+        let text = String::from_utf8(redacted.bytes).map_err(|_| {
+            ControllerError::InvalidPlan(
+                "redactor produced non-UTF-8 bytes for UTF-8 external evidence".to_owned(),
+            )
+        })?;
+        for event in redacted.events {
+            redaction_event_ids.insert(event.event_id);
+        }
+        let redacted_content_digest = sha256_prefixed(text.as_bytes());
+        bindings.push(ExternalEvidenceBinding {
+            evidence_id: evidence.evidence_id.clone(),
+            data_class: selection.data_class,
+            source_digest: evidence.source_digest.clone(),
+            content_digest: evidence.content_digest.clone(),
+            redacted_content_digest,
+        });
+        packet_items.push(ExternalPacketItemV1 {
+            evidence_id: evidence.evidence_id.clone(),
+            data_class: selection.data_class,
+            source_digest: evidence.source_digest.clone(),
+            content_digest: evidence.content_digest.clone(),
+            text,
+        });
+        classes.insert(selection.data_class);
+    }
+
+    let packet = ExternalPacketV1 {
+        schema_version: EXTERNAL_PACKET_SCHEMA_VERSION,
+        evidence: packet_items,
+    };
+    let payload = serde_json::to_string(&packet)?;
+    let payload_digest = sha256_prefixed(payload.as_bytes());
+    let redaction_result_digest = digest_json(&json!({
+        "payload_digest": payload_digest,
+        "redaction_event_ids": redaction_event_ids,
+        "bindings": bindings,
+    }))?;
+    let estimated_tokens = u32::try_from(payload.len().div_ceil(4)).unwrap_or(u32::MAX);
+    Ok(PreparedExternalPacketV1 {
+        payload,
+        payload_digest,
+        selected_evidence: bindings,
+        data_classes: classes,
+        redaction_event_ids,
+        redaction_result_digest,
+        estimated_tokens,
+    })
+}
+
+fn external_data_class_matches_evidence(
+    data_class: ExternalDataClass,
+    evidence: &EvidenceItem,
+) -> bool {
+    match data_class {
+        ExternalDataClass::Contract => evidence.kind == EvidenceKind::TaskContract,
+        ExternalDataClass::Requirement | ExternalDataClass::ArchitectureDoc => {
+            evidence.kind == EvidenceKind::Instruction
+        }
+        ExternalDataClass::SourceSlice => {
+            matches!(
+                evidence.kind,
+                EvidenceKind::SourceSlice | EvidenceKind::SearchHit
+            )
+        }
+        ExternalDataClass::Diff => evidence.kind == EvidenceKind::Diff,
+        ExternalDataClass::ToolSynopsis => {
+            matches!(
+                evidence.kind,
+                EvidenceKind::ToolSynopsis | EvidenceKind::FailureSynopsis
+            ) && evidence.trust_label.source != TrustSource::Memory
+        }
+        ExternalDataClass::Verification => evidence.kind == EvidenceKind::Verification,
+        ExternalDataClass::MemorySynopsis => {
+            evidence.trust_label.source == TrustSource::Memory
+                && matches!(
+                    evidence.kind,
+                    EvidenceKind::FailureSynopsis | EvidenceKind::RoutedExpansion
+                )
+        }
+    }
 }
 
 fn authority_record_matches_plan_revision(

@@ -7,6 +7,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sovereign_evidence::ToolEvidence;
+use sovereign_model::{
+    ExternalIntelligenceError, ExternalIntelligenceRequest, ExternalIntelligenceResponse,
+};
 pub use sovereign_policy::{TrustLabel, TrustLevel, TrustSource};
 use sovereign_repo::{ExactDiffEvidence, ExactFileEvidence, ExactSearchHit, InstructionDocument};
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,6 +71,7 @@ pub enum EvidenceKind {
     RoutedExpansion,
     ToolSynopsis,
     FailureSynopsis,
+    ExternalAdvisory,
     Verification,
     OutputSchema,
     PriorAttemptTranscript,
@@ -354,6 +358,58 @@ impl EvidenceItem {
         })
         .with_implicated(evidence.failure_signature.is_some())
         .with_trust_label(untrusted_label(TrustSource::ToolOutput))
+    }
+
+    /// Imports one optional external-model response as untrusted advisory evidence.
+    ///
+    /// Provider/model/version identity and full request/response digests are retained in provenance.
+    /// The returned item deliberately carries no tool-schema role and no expansion handle.
+    ///
+    /// # Errors
+    /// Returns [`ExternalIntelligenceError`] when request/response identity is invalid or either
+    /// contract cannot be serialized for deterministic provenance hashing.
+    pub fn from_external_model(
+        request: &ExternalIntelligenceRequest,
+        response: &ExternalIntelligenceResponse,
+        routing_reason: &str,
+    ) -> Result<Self, ExternalIntelligenceError> {
+        response.validate_for(request)?;
+        let request_bytes = serde_json::to_vec(request).map_err(|error| {
+            ExternalIntelligenceError::invalid_contract(format!(
+                "cannot serialize external intelligence request for provenance: {error}"
+            ))
+        })?;
+        let response_bytes = serde_json::to_vec(response).map_err(|error| {
+            ExternalIntelligenceError::invalid_response(format!(
+                "cannot serialize external intelligence response for provenance: {error}"
+            ))
+        })?;
+        let request_digest = sha256_prefixed(&request_bytes);
+        let response_digest = sha256_prefixed(&response_bytes);
+        Ok(Self::new(
+            format!(
+                "external-model:{}:{}",
+                response.provider_id, response.request_id
+            ),
+            PacketSection::RoutedExpansion,
+            ContextLevel::C3,
+            EvidenceKind::ExternalAdvisory,
+            format!(
+                "external-model://{}/{}/{}",
+                response.provider_id, response.model_id, response.model_version
+            ),
+            response_digest.clone(),
+            format!(
+                "external_model;provider={};model={};version={};request_digest={request_digest};response_digest={response_digest}",
+                response.provider_id, response.model_id, response.model_version
+            ),
+            TrustClass::Untrusted,
+            routing_reason,
+            response.content.clone(),
+        )
+        .with_locator(format!("request_id:{}", response.request_id))
+        .with_implicated(true)
+        .with_trust_label(untrusted_label(TrustSource::ExternalModel)))
     }
 }
 
@@ -855,7 +911,7 @@ impl<C: TokenCounter> ContextPlanner<C> {
                 break;
             }
             let retained_len = u64::try_from(truncated.len()).unwrap_or(u64::MAX);
-            if item.expansion_handle.is_none() {
+            if item.expansion_handle.is_none() && item.kind != EvidenceKind::ExternalAdvisory {
                 item.expansion_handle = Some(ExpansionHandle {
                     source_uri: item.source_uri.clone(),
                     source_digest: item.source_digest.clone(),
@@ -915,6 +971,9 @@ fn legacy_trust_label(kind: EvidenceKind, trust_class: TrustClass) -> TrustLabel
             }
         }
         TrustClass::Derived => TrustLabel::observed_derived(),
+        TrustClass::Untrusted if kind == EvidenceKind::ExternalAdvisory => {
+            untrusted_label(TrustSource::ExternalModel)
+        }
         TrustClass::Untrusted => untrusted_label(TrustSource::Source),
     }
 }
@@ -927,6 +986,12 @@ fn untrusted_label(source: TrustSource) -> TrustLabel {
 /// retain Controller/governed trust. Every caller-supplied candidate is evidence only. Invalid or
 /// self-promoted labels are deterministically demoted rather than interpreted as policy.
 fn normalize_candidate_trust(mut item: EvidenceItem) -> EvidenceItem {
+    if item.kind == EvidenceKind::ExternalAdvisory {
+        item.trust_class = TrustClass::Untrusted;
+        item.trust_label = untrusted_label(TrustSource::ExternalModel);
+        item.expansion_handle = None;
+        return item;
+    }
     let invalid = item.trust_label.validate().is_err();
     if invalid
         || item.trust_class == TrustClass::Controller
@@ -967,7 +1032,8 @@ fn allowed_in_mode(mode: ContextMode, item: &EvidenceItem) -> bool {
             | EvidenceKind::SearchHit
             | EvidenceKind::Instruction
             | EvidenceKind::RoutedExpansion
-            | EvidenceKind::ToolSynopsis => item.implicated,
+            | EvidenceKind::ToolSynopsis
+            | EvidenceKind::ExternalAdvisory => item.implicated,
             _ => false,
         },
         ContextMode::Reviewer | ContextMode::Verifier => matches!(
@@ -1029,6 +1095,7 @@ fn kind_name(kind: EvidenceKind) -> &'static str {
         EvidenceKind::RoutedExpansion => "routed_expansion",
         EvidenceKind::ToolSynopsis => "tool_synopsis",
         EvidenceKind::FailureSynopsis => "failure_synopsis",
+        EvidenceKind::ExternalAdvisory => "external_advisory",
         EvidenceKind::Verification => "verification",
         EvidenceKind::OutputSchema => "output_schema",
         EvidenceKind::PriorAttemptTranscript => "prior_attempt_transcript",

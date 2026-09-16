@@ -6,9 +6,10 @@ mod replan;
 
 pub use compiler::{
     CompilationEvidence, CompilationEvidenceHandle, ControllerBindingEvidence,
-    GovernedEvaluatorRef, M3PlanningInput, ModelAttemptEvidence, PLAN_COMPILATION_SCHEMA_VERSION,
-    PlanCompilationError, PlanCompilationInput, PlanCompilationRepository, PlanCompilationResult,
-    PlanCompiler, PreauthorizedManualGate, SuppliedPlanningSourceKind, SuppliedPlanningSourceRef,
+    ControllerExternalIntelligenceBindingEvidence, GovernedEvaluatorRef, M3PlanningInput,
+    ModelAttemptEvidence, PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationError,
+    PlanCompilationInput, PlanCompilationRepository, PlanCompilationResult, PlanCompiler,
+    PreauthorizedManualGate, SuppliedPlanningSourceKind, SuppliedPlanningSourceRef,
 };
 pub use depth::{DepthClassifier, DepthDecision, DepthFeatureInput, DepthFeatures, ExecutionDepth};
 pub use replan::{

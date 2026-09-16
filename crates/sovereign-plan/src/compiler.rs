@@ -201,6 +201,33 @@ impl ControllerBindingEvidence {
     }
 }
 
+/// Digest-only provenance for one Controller-owned post-compilation external
+/// intelligence binding. The concrete provider/data-class scope remains in Plan
+/// IR while this record binds that authority to the exact source plan and task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerExternalIntelligenceBindingEvidence {
+    source_plan_digest: String,
+    target_task_id: String,
+    binding_digest: String,
+}
+
+impl ControllerExternalIntelligenceBindingEvidence {
+    #[must_use]
+    pub fn source_plan_digest(&self) -> &str {
+        &self.source_plan_digest
+    }
+
+    #[must_use]
+    pub fn target_task_id(&self) -> &str {
+        &self.target_task_id
+    }
+
+    #[must_use]
+    pub fn binding_digest(&self) -> &str {
+        &self.binding_digest
+    }
+}
+
 /// Immutable provenance record for a successful compilation candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilationEvidence {
@@ -216,6 +243,8 @@ pub struct CompilationEvidence {
     model_attempts: Vec<ModelAttemptEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     controller_bindings: Vec<ControllerBindingEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    controller_external_intelligence_bindings: Vec<ControllerExternalIntelligenceBindingEvidence>,
     validator_passed: bool,
     plan_digest: String,
 }
@@ -259,6 +288,13 @@ impl CompilationEvidence {
     #[must_use]
     pub fn controller_bindings(&self) -> &[ControllerBindingEvidence] {
         &self.controller_bindings
+    }
+
+    #[must_use]
+    pub fn controller_external_intelligence_bindings(
+        &self,
+    ) -> &[ControllerExternalIntelligenceBindingEvidence] {
+        &self.controller_external_intelligence_bindings
     }
 
     #[must_use]
@@ -421,6 +457,87 @@ impl PlanCompilationResult {
         })
     }
 
+    /// Enables external intelligence for one exact already-generated task
+    /// without exposing that authority to model/proposal text.
+    ///
+    /// The source compilation must still be digest-consistent and valid under
+    /// the supplied validator. Global policy must already permit the capability,
+    /// exact provider, and requested network-byte ceiling. The binding keeps raw
+    /// logs, resolved secrets, whole-repository export, and tool authority
+    /// disabled; only the target task gains the permission, provider/data-class
+    /// scope, and bounded payload/network budget. The transformed candidate is
+    /// revalidated and all affected compilation/provenance digests are
+    /// recomputed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed binding rejection for stale/inconsistent source
+    /// results, missing global authority, invalid/duplicate scope, unknown or
+    /// duplicate targets, or pre-existing task-level external-intelligence
+    /// authority. Returns validation/serialization errors when the exact
+    /// transformed candidate is invalid.
+    pub fn bind_controller_external_intelligence(
+        &self,
+        validator: &PlanValidator,
+        target_task_id: &str,
+        provider_id: &str,
+        allowed_data_classes: &[String],
+        max_payload_bytes: u64,
+    ) -> Result<Self, PlanCompilationError> {
+        self.validate_binding_source(validator)?;
+        let data_classes = normalize_external_binding_scope(
+            target_task_id,
+            provider_id,
+            allowed_data_classes,
+            max_payload_bytes,
+        )?;
+
+        let source_plan_digest = self.plan_digest.clone();
+        let mut document = self.plan.as_value().clone();
+        validate_external_binding_global_policy(&document, provider_id, max_payload_bytes)?;
+
+        let tasks = document
+            .get_mut("tasks")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                PlanCompilationError::ControllerBindingRejected(
+                    "source plan does not contain tasks[]".to_owned(),
+                )
+            })?;
+        let target_index = external_binding_target_index(tasks, target_task_id)?;
+        let binding_digest = apply_external_binding_to_task(
+            &mut tasks[target_index],
+            target_task_id,
+            provider_id,
+            &data_classes,
+            max_payload_bytes,
+        )?;
+        let plan = PlanIr::from_value(canonicalize(&document));
+        let diagnostics = validator.validate(&plan);
+        if !diagnostics.is_empty() {
+            return Err(PlanCompilationError::ValidationRejected(diagnostics));
+        }
+        let plan_digest = plan.canonical_digest()?;
+        let mut compilation_evidence = self.compilation_evidence.clone();
+        compilation_evidence
+            .controller_external_intelligence_bindings
+            .push(ControllerExternalIntelligenceBindingEvidence {
+                source_plan_digest,
+                target_task_id: target_task_id.to_owned(),
+                binding_digest,
+            });
+        compilation_evidence.plan_digest.clone_from(&plan_digest);
+        compilation_evidence.validator_passed = true;
+        let compilation_evidence_digest = canonical_digest(&compilation_evidence)?;
+
+        Ok(Self {
+            plan,
+            plan_digest,
+            compilation_evidence,
+            compilation_evidence_digest,
+        })
+    }
+
     fn validate_binding_source(
         &self,
         validator: &PlanValidator,
@@ -436,7 +553,12 @@ impl PlanCompilationResult {
                 "source compilation result is not digest-consistent".to_owned(),
             ));
         }
-        if !self.compilation_evidence.controller_bindings.is_empty() {
+        if !self.compilation_evidence.controller_bindings.is_empty()
+            || !self
+                .compilation_evidence
+                .controller_external_intelligence_bindings
+                .is_empty()
+        {
             return Err(PlanCompilationError::ControllerBindingRejected(
                 "source compilation already contains a Controller authority binding".to_owned(),
             ));
@@ -448,6 +570,172 @@ impl PlanCompilationResult {
         }
         Ok(())
     }
+}
+
+fn normalize_external_binding_scope(
+    target_task_id: &str,
+    provider_id: &str,
+    allowed_data_classes: &[String],
+    max_payload_bytes: u64,
+) -> Result<Vec<String>, PlanCompilationError> {
+    if target_task_id.trim().is_empty() || provider_id.trim().is_empty() {
+        return Err(PlanCompilationError::ControllerBindingRejected(
+            "external-intelligence binding requires non-empty task and provider ids".to_owned(),
+        ));
+    }
+    if allowed_data_classes.is_empty() || max_payload_bytes == 0 {
+        return Err(PlanCompilationError::ControllerBindingRejected(
+            "external-intelligence binding requires explicit data classes and a positive payload ceiling"
+                .to_owned(),
+        ));
+    }
+    let normalized = allowed_data_classes
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if normalized.len() != allowed_data_classes.len()
+        || normalized.iter().any(|value| value.is_empty())
+    {
+        return Err(PlanCompilationError::ControllerBindingRejected(
+            "external-intelligence data classes must be non-empty and unique".to_owned(),
+        ));
+    }
+    Ok(normalized.into_iter().map(str::to_owned).collect())
+}
+
+fn validate_external_binding_global_policy(
+    document: &Value,
+    provider_id: &str,
+    max_payload_bytes: u64,
+) -> Result<(), PlanCompilationError> {
+    if !string_set(document.pointer("/policy/capability_ceiling")).contains("external_intelligence")
+    {
+        return Err(PlanCompilationError::ControllerBindingRejected(
+            "global policy capability ceiling does not include external_intelligence".to_owned(),
+        ));
+    }
+    if !string_set(document.pointer("/policy/external_intelligence/allowed_providers"))
+        .contains(provider_id)
+    {
+        return Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "global external-intelligence policy does not allow provider {provider_id}"
+        )));
+    }
+    let global_network_bytes = document
+        .pointer("/policy/resources/max_network_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            PlanCompilationError::ControllerBindingRejected(
+                "global policy does not define a network-byte ceiling".to_owned(),
+            )
+        })?;
+    if max_payload_bytes > global_network_bytes {
+        return Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "external-intelligence payload ceiling {max_payload_bytes} exceeds global network-byte ceiling {global_network_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+fn task_has_external_intelligence_authority(task: &Value) -> bool {
+    if string_set(task.get("permissions")).contains("external_intelligence") {
+        return true;
+    }
+    task.pointer("/action_policy/external_intelligence")
+        .is_some_and(|policy| {
+            policy.get("allowed").and_then(Value::as_bool) == Some(true)
+                || !string_set(policy.get("allowed_providers")).is_empty()
+                || !string_set(policy.get("allowed_data_classes")).is_empty()
+                || policy
+                    .get("max_payload_bytes")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|bytes| bytes > 0)
+        })
+}
+
+fn external_binding_target_index(
+    tasks: &[Value],
+    target_task_id: &str,
+) -> Result<usize, PlanCompilationError> {
+    if let Some(task) = tasks
+        .iter()
+        .find(|task| task_has_external_intelligence_authority(task))
+    {
+        let task_id = task
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        return Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "source plan already contains task-level external-intelligence authority on {task_id}"
+        )));
+    }
+
+    let mut matching = tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task.get("task_id").and_then(Value::as_str) == Some(target_task_id));
+    let Some((target_index, _)) = matching.next() else {
+        return Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "target task {target_task_id} must exist exactly once"
+        )));
+    };
+    if matching.next().is_some() {
+        return Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "target task {target_task_id} must exist exactly once"
+        )));
+    }
+    Ok(target_index)
+}
+
+fn apply_external_binding_to_task(
+    target: &mut Value,
+    target_task_id: &str,
+    provider_id: &str,
+    data_classes: &[String],
+    max_payload_bytes: u64,
+) -> Result<String, PlanCompilationError> {
+    let permissions = target
+        .get_mut("permissions")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            PlanCompilationError::ControllerBindingRejected(format!(
+                "target task {target_task_id} lacks permissions[]"
+            ))
+        })?;
+    permissions.push(Value::String("external_intelligence".to_owned()));
+
+    let external_policy = json!({
+        "allowed": true,
+        "allowed_providers": [provider_id],
+        "allowed_data_classes": data_classes,
+        "whole_repository_export": "deny",
+        "raw_logs": false,
+        "resolved_secrets": false,
+        "tool_authority": "none",
+        "max_payload_bytes": max_payload_bytes
+    });
+    let policy_slot = target
+        .pointer_mut("/action_policy/external_intelligence")
+        .ok_or_else(|| {
+            PlanCompilationError::ControllerBindingRejected(format!(
+                "target task {target_task_id} lacks action_policy.external_intelligence"
+            ))
+        })?;
+    policy_slot.clone_from(&external_policy);
+    let network_budget = target
+        .pointer_mut("/resource_budget/max_network_bytes")
+        .ok_or_else(|| {
+            PlanCompilationError::ControllerBindingRejected(format!(
+                "target task {target_task_id} lacks resource_budget.max_network_bytes"
+            ))
+        })?;
+    *network_budget = json!(max_payload_bytes);
+
+    canonical_digest(&json!({
+        "permission": "external_intelligence",
+        "policy": external_policy,
+        "max_network_bytes": max_payload_bytes
+    }))
 }
 
 /// Deterministic compiler failures. Validation rejection never returns a
@@ -641,6 +929,7 @@ impl<'a> PlanCompiler<'a> {
                         depth_decision_digest,
                         model_attempts: attempts,
                         controller_bindings: Vec::new(),
+                        controller_external_intelligence_bindings: Vec::new(),
                         validator_passed: true,
                         plan_digest: plan_digest.clone(),
                     };

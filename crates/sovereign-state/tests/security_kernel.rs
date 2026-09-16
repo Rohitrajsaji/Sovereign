@@ -269,6 +269,79 @@ fn committed_action_requires_durable_result_reference() {
 }
 
 #[test]
+fn observed_action_recovery_becomes_unknown_before_epoch_advance() {
+    let temp = TestDir::new("observed-recovery");
+    let mut store = StateStore::open(temp.db()).unwrap_or_else(|error| panic!("open: {error}"));
+    let epoch = store
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("epoch: {error}"));
+    store
+        .insert_action_record(NewActionRecord {
+            action_id: "action_observed_crash",
+            state: "authorized",
+            payload_digest: "sha256:payload",
+            policy_digest: "sha256:policy",
+            execution_epoch: epoch,
+            event_id: "event_observed_authorized",
+            event_kind: "authorized",
+            payload_json: "{}",
+        })
+        .unwrap_or_else(|error| panic!("authorize: {error}"));
+    store
+        .transition_action_with_event(ActionTransition {
+            action_id: "action_observed_crash",
+            expected_state: "authorized",
+            next_state: "dispatched",
+            expected_epoch: epoch,
+            event_id: "event_observed_dispatched",
+            event_kind: "dispatched",
+            payload_json: "{}",
+            result_digest: None,
+        })
+        .unwrap_or_else(|error| panic!("dispatch: {error}"));
+    store
+        .transition_action_with_event(ActionTransition {
+            action_id: "action_observed_crash",
+            expected_state: "dispatched",
+            next_state: "observed",
+            expected_epoch: epoch,
+            event_id: "event_observed_result",
+            event_kind: "observed",
+            payload_json: "{}",
+            result_digest: None,
+        })
+        .unwrap_or_else(|error| panic!("observe: {error}"));
+
+    store
+        .recover_nonterminal_action_as_unknown(
+            "action_observed_crash",
+            &["observed"],
+            "event_observed_recovered_unknown",
+            "{\"reason\":\"restart_after_observed_before_terminal_commit\"}",
+        )
+        .unwrap_or_else(|error| panic!("recover observed as unknown: {error}"));
+    let record = store
+        .action_record("action_observed_crash")
+        .unwrap_or_else(|error| panic!("record: {error}"))
+        .unwrap_or_else(|| panic!("missing recovered action"));
+    assert_eq!(record.state, "unknown");
+    assert_eq!(
+        store
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("epoch after recovery: {error}")),
+        epoch
+    );
+    assert_eq!(
+        store
+            .journal()
+            .unwrap_or_else(|error| panic!("journal: {error}"))
+            .last()
+            .map(|event| event.event_kind.as_str()),
+        Some("unknown")
+    );
+}
+
+#[test]
 fn version_two_database_upgrades_in_place_to_single_canonical_version_three() {
     let temp = TestDir::new("v2-upgrade");
     let db = temp.db();

@@ -171,6 +171,19 @@ fn enable_secret_use(input: &mut PlanCompilationInput) {
         .push(json!("secret_use"));
 }
 
+fn enable_external_intelligence(
+    input: &mut PlanCompilationInput,
+    provider_id: &str,
+    max_network_bytes: u64,
+) {
+    input.policy["capability_ceiling"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("capability ceiling must be an array"))
+        .push(json!("external_intelligence"));
+    input.policy["external_intelligence"]["allowed_providers"] = json!([provider_id]);
+    input.policy["resources"]["max_network_bytes"] = json!(max_network_bytes);
+}
+
 fn one_task_proposal() -> String {
     json!({
         "tasks": [{
@@ -386,6 +399,171 @@ fn repository_instruction_refs_remain_untrusted_in_compiled_plan() {
     assert_eq!(instructions.len(), 1);
     assert_eq!(instructions[0]["trust"], json!("untrusted"));
     assert!(validator.is_valid(result.plan()));
+}
+
+#[test]
+fn compiler_keeps_external_intelligence_disabled_even_when_global_policy_permits_it() {
+    let backend = RecordingBackend::new(vec![response(one_task_proposal())]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    enable_external_intelligence(&mut input, "remote.reasoner", 4_096);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let result = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile: {error}"));
+    let task = &result.plan().as_value()["tasks"][0];
+
+    assert!(
+        !task["permissions"]
+            .as_array()
+            .is_some_and(|permissions| permissions.contains(&json!("external_intelligence")))
+    );
+    assert_eq!(
+        task["action_policy"]["external_intelligence"]["allowed"],
+        json!(false)
+    );
+    assert_eq!(
+        task["action_policy"]["external_intelligence"]["allowed_providers"],
+        json!([])
+    );
+    assert_eq!(
+        task["action_policy"]["external_intelligence"]["allowed_data_classes"],
+        json!([])
+    );
+    assert_eq!(
+        task["action_policy"]["external_intelligence"]["max_payload_bytes"],
+        json!(0)
+    );
+    assert_eq!(task["resource_budget"]["max_network_bytes"], json!(0));
+    assert!(validator.is_valid(result.plan()));
+}
+
+#[test]
+fn controller_external_intelligence_binding_targets_one_task_and_recomputes_provenance() {
+    let backend = RecordingBackend::new(vec![response(two_task_proposal(true))]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    enable_external_intelligence(&mut input, "remote.reasoner", 4_096);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let source = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile: {error}"));
+    let source_tasks = source.plan().as_value()["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tasks array"));
+    let sibling_before = source_tasks[0].clone();
+    let target_task_id = source_tasks[1]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("target task id"))
+        .to_owned();
+    let source_plan_digest = source.plan_digest().to_owned();
+    let source_evidence_digest = source.compilation_evidence_digest().to_owned();
+
+    let bound = source
+        .bind_controller_external_intelligence(
+            &validator,
+            &target_task_id,
+            "remote.reasoner",
+            &["source_slice".to_owned(), "verification".to_owned()],
+            1_024,
+        )
+        .unwrap_or_else(|error| panic!("bind external intelligence: {error}"));
+    let bound_tasks = bound.plan().as_value()["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bound tasks array"));
+    let task = &bound_tasks[1];
+
+    assert_eq!(bound_tasks[0], sibling_before);
+    assert!(
+        task["permissions"]
+            .as_array()
+            .is_some_and(|permissions| permissions.contains(&json!("external_intelligence")))
+    );
+    assert_eq!(
+        task["action_policy"]["external_intelligence"],
+        json!({
+            "allowed": true,
+            "allowed_providers": ["remote.reasoner"],
+            "allowed_data_classes": ["source_slice", "verification"],
+            "whole_repository_export": "deny",
+            "raw_logs": false,
+            "resolved_secrets": false,
+            "tool_authority": "none",
+            "max_payload_bytes": 1024
+        })
+    );
+    assert_eq!(task["resource_budget"]["max_network_bytes"], json!(1_024));
+    assert!(validator.is_valid(bound.plan()));
+    assert_ne!(bound.plan_digest(), source_plan_digest);
+    assert_ne!(bound.compilation_evidence_digest(), source_evidence_digest);
+    assert_eq!(
+        bound.compilation_evidence().plan_digest(),
+        bound.plan_digest()
+    );
+    let bindings = bound
+        .compilation_evidence()
+        .controller_external_intelligence_bindings();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].source_plan_digest(), source_plan_digest);
+    assert_eq!(bindings[0].target_task_id(), target_task_id);
+    assert!(bindings[0].binding_digest().starts_with("sha256:"));
+}
+
+#[test]
+fn controller_external_intelligence_binding_rejects_provider_outside_global_policy() {
+    let backend = RecordingBackend::new(vec![response(one_task_proposal())]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    enable_external_intelligence(&mut input, "remote.allowed", 4_096);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let source = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile: {error}"));
+    let target_task_id = source.plan().as_value()["tasks"][0]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("compiled task id"));
+
+    assert!(matches!(
+        source.bind_controller_external_intelligence(
+            &validator,
+            target_task_id,
+            "remote.denied",
+            &["source_slice".to_owned()],
+            1_024,
+        ),
+        Err(PlanCompilationError::ControllerBindingRejected(message))
+            if message.contains("does not allow provider")
+    ));
+}
+
+#[test]
+fn controller_external_intelligence_binding_reruns_plan_validation() {
+    let backend = RecordingBackend::new(vec![response(one_task_proposal())]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    enable_external_intelligence(&mut input, "remote.reasoner", 4_096);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let source = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile: {error}"));
+    let target_task_id = source.plan().as_value()["tasks"][0]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("compiled task id"));
+
+    assert!(matches!(
+        source.bind_controller_external_intelligence(
+            &validator,
+            target_task_id,
+            "remote.reasoner",
+            &["entire_machine".to_owned()],
+            1_024,
+        ),
+        Err(PlanCompilationError::ValidationRejected(_))
+    ));
 }
 
 #[test]

@@ -20,12 +20,211 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const MODEL_SCHEMA_VERSION: u32 = 1;
+pub const EXTERNAL_INTELLIGENCE_SCHEMA_VERSION: u32 = 1;
 pub const M1_HARD_INPUT_CONTEXT_TOKENS: u32 = 16_384;
 const DEFAULT_MAX_HTTP_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 
 static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static TRANSPORT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static ACTIVE_LOCAL_MODEL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Tool-free provider-neutral request for optional external intelligence.
+///
+/// This contract deliberately contains no tool declarations, credentials, approval state, or
+/// Controller transition authority. The caller supplies only an already-minimized/redacted payload
+/// and bounded transport/generation limits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalIntelligenceRequest {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub purpose: String,
+    pub payload: String,
+    pub max_output_tokens: u32,
+    pub max_response_bytes: u64,
+    pub deadline_ms: u64,
+}
+
+impl ExternalIntelligenceRequest {
+    /// Validates the stable external-intelligence request envelope.
+    ///
+    /// # Errors
+    /// Returns [`ExternalIntelligenceError`] when the request is empty, unbounded, or uses an
+    /// unsupported schema version.
+    pub fn validate(&self) -> Result<(), ExternalIntelligenceError> {
+        if self.schema_version != EXTERNAL_INTELLIGENCE_SCHEMA_VERSION {
+            return Err(ExternalIntelligenceError::invalid_contract(format!(
+                "unsupported ExternalIntelligenceRequest schema version {}",
+                self.schema_version
+            )));
+        }
+        if self.request_id.trim().is_empty()
+            || self.purpose.trim().is_empty()
+            || self.payload.trim().is_empty()
+        {
+            return Err(ExternalIntelligenceError::invalid_contract(
+                "external intelligence request requires request_id, purpose and payload",
+            ));
+        }
+        if self.max_output_tokens == 0 || self.max_response_bytes == 0 || self.deadline_ms == 0 {
+            return Err(ExternalIntelligenceError::invalid_contract(
+                "external intelligence request limits must be positive",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Provider-reported accounting for one external-intelligence transport attempt.
+///
+/// Byte counters are required even for failed attempts so Controller budgets can charge partial
+/// network use. Token counters are optional because not every provider exposes authoritative usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalIntelligenceUsage {
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub elapsed_ms: u64,
+}
+
+impl ExternalIntelligenceUsage {
+    #[must_use]
+    pub const fn network_bytes(self) -> u64 {
+        self.request_bytes.saturating_add(self.response_bytes)
+    }
+}
+
+/// Stable failure class for an optional external-intelligence provider call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalIntelligenceErrorKind {
+    InvalidContract,
+    Unavailable,
+    DeadlineExceeded,
+    Transport,
+    ProviderRejected,
+    InvalidResponse,
+}
+
+/// Provider-neutral external-intelligence failure with partial transport accounting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalIntelligenceError {
+    pub kind: ExternalIntelligenceErrorKind,
+    pub message: String,
+    pub usage: ExternalIntelligenceUsage,
+}
+
+impl ExternalIntelligenceError {
+    #[must_use]
+    pub fn new(
+        kind: ExternalIntelligenceErrorKind,
+        message: impl Into<String>,
+        usage: ExternalIntelligenceUsage,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            usage,
+        }
+    }
+
+    #[must_use]
+    pub fn invalid_contract(message: impl Into<String>) -> Self {
+        Self::new(
+            ExternalIntelligenceErrorKind::InvalidContract,
+            message,
+            ExternalIntelligenceUsage::default(),
+        )
+    }
+
+    #[must_use]
+    pub fn invalid_response(message: impl Into<String>) -> Self {
+        Self::new(
+            ExternalIntelligenceErrorKind::InvalidResponse,
+            message,
+            ExternalIntelligenceUsage::default(),
+        )
+    }
+}
+
+impl Display for ExternalIntelligenceError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "external intelligence {:?}: {}", self.kind, self.message)
+    }
+}
+
+impl Error for ExternalIntelligenceError {}
+
+/// Tool-free provider-neutral advisory response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalIntelligenceResponse {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub model_version: String,
+    pub content: String,
+    pub usage: ExternalIntelligenceUsage,
+}
+
+impl ExternalIntelligenceResponse {
+    /// Validates response identity against the originating request.
+    ///
+    /// # Errors
+    /// Returns [`ExternalIntelligenceError`] for an invalid request, unsupported response version,
+    /// mismatched request ID, missing provider/model/version identity, or empty advisory content.
+    pub fn validate_for(
+        &self,
+        request: &ExternalIntelligenceRequest,
+    ) -> Result<(), ExternalIntelligenceError> {
+        request.validate()?;
+        if self.schema_version != EXTERNAL_INTELLIGENCE_SCHEMA_VERSION {
+            return Err(ExternalIntelligenceError::invalid_response(format!(
+                "unsupported ExternalIntelligenceResponse schema version {}",
+                self.schema_version
+            )));
+        }
+        if self.request_id != request.request_id {
+            return Err(ExternalIntelligenceError::invalid_response(
+                "external intelligence response request_id mismatch",
+            ));
+        }
+        if self.provider_id.trim().is_empty()
+            || self.model_id.trim().is_empty()
+            || self.model_version.trim().is_empty()
+            || self.content.trim().is_empty()
+        {
+            return Err(ExternalIntelligenceError::invalid_response(
+                "external intelligence response requires provider/model/version identity and content",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Optional external-intelligence boundary. Implementations are transport adapters only.
+///
+/// The trait intentionally has no tool execution, approval, permission, policy, or task-state API.
+/// Core Sovereign operation does not require an implementation; callers may configure no provider.
+pub trait ExternalIntelligenceProvider: Send + Sync {
+    fn provider_id(&self) -> &str;
+    fn model_id(&self) -> &str;
+    fn model_version(&self) -> &str;
+
+    /// Executes one bounded tool-free advisory request.
+    ///
+    /// # Errors
+    /// Returns a provider-neutral failure carrying any network bytes already consumed by the
+    /// attempt, including timeout and transport failures.
+    fn complete_external(
+        &self,
+        request: &ExternalIntelligenceRequest,
+    ) -> Result<ExternalIntelligenceResponse, ExternalIntelligenceError>;
+}
 
 /// Provider-neutral capabilities advertised before a plan requests a model lease.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

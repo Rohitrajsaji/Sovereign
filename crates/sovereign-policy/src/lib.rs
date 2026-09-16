@@ -38,6 +38,8 @@ pub const APPROVAL_CLAIM_SCHEMA_VERSION: u32 = 1;
 pub const RECONCILIATION_POLICY_SCHEMA_VERSION: u32 = 1;
 pub const TRUST_LABEL_SCHEMA_VERSION: u32 = 1;
 pub const POLICY_VIOLATION_EVIDENCE_SCHEMA_VERSION: u32 = 1;
+pub const EXTERNAL_PAYLOAD_POLICY_SCHEMA_VERSION: u32 = 1;
+pub const EXTERNAL_ESCALATION_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// Security-relevant provenance for one piece of model-visible evidence.
 ///
@@ -486,6 +488,341 @@ impl Capability {
             "destructive" => Some(Self::Destructive),
             _ => None,
         }
+    }
+}
+
+/// Frozen Plan IR data classes that may be selected for an external-intelligence packet.
+///
+/// This enum is intentionally closed. Raw logs, resolved secrets, unrestricted CAS data, hidden
+/// reasoning, and whole-repository bytes have no representable ordinary data class here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalDataClass {
+    Contract,
+    Requirement,
+    SourceSlice,
+    Diff,
+    ToolSynopsis,
+    Verification,
+    MemorySynopsis,
+    ArchitectureDoc,
+}
+
+impl ExternalDataClass {
+    #[must_use]
+    pub const fn as_plan_ir_str(self) -> &'static str {
+        match self {
+            Self::Contract => "contract",
+            Self::Requirement => "requirement",
+            Self::SourceSlice => "source_slice",
+            Self::Diff => "diff",
+            Self::ToolSynopsis => "tool_synopsis",
+            Self::Verification => "verification",
+            Self::MemorySynopsis => "memory_synopsis",
+            Self::ArchitectureDoc => "architecture_doc",
+        }
+    }
+
+    #[must_use]
+    pub fn from_plan_ir_str(value: &str) -> Option<Self> {
+        match value {
+            "contract" => Some(Self::Contract),
+            "requirement" => Some(Self::Requirement),
+            "source_slice" => Some(Self::SourceSlice),
+            "diff" => Some(Self::Diff),
+            "tool_synopsis" => Some(Self::ToolSynopsis),
+            "verification" => Some(Self::Verification),
+            "memory_synopsis" => Some(Self::MemorySynopsis),
+            "architecture_doc" => Some(Self::ArchitectureDoc),
+            _ => None,
+        }
+    }
+}
+
+/// Global/task whole-repository export ceiling mirrored from Plan IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalRepositoryExport {
+    Deny,
+    ExplicitGrantOnly,
+}
+
+/// Typed allow/deny state for sensitive external payload classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalSensitiveDataAccess {
+    Deny,
+    Allow,
+}
+
+/// External-provider tool authority is intentionally a single-state contract in the local profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalToolAuthority {
+    None,
+}
+
+/// Pure, typed effective payload policy derived by the Controller from active Plan IR.
+///
+/// This value never grants authority on its own. The Controller must separately prove the exact
+/// `ExternalIntelligence` capability grant and every configured authority ceiling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalPayloadPolicy {
+    pub schema_version: u32,
+    pub enabled: bool,
+    pub requires_explicit_grant: bool,
+    pub allowed_providers: BTreeSet<String>,
+    pub allowed_data_classes: BTreeSet<ExternalDataClass>,
+    pub resolved_secrets: ExternalSensitiveDataAccess,
+    pub repository_export: ExternalRepositoryExport,
+    pub raw_logs: ExternalSensitiveDataAccess,
+    pub tool_authority: ExternalToolAuthority,
+    pub max_payload_bytes: u64,
+}
+
+impl ExternalPayloadPolicy {
+    /// Validates the effective policy shape without granting any capability.
+    ///
+    /// # Errors
+    /// Returns a denial when an enabled policy would permit unsafe baseline exports or when a
+    /// disabled policy retains provider/data/payload scope.
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        if self.schema_version != EXTERNAL_PAYLOAD_POLICY_SCHEMA_VERSION {
+            return Err(PolicyError::Denied(format!(
+                "unsupported external payload policy schema {}",
+                self.schema_version
+            )));
+        }
+        if !self.enabled {
+            if !self.allowed_providers.is_empty()
+                || !self.allowed_data_classes.is_empty()
+                || self.max_payload_bytes != 0
+            {
+                return Err(PolicyError::Denied(
+                    "disabled external intelligence retains provider/data/payload scope".to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        if !self.requires_explicit_grant {
+            return Err(PolicyError::Denied(
+                "external intelligence requires an explicit capability grant".to_owned(),
+            ));
+        }
+        if self.allowed_providers.is_empty()
+            || self.allowed_data_classes.is_empty()
+            || self.max_payload_bytes == 0
+        {
+            return Err(PolicyError::Denied(
+                "enabled external intelligence requires bounded provider/data/payload scope"
+                    .to_owned(),
+            ));
+        }
+        if self.resolved_secrets != ExternalSensitiveDataAccess::Deny
+            || self.raw_logs != ExternalSensitiveDataAccess::Deny
+            || self.tool_authority != ExternalToolAuthority::None
+        {
+            return Err(PolicyError::Denied(
+                "external payload policy exceeds the safe local-profile export boundary".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks one already-minimized packet against the exact effective provider/data/byte scope.
+    ///
+    /// # Errors
+    /// Returns a deterministic denial for a disabled policy, undeclared provider/data class, an
+    /// empty packet, or a payload that exceeds the active byte ceiling.
+    pub fn authorize_packet(
+        &self,
+        provider_id: &str,
+        data_classes: &BTreeSet<ExternalDataClass>,
+        payload_bytes: u64,
+    ) -> Result<(), PolicyError> {
+        self.validate()?;
+        if !self.enabled {
+            return Err(PolicyError::Denied(
+                "external intelligence is disabled for this task".to_owned(),
+            ));
+        }
+        if provider_id.trim().is_empty() || !self.allowed_providers.contains(provider_id) {
+            return Err(PolicyError::Denied(
+                "external provider is not in the exact active allowlist".to_owned(),
+            ));
+        }
+        if data_classes.is_empty() || !data_classes.is_subset(&self.allowed_data_classes) {
+            return Err(PolicyError::Denied(
+                "external data-class selection exceeds the active allowlist".to_owned(),
+            ));
+        }
+        if payload_bytes == 0 || payload_bytes > self.max_payload_bytes {
+            return Err(PolicyError::Denied(format!(
+                "external payload bytes {payload_bytes} exceed active ceiling {}",
+                self.max_payload_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Digest-only provenance for one selected evidence item in an external escalation packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalEvidenceBinding {
+    pub evidence_id: String,
+    pub data_class: ExternalDataClass,
+    pub source_digest: String,
+    pub content_digest: String,
+    pub redacted_content_digest: String,
+}
+
+impl ExternalEvidenceBinding {
+    fn validate(&self) -> Result<(), PolicyError> {
+        if self.evidence_id.trim().is_empty()
+            || !is_sha256_binding(&self.source_digest)
+            || !is_sha256_binding(&self.content_digest)
+            || !is_sha256_binding(&self.redacted_content_digest)
+        {
+            return Err(PolicyError::Denied(
+                "external evidence binding requires exact evidence and digest provenance"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Exact, reviewable authorization manifest constructed before any external provider dispatch.
+///
+/// The manifest contains only typed identities, digests, byte/token estimates and redaction event
+/// identifiers. Redacted packet bytes remain ephemeral and are bound by `payload_digest`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalEscalationManifest {
+    pub schema_version: u32,
+    pub provider_id: String,
+    pub model_id: String,
+    pub model_version: String,
+    pub purpose: String,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub task_id: String,
+    pub task_contract_digest: String,
+    pub policy_digest: String,
+    pub execution_epoch: i64,
+    pub selected_evidence: Vec<ExternalEvidenceBinding>,
+    pub data_classes: BTreeSet<ExternalDataClass>,
+    pub redaction_event_ids: BTreeSet<String>,
+    pub redaction_result_digest: String,
+    pub payload_digest: String,
+    pub payload_bytes: u64,
+    pub estimated_tokens: u32,
+    pub deadline_ms: u64,
+    pub expires_at_ms: i64,
+    pub nonce: String,
+}
+
+impl ExternalEscalationManifest {
+    /// Validates exact manifest shape and internally redundant data-class bindings.
+    ///
+    /// # Errors
+    /// Returns a denial for malformed identities/digests, duplicate evidence, non-canonical
+    /// evidence order, inconsistent data classes, or non-positive deadline/expiry fields.
+    pub fn validate(&self) -> Result<(), PolicyError> {
+        if self.schema_version != EXTERNAL_ESCALATION_MANIFEST_SCHEMA_VERSION
+            || self.provider_id.trim().is_empty()
+            || self.model_id.trim().is_empty()
+            || self.model_version.trim().is_empty()
+            || self.purpose.trim().is_empty()
+            || self.plan_id.trim().is_empty()
+            || self.task_id.trim().is_empty()
+            || !is_sha256_binding(&self.task_contract_digest)
+            || !is_sha256_binding(&self.policy_digest)
+            || self.execution_epoch < 0
+            || !is_sha256_binding(&self.redaction_result_digest)
+            || !is_sha256_binding(&self.payload_digest)
+            || self.payload_bytes == 0
+            || self.deadline_ms == 0
+            || self.expires_at_ms <= 0
+            || self.nonce.trim().is_empty()
+            || self.selected_evidence.is_empty()
+        {
+            return Err(PolicyError::Denied(
+                "external escalation manifest has incomplete exact-binding fields".to_owned(),
+            ));
+        }
+        let mut previous_key: Option<(&str, ExternalDataClass)> = None;
+        let mut derived_classes = BTreeSet::new();
+        for binding in &self.selected_evidence {
+            binding.validate()?;
+            let key = (binding.evidence_id.as_str(), binding.data_class);
+            if previous_key.is_some_and(|previous| previous >= key) {
+                return Err(PolicyError::Denied(
+                    "external evidence bindings must be unique and canonically ordered".to_owned(),
+                ));
+            }
+            previous_key = Some(key);
+            derived_classes.insert(binding.data_class);
+        }
+        if derived_classes != self.data_classes {
+            return Err(PolicyError::Denied(
+                "external manifest data classes do not match selected evidence".to_owned(),
+            ));
+        }
+        if self
+            .redaction_event_ids
+            .iter()
+            .any(|event_id| event_id.trim().is_empty())
+        {
+            return Err(PolicyError::Denied(
+                "external manifest contains an empty redaction event identity".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Stable exact-manifest digest used as the approval payload binding.
+    ///
+    /// # Errors
+    /// Returns the same fail-closed validation error as [`Self::validate`].
+    pub fn digest(&self) -> Result<String, PolicyError> {
+        self.validate()?;
+        let mut hasher = Sha256::new();
+        hasher.update(EXTERNAL_ESCALATION_MANIFEST_SCHEMA_VERSION.to_be_bytes());
+        digest_policy_field(&mut hasher, &self.provider_id);
+        digest_policy_field(&mut hasher, &self.model_id);
+        digest_policy_field(&mut hasher, &self.model_version);
+        digest_policy_field(&mut hasher, &self.purpose);
+        digest_policy_field(&mut hasher, &self.plan_id);
+        hasher.update(self.plan_revision.to_be_bytes());
+        digest_policy_field(&mut hasher, &self.task_id);
+        digest_policy_field(&mut hasher, &self.task_contract_digest);
+        digest_policy_field(&mut hasher, &self.policy_digest);
+        hasher.update(self.execution_epoch.to_be_bytes());
+        hasher.update((self.selected_evidence.len() as u64).to_be_bytes());
+        for binding in &self.selected_evidence {
+            digest_policy_field(&mut hasher, &binding.evidence_id);
+            digest_policy_field(&mut hasher, binding.data_class.as_plan_ir_str());
+            digest_policy_field(&mut hasher, &binding.source_digest);
+            digest_policy_field(&mut hasher, &binding.content_digest);
+            digest_policy_field(&mut hasher, &binding.redacted_content_digest);
+        }
+        for data_class in &self.data_classes {
+            digest_policy_field(&mut hasher, data_class.as_plan_ir_str());
+        }
+        for event_id in &self.redaction_event_ids {
+            digest_policy_field(&mut hasher, event_id);
+        }
+        digest_policy_field(&mut hasher, &self.redaction_result_digest);
+        digest_policy_field(&mut hasher, &self.payload_digest);
+        hasher.update(self.payload_bytes.to_be_bytes());
+        hasher.update(self.estimated_tokens.to_be_bytes());
+        hasher.update(self.deadline_ms.to_be_bytes());
+        hasher.update(self.expires_at_ms.to_be_bytes());
+        digest_policy_field(&mut hasher, &self.nonce);
+        Ok(format!("sha256:{:x}", hasher.finalize()))
     }
 }
 

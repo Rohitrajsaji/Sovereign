@@ -725,6 +725,7 @@ dependencies = [
  "sha2",
  "sovereign-evidence",
  "sovereign-memory",
+ "sovereign-model",
  "sovereign-policy",
  "sovereign-repo",
 ]

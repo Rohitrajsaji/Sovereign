@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "task_id": "M6-T07",
+  "title": "Implement optional external-intelligence policy gateway with no provider dependency",
+  "status": "completed",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "98e15c2a2c99c445cddca16ab70401cd8a9468c5",
+  "completed_at": "2026-09-16T02:34:22Z",
+  "verified_at": "2026-09-16T02:34:22Z",
+  "dependencies": [
+    "M6-T03",
+    "M6-T04",
+    "M6-T05",
+    "M6-T06"
+  ],
+  "interfaces": [
+    "ExternalIntelligenceGateway",
+    "ExternalEscalationManifest",
+    "ExternalPayloadPolicy"
+  ],
+  "objective": "Define an optional, disabled-by-default L7 external-intelligence boundary that exports only explicit minimized/redacted evidence under exact policy/grant/approval/budget controls and imports provider output as durable untrusted advisory evidence with zero execution authority.",
+  "frozen_tree": {
+    "head": "98e15c2a2c99c445cddca16ab70401cd8a9468c5",
+    "dirty_path_count": 15,
+    "source_hashes_match_final_audit": true,
+    "git_diff_check": "passed"
+  },
+  "source_hashes": {
+    "Cargo.lock": "sha256:848864d33f0310dd69644e8fbf89cce62ff73eda8a53173a7ccc363a750436cf",
+    "crates/sovereign-context/Cargo.toml": "sha256:25fb72275b33577de9c7088019814bf5bcf0ed608311151e8afbac7290d11ae7",
+    "crates/sovereign-context/src/lib.rs": "sha256:e574f6d0a99a3ee23f6d30d6da59b2a781863ef4143094c84cefd9f81923bfed",
+    "crates/sovereign-context/tests/external_advisory.rs": "sha256:319936d4afe939035b946a0fd76404fcda36a034d36d2be13738644fbe07f382",
+    "crates/sovereign-controller/src/lib.rs": "sha256:6203d0a477886c76273383a9f8941fca219e2bb1568d9706f0d7cee009e74b69",
+    "crates/sovereign-eval/tests/external_intelligence_policy.rs": "sha256:0492ffd33b2bb021cb2c527f0be19ec4d346a689055a520d96ff348288d9b40e",
+    "crates/sovereign-model/src/lib.rs": "sha256:21f726bcf07da7b1664500396ec06c0d7dee0181992f6edab490dc5d175ee6b6",
+    "crates/sovereign-model/tests/external_intelligence.rs": "sha256:bcf3aba3b707ef740eb7305194594c5cbd817ce65812f81e9e04daff99daf5ba",
+    "crates/sovereign-plan/src/compiler.rs": "sha256:800c1d78f06ac9521b588100548883c6cdad12df3d8efc1d8e4cb81d63db4cfe",
+    "crates/sovereign-plan/src/lib.rs": "sha256:b7f05ba462fb86e767108307830ffac40b73b64c540e2328fce16b8a2b922320",
+    "crates/sovereign-plan/tests/minimal_compiler.rs": "sha256:83e2071895eac8d1d70a548ca196682150b1e8b67c0c64c21752c9747635a063",
+    "crates/sovereign-policy/src/lib.rs": "sha256:b9d07909de512bd6896dfe76b7d0c7465134e9db1c402691b812f708ce0f0b1c",
+    "crates/sovereign-policy/tests/external_intelligence.rs": "sha256:e26cb329a2d9a049f9c0199bd78822867761463e22b1066f1293e3f620872f1f",
+    "crates/sovereign-state/src/lib.rs": "sha256:2658d3ae8d780ba0b1c73d39fdd728ef6924a753240f410d6a40aaf6e3ab757b",
+    "crates/sovereign-state/tests/security_kernel.rs": "sha256:f705ee6a72f6d411587d03187bcb579aa33d6de81b0cc9144dec4c92a6a41537"
+  },
+  "compiler_activation_contract": {
+    "baseline_compiler_external_intelligence_enabled": false,
+    "positive_path": "PlanCompilationResult::bind_controller_external_intelligence",
+    "raw_plan_ir_positive_fixture_bypass": false,
+    "validator_rerun_after_binding": true,
+    "plan_and_compilation_evidence_digests_recomputed": true,
+    "scope_exception": "crates/sovereign-plan is a narrow compatibility/reachability addition although the frozen task target list names controller/policy/model/context; it introduces no schema or execution-authority bypass",
+    "m1_local_autonomous_widened": false
+  },
+  "external_policy_contract": {
+    "disabled_by_default": true,
+    "provider_allowlist_exact": true,
+    "data_class_allowlist_exact": true,
+    "exact_task_capability_grant_required": true,
+    "authority_intersection": [
+      "controller ceiling",
+      "project ceiling",
+      "role ceiling",
+      "persisted user-grant ceiling",
+      "global Plan IR capability ceiling",
+      "task permissions",
+      "exact TaskCapabilityGrant"
+    ],
+    "resolved_secrets_exported": false,
+    "credential_bearing_traces_exported": false,
+    "unrestricted_raw_logs_exported": false,
+    "raw_whole_repository_exported_by_default": false,
+    "unrestricted_cas_exported": false,
+    "provider_tool_credentials": false,
+    "transport_deadline_enforced": true,
+    "transport_network_byte_budget_enforced": true
+  },
+  "approval_and_action_contract": {
+    "canonical_action_store": "existing action_records table",
+    "approval_request_namespace": "controller.approval_request",
+    "approval_claim_namespace": "controller.approval_claim",
+    "second_approval_or_action_database": false,
+    "fake_tool_manifest_or_command_spec": false,
+    "manifest_digest_is_exact_approval_payload_binding": true,
+    "provider_model_purpose_payload_drift_invalidates_resume": true,
+    "legal_plan_ir_approval_required_permissions": [
+      "package_install",
+      "network_write",
+      "external_side_effect",
+      "external_intelligence",
+      "destructive"
+    ]
+  },
+  "advisory_persistence_contract": {
+    "response_cas_registered_before_action_result_digest": true,
+    "response_artifact_reference_prefix": "external.response.",
+    "action_order": [
+      "authorized",
+      "dispatched",
+      "observed",
+      "committed"
+    ],
+    "durable_advisory_namespace": "controller.evidence_item",
+    "advisory_persisted_before_committed": true,
+    "trust_source": "external_model",
+    "trust_level": "untrusted",
+    "evidence_kind": "external_advisory",
+    "tool_authority": false,
+    "approval_authority": false,
+    "policy_authority": false,
+    "completion_authority": false,
+    "expansion_authority": false
+  },
+  "crash_recovery_and_budget_contract": {
+    "same_process_unresolved_fence_states": [
+      "dispatched",
+      "observed",
+      "unknown"
+    ],
+    "restart_nonterminal_to_unknown_states": [
+      "dispatched",
+      "observed"
+    ],
+    "unknown_is_failure": false,
+    "blind_redispatch_after_unknown": false,
+    "known_invalid_or_identity_drift_response_terminalizes_failed": true,
+    "task_and_goal_model_budget_charged": true,
+    "task_and_goal_network_budget_charged": true,
+    "budget_counters_survive_restart": true,
+    "ambiguous_post_provider_response_reservation": "max_response_bytes",
+    "reservation_phase": "recovery_unknown_response_reservation"
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-eval --test external_intelligence_policy --offline",
+      "result": "passed",
+      "detail": "10/10 strengthened cases covering all 7 frozen tests"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-state --test security_kernel --offline",
+      "result": "passed",
+      "detail": "7/7 including observed action recovery to Unknown before epoch advance"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-controller --offline",
+      "result": "passed",
+      "detail": "lib 39/39; t07 52/52; M6-T06 resilience remains green (4 default, 6 workspace recovery-hook configuration)"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test --workspace --all-targets --offline",
+      "result": "passed",
+      "detail": "all non-ignored tests passed; two explicit local-Qwen final-release qualification tests remain intentionally ignored here"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "independent_audit": {
+    "worker": "worker-2",
+    "run_id": "96dc64af-0316-482e-8a4d-40c526a69f7f",
+    "result": "CLOSABLE",
+    "verdict": "M6-T07 frozen task: CLOSABLE",
+    "blockers": [],
+    "exact_tree_reverified": true,
+    "independent_focused_validation": [
+      "external_intelligence_policy 10/10 passed",
+      "state security_kernel 7/7 passed",
+      "compiler external-binding 3/3 passed",
+      "git diff --check passed"
+    ]
+  },
+  "state_authority": {
+    "controller_sole_execution_authority": true,
+    "external_intelligence_is_advisory_only": true,
+    "second_authority_database_created": false
+  },
+  "intentional_ignored_tests": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "real_qwen_runtime_on_current_tree": "deferred to mandatory final-release current-tree qualification; not claimed by M6-T07",
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  }
+}
