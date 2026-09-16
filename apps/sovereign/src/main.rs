@@ -120,7 +120,7 @@ fn run(args: &[String], state_path: &Path) -> Result<String, String> {
                 .map_err(|error| format!("invalid serve address: {error}"))?;
             let listener = bind_loopback(address)?;
             let local_address = listener.local_addr().map_err(|error| error.to_string())?;
-            eprintln!("sovereign local control API listening on http://{local_address}");
+            eprintln!("sovereign local dashboard listening on http://{local_address}/dashboard");
             let mut control = open_read_control(state_path)?;
             serve_listener(&listener, |request| {
                 handle_control_request(&mut control, request)
@@ -150,6 +150,9 @@ fn handle_control_request(
     request: ControlApiRequest,
 ) -> Result<Value, String> {
     match request {
+        ControlApiRequest::Dashboard => {
+            Err("dashboard route is served as static read-only content".to_owned())
+        }
         ControlApiRequest::ReadModel => control
             .read_model()
             .and_then(|view| serde_json::to_value(view).map_err(Into::into))
@@ -196,7 +199,7 @@ fn help_text() -> String {
         "  resume                         Resume Controller readiness/mutation",
         "  approvals                      Render durable approval-request facts",
         "  approval <id> <approve|deny> <principal>  Respond through Controller approval validation",
-        "  serve [127.0.0.1:port]         Serve the loopback-only local control API",
+        "  serve [127.0.0.1:port]         Serve the loopback-only local dashboard and control API",
         "  doctor                         Check local state/control access",
         "  --version                      Print version",
         "",
@@ -214,7 +217,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -295,6 +298,29 @@ mod tests {
         stream
             .read_to_string(&mut response)
             .unwrap_or_else(|error| panic!("read local control response: {error}"));
+        response
+    }
+
+    fn local_control_http_once(state_path: &Path, request: &str) -> String {
+        let listener = bind_loopback(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .unwrap_or_else(|error| panic!("bind local control API: {error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("local control API address: {error}"));
+        let path = state_path.to_path_buf();
+        let server = thread::spawn(move || {
+            let mut control = LocalControl::read_only(
+                StateStore::open(&path).unwrap_or_else(|error| panic!("API state: {error}")),
+            );
+            serve_one(&listener, |api_request| {
+                handle_control_request(&mut control, api_request)
+            })
+            .unwrap_or_else(|error| panic!("serve local control request: {error}"));
+        });
+        let response = http_request(address, request);
+        server
+            .join()
+            .unwrap_or_else(|_| panic!("local control server thread panicked"));
         response
     }
 
@@ -405,6 +431,42 @@ mod tests {
     }
 
     #[test]
+    fn socket_pause_resume_delegate_to_controller_owned_state() {
+        let state_path = temp_state("api-socket-control");
+        let pause_body = r#"{"reason":"dashboard operator"}"#;
+        let pause = local_control_http_once(
+            &state_path,
+            &format!(
+                "POST /v1/control/pause HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: http://127.0.0.1\r\nContent-Length: {}\r\n\r\n{pause_body}",
+                pause_body.len()
+            ),
+        );
+        assert!(pause.starts_with("HTTP/1.1 200 OK\r\n"));
+        let paused = Controller::new(
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("paused state: {error}")),
+        )
+        .execution_control()
+        .unwrap_or_else(|error| panic!("paused control: {error}"));
+        assert!(paused.paused);
+        assert_eq!(paused.reason.as_deref(), Some("dashboard operator"));
+
+        let resume = local_control_http_once(
+            &state_path,
+            "POST /v1/control/resume HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        assert!(resume.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(
+            !Controller::new(
+                StateStore::open(&state_path)
+                    .unwrap_or_else(|error| panic!("resumed state: {error}")),
+            )
+            .execution_control()
+            .unwrap_or_else(|error| panic!("resumed control: {error}"))
+            .paused
+        );
+    }
+
+    #[test]
     fn rejected_raw_state_route_cannot_mutate_authoritative_journal() {
         let state_path = temp_state("api-deny-raw-state");
         let before_store =
@@ -473,5 +535,64 @@ mod tests {
         .and_then(|control| control.read_model())
         .unwrap_or_else(|error| panic!("read after restart: {error}"));
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn dashboard_is_read_only_and_uses_only_local_control_routes() {
+        let state_path = temp_state("dashboard");
+        run(
+            &["goal".to_owned(), "Build inventory".to_owned()],
+            &state_path,
+        )
+        .unwrap_or_else(|error| panic!("seed goal: {error}"));
+
+        let before_store =
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("state before: {error}"));
+        let before_sequence = before_store
+            .latest_journal_sequence()
+            .unwrap_or_else(|error| panic!("journal before: {error}"));
+        drop(before_store);
+
+        let listener = bind_loopback(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .unwrap_or_else(|error| panic!("bind dashboard: {error}"));
+        let address = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("dashboard local address: {error}"));
+        let server = thread::spawn(move || {
+            serve_one(&listener, |request| {
+                panic!("static dashboard must not reach Controller handler: {request:?}")
+            })
+            .unwrap_or_else(|error| panic!("serve dashboard: {error}"));
+        });
+        let response = http_request(
+            address,
+            "GET /dashboard HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        );
+        server
+            .join()
+            .unwrap_or_else(|_| panic!("dashboard server thread panicked"));
+
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(response.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(response.contains("Sovereign Local Dashboard"));
+        assert!(response.contains("Goals"));
+        assert!(response.contains("Tasks &amp; Progress"));
+        assert!(response.contains("Verification &amp; Evidence"));
+        assert!(response.contains("Blocked Approvals"));
+        assert!(response.contains("/v1/status"));
+        assert!(response.contains("/v1/control/pause"));
+        assert!(response.contains("/v1/control/resume"));
+        assert!(response.contains("/v1/approvals/respond"));
+        assert!(!response.contains("/v1/actions"));
+        assert!(!response.contains("/v1/state/"));
+
+        let after_store =
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("state after: {error}"));
+        assert_eq!(
+            after_store
+                .latest_journal_sequence()
+                .unwrap_or_else(|error| panic!("journal after: {error}")),
+            before_sequence
+        );
     }
 }

@@ -1,0 +1,134 @@
+{
+  "schema": "sovereign-product-task-evidence-v1",
+  "task": "PD-T02",
+  "title": "Controller-backed local dashboard",
+  "status": "completed",
+  "completed_at": "2026-09-16T04:20:01Z",
+  "verified_at": "2026-09-16T04:20:01Z",
+  "acceptance_base": "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md",
+  "scheduling_overlay": "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md",
+  "dependencies": [
+    "PD-T01",
+    "PD-T06"
+  ],
+  "base_head": "93106aec8dd0faab0b9af04bcc363b1ee2dd285a",
+  "objective": "Provide a lightweight loopback-local dashboard that renders the durable LocalControl read model and delegates mutations to the same Controller transitions as the CLI.",
+  "acceptance": {
+    "displays_goals": true,
+    "displays_plan_and_tasks": true,
+    "displays_current_progress": true,
+    "displays_verification_and_evidence": true,
+    "displays_blocked_approvals": true,
+    "displays_recovery_projection": true,
+    "pause_delegates_to_local_control_controller": true,
+    "resume_delegates_to_local_control_controller": true,
+    "approval_response_delegates_to_local_control_controller": true,
+    "approval_ui_can_directly_execute_actions": false,
+    "restart_projection_uses_durable_controller_state": true,
+    "duplicate_execution_state_database": false
+  },
+  "authority_and_security": {
+    "controller_remains_sole_execution_authority": true,
+    "dashboard_static_get_is_read_only": true,
+    "status_get_is_read_only": true,
+    "serve_bootstrap_uses_local_control_read_only": true,
+    "first_mutation_lazily_reacquires_controller_authority": true,
+    "raw_state_route": false,
+    "generic_tool_or_action_dispatch_route": false,
+    "direct_permission_minting_route": false,
+    "permissive_cors": false,
+    "http_11_requires_loopback_host": true,
+    "duplicate_host_rejected": true,
+    "remote_or_dns_rebinding_style_host_rejected": true,
+    "origin_if_present_requires_http_loopback_origin": true,
+    "duplicate_origin_rejected": true,
+    "origin_absent_non_browser_client_requests_remain_supported": true,
+    "durable_values_rendered_as_text_not_html": true
+  },
+  "dashboard_surface": {
+    "implementation": "embedded static HTML/JavaScript served by the existing bounded std::net loopback-local control server",
+    "dashboard_routes": [
+      "GET /",
+      "GET /dashboard"
+    ],
+    "read_route": "GET /v1/status",
+    "mutation_routes": [
+      "POST /v1/control/pause",
+      "POST /v1/control/resume",
+      "POST /v1/approvals/respond"
+    ],
+    "new_runtime_or_web_framework": false,
+    "new_database": false,
+    "client_persistence_or_local_storage": false
+  },
+  "frozen_tree": {
+    "head": "93106aec8dd0faab0b9af04bcc363b1ee2dd285a",
+    "dirty_source_path_count": 2,
+    "source_hashes_match_final_audit": true,
+    "frozen_contract_hashes_match": true
+  },
+  "source_hashes": {
+    "apps/sovereign/src/control_api.rs": "sha256:2d536edf98b86b219cc74c849b073d6d1a56bedfe29861123555ee407d7dd306",
+    "apps/sovereign/src/main.rs": "sha256:f222554aa94b21204ed6cebbc58e120b0954cfb14bfe6f2aab0a0f8b5ae8f5cc"
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test --workspace --all-targets --offline",
+      "result": "passed",
+      "detail": "all non-ignored tests passed; explicit final-release local-Qwen qualification remains deferred to release acceptance"
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign --all-targets --offline",
+      "result": "passed",
+      "detail": "11/11 focused app tests, including read-only dashboard GET and real-socket pause/resume delegation"
+    },
+    {
+      "command": "independent socket probes",
+      "result": "passed",
+      "detail": "missing/duplicate/remote Host and duplicate/remote/malformed Origin fail closed; valid local Origin and Origin-absent CLI-style mutation remain usable"
+    }
+  ],
+  "independent_audit": {
+    "worker": "worker-4",
+    "result": "CLOSABLE",
+    "verdict": "PD-T02: CLOSABLE",
+    "blockers": [],
+    "literal_blocker_result": "BLOCKERS: None",
+    "exact_tree_reverified": true,
+    "changes_made_by_auditor": false
+  },
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false
+  }
+}

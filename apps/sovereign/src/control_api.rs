@@ -1,6 +1,6 @@
 use serde_json::{Value, json};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -8,6 +8,7 @@ const MAX_REQUEST_BYTES: usize = MAX_HEADER_BYTES + MAX_BODY_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlApiRequest {
+    Dashboard,
     ReadModel,
     SubmitGoal {
         goal: String,
@@ -111,14 +112,17 @@ fn serve_stream<F>(stream: &mut TcpStream, handle: &mut F) -> Result<(), String>
 where
     F: FnMut(ControlApiRequest) -> Result<Value, String>,
 {
-    let response = match read_request(stream).and_then(|bytes| parse_request(&bytes)) {
-        Ok(request) => match handle(request) {
-            Ok(body) => (ApiStatus::Ok, body),
-            Err(message) => (ApiStatus::InternalServerError, json!({"error": message})),
-        },
-        Err(error) => (error.status, json!({"error": error.message})),
-    };
-    write_response(stream, response.0, &response.1)
+    match read_request(stream).and_then(|bytes| parse_request(&bytes)) {
+        Ok(ControlApiRequest::Dashboard) => write_dashboard_response(stream),
+        Ok(request) => {
+            let response = match handle(request) {
+                Ok(body) => (ApiStatus::Ok, body),
+                Err(message) => (ApiStatus::InternalServerError, json!({"error": message})),
+            };
+            write_json_response(stream, response.0, &response.1)
+        }
+        Err(error) => write_json_response(stream, error.status, &json!({"error": error.message})),
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>, ApiError> {
@@ -258,9 +262,14 @@ fn parse_request(bytes: &[u8]) -> Result<ControlApiRequest, ApiError> {
             "unsupported HTTP request line",
         ));
     }
+    validate_local_request_headers(header_text, version)?;
 
     let body = &bytes[header_end..];
     match (method, path) {
+        ("GET", "/" | "/dashboard") => {
+            require_empty_body(body)?;
+            Ok(ControlApiRequest::Dashboard)
+        }
         ("GET", "/v1/status") => {
             require_empty_body(body)?;
             Ok(ControlApiRequest::ReadModel)
@@ -315,6 +324,101 @@ fn parse_request(bytes: &[u8]) -> Result<ControlApiRequest, ApiError> {
             "local control API supports only GET and POST",
         )),
     }
+}
+
+fn validate_local_request_headers(header_text: &str, version: &str) -> Result<(), ApiError> {
+    let mut host = None;
+    let mut origin = None;
+    for line in header_text.split("\r\n").skip(1) {
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(ApiError::new(
+                ApiStatus::BadRequest,
+                "malformed HTTP header",
+            ));
+        };
+        let value = value.trim();
+        if name.trim().eq_ignore_ascii_case("host") {
+            if host.replace(value).is_some() {
+                return Err(ApiError::new(
+                    ApiStatus::BadRequest,
+                    "duplicate Host header",
+                ));
+            }
+        } else if name.trim().eq_ignore_ascii_case("origin") && origin.replace(value).is_some() {
+            return Err(ApiError::new(
+                ApiStatus::BadRequest,
+                "duplicate Origin header",
+            ));
+        }
+    }
+
+    if version == "HTTP/1.1" && host.is_none() {
+        return Err(ApiError::new(
+            ApiStatus::BadRequest,
+            "HTTP/1.1 local control requests require a Host header",
+        ));
+    }
+    if host.is_some_and(|value| !is_loopback_authority(value)) {
+        return Err(ApiError::new(
+            ApiStatus::BadRequest,
+            "local control Host must resolve syntactically to localhost or a loopback IP",
+        ));
+    }
+    if origin.is_some_and(|value| !is_loopback_origin(value)) {
+        return Err(ApiError::new(
+            ApiStatus::BadRequest,
+            "browser Origin must be the local control loopback origin",
+        ));
+    }
+    Ok(())
+}
+
+fn is_loopback_origin(value: &str) -> bool {
+    value
+        .strip_prefix("http://")
+        .filter(|authority| {
+            !authority.is_empty()
+                && !authority.contains('/')
+                && !authority.contains('?')
+                && !authority.contains('#')
+        })
+        .is_some_and(is_loopback_authority)
+}
+
+fn is_loopback_authority(value: &str) -> bool {
+    let host = if let Some(bracketed) = value.strip_prefix('[') {
+        let Some(close) = bracketed.find(']') else {
+            return false;
+        };
+        let host = &bracketed[..close];
+        let suffix = &bracketed[close + 1..];
+        if !valid_optional_port(suffix) {
+            return false;
+        }
+        host
+    } else if let Some((host, port)) = value.rsplit_once(':') {
+        if port.parse::<u16>().is_err() {
+            return false;
+        }
+        host
+    } else {
+        value
+    };
+
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn valid_optional_port(suffix: &str) -> bool {
+    suffix.is_empty()
+        || suffix
+            .strip_prefix(':')
+            .is_some_and(|port| port.parse::<u16>().is_ok())
 }
 
 fn parse_optional_json_object(body: &[u8]) -> Result<Value, ApiError> {
@@ -396,7 +500,146 @@ fn require_empty_body(body: &[u8]) -> Result<(), ApiError> {
     }
 }
 
-fn write_response(stream: &mut TcpStream, status: ApiStatus, body: &Value) -> Result<(), String> {
+const DASHBOARD_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sovereign Local Dashboard</title>
+<style>
+:root{font-family:ui-sans-serif,system-ui,sans-serif;color-scheme:light dark}
+body{max-width:1100px;margin:0 auto;padding:24px}
+header{display:flex;justify-content:space-between;gap:16px;align-items:center}
+section{border:1px solid #7776;border-radius:10px;padding:14px;margin:14px 0}
+pre{white-space:pre-wrap;overflow-wrap:anywhere}
+button,input{font:inherit;padding:8px;margin:4px}
+button{cursor:pointer}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.muted{opacity:.7}
+.error{color:#c33}
+.approval{border-top:1px solid #7776;padding:10px 0}
+</style>
+</head>
+<body>
+<header>
+<div>
+<h1>Sovereign Local Dashboard</h1>
+<div class="muted">Read model from the same Controller/StateStore authority as the CLI.</div>
+</div>
+<button id="refresh">Refresh</button>
+</header>
+<section>
+<h2>Controller</h2>
+<div id="control"></div>
+<div class="row">
+<input id="pause-reason" placeholder="Pause reason (optional)">
+<button id="pause">Pause</button>
+<button id="resume">Resume</button>
+</div>
+<div id="message" class="muted"></div>
+</section>
+<section><h2>Goals</h2><pre id="goals"></pre></section>
+<section><h2>Plan</h2><pre id="plan"></pre></section>
+<section><h2>Tasks &amp; Progress</h2><pre id="progress"></pre></section>
+<section><h2>Verification &amp; Evidence</h2><pre id="verification"></pre></section>
+<section>
+<h2>Blocked Approvals</h2>
+<div class="row"><input id="principal" value="operator" aria-label="Approval principal"></div>
+<div id="approvals"></div>
+</section>
+<section><h2>Recovery</h2><pre id="recovery"></pre></section>
+<script>
+const show=(id,value)=>document.getElementById(id).textContent=JSON.stringify(value,null,2);
+async function request(path,options){
+  const response=await fetch(path,options);
+  const body=await response.json();
+  if(!response.ok)throw new Error(body.error||`HTTP ${response.status}`);
+  return body;
+}
+function message(text,error=false){
+  const node=document.getElementById('message');
+  node.textContent=text;
+  node.className=error?'error':'muted';
+}
+async function refresh(){
+  try{
+    const view=await request('/v1/status');
+    const status=view.status||{};
+    document.getElementById('control').textContent=status.execution_control?.paused?'Paused':'Running';
+    show('goals',status.goal_intents||[]);
+    show('plan',{active_plan:status.active_plan||null,plan_revisions:view.plan_revisions||[]});
+    show('progress',{tasks:status.tasks||[],attempts:status.attempts||[],actions:status.actions||[]});
+    show('verification',{verifications:view.verifications||[],evidence:status.evidence||[]});
+    show('recovery',view.recovery||{});
+    renderApprovals(view.blocked_approvals||[]);
+    message('State refreshed.');
+  }catch(error){message(error.message,true);}
+}
+function renderApprovals(items){
+  const root=document.getElementById('approvals');
+  root.replaceChildren();
+  if(items.length===0){root.textContent='No blocked approvals.';return;}
+  for(const item of items){
+    const row=document.createElement('div');
+    row.className='approval';
+    const details=document.createElement('pre');
+    details.textContent=JSON.stringify(item,null,2);
+    const approve=document.createElement('button');
+    approve.textContent='Approve';
+    approve.onclick=()=>respond(item.request_id,'approve');
+    const deny=document.createElement('button');
+    deny.textContent='Deny';
+    deny.onclick=()=>respond(item.request_id,'deny');
+    row.append(details,approve,deny);
+    root.append(row);
+  }
+}
+async function post(path,payload){
+  return request(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+}
+async function respond(requestId,decision){
+  const principal=document.getElementById('principal').value.trim();
+  if(!principal){message('Approval principal is required.',true);return;}
+  try{
+    await post('/v1/approvals/respond',{request_id:requestId,decision,principal});
+    await refresh();
+  }catch(error){message(error.message,true);}
+}
+document.getElementById('refresh').onclick=refresh;
+document.getElementById('pause').onclick=async()=>{
+  try{
+    const reason=document.getElementById('pause-reason').value.trim();
+    await post('/v1/control/pause',reason?{reason}:{});
+    await refresh();
+  }catch(error){message(error.message,true);}
+};
+document.getElementById('resume').onclick=async()=>{
+  try{await post('/v1/control/resume',{});await refresh();}
+  catch(error){message(error.message,true);}
+};
+refresh();
+</script>
+</body>
+</html>
+"#;
+
+fn write_dashboard_response(stream: &mut TcpStream) -> Result<(), String> {
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\n\r\n",
+        DASHBOARD_HTML.len()
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .and_then(|()| stream.write_all(DASHBOARD_HTML.as_bytes()))
+        .and_then(|()| stream.flush())
+        .map_err(|error| error.to_string())
+}
+
+fn write_json_response(
+    stream: &mut TcpStream,
+    status: ApiStatus,
+    body: &Value,
+) -> Result<(), String> {
     let body = serde_json::to_vec(body).map_err(|error| error.to_string())?;
     let headers = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n\r\n",
@@ -441,6 +684,11 @@ mod tests {
     #[test]
     fn parser_exposes_only_bounded_local_control_operations() {
         assert_eq!(
+            parse_request(&request("GET", "/dashboard", ""))
+                .unwrap_or_else(|error| panic!("dashboard parse: {}", error.message)),
+            ControlApiRequest::Dashboard
+        );
+        assert_eq!(
             parse_request(&request("GET", "/v1/status", ""))
                 .unwrap_or_else(|error| panic!("read model parse: {}", error.message)),
             ControlApiRequest::ReadModel
@@ -481,5 +729,24 @@ mod tests {
             .is_err()
         );
         assert!(parse_request(&request("DELETE", "/v1/status", "")).is_err());
+
+        assert!(
+            parse_request(
+                b"GET /dashboard HTTP/1.1\r\nHost: attacker.example\r\nContent-Length: 0\r\n\r\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_request(
+                b"POST /v1/control/pause HTTP/1.1\r\nHost: 127.0.0.1:7777\r\nOrigin: https://attacker.example\r\nContent-Length: 2\r\n\r\n{}"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_request(
+                b"POST /v1/control/pause HTTP/1.1\r\nHost: [::1]:7777\r\nOrigin: http://[::1]:7777\r\nContent-Length: 2\r\n\r\n{}"
+            )
+            .is_ok()
+        );
     }
 }
