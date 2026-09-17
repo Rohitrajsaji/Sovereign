@@ -13,6 +13,10 @@ use sovereign_controller::{
     ResourcePressureProbe, RoleId, RoleRegistry, SchedulerView, SecretProcessRuntime, TaskState,
     VERIFICATION_RESULT_SCHEMA_VERSION, VerificationResultV1,
 };
+#[cfg(feature = "recovery-test-hooks")]
+use sovereign_controller::{
+    REPOSITORY_PROPOSAL_SCHEMA_VERSION, RepositoryActionV1, RepositoryProposalV1,
+};
 use sovereign_evidence::ArtifactStore;
 use sovereign_memory::{MemoryKind, MemoryTrust, ProcedurePattern};
 use sovereign_model::{
@@ -62,6 +66,16 @@ const OTHER_SOURCE: &str = "baseline other file\n";
 const WRITE_TOOL_DIGEST: &str =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "recovery-test-hooks")]
+const PD_T05_V4_CRASH_STATE: &str = "SOVEREIGN_PD_T05_V4_CRASH_STATE";
+#[cfg(feature = "recovery-test-hooks")]
+const PD_T05_V4_CRASH_ROOT: &str = "SOVEREIGN_PD_T05_V4_CRASH_ROOT";
+#[cfg(feature = "recovery-test-hooks")]
+const PD_T05_V4_CRASH_BASE: &str = "SOVEREIGN_PD_T05_V4_CRASH_BASE";
+#[cfg(feature = "recovery-test-hooks")]
+const PD_T05_V4_CRASH_TASK: &str = "SOVEREIGN_PD_T05_V4_CRASH_TASK";
+#[cfg(feature = "recovery-test-hooks")]
+const PD_T05_V4_CRASH_KIND: &str = "SOVEREIGN_PD_T05_V4_CRASH_KIND";
 
 #[derive(Clone)]
 struct FixedResourcePressureProbe(ResourcePressureSnapshotV1);
@@ -570,6 +584,7 @@ fn compiled_fixture(label: &str, evidence_query: bool) -> CompiledFixture {
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -599,6 +614,7 @@ fn compiled_secret_fixture(label: &str) -> (CompiledFixture, SecretRef) {
         None,
         None,
         Some(policy),
+        None,
     );
     let secret_ref = test_secret_ref();
     let target_task_id = fixture
@@ -626,7 +642,7 @@ fn compiled_secret_fixture(label: &str) -> (CompiledFixture, SecretRef) {
 #[allow(clippy::too_many_lines)]
 fn compiled_fixture_with_dirty_target(label: &str) -> CompiledFixture {
     compiled_fixture_inner(
-        label, false, true, None, None, false, false, None, None, None, None,
+        label, false, true, None, None, false, false, None, None, None, None, None,
     )
 }
 
@@ -640,6 +656,7 @@ fn compiled_fixture_with_task_model_call_cap(label: &str, cap: u64) -> CompiledF
         None,
         false,
         false,
+        None,
         None,
         None,
         None,
@@ -668,6 +685,7 @@ fn compiled_fixture_with_resource_override(
         None,
         Some(resource_override),
         None,
+        None,
     )
 }
 
@@ -684,12 +702,13 @@ fn compiled_fixture_with_target_mode(label: &str, mode: u32) -> CompiledFixture 
         None,
         None,
         None,
+        None,
     )
 }
 
 fn compiled_two_task_fixture(label: &str) -> CompiledFixture {
     compiled_fixture_inner(
-        label, false, false, None, None, true, false, None, None, None, None,
+        label, false, false, None, None, true, false, None, None, None, None, None,
     )
 }
 
@@ -730,12 +749,13 @@ fn compiled_learning_two_path_fixture(label: &str) -> CompiledFixture {
         ),
         None,
         None,
+        None,
     )
 }
 
 fn compiled_worktree_fixture(label: &str) -> CompiledFixture {
     compiled_fixture_inner(
-        label, false, false, None, None, false, true, None, None, None, None,
+        label, false, false, None, None, false, true, None, None, None, None, None,
     )
 }
 
@@ -757,6 +777,144 @@ fn compiled_worktree_graph_fixture(label: &str, tasks: &[Value]) -> CompiledFixt
         ),
         None,
         Some(policy),
+        None,
+    )
+}
+
+fn compiled_command_verification_fixture(
+    label: &str,
+    expected_exit_codes: &[i32],
+) -> CompiledFixture {
+    let mut policy = global_policy();
+    policy["resources"]["heavy_leases"] = json!(["MODEL", "BUILD_HEAVY"]);
+    let planning = json!({
+        "tasks": [{
+            "local_id": "settings-command-verification",
+            "repository_id": "repo.app",
+            "title": "Rename label and run governed verification",
+            "objective": "Change Save to Apply in SettingsForm and run the exact governed verification command.",
+            "rationale": "The repository edit and its command evidence are both frozen in the task contract.",
+            "files": ["src/settings/SettingsForm.tsx"],
+            "symbols": ["SettingsForm"],
+            "dependencies": [],
+            "evidence_needs": [],
+            "expected_change": "SettingsForm renders Apply.",
+            "acceptance": [
+                {
+                    "kind": "diff",
+                    "description": "The scoped Save-to-Apply diff is accepted.",
+                    "manual_gate_id": Value::Null
+                },
+                {
+                    "kind": "command",
+                    "description": "Run the immutable nonzero verification command through the governed process path.",
+                    "manual_gate_id": Value::Null,
+                    "command_spec": {
+                        "tool_id": "tool.patch",
+                        "mode": "exec",
+                        "program": "mvn",
+                        "args": ["-o", "-f", "sovereign-command-verification-missing-pom.xml", "validate"],
+                        "repository_id": "repo.app",
+                        "working_dir_relative": ".",
+                        "literal_env": {},
+                        "secret_env": {},
+                        "timeout_seconds": 15,
+                        "output_limit_bytes": 65_536
+                    },
+                    "expected_exit_codes": expected_exit_codes
+                }
+            ]
+        }]
+    });
+    compiled_fixture_inner(
+        label,
+        false,
+        false,
+        None,
+        None,
+        false,
+        false,
+        Some(planning),
+        Some("Rename Save to Apply and verify with the exact governed command.".to_owned()),
+        None,
+        Some(policy),
+        Some(ExecutionDepth::D2),
+    )
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+fn compiled_repository_create_fixture(label: &str) -> CompiledFixture {
+    let planning = json!({
+        "tasks": [{
+            "local_id": "create-generated-file",
+            "repository_id": "repo.app",
+            "title": "Create generated repository file",
+            "objective": "Create src/generated.txt with the exact governed content.",
+            "rationale": "The product proof requires a typed exact-scope create action.",
+            "files": [],
+            "create_files": ["src/generated.txt"],
+            "symbols": ["generated"],
+            "dependencies": [],
+            "evidence_needs": [],
+            "expected_change": "src/generated.txt exists with the exact governed content.",
+            "acceptance": [{
+                "kind": "diff",
+                "description": "The exact create-file diff is accepted.",
+                "manual_gate_id": Value::Null
+            }]
+        }]
+    });
+    compiled_fixture_inner(
+        label,
+        false,
+        false,
+        None,
+        None,
+        false,
+        false,
+        Some(planning),
+        Some("Create the exact governed generated repository file.".to_owned()),
+        None,
+        None,
+        Some(ExecutionDepth::D2),
+    )
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+fn compiled_repository_update_fixture(label: &str) -> CompiledFixture {
+    let planning = json!({
+        "tasks": [{
+            "local_id": "update-settings-file",
+            "repository_id": "repo.app",
+            "title": "Update governed repository file",
+            "objective": "Update SettingsForm.tsx with the exact governed content.",
+            "rationale": "The product proof requires a typed exact-scope structured update action.",
+            "files": ["src/settings/SettingsForm.tsx"],
+            "create_files": [],
+            "symbols": ["SettingsForm"],
+            "dependencies": [],
+            "evidence_needs": [],
+            "expected_change": "SettingsForm.tsx contains the exact governed postimage.",
+            "acceptance": [{
+                "kind": "diff",
+                "description": "The exact update-file diff is accepted.",
+                "manual_gate_id": Value::Null
+            }]
+        }]
+    });
+    compiled_fixture_inner(
+        label,
+        false,
+        false,
+        None,
+        None,
+        false,
+        false,
+        Some(planning),
+        Some("Update the exact governed SettingsForm repository file.".to_owned()),
+        None,
+        None,
+        Some(ExecutionDepth::D2),
     )
 }
 
@@ -777,6 +935,7 @@ fn compiled_fixture_inner(
     goal_statement_override: Option<String>,
     resource_override: Option<ResourceFixtureOverride>,
     policy_override: Option<Value>,
+    m3_depth_override: Option<ExecutionDepth>,
 ) -> CompiledFixture {
     let repo = TestRepo::create(label);
     if let Some(mode) = target_mode {
@@ -902,6 +1061,9 @@ fn compiled_fixture_inner(
             }]
         })
     };
+    let uses_general_repository_action = planning["tasks"]
+        .as_array()
+        .is_some_and(|tasks| tasks.iter().any(|task| task.get("create_files").is_some()));
     let planner = backend(vec![model_response(
         planning.to_string(),
         packet.metrics.final_serialized_input_tokens,
@@ -924,7 +1086,9 @@ fn compiled_fixture_inner(
             }
         }
     }
-    let m3 = worktree_depth.then(|| {
+    let requested_m3_depth =
+        m3_depth_override.or_else(|| worktree_depth.then_some(ExecutionDepth::D3));
+    let m3 = requested_m3_depth.map(|depth| {
         let mut decision = DepthClassifier.classify(&DepthFeatureInput {
             repository_count: 1,
             language_count: 1,
@@ -933,8 +1097,12 @@ fn compiled_fixture_inner(
             architecture_uncertainty_percent: 60,
             ..DepthFeatureInput::default()
         });
-        decision.mode = ExecutionDepth::D3;
-        "controller worktree fixture".clone_into(&mut decision.reason);
+        decision.mode = depth;
+        if worktree_depth {
+            "controller worktree fixture".clone_into(&mut decision.reason);
+        } else {
+            "controller rich-plan fixture".clone_into(&mut decision.reason);
+        }
         M3PlanningInput {
             depth: decision,
             supplied_sources: Vec::new(),
@@ -980,7 +1148,11 @@ fn compiled_fixture_inner(
         ],
         write_tool_id: "tool.patch".to_owned(),
         read_tool_id: "tool.read".to_owned(),
-        diff_evaluator: "builtin.diff.scope_and_literal.v1".to_owned(),
+        diff_evaluator: if uses_general_repository_action {
+            "builtin.diff.scoped_change.v1".to_owned()
+        } else {
+            "builtin.diff.scope_and_literal.v1".to_owned()
+        },
         rollback_diff_evaluator: "builtin.diff.controller_patch_absent.v1".to_owned(),
         context_packet: packet.clone(),
         m3,
@@ -1108,15 +1280,55 @@ fn secret_tool_manifest() -> ToolManifest {
 }
 
 fn runtime_parts(fixture: &CompiledFixture) -> RuntimeParts {
+    runtime_parts_for_paths(&fixture.repo.root, &fixture.repo.base)
+}
+
+fn runtime_parts_for_paths(root: &Path, base: &Path) -> RuntimeParts {
     let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python")
         .unwrap_or_else(|error| panic!("pin python: {error}"));
-    let root = python
+    let executable_root = python
         .path
         .parent()
         .unwrap_or_else(|| panic!("python parent"))
         .to_path_buf();
-    let command_policy = CommandPolicy::new([python], [root])
+    let command_policy = CommandPolicy::new([python], [executable_root])
         .unwrap_or_else(|error| panic!("command policy: {error}"));
+    let home = std::env::var_os("HOME").map_or_else(|| panic!("HOME"), PathBuf::from);
+    RuntimeParts {
+        command_policy,
+        isolation_request: IsolationRequest {
+            repository_root: root.to_path_buf(),
+            user_home_root: home,
+            extra_protected_read_roots: Vec::new(),
+            network_offline: true,
+            allow_repository_write: true,
+            require_full_filesystem_read_jail: false,
+        },
+        artifacts: ArtifactStore::open(base.join("cas"))
+            .unwrap_or_else(|error| panic!("artifacts: {error}")),
+        manifest: write_tool_manifest(),
+    }
+}
+
+fn runtime_parts_with_maven(fixture: &CompiledFixture) -> RuntimeParts {
+    let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python")
+        .unwrap_or_else(|error| panic!("pin python: {error}"));
+    let maven = PinnedExecutable::from_path("/opt/homebrew/bin/mvn", "homebrew-maven")
+        .unwrap_or_else(|error| panic!("pin maven: {error}"));
+    let roots = [
+        python
+            .path
+            .parent()
+            .unwrap_or_else(|| panic!("python parent"))
+            .to_path_buf(),
+        maven
+            .path
+            .parent()
+            .unwrap_or_else(|| panic!("maven parent"))
+            .to_path_buf(),
+    ];
+    let command_policy = CommandPolicy::new([python, maven], roots)
+        .unwrap_or_else(|error| panic!("command policy with maven: {error}"));
     let home = std::env::var_os("HOME").map_or_else(|| panic!("HOME"), PathBuf::from);
     RuntimeParts {
         command_policy,
@@ -1132,6 +1344,31 @@ fn runtime_parts(fixture: &CompiledFixture) -> RuntimeParts {
             .unwrap_or_else(|error| panic!("artifacts: {error}")),
         manifest: write_tool_manifest(),
     }
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+fn repository_context_packet(registry: &ProjectRegistry, task_contract: &str) -> ContextPacket {
+    let snapshot = registry
+        .snapshot("repo.app")
+        .unwrap_or_else(|error| panic!("snapshot crash-worker repository: {error}"));
+    let retriever = ExactRetriever::new(registry);
+    let form = retriever
+        .read_path("repo.app", Path::new("src/settings/SettingsForm.tsx"), None)
+        .unwrap_or_else(|error| panic!("read crash-worker source: {error}"));
+    ContextPlanner::default()
+        .build(
+            ContextMode::Implementation,
+            ContextBudget::m1_8k(),
+            ContextPacketInput {
+                controller_prefix: "Controller owns all state and authority.".to_owned(),
+                task_contract: task_contract.to_owned(),
+                current_state: format!("dirty_digest={}", snapshot.dirty_digest),
+                authorized_tool_schemas: Vec::new(),
+                candidates: vec![EvidenceItem::from_exact_file(&form, "exact source")],
+                output_schema: "phase-specific typed proposal".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("build crash-worker context: {error}"))
 }
 
 fn execute_verified_replace(
@@ -1977,6 +2214,7 @@ fn status_verification_fixture(
         expected_target_mode: 0o644,
         observed_target_mode: 0o644,
         evidence_ids: vec![format!("evidence.{label}-verification")],
+        command_results: Vec::new(),
         passed: true,
         failure_code: None,
     }
@@ -5097,6 +5335,115 @@ fn committed_nonzero_process_result_is_execution_failure_not_unknown() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn governed_command_verification_treats_real_nonzero_exit_as_evidence_only() {
+    for (label, expected_exit_codes, command_should_pass) in [
+        ("command-expected-nonzero", vec![0, 1], true),
+        ("command-unexpected-nonzero", vec![0], false),
+    ] {
+        let mut fixture = compiled_command_verification_fixture(label, &expected_exit_codes);
+        let (mut controller, task_id) = controller_for(&mut fixture);
+        let ready = controller
+            .derive_ready_lease(
+                &fixture.registry,
+                &task_id,
+                readiness(),
+                &write_tool_manifest(),
+            )
+            .unwrap_or_else(|error| panic!("derive governed command ready lease: {error}"));
+        let execution = backend(vec![model_response(
+            valid_execution_proposal(&fixture.form_digest),
+            fixture.packet.metrics.final_serialized_input_tokens,
+        )]);
+        let parts = runtime_parts_with_maven(&fixture);
+        let isolation = PassthroughIsolation {
+            capabilities: MacSandboxExecBackend::detect()
+                .unwrap_or_else(|error| panic!("detect command isolation capabilities: {error}")),
+        };
+        let runtime = ExecutionRuntime {
+            registry: &fixture.registry,
+            backend: &execution,
+            command_policy: &parts.command_policy,
+            isolation_backend: &isolation,
+            isolation_request: &parts.isolation_request,
+            artifacts: &parts.artifacts,
+            tool_manifest: &parts.manifest,
+            python_executable: Path::new("/usr/bin/python3"),
+        };
+        let mut budget = ModelCallBudget::new(1, 30_000);
+        let verification =
+            match controller.execute_replace(ready, &runtime, &fixture.packet, &mut budget) {
+                Ok(success) => {
+                    assert!(
+                        command_should_pass,
+                        "unexpected nonzero command exit must not complete the task"
+                    );
+                    success.verification
+                }
+                Err(ControllerError::VerificationFailed(verification)) => {
+                    assert!(
+                        !command_should_pass,
+                        "expected nonzero command exit must be accepted as verification evidence"
+                    );
+                    *verification
+                }
+                other => {
+                    panic!("governed command verification returned unexpected result: {other:?}")
+                }
+            };
+
+        assert_eq!(verification.command_results.len(), 1);
+        let command = &verification.command_results[0];
+        assert_eq!(command.expected_exit_codes, expected_exit_codes);
+        assert_eq!(command.exit_code, Some(1));
+        assert!(command.process_group_reaped);
+        assert_eq!(command.passed, command_should_pass);
+        assert_eq!(
+            command.failure_code.as_deref(),
+            (!command_should_pass).then_some("command_unexpected_exit")
+        );
+        assert_eq!(verification.passed, command_should_pass);
+        assert_eq!(
+            verification.failure_code.as_deref(),
+            (!command_should_pass).then_some("command_unexpected_exit")
+        );
+        assert_eq!(
+            controller.task_state(&task_id) == Some(TaskState::Succeeded),
+            command_should_pass,
+            "command evidence must not become a second completion authority"
+        );
+
+        let action = controller
+            .state()
+            .action_record(&command.action_id)
+            .unwrap_or_else(|error| panic!("read governed command action: {error}"))
+            .unwrap_or_else(|| panic!("governed command action missing"));
+        assert_eq!(action.state, "committed");
+        assert_eq!(
+            action.result_digest.as_deref(),
+            command.result_digest.as_deref()
+        );
+        let process_raw = controller
+            .state()
+            .get_state("controller.process_lease", &command.action_id)
+            .unwrap_or_else(|error| panic!("read governed command process lease: {error}"))
+            .unwrap_or_else(|| panic!("governed command process lease missing"));
+        let process: Value = serde_json::from_str(&process_raw)
+            .unwrap_or_else(|error| panic!("decode governed command process lease: {error}"));
+        assert_eq!(process["state"], json!("reaped"));
+        assert_eq!(
+            controller
+                .state()
+                .state_records("controller.verification")
+                .unwrap_or_else(|error| panic!("read aggregate verification rows: {error}"))
+                .len(),
+            1,
+            "command verification must remain part of one aggregate verification row"
+        );
+    }
+}
+
+#[test]
 fn controller_learning_records_real_failure_and_accepts_exact_repair_origin() {
     let mut fixture = compiled_fixture_with_task_model_call_cap("controller-learning-repair", 2);
     let (mut controller, task_id) = controller_for(&mut fixture);
@@ -6096,5 +6443,528 @@ fn worktree_join_conflict_is_durable_and_blocks_before_mutation() {
         fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
             .unwrap_or_else(|error| panic!("read conflict primary: {error}"))
             .contains(">Save</button>")
+    );
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+#[test]
+fn repository_v4_recovery_crash_worker_entry() {
+    let Some(state_path) = std::env::var_os(PD_T05_V4_CRASH_STATE).map(PathBuf::from) else {
+        return;
+    };
+    let root = PathBuf::from(
+        std::env::var_os(PD_T05_V4_CRASH_ROOT)
+            .unwrap_or_else(|| panic!("PD-T05 v4 crash root env missing")),
+    );
+    let base = PathBuf::from(
+        std::env::var_os(PD_T05_V4_CRASH_BASE)
+            .unwrap_or_else(|| panic!("PD-T05 v4 crash base env missing")),
+    );
+    let task_id = std::env::var(PD_T05_V4_CRASH_TASK)
+        .unwrap_or_else(|error| panic!("PD-T05 v4 crash task env: {error}"));
+    let mutation_kind = std::env::var(PD_T05_V4_CRASH_KIND).unwrap_or_else(|_| "create".to_owned());
+    let mut registry = ProjectRegistry::new();
+    registry
+        .register("repo.app", &root)
+        .unwrap_or_else(|error| panic!("register PD-T05 crash-worker repository: {error}"));
+    let state = StateStore::open(&state_path)
+        .unwrap_or_else(|error| panic!("open PD-T05 crash-worker state: {error}"));
+    let (mut controller, summary) = RecoveryManager::recover(state, &registry)
+        .unwrap_or_else(|error| panic!("recover before PD-T05 crash-worker create: {error}"));
+    assert!(!summary.mutation_blocked);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
+    let manifest = write_tool_manifest();
+    let ready = controller
+        .derive_ready_lease(&registry, &task_id, readiness(), &manifest)
+        .unwrap_or_else(|error| panic!("derive PD-T05 create ready lease: {error}"));
+    let task_contract = match mutation_kind.as_str() {
+        "create" => "Create the exact governed generated repository file.",
+        "update" => "Update the exact governed SettingsForm repository file.",
+        other => panic!("unsupported PD-T05 v4 crash mutation kind: {other}"),
+    };
+    let context = repository_context_packet(&registry, task_contract);
+    let exact_source = context
+        .items
+        .iter()
+        .find(|item| item.evidence_id == "file:repo.app:src/settings/SettingsForm.tsx")
+        .unwrap_or_else(|| panic!("PD-T05 exact repository source evidence missing"));
+    let evidence_id = exact_source.evidence_id.clone();
+    let action = match mutation_kind.as_str() {
+        "create" => RepositoryActionV1::CreateFile {
+            repository_id: "repo.app".to_owned(),
+            path: "src/generated.txt".to_owned(),
+            content: "generated by governed v4 recovery\n".to_owned(),
+        },
+        "update" => {
+            let path = "src/settings/SettingsForm.tsx";
+            let source = fs::read(root.join(path))
+                .unwrap_or_else(|error| panic!("read PD-T05 update preimage: {error}"));
+            assert_eq!(sha256_prefixed(&source), exact_source.source_digest);
+            let updated_content = String::from_utf8(source.clone())
+                .unwrap_or_else(|error| panic!("decode PD-T05 update preimage: {error}"))
+                .replacen("Save", "Apply", 1);
+            RepositoryActionV1::UpdateFile {
+                repository_id: "repo.app".to_owned(),
+                path: path.to_owned(),
+                expected_source_digest: exact_source.source_digest.clone(),
+                content: updated_content,
+            }
+        }
+        other => panic!("unsupported PD-T05 v4 crash mutation kind: {other}"),
+    };
+    let proposal = RepositoryProposalV1 {
+        schema_version: REPOSITORY_PROPOSAL_SCHEMA_VERSION,
+        evidence_ids: vec![evidence_id],
+        action,
+    };
+    let execution = backend(Vec::new());
+    let parts = runtime_parts_for_paths(&root, &base);
+    let isolation = PassthroughIsolation {
+        capabilities: MacSandboxExecBackend::detect()
+            .unwrap_or_else(|error| panic!("detect PD-T05 crash-worker isolation: {error}")),
+    };
+    let runtime = ExecutionRuntime {
+        registry: &registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let result = controller.execute_repository_proposal(ready, &runtime, &context, proposal);
+    panic!("PD-T05 v4 recovery crash worker unexpectedly returned: {result:?}");
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn committed_v4_repository_create_recovers_through_recovery_manager_to_success() {
+    let mut fixture = compiled_repository_create_fixture("repository-v4-create-recovery");
+    let compiled_task = &fixture
+        .compilation
+        .as_ref()
+        .unwrap_or_else(|| panic!("compiled repository create fixture missing plan"))
+        .plan()
+        .as_value()["tasks"][0];
+    assert_eq!(
+        compiled_task["verification"]["steps"][0]["evaluator"],
+        json!("builtin.diff.scoped_change.v1")
+    );
+    let (controller, task_id) = controller_for(&mut fixture);
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Planned));
+    drop(controller);
+
+    let marker = fixture.repo.base.join("repository-v4-recovery.marker");
+    let current =
+        std::env::current_exe().unwrap_or_else(|error| panic!("current test executable: {error}"));
+    let mut child = Command::new(current)
+        .args([
+            "--exact",
+            "repository_v4_recovery_crash_worker_entry",
+            "--nocapture",
+        ])
+        .env(PD_T05_V4_CRASH_STATE, &fixture.repo.state_path)
+        .env(PD_T05_V4_CRASH_ROOT, &fixture.repo.root)
+        .env(PD_T05_V4_CRASH_BASE, &fixture.repo.base)
+        .env(PD_T05_V4_CRASH_TASK, &task_id)
+        .env(PD_T05_V4_CRASH_KIND, "create")
+        .env("SOVEREIGN_RECOVERY_TEST_PAUSE_AT", "verification_started")
+        .env("SOVEREIGN_RECOVERY_TEST_MARKER", &marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn PD-T05 v4 crash worker: {error}"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !marker.exists() {
+        if child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("poll PD-T05 v4 crash worker: {error}"))
+            .is_some()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !marker.exists() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        panic!("PD-T05 v4 crash worker never reached verification_started: {stderr}");
+    }
+
+    let precrash_state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open PD-T05 precrash state: {error}"));
+    let intent_records = precrash_state
+        .state_records("controller.action_intent")
+        .unwrap_or_else(|error| panic!("read PD-T05 action intents: {error}"));
+    let (intent_key, intent) = intent_records
+        .iter()
+        .find_map(|record| {
+            let value = serde_json::from_str::<Value>(&record.value_json).ok()?;
+            (value["schema_version"] == json!(4)).then_some((record.key.clone(), value))
+        })
+        .unwrap_or_else(|| panic!("committed repository-v4 action intent missing"));
+    assert_eq!(intent["mutation"]["kind"], json!("create_file"));
+    assert_eq!(intent["mutation"]["path"], json!("src/generated.txt"));
+    assert_eq!(intent["expected_target_mode"], json!(0o644));
+    let expected_post_digest = intent["expected_post_digest"]
+        .as_str()
+        .unwrap_or_else(|| panic!("v4 expected post digest missing"))
+        .to_owned();
+    let expected_post_artifact_digest = expected_post_digest
+        .strip_prefix("sha256:")
+        .unwrap_or_else(|| panic!("v4 expected post digest is not canonical sha256"));
+    assert_eq!(
+        intent["postimage_artifact_digest"].as_str(),
+        Some(expected_post_artifact_digest)
+    );
+    let origin_epoch = intent["execution_epoch"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("v4 origin execution epoch missing"));
+    let attempt_id = intent["attempt_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("v4 attempt id missing"))
+        .to_owned();
+    let action = precrash_state
+        .action_record(&intent_key)
+        .unwrap_or_else(|error| panic!("read committed v4 action: {error}"))
+        .unwrap_or_else(|| panic!("committed v4 action record missing"));
+    assert_eq!(action.state, "committed");
+    let committed_result_digest = action
+        .result_digest
+        .clone()
+        .unwrap_or_else(|| panic!("committed v4 action result digest missing"));
+
+    let target = fixture.repo.root.join("src/generated.txt");
+    let target_bytes = fs::read(&target)
+        .unwrap_or_else(|error| panic!("read committed v4 create target: {error}"));
+    assert_eq!(target_bytes, b"generated by governed v4 recovery\n");
+    assert_eq!(sha256_prefixed(&target_bytes), expected_post_digest);
+    let target_metadata = fs::symlink_metadata(&target)
+        .unwrap_or_else(|error| panic!("v4 create target metadata: {error}"));
+    assert!(target_metadata.is_file() && !target_metadata.file_type().is_symlink());
+    assert_eq!(target_metadata.permissions().mode() & 0o7777, 0o644);
+
+    let task_runtime = precrash_state
+        .state_records("controller.task")
+        .unwrap_or_else(|error| panic!("read precrash task runtime: {error}"))
+        .into_iter()
+        .filter_map(|record| serde_json::from_str::<Value>(&record.value_json).ok())
+        .find(|value| value.pointer("/task/task_id").and_then(Value::as_str) == Some(&task_id))
+        .unwrap_or_else(|| panic!("precrash v4 task runtime missing"));
+    assert_eq!(task_runtime["state"], json!("verifying"));
+    let attempt_runtime = precrash_state
+        .get_state("controller.attempt", &attempt_id)
+        .unwrap_or_else(|error| panic!("read precrash v4 attempt: {error}"))
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| panic!("precrash v4 attempt runtime missing"));
+    assert_eq!(attempt_runtime["state"], json!("verifying"));
+    assert!(
+        precrash_state
+            .state_records("controller.verification")
+            .unwrap_or_else(|error| panic!("read precrash verification rows: {error}"))
+            .is_empty(),
+        "crash must occur before deterministic verification is persisted"
+    );
+    drop(precrash_state);
+
+    child
+        .kill()
+        .unwrap_or_else(|error| panic!("kill PD-T05 v4 crash worker: {error}"));
+    child
+        .wait()
+        .unwrap_or_else(|error| panic!("wait PD-T05 v4 crash worker: {error}"));
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen PD-T05 crashed state: {error}"));
+    let (recovered, summary) = RecoveryManager::recover(state, &fixture.registry)
+        .unwrap_or_else(|error| panic!("recover committed repository-v4 action: {error}"));
+    assert!(!summary.mutation_blocked);
+    assert!(summary.unknown_action_ids.is_empty());
+    assert!(summary.pending_recovery_action_ids.is_empty());
+    assert!(summary.unresolved_process_lease_ids.is_empty());
+    assert_eq!(recovered.task_state(&task_id), Some(TaskState::Succeeded));
+    let recovered_action = recovered
+        .state()
+        .action_record(&intent_key)
+        .unwrap_or_else(|error| panic!("read recovered v4 action: {error}"))
+        .unwrap_or_else(|| panic!("recovered v4 action missing"));
+    assert_eq!(recovered_action.state, "committed");
+    assert_eq!(
+        recovered_action.result_digest.as_deref(),
+        Some(committed_result_digest.as_str())
+    );
+
+    let verification_records = recovered
+        .state()
+        .state_records("controller.verification")
+        .unwrap_or_else(|error| panic!("read recovered aggregate verification: {error}"));
+    assert_eq!(verification_records.len(), 1);
+    let verification: VerificationResultV1 =
+        serde_json::from_str(&verification_records[0].value_json)
+            .unwrap_or_else(|error| panic!("decode recovered aggregate verification: {error}"));
+    assert!(verification.passed);
+    assert!(verification.command_results.is_empty());
+    assert_eq!(verification.task_id, task_id);
+    assert_eq!(verification.attempt_id, attempt_id);
+    let current_epoch = recovered
+        .state()
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("read recovered execution epoch: {error}"));
+    assert!(verification.execution_epoch > origin_epoch);
+    assert!(current_epoch > verification.execution_epoch);
+    assert_eq!(
+        recovered
+            .state()
+            .action_records()
+            .unwrap_or_else(|error| panic!("read recovered action records: {error}"))
+            .into_iter()
+            .filter(|record| record.state == "unknown")
+            .count(),
+        0
+    );
+    let recovered_bytes =
+        fs::read(&target).unwrap_or_else(|error| panic!("read recovered v4 target: {error}"));
+    assert_eq!(sha256_prefixed(&recovered_bytes), expected_post_digest);
+    assert_eq!(
+        fs::symlink_metadata(&target)
+            .unwrap_or_else(|error| panic!("recovered target metadata: {error}"))
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o644
+    );
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn committed_v4_repository_update_recovers_through_recovery_manager_to_success() {
+    let mut fixture = compiled_repository_update_fixture("repository-v4-update-recovery");
+    let compiled_task = &fixture
+        .compilation
+        .as_ref()
+        .unwrap_or_else(|| panic!("compiled repository update fixture missing plan"))
+        .plan()
+        .as_value()["tasks"][0];
+    assert_eq!(
+        compiled_task["verification"]["steps"][0]["evaluator"],
+        json!("builtin.diff.scoped_change.v1")
+    );
+    let expected_source_digest = fixture.form_digest.clone();
+    let expected_postimage = SOURCE.replacen("Save", "Apply", 1);
+    let expected_post_digest = sha256_prefixed(expected_postimage.as_bytes());
+    let (controller, task_id) = controller_for(&mut fixture);
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Planned));
+    drop(controller);
+
+    let marker = fixture
+        .repo
+        .base
+        .join("repository-v4-update-recovery.marker");
+    let current =
+        std::env::current_exe().unwrap_or_else(|error| panic!("current test executable: {error}"));
+    let mut child = Command::new(current)
+        .args([
+            "--exact",
+            "repository_v4_recovery_crash_worker_entry",
+            "--nocapture",
+        ])
+        .env(PD_T05_V4_CRASH_STATE, &fixture.repo.state_path)
+        .env(PD_T05_V4_CRASH_ROOT, &fixture.repo.root)
+        .env(PD_T05_V4_CRASH_BASE, &fixture.repo.base)
+        .env(PD_T05_V4_CRASH_TASK, &task_id)
+        .env(PD_T05_V4_CRASH_KIND, "update")
+        .env("SOVEREIGN_RECOVERY_TEST_PAUSE_AT", "verification_started")
+        .env("SOVEREIGN_RECOVERY_TEST_MARKER", &marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn PD-T05 update crash worker: {error}"));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !marker.exists() {
+        if child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("poll PD-T05 update crash worker: {error}"))
+            .is_some()
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if !marker.exists() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        panic!("PD-T05 update crash worker never reached verification_started: {stderr}");
+    }
+
+    let precrash_state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open PD-T05 update precrash state: {error}"));
+    let intent_records = precrash_state
+        .state_records("controller.action_intent")
+        .unwrap_or_else(|error| panic!("read PD-T05 update action intents: {error}"));
+    let (intent_key, intent) = intent_records
+        .iter()
+        .find_map(|record| {
+            let value = serde_json::from_str::<Value>(&record.value_json).ok()?;
+            (value["schema_version"] == json!(4)).then_some((record.key.clone(), value))
+        })
+        .unwrap_or_else(|| panic!("committed repository-v4 update action intent missing"));
+    assert_eq!(intent["mutation"]["kind"], json!("update_file"));
+    assert_eq!(
+        intent["mutation"]["path"],
+        json!("src/settings/SettingsForm.tsx")
+    );
+    assert_eq!(
+        intent["mutation"]["expected_source_digest"],
+        json!(expected_source_digest)
+    );
+    let expected_source_mode = u32::try_from(
+        intent["mutation"]["expected_source_mode"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("v4 update expected source mode missing")),
+    )
+    .unwrap_or_else(|error| panic!("v4 update expected source mode out of range: {error}"));
+    assert_eq!(
+        intent["expected_target_mode"].as_u64(),
+        Some(u64::from(expected_source_mode))
+    );
+    assert_eq!(
+        intent["expected_post_digest"].as_str(),
+        Some(expected_post_digest.as_str())
+    );
+    let expected_post_artifact_digest = expected_post_digest
+        .strip_prefix("sha256:")
+        .unwrap_or_else(|| panic!("v4 update expected post digest is not canonical sha256"));
+    assert_eq!(
+        intent["postimage_artifact_digest"].as_str(),
+        Some(expected_post_artifact_digest)
+    );
+    let origin_epoch = intent["execution_epoch"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("v4 update origin execution epoch missing"));
+    let attempt_id = intent["attempt_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("v4 update attempt id missing"))
+        .to_owned();
+    let action = precrash_state
+        .action_record(&intent_key)
+        .unwrap_or_else(|error| panic!("read committed v4 update action: {error}"))
+        .unwrap_or_else(|| panic!("committed v4 update action record missing"));
+    assert_eq!(action.state, "committed");
+    let committed_result_digest = action
+        .result_digest
+        .clone()
+        .unwrap_or_else(|| panic!("committed v4 update action result digest missing"));
+
+    let target = fixture.repo.root.join("src/settings/SettingsForm.tsx");
+    let target_bytes = fs::read(&target)
+        .unwrap_or_else(|error| panic!("read committed v4 update target: {error}"));
+    assert_eq!(target_bytes, expected_postimage.as_bytes());
+    assert_eq!(sha256_prefixed(&target_bytes), expected_post_digest);
+    let target_metadata = fs::symlink_metadata(&target)
+        .unwrap_or_else(|error| panic!("v4 update target metadata: {error}"));
+    assert!(target_metadata.is_file() && !target_metadata.file_type().is_symlink());
+    assert_eq!(
+        target_metadata.permissions().mode() & 0o7777,
+        expected_source_mode
+    );
+
+    let task_runtime = precrash_state
+        .state_records("controller.task")
+        .unwrap_or_else(|error| panic!("read precrash update task runtime: {error}"))
+        .into_iter()
+        .filter_map(|record| serde_json::from_str::<Value>(&record.value_json).ok())
+        .find(|value| value.pointer("/task/task_id").and_then(Value::as_str) == Some(&task_id))
+        .unwrap_or_else(|| panic!("precrash v4 update task runtime missing"));
+    assert_eq!(task_runtime["state"], json!("verifying"));
+    let attempt_runtime = precrash_state
+        .get_state("controller.attempt", &attempt_id)
+        .unwrap_or_else(|error| panic!("read precrash v4 update attempt: {error}"))
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or_else(|| panic!("precrash v4 update attempt runtime missing"));
+    assert_eq!(attempt_runtime["state"], json!("verifying"));
+    assert!(
+        precrash_state
+            .state_records("controller.verification")
+            .unwrap_or_else(|error| panic!("read precrash update verification rows: {error}"))
+            .is_empty(),
+        "update crash must occur before deterministic verification is persisted"
+    );
+    drop(precrash_state);
+
+    child
+        .kill()
+        .unwrap_or_else(|error| panic!("kill PD-T05 update crash worker: {error}"));
+    child
+        .wait()
+        .unwrap_or_else(|error| panic!("wait PD-T05 update crash worker: {error}"));
+
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("reopen PD-T05 update crashed state: {error}"));
+    let (recovered, summary) = RecoveryManager::recover(state, &fixture.registry)
+        .unwrap_or_else(|error| panic!("recover committed repository-v4 update action: {error}"));
+    assert!(!summary.mutation_blocked);
+    assert!(summary.unknown_action_ids.is_empty());
+    assert!(summary.pending_recovery_action_ids.is_empty());
+    assert!(summary.unresolved_process_lease_ids.is_empty());
+    assert_eq!(recovered.task_state(&task_id), Some(TaskState::Succeeded));
+    let recovered_action = recovered
+        .state()
+        .action_record(&intent_key)
+        .unwrap_or_else(|error| panic!("read recovered v4 update action: {error}"))
+        .unwrap_or_else(|| panic!("recovered v4 update action missing"));
+    assert_eq!(recovered_action.state, "committed");
+    assert_eq!(
+        recovered_action.result_digest.as_deref(),
+        Some(committed_result_digest.as_str())
+    );
+
+    let verification_records = recovered
+        .state()
+        .state_records("controller.verification")
+        .unwrap_or_else(|error| panic!("read recovered update aggregate verification: {error}"));
+    assert_eq!(verification_records.len(), 1);
+    let verification: VerificationResultV1 =
+        serde_json::from_str(&verification_records[0].value_json)
+            .unwrap_or_else(|error| panic!("decode recovered update verification: {error}"));
+    assert!(verification.passed);
+    assert!(verification.command_results.is_empty());
+    assert_eq!(verification.task_id, task_id);
+    assert_eq!(verification.attempt_id, attempt_id);
+    let current_epoch = recovered
+        .state()
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("read recovered update execution epoch: {error}"));
+    assert!(verification.execution_epoch > origin_epoch);
+    assert!(current_epoch > verification.execution_epoch);
+    assert_eq!(
+        recovered
+            .state()
+            .action_records()
+            .unwrap_or_else(|error| panic!("read recovered update action records: {error}"))
+            .into_iter()
+            .filter(|record| record.state == "unknown")
+            .count(),
+        0
+    );
+    let recovered_bytes = fs::read(&target)
+        .unwrap_or_else(|error| panic!("read recovered v4 update target: {error}"));
+    assert_eq!(sha256_prefixed(&recovered_bytes), expected_post_digest);
+    assert_eq!(recovered_bytes, expected_postimage.as_bytes());
+    assert_eq!(
+        fs::symlink_metadata(&target)
+            .unwrap_or_else(|error| panic!("recovered update target metadata: {error}"))
+            .permissions()
+            .mode()
+            & 0o7777,
+        expected_source_mode
     );
 }

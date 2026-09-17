@@ -211,6 +211,83 @@ fn command_timeout_cannot_exceed_task_tool_deadline() {
 }
 
 #[test]
+fn command_verification_requires_process_exec_permission() {
+    let mut value = fixture();
+    task_mut(&mut value, 0)["permissions"] = json!(["read", "repo_write"]);
+    assert_code(&diagnostics(value), DiagnosticCode::PermissionPolicy);
+}
+
+#[test]
+fn command_verification_requires_build_heavy_resource_authority() {
+    let mut value = fixture();
+    task_mut(&mut value, 0)["resource_budget"]["heavy_leases"] = json!(["MODEL"]);
+    assert_code(&diagnostics(value), DiagnosticCode::ResourcePolicy);
+}
+
+#[test]
+fn command_tool_and_repository_must_resolve_within_task_scope() {
+    let mut wrong_tool = fixture();
+    task_mut(&mut wrong_tool, 0)["verification"]["steps"][1]["command_spec"]["tool_id"] =
+        json!("tool.missing");
+    assert_code(&diagnostics(wrong_tool), DiagnosticCode::MissingReference);
+
+    let mut wrong_repository = fixture();
+    task_mut(&mut wrong_repository, 0)["verification"]["steps"][1]["command_spec"]["repository_id"] =
+        json!("repo.other");
+    assert_code(
+        &diagnostics(wrong_repository),
+        DiagnosticCode::MissingReference,
+    );
+}
+
+#[test]
+fn command_working_directory_cannot_escape_repository_scope() {
+    let mut value = fixture();
+    task_mut(&mut value, 0)["verification"]["steps"][1]["command_spec"]["working_dir_relative"] =
+        json!("../outside");
+    assert_code(&diagnostics(value), DiagnosticCode::Schema);
+}
+
+#[test]
+fn command_shell_and_literal_environment_follow_global_process_policy() {
+    let mut shell = fixture();
+    task_mut(&mut shell, 0)["verification"]["steps"][1]["command_spec"]["mode"] =
+        json!("shell_explicit");
+    assert_code(&diagnostics(shell), DiagnosticCode::PermissionPolicy);
+
+    let mut env = fixture();
+    task_mut(&mut env, 0)["verification"]["steps"][1]["command_spec"]["literal_env"] =
+        json!({"CI": "1", "UNAUTHORIZED": "1"});
+    assert_code(&diagnostics(env), DiagnosticCode::PermissionPolicy);
+}
+
+#[test]
+fn command_secret_environment_must_resolve_task_secret_ref() {
+    let mut value = fixture();
+    task_mut(&mut value, 0)["verification"]["steps"][1]["command_spec"]["secret_env"] =
+        json!({"TOKEN": "secret.missing"});
+    assert_code(&diagnostics(value), DiagnosticCode::MissingReference);
+
+    let mut allowed = fixture();
+    task_mut(&mut allowed, 0)["action_policy"]["secret_refs"] = json!([{
+        "secret_ref_id": "secret.test-token",
+        "provider": "environment",
+        "purpose": "fixture command authentication",
+        "injection": "environment",
+        "target": "TOKEN"
+    }]);
+    task_mut(&mut allowed, 0)["verification"]["steps"][1]["command_spec"]["secret_env"] =
+        json!({"TOKEN": "secret.test-token"});
+    let diagnostics = diagnostics(allowed);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::MissingReference),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
 fn task_model_call_deadline_cannot_exceed_global_deadline() {
     let mut value = fixture();
     task_mut(&mut value, 0)["resource_budget"]["max_model_call_seconds"] = json!(181);

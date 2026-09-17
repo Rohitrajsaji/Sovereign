@@ -201,10 +201,10 @@
       "max_network_bytes": 0,
       "max_subprocesses": 16,
       "max_child_cpu_seconds": 1800,
-      "heavy_leases": [
-        "MODEL",
-        "BUILD_HEAVY"
-      ]
+        "heavy_leases": [
+          "MODEL",
+          "BUILD_HEAVY"
+        ]
     }
   },
   "tasks": [
@@ -510,7 +510,8 @@
         "max_subprocesses": 8,
         "max_child_cpu_seconds": 300,
         "heavy_leases": [
-          "MODEL"
+          "MODEL",
+          "BUILD_HEAVY"
         ]
       },
       "context_budget": {

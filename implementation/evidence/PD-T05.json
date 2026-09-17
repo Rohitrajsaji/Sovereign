@@ -1,0 +1,153 @@
+{
+  "schema": "sovereign.product-task-evidence.v1",
+  "task": "PD-T05",
+  "title": "General repository engineering action surface",
+  "status": "completed",
+  "completed_at": "2026-09-17T02:55:43Z",
+  "verified_at": "2026-09-17T02:55:43Z",
+  "acceptance_base": {
+    "path": "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md",
+    "lines": "14-29",
+    "version": "1.2"
+  },
+  "scheduling_overlay": {
+    "profile": "local_full_stack_v1",
+    "dependencies": [
+      "M3-T02",
+      "M3-T04",
+      "M6-T02"
+    ],
+    "next_dependency_valid_task": "M7-T02"
+  },
+  "base_head": "9eb58cc679ceda36eb9c22b9eb8bd0f35392405f",
+  "objective": "Extend the existing ToolAdapter, AuthorizedAction, Controller, action-journal, checkpoint/recovery, isolation, evidence, and Verifier contracts with typed create-file, structured update, and governed structured build/test execution needed by the local product proof.",
+  "acceptance": {
+    "typed_create_and_update_exact_scope": true,
+    "repository_relative_paths": true,
+    "create_postimage_and_update_preimage_postimage_evidence": true,
+    "durable_authorization_policy_epoch_receipts_checkpoint_recovery": true,
+    "unknown_outcome_and_isolation_floors_preserved": true,
+    "governed_command_spec_process_runner_only": true,
+    "opaque_shell_bypass_absent": true,
+    "protected_root_path_symlink_and_stale_preimage_fail_closed": true,
+    "ungranted_package_network_and_destructive_effects_fail_closed": true,
+    "ambiguous_repository_truth_fail_closed": true,
+    "build_test_success_is_evidence_not_completion_authority": true,
+    "legacy_m1_replace_literal_compatible": true
+  },
+  "authority_and_security": {
+    "controller_sole_execution_and_lifecycle_authority": true,
+    "state_store_remains_single_authoritative_execution_database": true,
+    "repository_mutations_use_existing_action_journal": true,
+    "pinned_executable_resolution_only": true,
+    "ambient_path_resolution": false,
+    "shell_command_bypass": false,
+    "command_receipt_recovery_redispatch": false,
+    "unknown_repository_mutation_blind_replay": false,
+    "process_group_cleanup_weakened": false,
+    "network_or_package_authority_added": false,
+    "artifact_store_digest_convention_changed": false
+  },
+  "frozen_tree": {
+    "head": "9eb58cc679ceda36eb9c22b9eb8bd0f35392405f",
+    "dirty_source_path_count": 11,
+    "governed_command_fixture_timeout_seconds": 15,
+    "diff_stat": "11 files changed, 6063 insertions(+), 548 deletions(-)",
+    "git_diff_check": "pass"
+  },
+  "source_hashes": {
+    "crates/sovereign-controller/src/lib.rs": "83cf0067d55a4c76cdea03624350cf2e667d154bef53d1ae764bbf859324a21c",
+    "crates/sovereign-controller/tests/t07.rs": "ab26187efc27582811bac29bbadbd073da32f1cb99aff676198d5045bfcd3649",
+    "crates/sovereign-plan/src/compiler.rs": "b131d4f41e4fedbb79775c4ea9ce8d4529cf6fa787245ee679d86af2e9d8f1b1",
+    "crates/sovereign-plan/src/lib.rs": "6ad2f606671649d47ef1bbfbc17534ddf68c165f301a254310daef1f0684da1a",
+    "crates/sovereign-plan/tests/compiler_m3.rs": "3ff44f6c00f458b88ed754647411e0d919b94bdd699f7a9d690469054ce7ac7a",
+    "crates/sovereign-plan/tests/fixtures/valid_trivial_plan.json": "41b00676b24682abe70530e4abf2040fb724fdaa87514cceac3af7d1076486f1",
+    "crates/sovereign-plan/tests/validator.rs": "468c1facc5291718bce2fe6de47e11b3f2a5e626d34135503bc156d83332b185",
+    "crates/sovereign-policy/src/lib.rs": "fb2b76161971615703781b800ca76f0a3bbfd2418fa044731f4f18e65927945b",
+    "crates/sovereign-policy/tests/security.rs": "1005772fe807eaa17cadaa8acea1f26e488b0acf8581b6352a84c7d7ecbae94e",
+    "crates/sovereign-tools/src/lib.rs": "58ff88ddf41b4e0ab8cee4ea7efa1402853d5128245b51deb0b9252e75ffb9e4",
+    "crates/sovereign-tools/tests/runner.rs": "43c9376093c3d7b364d4cca8c74ced86f1fe98d8f4bb33f9ead970f8eb7e34e2"
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "verification": [
+    {
+      "name": "controller recovery-hooks closure suite",
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-controller --features recovery-test-hooks --offline",
+      "result": "pass",
+      "details": [
+        "controller lib 45/45",
+        "m6_t06_resilience 6/6",
+        "t07 63/63",
+        "committed v4 create RecoveryManager restart pass",
+        "committed v4 update RecoveryManager restart pass",
+        "real governed nonzero Maven command evidence semantics pass under loaded suite"
+      ]
+    },
+    {
+      "name": "plan policy tools suites",
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-plan -p sovereign-policy -p sovereign-tools --offline",
+      "result": "pass",
+      "details": [
+        "compiler_m3 16/16",
+        "depth 7/7",
+        "minimal_compiler 21/21",
+        "validator 28/28",
+        "policy security 11/11",
+        "tools runner 33/33"
+      ]
+    },
+    {
+      "name": "workspace all-targets check",
+      "command": "CARGO_NET_OFFLINE=true cargo check --workspace --all-targets --offline",
+      "result": "pass"
+    },
+    {
+      "name": "workspace all-targets tests",
+      "command": "CARGO_NET_OFFLINE=true cargo test --workspace --all-targets --offline",
+      "result": "pass"
+    },
+    {
+      "name": "strict clippy",
+      "command": "CARGO_NET_OFFLINE=true cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "pass"
+    },
+    {
+      "name": "format and diff integrity",
+      "command": "cargo fmt --all -- --check && git diff --check",
+      "result": "pass"
+    },
+    {
+      "name": "command recovery authority regressions",
+      "result": "pass",
+      "details": [
+        "command_verification_recovery_reuses_exact_committed_receipt_and_rejects_step_drift",
+        "post_checkpoint_command_intent_requires_exact_journal_correlated_postimage"
+      ]
+    }
+  ],
+  "independent_audit": {
+    "worker": "worker-66",
+    "mode": "fresh exact-tree read-only",
+    "result": "CLOSABLE",
+    "verdict": "PD-T05 frozen task: CLOSABLE",
+    "blockers": [],
+    "details": "Exact HEAD/status/BUILD_STATE/hashes were rechecked before and after audit; focused governed-command, v4 create/update recovery, M1 compatibility, pinned resolver, atomic mutation guards, and Plan compilation tests passed."
+  },
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false
+  }
+}

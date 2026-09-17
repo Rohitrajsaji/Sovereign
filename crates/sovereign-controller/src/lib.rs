@@ -33,7 +33,7 @@ use sovereign_policy::{
     EXTERNAL_ESCALATION_MANIFEST_SCHEMA_VERSION, EXTERNAL_PAYLOAD_POLICY_SCHEMA_VERSION,
     ExternalDataClass, ExternalEscalationManifest, ExternalEvidenceBinding, ExternalPayloadPolicy,
     ExternalRepositoryExport, ExternalSensitiveDataAccess, ExternalToolAuthority, HeavyLeaseClass,
-    IsolationRequest, LeaseStateV1, M6ResourceGovernorSnapshotV1, ModelCallBudget,
+    IsolationRequest, LeaseStateV1, M6ResourceGovernorSnapshotV1, ModelCallBudget, PathPolicy,
     PermissionDecision, PlanHeavyLeaseClass, PolicyError, ReconciliationClass,
     ReconciliationPolicy, ResourceLeaseOwnerV1, ResourceLeaseRequestV1, ResourceLeaseV1,
     ResourcePolicyEventV1, ResourcePressureEventV1, SecretBroker, SecretInjection,
@@ -51,10 +51,13 @@ use sovereign_state::{
     StateError, StateRecordUpdate, StateStore,
 };
 use sovereign_tools::{
-    APPROVAL_CLAIM_NAMESPACE, ActionJournal, ActionState, ApprovalClaim, AuthorizedAction,
-    EPHEMERAL_SECRET_FILE_ENV, PermissionClass, ProcessCancellationToken, ProcessRunner,
-    RawToolResult, ReconciliationMode, ToolError, ToolManifest, ToolSchemaV1,
-    filter_authorized_tool_schemas, reap_owned_process_group,
+    ACTION_RECEIPT_SCHEMA, ACTION_RECEIPT_SCHEMA_VERSION, APPROVAL_CLAIM_NAMESPACE, ActionJournal,
+    ActionReceipt, ActionState, ApprovalClaim, AtomicCreateGuard, AtomicUpdateGuard,
+    AuthorizedAction, AuthorizedRepositoryMutation, EPHEMERAL_SECRET_FILE_ENV,
+    JournalActionAuthority, PermissionClass, ProcessCancellationToken, ProcessRunner,
+    RawToolResult, ReconciliationMode, RepositoryMutationKind, RepositoryMutationPrecondition,
+    ResourceLimitKind, ToolError, ToolManifest, ToolSchemaV1, filter_authorized_tool_schemas,
+    reap_owned_process_group,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -97,11 +100,13 @@ pub use skills::{
 };
 
 pub const MODEL_PROPOSAL_SCHEMA_VERSION: u32 = 1;
+pub const REPOSITORY_PROPOSAL_SCHEMA_VERSION: u32 = 1;
 pub const VERIFICATION_RESULT_SCHEMA_VERSION: u32 = 1;
 pub const FAILURE_RECORD_SCHEMA_VERSION: u32 = 1;
 const M1_MODEL_OUTPUT_TOKENS: u32 = 512;
 const M1_MODEL_UNCALIBRATED_ADMISSION_MIB: u64 = 4_096;
 const MAX_LITERAL_BYTES: usize = 4_096;
+const MAX_REPOSITORY_PROPOSAL_BYTES: usize = 64 * 1_024;
 const EVIDENCE_SATISFACTION_SCHEMA_VERSION: u32 = 1;
 const VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION: u32 = 1;
 const TASK_CARRY_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
@@ -122,8 +127,11 @@ const ROLLBACK_RECORD_NAMESPACE: &str = "controller.rollback";
 const CANCELLATION_REQUEST_NAMESPACE: &str = "controller.cancellation_request";
 const ACTION_RECONCILIATION_SCHEMA_VERSION: u32 = 1;
 const ACTION_RECONCILIATION_NAMESPACE: &str = "controller.action_reconciliation";
+const VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION: u32 = 1;
+const VERIFICATION_COMMAND_INTENT_NAMESPACE: &str = "controller.verification_command_intent";
 const LEGACY_ACTION_INTENT_SCHEMA_VERSION: u32 = 2;
 const ACTION_INTENT_SCHEMA_VERSION: u32 = 3;
+const REPOSITORY_ACTION_INTENT_SCHEMA_VERSION: u32 = 4;
 const EXTERNAL_PACKET_SCHEMA_VERSION: u32 = 1;
 const EXTERNAL_MAX_OUTPUT_TOKENS: u32 = 1_024;
 const EXTERNAL_MAX_EVIDENCE_ITEMS: usize = 16;
@@ -1249,6 +1257,67 @@ pub struct ModelProposalV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RepositoryProposalV1 {
+    pub schema_version: u32,
+    pub evidence_ids: Vec<String>,
+    pub action: RepositoryActionV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RepositoryActionV1 {
+    CreateFile {
+        repository_id: String,
+        path: String,
+        content: String,
+    },
+    UpdateFile {
+        repository_id: String,
+        path: String,
+        expected_source_digest: String,
+        content: String,
+    },
+}
+
+impl RepositoryActionV1 {
+    fn repository_id(&self) -> &str {
+        match self {
+            Self::CreateFile { repository_id, .. } | Self::UpdateFile { repository_id, .. } => {
+                repository_id
+            }
+        }
+    }
+
+    fn path(&self) -> &str {
+        match self {
+            Self::CreateFile { path, .. } | Self::UpdateFile { path, .. } => path,
+        }
+    }
+
+    fn content(&self) -> &str {
+        match self {
+            Self::CreateFile { content, .. } | Self::UpdateFile { content, .. } => content,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RepositoryPreimageV1 {
+    Absent,
+    ExactFile { digest: String, mode: u32 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedRepositoryActionV1 {
+    pub action: RepositoryActionV1,
+    pub preimage: RepositoryPreimageV1,
+    pub expected_post_digest: String,
+    pub expected_target_mode: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplaceLiteral {
     pub kind: ReplaceLiteralKind,
     pub repository_id: String,
@@ -1406,6 +1475,22 @@ struct FailureRecordInput {
 pub type ExecutionFailureV1 = FailureRecordV1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandVerificationResultV1 {
+    pub step_id: String,
+    pub action_id: String,
+    pub result_digest: Option<String>,
+    pub expected_exit_codes: Vec<i32>,
+    pub exit_code: Option<i32>,
+    pub elapsed_ms: u64,
+    pub terminated_for_limit: Option<String>,
+    pub process_group_reaped: bool,
+    pub stdout_digest: Option<String>,
+    pub stderr_digest: Option<String>,
+    pub passed: bool,
+    pub failure_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationResultV1 {
     pub schema_version: u32,
     pub verification_id: String,
@@ -1423,6 +1508,8 @@ pub struct VerificationResultV1 {
     pub expected_target_mode: u32,
     pub observed_target_mode: u32,
     pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub command_results: Vec<CommandVerificationResultV1>,
     pub passed: bool,
     pub failure_code: Option<String>,
 }
@@ -1942,16 +2029,16 @@ impl Controller {
 
     fn action_cancellation_handle(
         &self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
     ) -> Result<CancellationHandle, ControllerError> {
-        let attempt = self.attempt_cancellation_handle(&action.task_id, &action.attempt_id)?;
+        let attempt = self.attempt_cancellation_handle(action.task_id(), action.attempt_id())?;
         let active = self.active_ref()?;
         let scope = cancellation_scope(
             active,
             CancellationScopeKindV1::Action,
-            Some(&action.task_id),
-            Some(&action.attempt_id),
-            Some(&action.action_id),
+            Some(action.task_id()),
+            Some(action.attempt_id()),
+            Some(action.action_id()),
         );
         self.cancellations.register_child(scope, &attempt.scope_id)
     }
@@ -3921,11 +4008,11 @@ impl Controller {
 
     fn ensure_action_authorized(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
         manifest: &ToolManifest,
         permission_decision: &PermissionDecision,
     ) -> Result<(), ControllerError> {
-        let existing = self.state.action_record(&action.action_id)?;
+        let existing = self.state.action_record(action.action_id())?;
         let mut journal = ActionJournal::new(&mut self.state);
         match existing.as_ref().map(|record| record.state.as_str()) {
             None | Some("prepared") => {
@@ -3935,12 +4022,14 @@ impl Controller {
                 journal.verify_authorized(action)?;
             }
             Some("unknown") => {
-                return Err(ControllerError::UnknownAction(action.action_id.clone()));
+                return Err(ControllerError::UnknownAction(
+                    action.action_id().to_owned(),
+                ));
             }
             Some(state) => {
                 return Err(ControllerError::NotReady(format!(
                     "action {} cannot be re-authorized from durable state {state}",
-                    action.action_id
+                    action.action_id()
                 )));
             }
         }
@@ -3949,24 +4038,24 @@ impl Controller {
 
     fn persist_action_reconciliation_binding(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
     ) -> Result<(), ControllerError> {
         let binding = PersistedActionReconciliationBindingV1 {
             schema_version: ACTION_RECONCILIATION_SCHEMA_VERSION,
-            action_id: action.action_id.clone(),
-            plan_id: action.plan_id.clone(),
-            plan_revision: action.plan_revision,
-            task_id: action.task_id.clone(),
+            action_id: action.action_id().to_owned(),
+            plan_id: action.plan_id().to_owned(),
+            plan_revision: action.plan_revision(),
+            task_id: action.task_id().to_owned(),
             payload_digest: action.payload_digest(),
-            policy_digest: action.policy_digest.clone(),
-            execution_epoch: action.execution_epoch,
-            policy: action.reconciliation_mode.policy(),
+            policy_digest: action.policy_digest().to_owned(),
+            execution_epoch: action.execution_epoch(),
+            policy: action.reconciliation_mode().policy(),
         };
         binding.policy.validate()?;
         let value_json = serde_json::to_string(&binding)?;
         if let Some(existing) = self
             .state
-            .get_state(ACTION_RECONCILIATION_NAMESPACE, &action.action_id)?
+            .get_state(ACTION_RECONCILIATION_NAMESPACE, action.action_id())?
         {
             if existing != value_json {
                 return Err(ControllerError::NotReady(
@@ -3975,22 +4064,22 @@ impl Controller {
             }
             return Ok(());
         }
-        let binding_key = format!("{ACTION_RECONCILIATION_NAMESPACE}:{}", action.action_id);
+        let binding_key = format!("{ACTION_RECONCILIATION_NAMESPACE}:{}", action.action_id());
         let record_digest = sha256_prefixed(value_json.as_bytes());
         self.persist_runtime_records_with_events(
             &[(
                 ACTION_RECONCILIATION_NAMESPACE.to_owned(),
-                action.action_id.clone(),
+                action.action_id().to_owned(),
                 value_json,
             )],
             &[(
                 "action_reconciliation_bound".to_owned(),
-                action.action_id.clone(),
+                action.action_id().to_owned(),
                 json!({
-                    "action_id": action.action_id,
-                    "plan_id": action.plan_id,
-                    "plan_revision": action.plan_revision,
-                    "task_id": action.task_id,
+                    "action_id": action.action_id(),
+                    "plan_id": action.plan_id(),
+                    "plan_revision": action.plan_revision(),
+                    "task_id": action.task_id(),
                     "payload_digest": binding.payload_digest,
                     "policy_digest": binding.policy_digest,
                     "execution_epoch": binding.execution_epoch,
@@ -4004,25 +4093,26 @@ impl Controller {
 
     fn require_dispatch_approval(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
     ) -> Result<(), ControllerError> {
-        if !action.approval_required {
+        if !action.approval_required() {
             return Ok(());
         }
         let request = self.persist_approval_request_for_action(action)?;
         match request.status {
             ApprovalRequestStatusV1::Pending => Err(ControllerError::AwaitingApproval {
-                action_id: action.action_id.clone(),
+                action_id: action.action_id().to_owned(),
                 request_id: request.request_id,
             }),
             ApprovalRequestStatusV1::Denied => Err(ControllerError::NotReady(format!(
                 "action {} was denied by approval request {}",
-                action.action_id, request.request_id
+                action.action_id(),
+                request.request_id
             ))),
             ApprovalRequestStatusV1::Approved => {
                 let raw = self
                     .state
-                    .get_state(APPROVAL_CLAIM_NAMESPACE, &action.action_id)?
+                    .get_state(APPROVAL_CLAIM_NAMESPACE, action.action_id())?
                     .ok_or_else(|| {
                         ControllerError::NotReady(
                             "approved request has no durable exact approval claim".to_owned(),
@@ -4043,12 +4133,12 @@ impl Controller {
 
     fn prepare_action_for_dispatch(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
         manifest: &ToolManifest,
         permission_decision: &PermissionDecision,
     ) -> Result<(), ControllerError> {
         RecoveryIntegrityGate::verify_before_high_risk_mutation(&mut self.state)?;
-        if self.cancellation_blocks_task(&action.task_id)? {
+        if self.cancellation_blocks_task(action.task_id())? {
             return Err(ControllerError::NotReady(
                 "durable cancellation blocks action dispatch".to_owned(),
             ));
@@ -4062,7 +4152,7 @@ impl Controller {
         }
         if self.any_unresolved_action()?
             || has_unresolved_process_lease(&self.state)?
-            || has_unresolved_rollback(&self.state, Some(&action.action_id))?
+            || has_unresolved_rollback(&self.state, Some(action.action_id()))?
         {
             return Err(ControllerError::NotReady(
                 "high-risk mutation is blocked by unresolved action/process/rollback authority"
@@ -4081,14 +4171,15 @@ impl Controller {
     #[allow(clippy::too_many_lines)]
     fn charge_autonomy_action_once(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
     ) -> Result<(), ControllerError> {
+        let reservation = action.reservation();
         let (plan_id, plan_revision, task_contract_digest, mut budget, mut goal_autonomy_budget) = {
             let active = self.active_ref()?;
-            let task = active.tasks.get(&action.task_id).ok_or_else(|| {
+            let task = active.tasks.get(action.task_id()).ok_or_else(|| {
                 ControllerError::InvalidPlan("autonomy charge task disappeared".to_owned())
             })?;
-            if active.plan_id != action.plan_id || active.revision != action.plan_revision {
+            if active.plan_id != action.plan_id() || active.revision != action.plan_revision() {
                 return Err(ControllerError::NotReady(
                     "autonomy action charge is stale for the active plan revision".to_owned(),
                 ));
@@ -4108,21 +4199,21 @@ impl Controller {
         };
         budget.validate()?;
         goal_autonomy_budget.validate()?;
-        let charge_key = revision_scoped_key(&plan_id, plan_revision, &action.action_id);
+        let charge_key = revision_scoped_key(&plan_id, plan_revision, action.action_id());
         let expected = AutonomyActionChargeV1 {
             schema_version: AUTONOMY_ACTION_CHARGE_SCHEMA_VERSION,
-            action_id: action.action_id.clone(),
+            action_id: action.action_id().to_owned(),
             plan_id: plan_id.clone(),
             plan_revision,
-            task_id: action.task_id.clone(),
+            task_id: action.task_id().to_owned(),
             task_contract_digest: task_contract_digest.clone(),
             payload_digest: action.payload_digest(),
-            execution_epoch: action.execution_epoch,
-            tool_actions_charged: 1,
-            subprocesses_charged: 1,
-            wall_ms_reserved: action.command.timeout_ms,
-            output_bytes_reserved: action.command.output_limit_bytes,
-            disk_write_bytes_reserved: action.command.disk_write_limit_bytes,
+            execution_epoch: action.execution_epoch(),
+            tool_actions_charged: reservation.tool_actions,
+            subprocesses_charged: reservation.subprocesses,
+            wall_ms_reserved: reservation.wall_ms,
+            output_bytes_reserved: reservation.output_bytes,
+            disk_write_bytes_reserved: reservation.disk_write_bytes,
         };
         if let Some(existing) = self
             .state
@@ -4136,35 +4227,45 @@ impl Controller {
             }
             return Ok(());
         }
-        budget.charge_tool_action(action.command.timeout_ms)?;
-        budget.charge_process_spawn()?;
-        budget.charge_wall_ms(action.command.timeout_ms)?;
-        budget.charge_output_bytes(action.command.output_limit_bytes)?;
-        budget.charge_disk_write_bytes(action.command.disk_write_limit_bytes)?;
-        goal_autonomy_budget.charge_tool_action(action.command.timeout_ms)?;
-        goal_autonomy_budget.charge_process_spawn()?;
-        goal_autonomy_budget.charge_wall_ms(action.command.timeout_ms)?;
-        goal_autonomy_budget.charge_output_bytes(action.command.output_limit_bytes)?;
-        goal_autonomy_budget.charge_disk_write_bytes(action.command.disk_write_limit_bytes)?;
+        if reservation.tool_actions != 1 || reservation.subprocesses > 1 {
+            return Err(ControllerError::InvalidPlan(
+                "journal action reservation exceeds supported v1 autonomy charging shape"
+                    .to_owned(),
+            ));
+        }
+        budget.charge_tool_action(reservation.wall_ms)?;
+        if reservation.subprocesses == 1 {
+            budget.charge_process_spawn()?;
+        }
+        budget.charge_wall_ms(reservation.wall_ms)?;
+        budget.charge_output_bytes(reservation.output_bytes)?;
+        budget.charge_disk_write_bytes(reservation.disk_write_bytes)?;
+        goal_autonomy_budget.charge_tool_action(reservation.wall_ms)?;
+        if reservation.subprocesses == 1 {
+            goal_autonomy_budget.charge_process_spawn()?;
+        }
+        goal_autonomy_budget.charge_wall_ms(reservation.wall_ms)?;
+        goal_autonomy_budget.charge_output_bytes(reservation.output_bytes)?;
+        goal_autonomy_budget.charge_disk_write_bytes(reservation.disk_write_bytes)?;
         let budget_digest = digest_json(&serde_json::to_value(&budget)?)?;
         let goal_budget_digest = digest_json(&serde_json::to_value(&goal_autonomy_budget)?)?;
         {
             let active = self.active_mut()?;
-            let task = active.tasks.get_mut(&action.task_id).ok_or_else(|| {
+            let task = active.tasks.get_mut(action.task_id()).ok_or_else(|| {
                 ControllerError::InvalidPlan("autonomy charge task disappeared".to_owned())
             })?;
             task.autonomy_budget = Some(budget.clone());
             active.goal_autonomy_budget = goal_autonomy_budget.clone();
         }
         let task_json =
-            serde_json::to_string(self.active_ref()?.tasks.get(&action.task_id).ok_or_else(
+            serde_json::to_string(self.active_ref()?.tasks.get(action.task_id()).ok_or_else(
                 || ControllerError::InvalidPlan("autonomy task disappeared".to_owned()),
             )?)?;
         self.persist_runtime_records_with_events(
             &[
                 (
                     "controller.task".to_owned(),
-                    action.task_id.clone(),
+                    action.task_id().to_owned(),
                     task_json,
                 ),
                 (
@@ -4175,16 +4276,16 @@ impl Controller {
             ],
             &[(
                 "autonomy_action_charged".to_owned(),
-                action.task_id.clone(),
+                action.task_id().to_owned(),
                 json!({
-                    "action_id": action.action_id,
+                    "action_id": action.action_id(),
                     "payload_digest": expected.payload_digest,
-                    "execution_epoch": action.execution_epoch,
-                    "tool_actions_charged": 1,
-                    "subprocesses_charged": 1,
-                    "wall_ms_reserved": action.command.timeout_ms,
-                    "output_bytes_reserved": action.command.output_limit_bytes,
-                    "disk_write_bytes_reserved": action.command.disk_write_limit_bytes,
+                    "execution_epoch": action.execution_epoch(),
+                    "tool_actions_charged": reservation.tool_actions,
+                    "subprocesses_charged": reservation.subprocesses,
+                    "wall_ms_reserved": reservation.wall_ms,
+                    "output_bytes_reserved": reservation.output_bytes,
+                    "disk_write_bytes_reserved": reservation.disk_write_bytes,
                     "autonomy_budget_digest": budget_digest,
                     "goal_autonomy_budget": goal_autonomy_budget,
                     "goal_autonomy_budget_digest": goal_budget_digest,
@@ -4196,31 +4297,31 @@ impl Controller {
 
     fn append_dispatch_security_audit(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
         manifest: &ToolManifest,
         permission_decision: &PermissionDecision,
     ) -> Result<SecurityAuditHead, ControllerError> {
         let approval_provenance_digest = self
             .state
-            .get_state(APPROVAL_CLAIM_NAMESPACE, &action.action_id)?
+            .get_state(APPROVAL_CLAIM_NAMESPACE, action.action_id())?
             .map(|raw| sha256_prefixed(raw.as_bytes()));
         let evidence_provenance_digest = self
             .state
-            .get_state("controller.action_intent", &action.action_id)?
+            .get_state("controller.action_intent", action.action_id())?
             .or(self
                 .state
-                .get_state(ACTION_RECONCILIATION_NAMESPACE, &action.action_id)?)
+                .get_state(ACTION_RECONCILIATION_NAMESPACE, action.action_id())?)
             .map(|raw| sha256_prefixed(raw.as_bytes()));
         let event = SecurityAuditEventV1 {
             actor_id: "controller".to_owned(),
-            plan_id: Some(action.plan_id.clone()),
-            task_id: Some(action.task_id.clone()),
-            attempt_id: Some(action.attempt_id.clone()),
-            action_id: Some(action.action_id.clone()),
-            execution_epoch: Some(action.execution_epoch),
+            plan_id: Some(action.plan_id().to_owned()),
+            task_id: Some(action.task_id().to_owned()),
+            attempt_id: Some(action.attempt_id().to_owned()),
+            action_id: Some(action.action_id().to_owned()),
+            execution_epoch: Some(action.execution_epoch()),
             decision: "allow".to_owned(),
             action: "dispatch_authorized".to_owned(),
-            policy_digest: action.policy_digest.clone(),
+            policy_digest: action.policy_digest().to_owned(),
             config_digest: permission_decision.digest(),
             tool_digest: manifest.content_digest.clone(),
             approval_provenance_digest,
@@ -4412,32 +4513,39 @@ impl Controller {
     #[allow(clippy::too_many_lines)]
     fn persist_approval_request_for_action(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
     ) -> Result<ApprovalRequestV1, ControllerError> {
         let now_ms = unix_millis()?;
         action.validate(now_ms)?;
-        if !action.approval_required
-            || !self
-                .approval_required_for_task_permission(&action.task_id, action.permission_class)?
+        if !action.approval_required()
+            || !self.approval_required_for_task_permission(
+                action.task_id(),
+                action.permission_class(),
+            )?
         {
             return Err(ControllerError::Policy(PolicyError::Denied(
                 "Controller cannot request approval for an action not required by active Plan IR policy"
                     .to_owned(),
             )));
         }
+        let executable_digest = action.approval_execution_identity_digest().ok_or_else(|| {
+            ControllerError::Policy(PolicyError::Denied(
+                "approval-sensitive action lacks an approval execution identity digest".to_owned(),
+            ))
+        })?;
         let binding = ImmutableApprovalBindingV1 {
-            action_id: action.action_id.clone(),
-            plan_id: action.plan_id.clone(),
-            plan_revision: action.plan_revision,
-            task_id: action.task_id.clone(),
-            permission_class: action.permission_class,
+            action_id: action.action_id().to_owned(),
+            plan_id: action.plan_id().to_owned(),
+            plan_revision: action.plan_revision(),
+            task_id: action.task_id().to_owned(),
+            permission_class: action.permission_class(),
             payload_digest: action.payload_digest(),
-            destination_digest: action.destination_digest.clone(),
-            executable_digest: action.executable_digest.clone(),
-            policy_digest: action.policy_digest.clone(),
-            execution_epoch: action.execution_epoch,
-            nonce: action.nonce.clone(),
-            action_expires_at_ms: action.expires_at_ms,
+            destination_digest: action.destination_digest().map(str::to_owned),
+            executable_digest: executable_digest.to_owned(),
+            policy_digest: action.policy_digest().to_owned(),
+            execution_epoch: action.execution_epoch(),
+            nonce: action.nonce().to_owned(),
+            action_expires_at_ms: action.expires_at_ms(),
         };
         self.persist_approval_request_for_binding(&binding)
     }
@@ -7237,6 +7345,158 @@ impl Controller {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn acquire_verification_build_heavy(
+        &mut self,
+        task_id: &str,
+        attempt_id: &str,
+        step_id: &str,
+        tool_manifest: &ToolManifest,
+        backend: &dyn ModelBackend,
+    ) -> Result<HeavyPhaseLease, ControllerError> {
+        self.require_execution_not_paused()?;
+        let epoch = self.state.current_execution_epoch()?;
+        let (plan_id, plan_revision, task_contract_digest) = {
+            let active = self.active_ref()?;
+            if active.validity != PlanValidity::Current {
+                return Err(ControllerError::NotReady(
+                    "command verification requires the active plan to remain current".to_owned(),
+                ));
+            }
+            let task = active.tasks.get(task_id).ok_or_else(|| {
+                ControllerError::NotReady("command verification task disappeared".to_owned())
+            })?;
+            let attempt = active.attempts.get(attempt_id).ok_or_else(|| {
+                ControllerError::NotReady("command verification attempt disappeared".to_owned())
+            })?;
+            if task.state != TaskState::Verifying
+                || attempt.state != AttemptState::Verifying
+                || attempt.task_id != task_id
+                || attempt.task_contract_digest != task.task_contract_digest
+            {
+                return Err(ControllerError::NotReady(
+                    "command verification heavy phase requires the exact task and attempt to remain Verifying"
+                        .to_owned(),
+                ));
+            }
+            (
+                active.plan_id.clone(),
+                active.revision,
+                task.task_contract_digest.clone(),
+            )
+        };
+        if self.any_unresolved_action()? {
+            return Err(ControllerError::NotReady(
+                "command verification cannot dispatch while another action outcome is unknown"
+                    .to_owned(),
+            ));
+        }
+        let current_sequence = self.state.latest_journal_sequence()?;
+        self.state
+            .validate_checkpoint_integrity_floor(current_sequence)?;
+        if backend.residency_proof()? != ModelResidencyProof::Absent
+            || self.resources.model_residency().is_some()
+            || self
+                .resources
+                .snapshot()
+                .active_leases
+                .iter()
+                .any(|lease| lease.class == HeavyLeaseClass::Model)
+        {
+            return Err(ControllerError::NotReady(
+                "command verification BUILD_HEAVY admission requires proven MODEL absence"
+                    .to_owned(),
+            ));
+        }
+
+        let task_budget = self.task_resource_budget(task_id)?;
+        if !task_budget.permits(HeavyLeaseClass::BuildHeavy) {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                "command verification task does not authorize BUILD_HEAVY".to_owned(),
+            )));
+        }
+        if task_budget.max_subprocesses == 0 {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                "command verification task has zero subprocess capacity".to_owned(),
+            )));
+        }
+        let heavy_admission_mib = self.resources.profile().unknown_heavy_admission_mib;
+        if task_budget.max_peak_rss_mib < heavy_admission_mib {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                format!(
+                    "command verification max-RSS contract {} MiB is below BUILD_HEAVY admission {} MiB",
+                    task_budget.max_peak_rss_mib, heavy_admission_mib
+                ),
+            )));
+        }
+        let permission_decision = self.permission_decision_for_task(task_id, tool_manifest)?;
+        let snapshot = self.resource_probe.sample().map_err(|error| {
+            ControllerError::Policy(PolicyError::ResourceDenied(format!(
+                "live resource pressure probe failed before command verification: {error}"
+            )))
+        })?;
+        let pressure = self.resources.observe_pressure(snapshot);
+        let request = ResourceLeaseRequestV1 {
+            lease_id: verification_build_lease_id(
+                &plan_id,
+                plan_revision,
+                task_id,
+                attempt_id,
+                step_id,
+                epoch,
+            ),
+            owner: ResourceLeaseOwnerV1 {
+                plan_id: plan_id.clone(),
+                plan_revision,
+                task_id: task_id.to_owned(),
+            },
+            class: HeavyLeaseClass::BuildHeavy,
+            calibrated: false,
+            calibrated_p95_rss_mib: heavy_admission_mib,
+            evictable_idle_rss_mib: 0,
+            task_budget,
+            conditional: ConditionalLeaseContextV1::default(),
+            automatic_reload: false,
+            disk_expanding: false,
+        };
+        let admission = self.resources.admit(&request, &pressure);
+        let Some(resource_lease) = admission.lease.clone() else {
+            self.persist_resource_policy_decision(&pressure, &admission.event, None, None)?;
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                format!(
+                    "command verification BUILD_HEAVY admission {:?}: {:?}",
+                    admission.status, admission.event
+                ),
+            )));
+        };
+        if !ControllerResourceCoordinator::admission_is_success(&admission) {
+            let _ = self.resources.release(&resource_lease.lease_id);
+            return Err(ControllerError::InvalidPlan(
+                "command verification BUILD_HEAVY admission returned an inconsistent lease"
+                    .to_owned(),
+            ));
+        }
+        self.persist_resource_policy_decision(
+            &pressure,
+            &admission.event,
+            Some(&resource_lease),
+            None,
+        )?;
+        self.checkpoint_now()?;
+        Ok(HeavyPhaseLease {
+            plan_id,
+            plan_revision,
+            task_id: task_id.to_owned(),
+            task_contract_digest,
+            execution_epoch: epoch,
+            resource_lease,
+            parallel_job_cap: admission.parallel_job_cap,
+            subprocess_cap: admission.subprocess_cap,
+            permission_decision,
+            completion: None,
+        })
+    }
+
     fn validate_heavy_phase_lease(&self, lease: &HeavyPhaseLease) -> Result<(), ControllerError> {
         let active = self.active_ref()?;
         let task = active
@@ -7259,8 +7519,8 @@ impl Controller {
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    fn authorize_build_heavy_action(
-        &mut self,
+    fn lower_build_heavy_action(
+        &self,
         lease: &HeavyPhaseLease,
         mut command: CommandSpec,
         command_policy: &CommandPolicy,
@@ -7356,7 +7616,7 @@ impl Controller {
         let fallback_expires_at_ms = now_ms.saturating_add(timeout_i64).saturating_add(60_000);
         let expires_at_ms =
             self.approval_bound_action_expiry(&action_id, fallback_expires_at_ms)?;
-        let action = AuthorizedAction {
+        Ok(AuthorizedAction {
             action_id: action_id.clone(),
             plan_id: lease.plan_id.clone(),
             plan_revision: lease.plan_revision,
@@ -7380,9 +7640,138 @@ impl Controller {
             approval_required: self
                 .approval_required_for_task_permission(&lease.task_id, permission_class)?,
             reconciliation_mode: Self::reconciliation_mode_for_manifest(tool_manifest)?,
-        };
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn authorize_build_heavy_action(
+        &mut self,
+        lease: &HeavyPhaseLease,
+        command: CommandSpec,
+        command_policy: &CommandPolicy,
+        isolation_request: &IsolationRequest,
+        tool_manifest: &ToolManifest,
+        verification_command: Option<(&str, &RequiredCommandVerificationStep, &Path)>,
+    ) -> Result<AuthorizedAction, ControllerError> {
+        let action = self.lower_build_heavy_action(
+            lease,
+            command,
+            command_policy,
+            isolation_request,
+            tool_manifest,
+        )?;
+        if let Some((task_attempt_id, step, artifact_store_root)) = verification_command {
+            self.persist_verification_command_intent(
+                lease,
+                task_attempt_id,
+                step,
+                &action,
+                artifact_store_root,
+            )?;
+        }
+        let permission_decision =
+            self.permission_decision_for_task(&lease.task_id, tool_manifest)?;
         self.prepare_action_for_dispatch(&action, tool_manifest, &permission_decision)?;
         Ok(action)
+    }
+
+    fn persist_verification_command_intent(
+        &mut self,
+        lease: &HeavyPhaseLease,
+        task_attempt_id: &str,
+        step: &RequiredCommandVerificationStep,
+        action: &AuthorizedAction,
+        artifact_store_root: &Path,
+    ) -> Result<(), ControllerError> {
+        let active = self.active_ref()?;
+        let task = active.tasks.get(&lease.task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "verification command intent task disappeared from active plan".to_owned(),
+            )
+        })?;
+        let expected_lease_id = verification_build_lease_id(
+            &lease.plan_id,
+            lease.plan_revision,
+            &lease.task_id,
+            task_attempt_id,
+            &step.step_id,
+            lease.execution_epoch,
+        );
+        let expected_action_id = heavy_build_action_id(&expected_lease_id);
+        if lease.resource_lease.lease_id != expected_lease_id
+            || action.action_id != expected_action_id
+            || action.plan_id != active.plan_id
+            || action.plan_revision != active.revision
+            || action.task_id != lease.task_id
+            || action.execution_epoch != lease.execution_epoch
+            || action.repository_id != active.repository_id
+            || action.policy_digest != active.policy_digest
+        {
+            return Err(ControllerError::InvalidPlan(
+                "verification command intent does not match exact active execution authority"
+                    .to_owned(),
+            ));
+        }
+        let intent = PersistedVerificationCommandIntentV1 {
+            schema_version: VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION,
+            plan_id: active.plan_id.clone(),
+            plan_revision: active.revision,
+            plan_digest: active.plan_digest.clone(),
+            task_id: lease.task_id.clone(),
+            task_contract_digest: task.task_contract_digest.clone(),
+            attempt_id: task_attempt_id.to_owned(),
+            step_id: step.step_id.clone(),
+            step_digest: step.step_digest.clone(),
+            resource_lease_id: lease.resource_lease.lease_id.clone(),
+            action_id: action.action_id.clone(),
+            payload_digest: action.payload_digest(),
+            policy_digest: action.policy_digest.clone(),
+            execution_epoch: action.execution_epoch,
+            artifact_store_root: artifact_store_root.to_path_buf(),
+        };
+        if let Some(existing) = self
+            .state
+            .get_state(VERIFICATION_COMMAND_INTENT_NAMESPACE, &intent.action_id)?
+        {
+            let existing: PersistedVerificationCommandIntentV1 = serde_json::from_str(&existing)?;
+            if existing != intent {
+                return Err(ControllerError::InvalidPlan(
+                    "verification command intent drifted for deterministic action identity"
+                        .to_owned(),
+                ));
+            }
+            return Ok(());
+        }
+        let value_json = serde_json::to_string(&intent)?;
+        let binding_key = format!(
+            "{VERIFICATION_COMMAND_INTENT_NAMESPACE}:{}",
+            intent.action_id
+        );
+        let record_digest = sha256_prefixed(value_json.as_bytes());
+        self.persist_runtime_records_with_events(
+            &[(
+                VERIFICATION_COMMAND_INTENT_NAMESPACE.to_owned(),
+                intent.action_id.clone(),
+                value_json,
+            )],
+            &[(
+                "verification_command_intent_bound".to_owned(),
+                intent.action_id.clone(),
+                json!({
+                    "action_id": intent.action_id,
+                    "task_id": intent.task_id,
+                    "attempt_id": intent.attempt_id,
+                    "step_id": intent.step_id,
+                    "step_digest": intent.step_digest,
+                    "resource_lease_id": intent.resource_lease_id,
+                    "payload_digest": intent.payload_digest,
+                    "policy_digest": intent.policy_digest,
+                    "execution_epoch": intent.execution_epoch,
+                    "post_image_digests": {binding_key: record_digest},
+                }),
+            )],
+        )?;
+        Ok(())
     }
 
     /// Executes the exact `BUILD_HEAVY` phase through the existing durable [`ProcessRunner`].
@@ -7409,6 +7798,30 @@ impl Controller {
         artifacts: &ArtifactStore,
         tool_manifest: &ToolManifest,
     ) -> Result<RawToolResult, ControllerError> {
+        self.execute_build_heavy_internal(
+            lease,
+            command,
+            command_policy,
+            isolation_backend,
+            isolation_request,
+            artifacts,
+            tool_manifest,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_build_heavy_internal<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        lease: &mut HeavyPhaseLease,
+        command: CommandSpec,
+        command_policy: &CommandPolicy,
+        isolation_backend: &I,
+        isolation_request: &IsolationRequest,
+        artifacts: &ArtifactStore,
+        tool_manifest: &ToolManifest,
+        verification_command: Option<(&str, &RequiredCommandVerificationStep, &Path)>,
+    ) -> Result<RawToolResult, ControllerError> {
         self.validate_heavy_phase_lease(lease)?;
         if lease.completion.is_some() {
             return Err(ControllerError::NotReady(
@@ -7421,6 +7834,7 @@ impl Controller {
             command_policy,
             isolation_request,
             tool_manifest,
+            verification_command,
         ) {
             Ok(action) => action,
             Err(error @ ControllerError::AwaitingApproval { .. }) => return Err(error),
@@ -7624,6 +8038,309 @@ impl Controller {
             ));
         }
         self.release_build_heavy_proven_absent(lease, "resource_build_heavy_released")
+    }
+
+    fn verification_command_disk_write_limit(
+        &self,
+        task_id: &str,
+        commands_remaining: usize,
+    ) -> Result<u64, ControllerError> {
+        let budget = self
+            .active_ref()?
+            .tasks
+            .get(task_id)
+            .and_then(|task| task.autonomy_budget.as_ref())
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "command verification task lacks an autonomy budget".to_owned(),
+                )
+            })?;
+        budget.validate()?;
+        let commands_remaining = u64::try_from(commands_remaining).map_err(|_| {
+            ControllerError::InvalidPlan(
+                "command verification step count does not fit resource arithmetic".to_owned(),
+            )
+        })?;
+        if commands_remaining == 0 {
+            return Err(ControllerError::InvalidPlan(
+                "command verification resource allocation has no remaining command".to_owned(),
+            ));
+        }
+        let remaining = budget
+            .max_disk_write_bytes
+            .saturating_sub(budget.used_disk_write_bytes);
+        let limit = remaining / commands_remaining;
+        if limit == 0 {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                "command verification has no remaining governed disk-write budget".to_owned(),
+            )));
+        }
+        Ok(limit)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_required_command_verification<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        runtime: &ExecutionRuntime<'_, I>,
+        task_id: &str,
+        attempt_id: &str,
+    ) -> Result<Vec<CommandVerificationResultV1>, ControllerError> {
+        let (task, repository_id) = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "command verification task disappeared from the active plan".to_owned(),
+                )
+            })?;
+            let attempt = active.attempts.get(attempt_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "command verification attempt disappeared from the active plan".to_owned(),
+                )
+            })?;
+            if task.state != TaskState::Verifying
+                || attempt.state != AttemptState::Verifying
+                || attempt.task_id != task_id
+                || attempt.task_contract_digest != task.task_contract_digest
+            {
+                return Err(ControllerError::NotReady(
+                    "command verification requires the real task and attempt to remain Verifying"
+                        .to_owned(),
+                ));
+            }
+            (task.task.clone(), active.repository_id.clone())
+        };
+        let required_steps = required_command_verification_steps(&task)?;
+        if required_steps.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let execution_root = self.task_execution_root(task_id)?;
+        let mut resolved = Vec::with_capacity(required_steps.len());
+        for step in required_steps {
+            if step.repository_id != repository_id {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "command verification step {} targets repository {:?}, expected {:?}",
+                    step.step_id, step.repository_id, repository_id
+                )));
+            }
+            if step.tool_id != runtime.tool_manifest.tool_id {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "command verification step {} requires tool {:?}, but runtime supplied {:?}",
+                    step.step_id, step.tool_id, runtime.tool_manifest.tool_id
+                )));
+            }
+            let executable = runtime
+                .command_policy
+                .resolve_pinned_program(&step.program)?
+                .path
+                .clone();
+            resolved.push((step, executable));
+        }
+
+        let mut results = Vec::with_capacity(resolved.len());
+        let total_steps = resolved.len();
+        for (index, (step, executable)) in resolved.into_iter().enumerate() {
+            let commands_remaining = total_steps.saturating_sub(index);
+            let disk_write_limit_bytes =
+                self.verification_command_disk_write_limit(task_id, commands_remaining)?;
+            let mut isolation_request = runtime.isolation_request.clone();
+            isolation_request
+                .repository_root
+                .clone_from(&execution_root);
+            isolation_request.network_offline = true;
+
+            let mut heavy = self.acquire_verification_build_heavy(
+                task_id,
+                attempt_id,
+                &step.step_id,
+                runtime.tool_manifest,
+                runtime.backend,
+            )?;
+            let action_id = heavy_build_action_id(&heavy.resource_lease.lease_id);
+            let command = CommandSpec {
+                executable,
+                args: step.args.clone(),
+                working_directory: execution_root.clone(),
+                environment: BTreeMap::new(),
+                mode: CommandMode::Direct,
+                declared_risk: CommandRisk::UntrustedCode,
+                timeout_ms: step.timeout_ms,
+                output_limit_bytes: step.output_limit_bytes,
+                disk_write_limit_bytes,
+                subprocess_limit: heavy.subprocess_cap,
+            };
+            let raw = self.execute_build_heavy_internal(
+                &mut heavy,
+                command,
+                runtime.command_policy,
+                runtime.isolation_backend,
+                &isolation_request,
+                runtime.artifacts,
+                runtime.tool_manifest,
+                Some((attempt_id, &step, runtime.artifacts.root())),
+            )?;
+            let action_record = self.state.action_record(&action_id)?.ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "committed command verification action disappeared".to_owned(),
+                )
+            })?;
+            let result_digest = action_record.result_digest.clone().ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "committed command verification action lacks a result digest".to_owned(),
+                )
+            })?;
+            let failure_code = command_verification_failure_code(&raw, &step.expected_exit_codes);
+            let result = CommandVerificationResultV1 {
+                step_id: step.step_id,
+                action_id,
+                result_digest: Some(result_digest),
+                expected_exit_codes: step.expected_exit_codes,
+                exit_code: raw.exit_code,
+                elapsed_ms: raw.elapsed_ms,
+                terminated_for_limit: raw
+                    .terminated_for_limit
+                    .map(command_resource_limit_name)
+                    .map(str::to_owned),
+                process_group_reaped: raw.process_group_reaped,
+                stdout_digest: Some(sha256_prefixed(&raw.stdout)),
+                stderr_digest: Some(sha256_prefixed(&raw.stderr)),
+                passed: failure_code.is_none(),
+                failure_code,
+            };
+            self.release_build_heavy(&heavy)?;
+            results.push(result);
+        }
+        Ok(results)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn recover_required_command_verification(
+        &self,
+        intent: &DecodedPersistedActionIntent,
+        task: &Value,
+    ) -> Result<Vec<CommandVerificationResultV1>, ControllerError> {
+        let required_steps = required_command_verification_steps(task)?;
+        if required_steps.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::with_capacity(required_steps.len());
+        for step in required_steps {
+            let resource_lease_id = verification_build_lease_id(
+                intent.plan_id(),
+                intent.plan_revision(),
+                intent.task_id(),
+                intent.attempt_id(),
+                &step.step_id,
+                intent.execution_epoch(),
+            );
+            let action_id = heavy_build_action_id(&resource_lease_id);
+            let raw_command_intent = self
+                .state
+                .get_state(VERIFICATION_COMMAND_INTENT_NAMESPACE, &action_id)?
+                .ok_or_else(|| {
+                    ControllerError::NotReady(format!(
+                        "recovery command verification intent {action_id} is missing; command will not be redispatched"
+                    ))
+                })?;
+            let command_intent: PersistedVerificationCommandIntentV1 =
+                serde_json::from_str(&raw_command_intent)?;
+            if command_intent.schema_version != VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION
+                || command_intent.plan_id != intent.plan_id()
+                || command_intent.plan_revision != intent.plan_revision()
+                || command_intent.plan_digest != intent.plan_digest()
+                || command_intent.task_id != intent.task_id()
+                || command_intent.task_contract_digest != intent.task_contract_digest()
+                || command_intent.attempt_id != intent.attempt_id()
+                || command_intent.step_id != step.step_id
+                || command_intent.step_digest != step.step_digest
+                || command_intent.resource_lease_id != resource_lease_id
+                || command_intent.action_id != action_id
+                || command_intent.execution_epoch != intent.execution_epoch()
+                || command_intent.artifact_store_root != intent.artifact_store_root()
+                || !is_sha256_digest(&command_intent.payload_digest)
+                || !is_sha256_digest(&command_intent.policy_digest)
+            {
+                return Err(ControllerError::NotReady(format!(
+                    "recovery command verification intent {action_id} drifted from immutable Plan/action authority"
+                )));
+            }
+            let action = self.state.action_record(&action_id)?.ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "recovery command verification action {action_id} is missing"
+                ))
+            })?;
+            let result_digest = action.result_digest.clone().ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "recovery command verification action {action_id} has no committed result"
+                ))
+            })?;
+            if action.state != "committed"
+                || action.payload_digest != command_intent.payload_digest
+                || action.policy_digest != command_intent.policy_digest
+                || action.execution_epoch != command_intent.execution_epoch
+            {
+                return Err(ControllerError::NotReady(format!(
+                    "recovery command verification action {action_id} is not exactly committed"
+                )));
+            }
+            let raw_process = self
+                .state
+                .get_state("controller.process_lease", &action_id)?
+                .ok_or_else(|| {
+                    ControllerError::NotReady(format!(
+                        "recovery command verification action {action_id} lacks process reap proof"
+                    ))
+                })?;
+            let process: RecoveryProcessLease = serde_json::from_str(&raw_process)?;
+            if process.action_id != action_id
+                || process.task_id != intent.task_id()
+                || process.attempt_id != heavy_build_attempt_id(&resource_lease_id)
+                || !process_lease_is_terminal(&process)
+            {
+                return Err(ControllerError::NotReady(format!(
+                    "recovery command verification action {action_id} has stale process reap proof"
+                )));
+            }
+            let artifacts = ArtifactStore::open(&command_intent.artifact_store_root)?;
+            let mut receipt_bytes = Vec::new();
+            artifacts
+                .open_artifact(&self.state, &result_digest)?
+                .read_to_end(&mut receipt_bytes)?;
+            let receipt = ActionReceipt::from_bytes(&receipt_bytes)?;
+            if receipt.schema != ACTION_RECEIPT_SCHEMA
+                || receipt.schema_version != ACTION_RECEIPT_SCHEMA_VERSION
+                || receipt.action_id != action_id
+                || receipt.payload_digest != command_intent.payload_digest
+                || receipt.policy_digest != command_intent.policy_digest
+                || receipt.execution_epoch != command_intent.execution_epoch
+                || !is_sha256_digest(&receipt.stdout.sha256)
+                || !is_sha256_digest(&receipt.stderr.sha256)
+            {
+                return Err(ControllerError::NotReady(format!(
+                    "recovery command verification receipt {result_digest} is misbound"
+                )));
+            }
+            let failure_code =
+                command_verification_receipt_failure_code(&receipt, &step.expected_exit_codes);
+            results.push(CommandVerificationResultV1 {
+                step_id: step.step_id,
+                action_id,
+                result_digest: Some(result_digest),
+                expected_exit_codes: step.expected_exit_codes,
+                exit_code: receipt.exit_code,
+                elapsed_ms: receipt.elapsed_ms,
+                terminated_for_limit: receipt
+                    .terminated_for_limit
+                    .map(command_resource_limit_name)
+                    .map(str::to_owned),
+                process_group_reaped: receipt.process_group_reaped,
+                stdout_digest: Some(receipt.stdout.sha256),
+                stderr_digest: Some(receipt.stderr.sha256),
+                passed: failure_code.is_none(),
+                failure_code,
+            });
+        }
+        Ok(results)
     }
 
     /// Re-admits MODEL after a completed `BUILD_HEAVY` phase through the governor's automatic-reload
@@ -8291,6 +9008,45 @@ impl Controller {
             (Ok(success), Ok(())) => Ok(success),
             (_, Err(error)) | (Err(error), Ok(())) => Err(error),
         }
+    }
+
+    /// Executes one already-typed repository create/update proposal through the canonical
+    /// Controller authorization, journal, filesystem-guard, verification, and completion path.
+    /// This entry point does not grant model or caller command authority; the proposal is still
+    /// constrained to the immutable active Plan IR task scope and current `ContextPacket` evidence.
+    ///
+    /// # Errors
+    /// Returns fail-closed for stale readiness, invalid proposal scope/evidence, authorization,
+    /// filesystem ambiguity, unknown outcome, or deterministic verification failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn execute_repository_proposal<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        mut lease: ReadyLease,
+        runtime: &ExecutionRuntime<'_, I>,
+        context: &ContextPacket,
+        proposal: RepositoryProposalV1,
+    ) -> Result<ExecutionSuccess, ControllerError> {
+        self.validate_ready_lease(&lease, runtime.registry, runtime.tool_manifest)?;
+        // A typed repository proposal is already the immutable action input; it never consumes the
+        // readiness MODEL reservation. Retire that unused authority before any mutation can cross
+        // dispatch so crash recovery has a durable physical-absence proof and command verification
+        // may later acquire BUILD_HEAVY without overlapping MODEL authority.
+        self.unload_model_for_ready_lease(&mut lease, runtime.backend)?;
+        let validated =
+            self.validate_repository_proposal(runtime.registry, context, &lease, proposal)?;
+        let attempt_id = self.start_attempt(&lease, runtime.registry)?;
+        let result =
+            self.execute_validated_repository_action(&mut lease, runtime, &attempt_id, &validated);
+        if result.is_err()
+            && self
+                .active_ref()?
+                .attempts
+                .get(&attempt_id)
+                .is_some_and(|attempt| attempt.state == AttemptState::Executing)
+        {
+            self.checkpoint_now()?;
+        }
+        result
     }
 
     /// Executes one bounded targeted repair attempt against the same active task contract.
@@ -9250,17 +10006,22 @@ impl Controller {
         self.transition_attempt(attempt_id, AttemptState::Verifying, "attempt_verifying")?;
         self.transition_task(&lease.task_id, TaskState::Verifying, "task_verifying")?;
         recovery_test_hook("verification_started");
+        let command_results =
+            self.run_required_command_verification(runtime, &lease.task_id, attempt_id)?;
         let verification_binding = VerificationLeaseBinding::from(&*lease);
-        let verification = DeterministicVerifier::verify(
-            &self.state,
-            self.active_ref()?,
-            runtime.registry,
-            &verification_binding,
-            attempt_id,
-            &action.action_id,
-            action.destination_digest.as_deref(),
-            validated,
-        )?;
+        let verification = aggregate_command_verification(
+            DeterministicVerifier::verify(
+                &self.state,
+                self.active_ref()?,
+                runtime.registry,
+                &verification_binding,
+                attempt_id,
+                &action.action_id,
+                action.destination_digest.as_deref(),
+                validated,
+            )?,
+            command_results,
+        );
         let verification_bytes = serde_json::to_vec(&verification)?;
         let artifact = runtime
             .artifacts
@@ -9340,6 +10101,254 @@ impl Controller {
             attempt_id: attempt_id.to_owned(),
             action_id: action.action_id,
             action_result_digest,
+            verification_evidence_id,
+            verification,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_validated_repository_action<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        lease: &mut ReadyLease,
+        runtime: &ExecutionRuntime<'_, I>,
+        attempt_id: &str,
+        validated: &ValidatedRepositoryActionV1,
+    ) -> Result<ExecutionSuccess, ControllerError> {
+        let execution_root = self.task_execution_root(&lease.task_id)?;
+        let permission_decision =
+            self.permission_decision_for_task(&lease.task_id, runtime.tool_manifest)?;
+        if permission_decision != lease.permission_decision {
+            return Err(ControllerError::NotReady(
+                "ready lease permission decision no longer matches repository mutation authority"
+                    .to_owned(),
+            ));
+        }
+        let mut isolation_request = runtime.isolation_request.clone();
+        isolation_request
+            .repository_root
+            .clone_from(&execution_root);
+        let path_policy =
+            self.repository_path_policy(&lease.task_id, &isolation_request, runtime.artifacts)?;
+        let guard = match &validated.preimage {
+            RepositoryPreimageV1::Absent => PreparedRepositoryMutationGuard::Create(
+                AtomicCreateGuard::prepare(&path_policy, validated.action.path())?,
+            ),
+            RepositoryPreimageV1::ExactFile { digest, mode } => {
+                PreparedRepositoryMutationGuard::Update(AtomicUpdateGuard::prepare_exact(
+                    &path_policy,
+                    validated.action.path(),
+                    digest,
+                    *mode,
+                )?)
+            }
+        };
+        let action = self.lower_repository_action(
+            lease,
+            attempt_id,
+            validated,
+            runtime,
+            &isolation_request,
+        )?;
+        let postimage = runtime
+            .artifacts
+            .put(&mut self.state, validated.action.content().as_bytes())?;
+        if !artifact_digest_matches_sha256_prefixed(
+            &postimage.digest,
+            &validated.expected_post_digest,
+        ) {
+            return Err(ControllerError::InvalidPlan(
+                "repository mutation CAS digest differs from validated postimage digest".to_owned(),
+            ));
+        }
+        self.persist_repository_action_intent(
+            &action,
+            validated,
+            &postimage.digest,
+            runtime.artifacts.root(),
+        )?;
+        self.prepare_action_for_dispatch(&action, runtime.tool_manifest, &permission_decision)?;
+        self.rebind_ready_checkpoint(lease)?;
+        self.validate_ready_lease(lease, runtime.registry, runtime.tool_manifest)?;
+        let cancellation = self.action_cancellation_handle(&action)?;
+        if cancellation.is_cancelled() {
+            self.persist_observed_cancellation(&cancellation)?;
+            self.mark_cancelled_without_dispatch(attempt_id, &lease.task_id)?;
+            return Err(ControllerError::NotReady(
+                "repository mutation cancelled before dispatch".to_owned(),
+            ));
+        }
+        {
+            let mut journal = ActionJournal::new(&mut self.state);
+            journal.transition(&action, ActionState::Authorized, ActionState::Dispatched)?;
+        }
+        if guard
+            .commit(
+                validated.action.content().as_bytes(),
+                validated.expected_target_mode,
+            )
+            .is_err()
+        {
+            {
+                let mut journal = ActionJournal::new(&mut self.state);
+                journal.recover_dispatched_as_unknown(&action)?;
+            }
+            self.mark_unknown(attempt_id, &lease.task_id, &action.action_id)?;
+            return Err(ControllerError::UnknownAction(action.action_id));
+        }
+
+        let postimage_check = (|| -> Result<(), ControllerError> {
+            let metadata = fs::symlink_metadata(execution_root.join(validated.action.path()))?;
+            if !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || permission_mode(&metadata) != validated.expected_target_mode
+            {
+                return Err(ControllerError::NotReady(
+                    "repository mutation postimage identity or mode is ambiguous".to_owned(),
+                ));
+            }
+            let exact = self.task_execution_read(
+                runtime.registry,
+                &lease.task_id,
+                Path::new(validated.action.path()),
+                Some(&validated.expected_post_digest),
+            )?;
+            if exact.digest != validated.expected_post_digest {
+                return Err(ControllerError::NotReady(
+                    "repository mutation postimage digest is ambiguous".to_owned(),
+                ));
+            }
+            Ok(())
+        })();
+        if postimage_check.is_err() {
+            {
+                let mut journal = ActionJournal::new(&mut self.state);
+                journal.recover_dispatched_as_unknown(&action)?;
+            }
+            self.mark_unknown(attempt_id, &lease.task_id, &action.action_id)?;
+            return Err(ControllerError::UnknownAction(action.action_id));
+        }
+        let receipt = RepositoryMutationReceiptV1 {
+            schema_version: 1,
+            action_id: action.action_id.clone(),
+            payload_digest: action.payload_digest(),
+            policy_digest: action.policy_digest.clone(),
+            execution_epoch: action.execution_epoch,
+            repository_id: action.repository_id.clone(),
+            path: validated.action.path().to_owned(),
+            preimage: validated.preimage.clone(),
+            post_digest: validated.expected_post_digest.clone(),
+            post_mode: validated.expected_target_mode,
+        };
+        let receipt_bytes = serde_json::to_vec(&receipt)?;
+        let result_digest = {
+            let mut journal = ActionJournal::new(&mut self.state);
+            match journal.observe_with_receipt(&action, runtime.artifacts, &receipt_bytes) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    if journal
+                        .record(&action.action_id)?
+                        .is_some_and(|record| record.state == ActionState::Dispatched.as_str())
+                    {
+                        journal.recover_dispatched_as_unknown(&action)?;
+                    }
+                    return Err(ControllerError::Tool(error));
+                }
+            }
+        };
+        {
+            let mut journal = ActionJournal::new(&mut self.state);
+            journal.commit_with_bound_result(&action, ActionState::Observed)?;
+        }
+        self.checkpoint_now()?;
+        recovery_test_hook("after_mutation_checkpoint");
+        self.transition_attempt(attempt_id, AttemptState::Verifying, "attempt_verifying")?;
+        self.transition_task(&lease.task_id, TaskState::Verifying, "task_verifying")?;
+        recovery_test_hook("verification_started");
+        let command_results =
+            self.run_required_command_verification(runtime, &lease.task_id, attempt_id)?;
+        let verification_binding = VerificationLeaseBinding::from(&*lease);
+        let verification = aggregate_command_verification(
+            DeterministicVerifier::verify_repository_action(
+                &self.state,
+                self.active_ref()?,
+                runtime.registry,
+                &verification_binding,
+                attempt_id,
+                &action.action_id,
+                validated,
+            )?,
+            command_results,
+        );
+        let verification_bytes = serde_json::to_vec(&verification)?;
+        let artifact = runtime
+            .artifacts
+            .put(&mut self.state, &verification_bytes)?;
+        let verification_evidence_id = format!(
+            "evidence.verification.{}",
+            digest_fragment(&artifact.digest, 16)
+        );
+        self.state
+            .add_artifact_reference(&verification_evidence_id, &artifact.digest)?;
+        self.state.put_state(
+            "controller.verification",
+            &revision_scoped_key(
+                &verification.plan_id,
+                verification.plan_revision,
+                &verification.verification_id,
+            ),
+            &serde_json::to_string(&verification)?,
+        )?;
+        self.append_controller_event(
+            "verification_recorded",
+            &verification.verification_id,
+            &json!({
+                "passed": verification.passed,
+                "artifact_digest": artifact.digest,
+                "plan_id": verification.plan_id,
+                "plan_revision": verification.plan_revision,
+                "plan_digest": verification.plan_digest,
+                "task_id": verification.task_id,
+                "task_contract_digest": verification.task_contract_digest,
+                "attempt_id": verification.attempt_id,
+            }),
+        )?;
+        self.checkpoint_now()?;
+        if !verification.passed {
+            let failure_code = verification
+                .failure_code
+                .clone()
+                .unwrap_or_else(|| "unknown_verification_failure".to_owned());
+            let failure = self.build_failure_record(FailureRecordInput {
+                task_id: lease.task_id.clone(),
+                attempt_id: attempt_id.to_owned(),
+                action_id: Some(action.action_id.clone()),
+                result_digest: Some(artifact.digest.clone()),
+                exit_code: None,
+                category: "verification_failure".to_owned(),
+                diagnostic: format!("deterministic verification failed: {failure_code}"),
+                failure_code,
+                failed_action_facts: BTreeMap::from([(
+                    "action_id".to_owned(),
+                    action.action_id.clone(),
+                )]),
+                evidence_refs: vec![verification_evidence_id.clone()],
+            })?;
+            let _ = self.route_failure_record(failure)?;
+            return Err(ControllerError::VerificationFailed(Box::new(verification)));
+        }
+        self.persist_worktree_change_set_if_required(
+            runtime.registry,
+            &lease.task_id,
+            runtime.artifacts,
+        )?;
+        self.record_verified_output_bindings(&verification, &artifact.digest)?;
+        self.apply_verified_success(&verification)?;
+        self.finalize_verified_repository_success(runtime.registry, &lease.task_id)?;
+        Ok(ExecutionSuccess {
+            task_id: lease.task_id.clone(),
+            attempt_id: attempt_id.to_owned(),
+            action_id: action.action_id,
+            action_result_digest: result_digest,
             verification_evidence_id,
             verification,
         })
@@ -10482,6 +11491,313 @@ impl Controller {
         })
     }
 
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    fn validate_repository_proposal(
+        &self,
+        registry: &ProjectRegistry,
+        context: &ContextPacket,
+        lease: &ReadyLease,
+        proposal: RepositoryProposalV1,
+    ) -> Result<ValidatedRepositoryActionV1, ControllerError> {
+        if proposal.schema_version != REPOSITORY_PROPOSAL_SCHEMA_VERSION
+            || serde_json::to_vec(&proposal)?.len() > MAX_REPOSITORY_PROPOSAL_BYTES
+        {
+            return Err(ControllerError::ProposalRejected(
+                "repository proposal violates schema or payload bounds".to_owned(),
+            ));
+        }
+        let unique_evidence = proposal.evidence_ids.iter().collect::<BTreeSet<_>>();
+        let allowed_evidence = context
+            .items
+            .iter()
+            .map(|item| item.evidence_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if proposal.evidence_ids.is_empty()
+            || proposal.evidence_ids.len() > MAX_PROPOSAL_EVIDENCE_IDS
+            || unique_evidence.len() != proposal.evidence_ids.len()
+            || proposal.evidence_ids.iter().any(|evidence_id| {
+                evidence_id.is_empty()
+                    || evidence_id.len() > MAX_PROPOSAL_EVIDENCE_ID_BYTES
+                    || !allowed_evidence.contains(evidence_id.as_str())
+            })
+        {
+            return Err(ControllerError::ProposalRejected(
+                "repository proposal evidence is outside the current ContextPacket or unbounded"
+                    .to_owned(),
+            ));
+        }
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(&lease.task_id)
+            .ok_or_else(|| ControllerError::ProposalRejected("task disappeared".to_owned()))?;
+        if !required_array(&task.task, "/scope/repositories")?
+            .iter()
+            .any(|value| value.as_str() == Some(active.repository_id.as_str()))
+        {
+            return Err(ControllerError::ProposalRejected(
+                "active repository is outside exact task repository scope".to_owned(),
+            ));
+        }
+        let execution_root = self.task_execution_root(&lease.task_id)?;
+        match &proposal.action {
+            RepositoryActionV1::CreateFile {
+                repository_id,
+                path,
+                content,
+            } => {
+                if repository_id != &active.repository_id
+                    || !valid_repo_relative_path(path)
+                    || repository_path_is_internal(path)
+                    || !scope_contains_path(&task.task, "/scope/allow_create", path)?
+                    || scope_contains_path(&task.task, "/scope/files", path)?
+                    || !task_write_root_allows(&task.task, repository_id, path)?
+                {
+                    return Err(ControllerError::ProposalRejected(
+                        "create_file is outside exact repository/create/write-root scope"
+                            .to_owned(),
+                    ));
+                }
+                match fs::symlink_metadata(execution_root.join(path)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Ok(_) => {
+                        return Err(ControllerError::ProposalRejected(
+                            "create_file target must be absent".to_owned(),
+                        ));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                let expected_post_digest = sha256_prefixed(content.as_bytes());
+                Ok(ValidatedRepositoryActionV1 {
+                    action: proposal.action.clone(),
+                    preimage: RepositoryPreimageV1::Absent,
+                    expected_post_digest,
+                    expected_target_mode: 0o644,
+                })
+            }
+            RepositoryActionV1::UpdateFile {
+                repository_id,
+                path,
+                expected_source_digest,
+                content,
+            } => {
+                if repository_id != &active.repository_id
+                    || !is_sha256_digest(expected_source_digest)
+                    || !valid_repo_relative_path(path)
+                    || repository_path_is_internal(path)
+                    || !scope_contains_path(&task.task, "/scope/files", path)?
+                    || scope_contains_path(&task.task, "/scope/allow_create", path)?
+                    || !task_write_root_allows(&task.task, repository_id, path)?
+                {
+                    return Err(ControllerError::ProposalRejected(
+                        "update_file is outside exact repository/update/write-root scope"
+                            .to_owned(),
+                    ));
+                }
+                let relevant_evidence = proposal.evidence_ids.iter().find_map(|evidence_id| {
+                    context.items.iter().find(|item| {
+                        item.evidence_id == *evidence_id
+                            && evidence_repo_relative_path(repository_id, item)
+                                == Some(path.as_str())
+                            && item.source_digest == *expected_source_digest
+                    })
+                });
+                let relevant_evidence = relevant_evidence.ok_or_else(|| {
+                    ControllerError::ProposalRejected(
+                        "update_file lacks exact current source evidence for its preimage"
+                            .to_owned(),
+                    )
+                })?;
+                self.validate_task_exact_context_evidence(
+                    registry,
+                    &lease.task_id,
+                    repository_id,
+                    relevant_evidence,
+                )?;
+                let source = self.task_execution_read(
+                    registry,
+                    &lease.task_id,
+                    Path::new(path),
+                    Some(expected_source_digest),
+                )?;
+                if source.digest != *expected_source_digest {
+                    return Err(ControllerError::ProposalRejected(
+                        "update_file preimage digest is stale".to_owned(),
+                    ));
+                }
+                let target_metadata = fs::symlink_metadata(execution_root.join(path))?;
+                if !target_metadata.is_file() || target_metadata.file_type().is_symlink() {
+                    return Err(ControllerError::ProposalRejected(
+                        "update_file target must remain a regular non-symlink file".to_owned(),
+                    ));
+                }
+                if active
+                    .baseline
+                    .untracked
+                    .paths
+                    .contains(&PathBuf::from(path))
+                {
+                    return Err(ControllerError::ProposalRejected(
+                        "update_file cannot claim an untracked baseline target".to_owned(),
+                    ));
+                }
+                let mode = permission_mode(&target_metadata);
+                Ok(ValidatedRepositoryActionV1 {
+                    action: proposal.action.clone(),
+                    preimage: RepositoryPreimageV1::ExactFile {
+                        digest: expected_source_digest.clone(),
+                        mode,
+                    },
+                    expected_post_digest: sha256_prefixed(content.as_bytes()),
+                    expected_target_mode: mode,
+                })
+            }
+        }
+    }
+
+    fn repository_path_policy(
+        &self,
+        task_id: &str,
+        isolation_request: &IsolationRequest,
+        artifacts: &ArtifactStore,
+    ) -> Result<PathPolicy, ControllerError> {
+        let execution_root = self.task_execution_root(task_id)?;
+        if !isolation_request.network_offline
+            || !isolation_request.allow_repository_write
+            || isolation_request.repository_root.canonicalize()? != execution_root.canonicalize()?
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "repository mutation requires exact offline task-root write isolation".to_owned(),
+            )));
+        }
+        let state_path = self.state.path().to_path_buf();
+        let state_parent = state_path.parent().ok_or_else(|| {
+            ControllerError::InvalidPlan("state database has no parent directory".to_owned())
+        })?;
+        let mut protected = vec![
+            execution_root.join(".git"),
+            state_path.clone(),
+            PathBuf::from(format!("{}-wal", state_path.display())),
+            PathBuf::from(format!("{}-shm", state_path.display())),
+            state_parent.join("checkpoint-cas"),
+            artifacts.root().to_path_buf(),
+        ];
+        protected.extend(isolation_request.extra_protected_read_roots.iter().cloned());
+        Ok(PathPolicy::new(execution_root, protected)?)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn lower_repository_action<I: sovereign_policy::ExecutionIsolationBackend>(
+        &self,
+        lease: &ReadyLease,
+        attempt_id: &str,
+        validated: &ValidatedRepositoryActionV1,
+        runtime: &ExecutionRuntime<'_, I>,
+        isolation_request: &IsolationRequest,
+    ) -> Result<AuthorizedRepositoryMutation, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active.tasks.get(&lease.task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan("repository mutation task disappeared".to_owned())
+        })?;
+        let decision = &lease.permission_decision;
+        decision.validate()?;
+        if decision.task_id != lease.task_id
+            || decision.task_contract_digest != task.task_contract_digest
+            || runtime.tool_manifest.tool_id != decision.tool_id
+            || runtime.tool_manifest.version != decision.tool_version
+            || runtime.tool_manifest.content_digest != decision.tool_digest
+            || !runtime
+                .tool_manifest
+                .permission_ceiling
+                .contains(&PermissionClass::RepositoryWrite)
+            || !decision.effective.contains(Capability::RepositoryWrite)
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "repository mutation tool/permission authority does not match active task"
+                    .to_owned(),
+            )));
+        }
+        if self.approval_required_for_task_permission(
+            &lease.task_id,
+            PermissionClass::RepositoryWrite,
+        )? {
+            return Err(ControllerError::InvalidPlan(
+                "repo_write cannot be approval-required under Plan IR v1.2".to_owned(),
+            ));
+        }
+        if Self::reconciliation_mode_for_manifest(runtime.tool_manifest)?
+            != ReconciliationMode::UnsafeSideEffect
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "repository mutation tool must use proof-required local reconciliation".to_owned(),
+            )));
+        }
+        let execution_root = self.task_execution_root(&lease.task_id)?;
+        if isolation_request.repository_root.canonicalize()? != execution_root.canonicalize()?
+            || !isolation_request.allow_repository_write
+            || !isolation_request.network_offline
+        {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "repository mutation requires exact offline repository-write isolation".to_owned(),
+            )));
+        }
+        let action_seed = digest_json(&json!({
+            "domain": "repository_mutation_v1",
+            "plan": lease.plan_digest,
+            "task": lease.task_contract_digest,
+            "attempt": attempt_id,
+            "repository_id": validated.action.repository_id(),
+            "path": validated.action.path(),
+            "mutation_kind": match validated.preimage {
+                RepositoryPreimageV1::Absent => "create_file",
+                RepositoryPreimageV1::ExactFile { .. } => "update_file",
+            },
+            "preimage": validated.preimage,
+            "post_digest": validated.expected_post_digest,
+            "mode": validated.expected_target_mode,
+        }))?;
+        let action_id = format!("action.{}", &action_seed[7..27]);
+        let now_ms = unix_millis()?;
+        let expires_at_ms = now_ms.saturating_add(60_000);
+        let (kind, precondition) = match &validated.preimage {
+            RepositoryPreimageV1::Absent => (
+                RepositoryMutationKind::Create,
+                RepositoryMutationPrecondition::Absent,
+            ),
+            RepositoryPreimageV1::ExactFile { digest, mode } => (
+                RepositoryMutationKind::Update,
+                RepositoryMutationPrecondition::ExactFile {
+                    digest: digest.clone(),
+                    mode: *mode,
+                },
+            ),
+        };
+        Ok(AuthorizedRepositoryMutation {
+            action_id,
+            plan_id: active.plan_id.clone(),
+            plan_revision: active.revision,
+            task_id: lease.task_id.clone(),
+            attempt_id: attempt_id.to_owned(),
+            tool_id: decision.tool_id.clone(),
+            tool_version: decision.tool_version.clone(),
+            tool_digest: decision.tool_digest.clone(),
+            repository_id: validated.action.repository_id().to_owned(),
+            relative_path: PathBuf::from(validated.action.path()),
+            kind,
+            precondition,
+            expected_post_digest: validated.expected_post_digest.clone(),
+            expected_target_mode: validated.expected_target_mode,
+            execution_epoch: lease.execution_epoch,
+            policy_digest: active.policy_digest.clone(),
+            permission_decision_digest: decision.digest(),
+            isolation_policy_digest: isolation_request.digest()?,
+            nonce: format!("nonce.{}", &action_seed[27..47]),
+            expires_at_ms,
+            action_deadline_ms: 5_000,
+            disk_write_bytes: u64::try_from(validated.action.content().len()).unwrap_or(u64::MAX),
+        })
+    }
+
     fn lower_replace_action<I: sovereign_policy::ExecutionIsolationBackend>(
         &self,
         lease: &ReadyLease,
@@ -10850,6 +12166,89 @@ impl Controller {
         Ok(())
     }
 
+    fn persist_repository_action_intent(
+        &mut self,
+        action: &AuthorizedRepositoryMutation,
+        validated: &ValidatedRepositoryActionV1,
+        postimage_artifact_digest: &str,
+        artifact_store_root: &Path,
+    ) -> Result<(), ControllerError> {
+        if !artifact_digest_matches_sha256_prefixed(
+            postimage_artifact_digest,
+            &validated.expected_post_digest,
+        ) {
+            return Err(ControllerError::InvalidPlan(
+                "repository mutation postimage CAS digest does not match validated postimage"
+                    .to_owned(),
+            ));
+        }
+        let (plan_digest, task_contract_digest, worktree_lease_id, execution_root) = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&action.task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan("repository action intent task disappeared".to_owned())
+            })?;
+            (
+                active.plan_digest.clone(),
+                task.task_contract_digest.clone(),
+                task.worktree_lease
+                    .as_ref()
+                    .map(|lease| lease.lease_id.clone()),
+                task.worktree_lease.as_ref().map_or_else(
+                    || active.repository_root.clone(),
+                    |lease| lease.worktree_path.clone(),
+                ),
+            )
+        };
+        let mutation = match &validated.preimage {
+            RepositoryPreimageV1::Absent => RepositoryMutationIntentV1::CreateFile {
+                path: validated.action.path().to_owned(),
+            },
+            RepositoryPreimageV1::ExactFile { digest, mode } => {
+                RepositoryMutationIntentV1::UpdateFile {
+                    path: validated.action.path().to_owned(),
+                    expected_source_digest: digest.clone(),
+                    expected_source_mode: *mode,
+                }
+            }
+        };
+        let intent = PersistedRepositoryActionIntentV4 {
+            schema_version: REPOSITORY_ACTION_INTENT_SCHEMA_VERSION,
+            action_id: action.action_id.clone(),
+            plan_id: action.plan_id.clone(),
+            plan_revision: action.plan_revision,
+            plan_digest,
+            task_id: action.task_id.clone(),
+            task_contract_digest,
+            attempt_id: action.attempt_id.clone(),
+            execution_epoch: action.execution_epoch,
+            payload_digest: action.payload_digest(),
+            action_nonce: action.nonce.clone(),
+            policy_digest: action.policy_digest.clone(),
+            repository_id: action.repository_id.clone(),
+            worktree_lease_id,
+            execution_root,
+            mutation,
+            expected_post_digest: validated.expected_post_digest.clone(),
+            expected_target_mode: validated.expected_target_mode,
+            postimage_artifact_digest: postimage_artifact_digest.to_owned(),
+            artifact_store_root: artifact_store_root.to_path_buf(),
+        };
+        let seed = repository_intent_action_seed(&intent)?;
+        if intent.action_id != format!("action.{}", &seed[7..27])
+            || intent.action_nonce != format!("nonce.{}", &seed[27..47])
+        {
+            return Err(ControllerError::InvalidPlan(
+                "repository action intent does not reproduce authorized action identity".to_owned(),
+            ));
+        }
+        self.state.put_state(
+            "controller.action_intent",
+            &action.action_id,
+            &serde_json::to_string(&intent)?,
+        )?;
+        Ok(())
+    }
+
     fn validate_recovered_action_intent(
         &self,
         intent: &PersistedActionIntent,
@@ -10957,24 +12356,33 @@ impl Controller {
                     "recovery verification intent {action_id} is missing"
                 ))
             })?;
-        let raw_intent: PersistedActionIntent = serde_json::from_str(&raw)?;
-        let legacy_primary_recovery =
-            raw_intent.schema_version == LEGACY_ACTION_INTENT_SCHEMA_VERSION;
+        let raw_value: Value = serde_json::from_str(&raw)?;
+        let repository_id = required_str(&raw_value, "/repository_id")?;
         let primary_root = registry
-            .repository(&raw_intent.repository_id)
+            .repository(repository_id)
             .ok_or_else(|| {
                 ControllerError::InvalidPlan("recovery verification repository missing".to_owned())
             })?
             .root
             .clone();
-        let intent = normalize_persisted_action_intent(raw_intent, &primary_root)?;
+        let intent = decode_persisted_action_intent(&raw, &primary_root)?;
+        let legacy_primary_recovery = matches!(
+            intent,
+            DecodedPersistedActionIntent::Legacy {
+                legacy_primary_recovery: true,
+                ..
+            }
+        );
         let record = self
             .state
             .action_record(action_id)?
             .ok_or_else(|| ControllerError::InvalidPlan("recovery action missing".to_owned()))?;
         if record.state != "committed"
             || record.result_digest.is_none()
-            || record.payload_digest != intent.payload_digest
+            || record.action_id != intent.action_id()
+            || record.payload_digest != intent.payload_digest()
+            || record.policy_digest != intent.policy_digest()
+            || record.execution_epoch != intent.execution_epoch()
         {
             return Err(ControllerError::NotReady(format!(
                 "recovery action {action_id} is not durably committed"
@@ -10982,15 +12390,39 @@ impl Controller {
         }
         let (task_contract_digest, baseline_digest) = {
             let active = self.active_ref()?;
-            let task = active.tasks.get(&intent.task_id).ok_or_else(|| {
+            if active.plan_id != intent.plan_id()
+                || active.revision != intent.plan_revision()
+                || active.plan_digest
+                    != raw_value
+                        .get("plan_digest")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                || active.repository_id != intent.repository_id()
+            {
+                return Err(ControllerError::NotReady(
+                    "recovery action intent no longer matches the active plan/repository"
+                        .to_owned(),
+                ));
+            }
+            let task = active.tasks.get(intent.task_id()).ok_or_else(|| {
                 ControllerError::InvalidPlan("recovery verification task missing".to_owned())
             })?;
-            let attempt = active.attempts.get(&intent.attempt_id).ok_or_else(|| {
+            let attempt = active.attempts.get(intent.attempt_id()).ok_or_else(|| {
                 ControllerError::InvalidPlan("recovery verification attempt missing".to_owned())
             })?;
-            if task.state != TaskState::Verifying || attempt.state != AttemptState::Verifying {
+            if task.task_contract_digest
+                != raw_value
+                    .get("task_contract_digest")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                || task.state != TaskState::Verifying
+                || attempt.state != AttemptState::Verifying
+                || attempt.task_id != intent.task_id()
+                || attempt.task_contract_digest != task.task_contract_digest
+            {
                 return Err(ControllerError::NotReady(
-                    "recovery verification state is not Verifying".to_owned(),
+                    "recovery verification task/attempt authority is stale or not Verifying"
+                        .to_owned(),
                 ));
             }
             if legacy_primary_recovery
@@ -11013,42 +12445,100 @@ impl Controller {
                 attempt.baseline_digest.clone(),
             )
         };
-        let proposal = ReplaceLiteral {
-            kind: ReplaceLiteralKind::ReplaceLiteral,
-            repository_id: intent.repository_id.clone(),
-            path: intent.path.clone(),
-            expected_source_digest: intent.expected_source_digest.clone(),
-            old_literal: intent.old_literal.clone(),
-            new_literal: intent.new_literal.clone(),
-            expected_occurrences: 1,
-        };
-        let validated = ValidatedReplace {
-            proposal,
-            expected_post_digest: intent.expected_post_digest.clone(),
-            expected_target_mode: intent.expected_target_mode,
+        let recovered_command_results = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(intent.task_id()).ok_or_else(|| {
+                ControllerError::InvalidPlan("recovery verification task missing".to_owned())
+            })?;
+            self.recover_required_command_verification(&intent, &task.task)?
         };
         let active = self.active_ref()?;
         let binding = VerificationLeaseBinding {
             plan_id: active.plan_id.clone(),
             plan_revision: active.revision,
             plan_digest: active.plan_digest.clone(),
-            task_id: intent.task_id.clone(),
+            task_id: intent.task_id().to_owned(),
             task_contract_digest,
             baseline_digest,
             execution_epoch: self.state.current_execution_epoch()?,
             legacy_primary_recovery,
         };
-        let verification = DeterministicVerifier::verify(
-            &self.state,
-            self.active_ref()?,
-            registry,
-            &binding,
-            &intent.attempt_id,
-            action_id,
-            Some(&intent.expected_source_digest),
-            &validated,
-        )?;
-        let artifacts = ArtifactStore::open(&intent.artifact_store_root)?;
+        let artifacts = ArtifactStore::open(intent.artifact_store_root())?;
+        let base_verification = match &intent {
+            DecodedPersistedActionIntent::Legacy { intent, .. } => {
+                let proposal = ReplaceLiteral {
+                    kind: ReplaceLiteralKind::ReplaceLiteral,
+                    repository_id: intent.repository_id.clone(),
+                    path: intent.path.clone(),
+                    expected_source_digest: intent.expected_source_digest.clone(),
+                    old_literal: intent.old_literal.clone(),
+                    new_literal: intent.new_literal.clone(),
+                    expected_occurrences: 1,
+                };
+                let validated = ValidatedReplace {
+                    proposal,
+                    expected_post_digest: intent.expected_post_digest.clone(),
+                    expected_target_mode: intent.expected_target_mode,
+                };
+                DeterministicVerifier::verify(
+                    &self.state,
+                    self.active_ref()?,
+                    registry,
+                    &binding,
+                    &intent.attempt_id,
+                    action_id,
+                    Some(&intent.expected_source_digest),
+                    &validated,
+                )?
+            }
+            DecodedPersistedActionIntent::Repository(intent) => {
+                let mut postimage = Vec::new();
+                artifacts
+                    .open_artifact(&self.state, &intent.postimage_artifact_digest)?
+                    .read_to_end(&mut postimage)?;
+                let content = String::from_utf8(postimage).map_err(|_| {
+                    ControllerError::InvalidPlan(
+                        "repository recovery postimage is not valid UTF-8".to_owned(),
+                    )
+                })?;
+                let action = match &intent.mutation {
+                    RepositoryMutationIntentV1::CreateFile { path } => {
+                        RepositoryActionV1::CreateFile {
+                            repository_id: intent.repository_id.clone(),
+                            path: path.clone(),
+                            content,
+                        }
+                    }
+                    RepositoryMutationIntentV1::UpdateFile {
+                        path,
+                        expected_source_digest,
+                        ..
+                    } => RepositoryActionV1::UpdateFile {
+                        repository_id: intent.repository_id.clone(),
+                        path: path.clone(),
+                        expected_source_digest: expected_source_digest.clone(),
+                        content,
+                    },
+                };
+                let validated = ValidatedRepositoryActionV1 {
+                    action,
+                    preimage: intent.preimage(),
+                    expected_post_digest: intent.expected_post_digest.clone(),
+                    expected_target_mode: intent.expected_target_mode,
+                };
+                DeterministicVerifier::verify_repository_action(
+                    &self.state,
+                    self.active_ref()?,
+                    registry,
+                    &binding,
+                    &intent.attempt_id,
+                    action_id,
+                    &validated,
+                )?
+            }
+        };
+        let verification =
+            aggregate_command_verification(base_verification, recovered_command_results);
         let verification_bytes = serde_json::to_vec(&verification)?;
         let artifact = artifacts.put(&mut self.state, &verification_bytes)?;
         let verification_evidence_id = format!(
@@ -11087,9 +12577,9 @@ impl Controller {
                 .clone()
                 .unwrap_or_else(|| "unknown_verification_failure".to_owned());
             let failure = self.build_failure_record(FailureRecordInput {
-                task_id: intent.task_id.clone(),
-                attempt_id: intent.attempt_id.clone(),
-                action_id: Some(intent.action_id.clone()),
+                task_id: intent.task_id().to_owned(),
+                attempt_id: intent.attempt_id().to_owned(),
+                action_id: Some(intent.action_id().to_owned()),
                 result_digest: Some(artifact.digest.clone()),
                 exit_code: None,
                 category: "verification_failure".to_owned(),
@@ -11097,7 +12587,7 @@ impl Controller {
                 failure_code,
                 failed_action_facts: BTreeMap::from([(
                     "action_id".to_owned(),
-                    intent.action_id.clone(),
+                    intent.action_id().to_owned(),
                 )]),
                 evidence_refs: vec![verification_evidence_id],
             })?;
@@ -11109,7 +12599,7 @@ impl Controller {
             self.refresh_baseline_after_verified_success(registry)?;
             self.append_controller_event(
                 "legacy_v2_primary_recovery_verified",
-                &intent.task_id,
+                intent.task_id(),
                 &json!({
                     "action_id": action_id,
                     "verification_id": verification.verification_id,
@@ -11121,10 +12611,10 @@ impl Controller {
             )?;
             self.checkpoint_now()?;
         } else {
-            self.persist_worktree_change_set_if_required(registry, &intent.task_id, &artifacts)?;
+            self.persist_worktree_change_set_if_required(registry, intent.task_id(), &artifacts)?;
             self.record_verified_output_bindings(&verification, &artifact.digest)?;
             self.apply_verified_success(&verification)?;
-            self.finalize_verified_repository_success(registry, &intent.task_id)?;
+            self.finalize_verified_repository_success(registry, intent.task_id())?;
         }
         Ok(())
     }
@@ -11732,14 +13222,22 @@ impl Controller {
         let task = active.tasks.get(&verification.task_id).ok_or_else(|| {
             ControllerError::InvalidPlan("carry fingerprint task disappeared".to_owned())
         })?;
+        let mut fingerprint_paths = BTreeSet::new();
+        for pointer in ["/scope/files", "/scope/allow_create"] {
+            for path in required_array(&task.task, pointer)? {
+                let path = path.as_str().ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "task executable scope path must be a string".to_owned(),
+                    )
+                })?;
+                fingerprint_paths.insert(path.to_owned());
+            }
+        }
         let mut source_fingerprints = BTreeMap::new();
-        for path in required_array(&task.task, "/scope/files")? {
-            let path = path.as_str().ok_or_else(|| {
-                ControllerError::InvalidPlan("task scope file must be a string".to_owned())
-            })?;
+        for path in fingerprint_paths {
             source_fingerprints.insert(
-                path.to_owned(),
-                path_fingerprint(&execution_root, Path::new(path))?,
+                path.clone(),
+                path_fingerprint(&execution_root, Path::new(&path))?,
             );
         }
         let implementation_inputs_digest = digest_json(
@@ -12310,6 +13808,7 @@ impl Controller {
             "controller.acceptance_binding",
             "controller.verification",
             "controller.action_intent",
+            VERIFICATION_COMMAND_INTENT_NAMESPACE,
             "controller.failure_record",
             "controller.repair_packet",
             "controller.change_set",
@@ -12330,6 +13829,12 @@ impl Controller {
             for record in self.state.state_records(namespace)? {
                 let belongs_to_active_revision = if namespace == "controller.action_intent" {
                     true
+                } else if namespace == VERIFICATION_COMMAND_INTENT_NAMESPACE {
+                    let intent: PersistedVerificationCommandIntentV1 =
+                        serde_json::from_str(&record.value_json)?;
+                    intent.schema_version == VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION
+                        && intent.plan_id == active.plan_id
+                        && intent.plan_revision == active.revision
                 } else if namespace == SECRET_ACTION_LIFECYCLE_NAMESPACE {
                     let marker: PersistedSecretActionLifecycleV1 =
                         serde_json::from_str(&record.value_json)?;
@@ -14057,6 +15562,7 @@ fn validate_checkpoint_immutable_bindings(
         if !matches!(
             namespace,
             "controller.action_intent"
+                | VERIFICATION_COMMAND_INTENT_NAMESPACE
                 | "controller.failure_record"
                 | "controller.repair_packet"
                 | "controller.change_set"
@@ -14723,6 +16229,7 @@ fn validate_post_checkpoint_action_authority_correlation(
         APPROVAL_REQUEST_NAMESPACE,
         APPROVAL_CLAIM_NAMESPACE,
         ACTION_RECONCILIATION_NAMESPACE,
+        VERIFICATION_COMMAND_INTENT_NAMESPACE,
     ];
     let mut replayed = manifest
         .evidence_binding_digests
@@ -14743,6 +16250,7 @@ fn validate_post_checkpoint_action_authority_correlation(
                     | "approval_claim_issued"
                     | "approval_request_denied"
                     | "action_reconciliation_bound"
+                    | "verification_command_intent_bound"
             )
         {
             continue;
@@ -14758,13 +16266,13 @@ fn validate_post_checkpoint_action_authority_correlation(
             .and_then(Value::as_object)
             .ok_or_else(|| {
                 ControllerError::InvalidPlan(
-                    "post-checkpoint approval/reconciliation event is missing exact post-image digests"
+                    "post-checkpoint action-authority event is missing exact post-image digests"
                         .to_owned(),
                 )
             })?;
         if post_images.is_empty() {
             return Err(ControllerError::InvalidPlan(
-                "post-checkpoint approval/reconciliation event has an empty post-image digest map"
+                "post-checkpoint action-authority event has an empty post-image digest map"
                     .to_owned(),
             ));
         }
@@ -14779,8 +16287,7 @@ fn validate_post_checkpoint_action_authority_correlation(
                         .as_str()
                         .ok_or_else(|| {
                             ControllerError::InvalidPlan(
-                                "approval/reconciliation post-image digest must be a string"
-                                    .to_owned(),
+                                "action-authority post-image digest must be a string".to_owned(),
                             )
                         })?
                         .to_owned(),
@@ -14807,8 +16314,7 @@ fn validate_post_checkpoint_action_authority_correlation(
     }
     if replayed != current {
         return Err(ControllerError::InvalidPlan(
-            "current approval/reconciliation authority does not equal checkpoint plus journal replay"
-                .to_owned(),
+            "current action authority does not equal checkpoint plus journal replay".to_owned(),
         ));
     }
     Ok(())
@@ -15446,128 +16952,198 @@ fn reconcile_recovery_actions(
             unknown.push(record.action_id);
             continue;
         }
-        let raw_intent: PersistedActionIntent = serde_json::from_str(&raw_intent)?;
-        let Some(repository) = registry.repository(&raw_intent.repository_id) else {
+        let raw_value: Value = serde_json::from_str(&raw_intent)?;
+        let repository_id = required_str(&raw_value, "/repository_id")?;
+        let Some(repository) = registry.repository(repository_id) else {
             unknown.push(record.action_id);
             continue;
         };
-        let Ok(intent) = normalize_persisted_action_intent(raw_intent, &repository.root) else {
+        let Ok(intent) = decode_persisted_action_intent(&raw_intent, &repository.root) else {
             unknown.push(record.action_id);
             continue;
         };
-        if intent.action_id != record.action_id
-            || intent.payload_digest != record.payload_digest
-            || intent.policy_digest != record.policy_digest
-            || intent.plan_id != reconciliation.plan_id
-            || intent.plan_revision != reconciliation.plan_revision
-            || intent.task_id != reconciliation.task_id
+        if intent.action_id() != record.action_id
+            || intent.payload_digest() != record.payload_digest
+            || intent.policy_digest() != record.policy_digest
+            || intent.plan_id() != reconciliation.plan_id
+            || intent.plan_revision() != reconciliation.plan_revision
+            || intent.task_id() != reconciliation.task_id
+            || intent.execution_epoch() != record.execution_epoch
         {
             unknown.push(record.action_id);
             continue;
         }
-        let current = if let Some(lease_id) = intent.worktree_lease_id.as_deref() {
-            let Some(lease) = worktrees.get(&intent.task_id) else {
-                unknown.push(record.action_id);
-                continue;
-            };
-            if lease.lease_id != lease_id || lease.worktree_path != intent.execution_root {
-                unknown.push(record.action_id);
-                continue;
-            }
-            registry.read_worktree_path(lease, Path::new(&intent.path), None)
-        } else {
-            if intent.execution_root
-                != registry
-                    .repository(&intent.repository_id)
-                    .ok_or_else(|| {
-                        ControllerError::InvalidPlan(
-                            "recovery intent repository missing".to_owned(),
-                        )
-                    })?
-                    .root
-            {
-                unknown.push(record.action_id);
-                continue;
-            }
-            ExactRetriever::new(registry).read_path(
-                &intent.repository_id,
-                Path::new(&intent.path),
-                None,
-            )
-        };
-        let Ok(current) = current else {
+        let Some(execution_root) = recovery_intent_execution_root(&intent, registry, worktrees)
+        else {
             unknown.push(record.action_id);
             continue;
         };
-        let current_mode = permission_mode(&fs::symlink_metadata(
-            intent.execution_root.join(&intent.path),
-        )?);
-        if current.digest == intent.expected_post_digest
-            && current_mode == intent.expected_target_mode
-        {
-            let store = ArtifactStore::open(&intent.artifact_store_root)?;
-            let receipt = serde_json::to_vec(&json!({
-                "schema": "sovereign-recovery-result-v1",
-                "action_id": record.action_id,
-                "proof": "effect_observed",
-                "target_digest": current.digest,
-                "process_cleanup": "proven_or_absent"
-            }))?;
-            let artifact = store.put(state, &receipt)?;
-            let reconciled_event = recovery_event_id(
-                &record.action_id,
-                "reconciled_effect_observed",
-                state.latest_journal_sequence()?,
-            );
-            state.reconcile_historical_unknown_action(
-                &record.action_id,
-                "reconciled",
-                Some(&artifact.digest),
-                &reconciled_event,
-                "reconciled",
-                "{\"proof\":\"effect_observed\"}",
-            )?;
-            let committed_event = recovery_event_id(
-                &record.action_id,
-                "committed_recovery",
-                state.latest_journal_sequence()?,
-            );
-            state.commit_historical_reconciled_action(
-                &record.action_id,
-                &committed_event,
-                "{\"proof\":\"effect_observed\"}",
-            )?;
-        } else if current.digest == intent.expected_source_digest
-            && current_mode == intent.expected_target_mode
-        {
-            let reconciled_event = recovery_event_id(
-                &record.action_id,
-                "reconciled_effect_absent",
-                state.latest_journal_sequence()?,
-            );
-            state.reconcile_historical_unknown_action(
-                &record.action_id,
-                "reconciled",
-                None,
-                &reconciled_event,
-                "reconciled",
-                "{\"proof\":\"effect_absent\"}",
-            )?;
-            let failed_event = recovery_event_id(
-                &record.action_id,
-                "failed_recovery",
-                state.latest_journal_sequence()?,
-            );
-            state.fail_historical_reconciled_action(
-                &record.action_id,
-                &failed_event,
-                "{\"proof\":\"effect_absent\"}",
-            )?;
-        } else {
-            unknown.push(record.action_id);
+        match classify_recovery_file_truth(&intent, &execution_root)? {
+            RecoveryFileTruth::EffectObserved { target_digest } => {
+                let store = ArtifactStore::open(intent.artifact_store_root())?;
+                let receipt = serde_json::to_vec(&json!({
+                    "schema": "sovereign-recovery-result-v1",
+                    "action_id": record.action_id,
+                    "proof": "effect_observed",
+                    "target_digest": target_digest,
+                    "process_cleanup": "proven_or_absent"
+                }))?;
+                let artifact = store.put(state, &receipt)?;
+                let reconciled_event = recovery_event_id(
+                    &record.action_id,
+                    "reconciled_effect_observed",
+                    state.latest_journal_sequence()?,
+                );
+                state.reconcile_historical_unknown_action(
+                    &record.action_id,
+                    "reconciled",
+                    Some(&artifact.digest),
+                    &reconciled_event,
+                    "reconciled",
+                    "{\"proof\":\"effect_observed\"}",
+                )?;
+                let committed_event = recovery_event_id(
+                    &record.action_id,
+                    "committed_recovery",
+                    state.latest_journal_sequence()?,
+                );
+                state.commit_historical_reconciled_action(
+                    &record.action_id,
+                    &committed_event,
+                    "{\"proof\":\"effect_observed\"}",
+                )?;
+            }
+            RecoveryFileTruth::EffectAbsent => {
+                let reconciled_event = recovery_event_id(
+                    &record.action_id,
+                    "reconciled_effect_absent",
+                    state.latest_journal_sequence()?,
+                );
+                state.reconcile_historical_unknown_action(
+                    &record.action_id,
+                    "reconciled",
+                    None,
+                    &reconciled_event,
+                    "reconciled",
+                    "{\"proof\":\"effect_absent\"}",
+                )?;
+                let failed_event = recovery_event_id(
+                    &record.action_id,
+                    "failed_recovery",
+                    state.latest_journal_sequence()?,
+                );
+                state.fail_historical_reconciled_action(
+                    &record.action_id,
+                    &failed_event,
+                    "{\"proof\":\"effect_absent\"}",
+                )?;
+            }
+            RecoveryFileTruth::Ambiguous => unknown.push(record.action_id),
         }
     }
     Ok(unknown)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecoveryFileTruth {
+    EffectObserved { target_digest: String },
+    EffectAbsent,
+    Ambiguous,
+}
+
+fn recovery_intent_execution_root(
+    intent: &DecodedPersistedActionIntent,
+    registry: &ProjectRegistry,
+    worktrees: &BTreeMap<String, WorktreeLease>,
+) -> Option<PathBuf> {
+    if matches!(
+        intent,
+        DecodedPersistedActionIntent::Legacy {
+            legacy_primary_recovery: true,
+            ..
+        }
+    ) {
+        let repository = registry.repository(intent.repository_id())?;
+        if intent.execution_root() != repository.root {
+            return None;
+        }
+        return Some(repository.root.clone());
+    }
+    if let Some(lease_id) = intent.worktree_lease_id() {
+        let lease = worktrees.get(intent.task_id())?;
+        if lease.lease_id != lease_id || lease.worktree_path != intent.execution_root() {
+            return None;
+        }
+        return Some(lease.worktree_path.clone());
+    }
+    let repository = registry.repository(intent.repository_id())?;
+    if intent.execution_root() != repository.root {
+        return None;
+    }
+    Some(repository.root.clone())
+}
+
+fn classify_recovery_file_truth(
+    intent: &DecodedPersistedActionIntent,
+    execution_root: &Path,
+) -> Result<RecoveryFileTruth, ControllerError> {
+    let (path, expected_post_digest, expected_target_mode) = match intent {
+        DecodedPersistedActionIntent::Legacy { intent, .. } => (
+            intent.path.as_str(),
+            intent.expected_post_digest.as_str(),
+            intent.expected_target_mode,
+        ),
+        DecodedPersistedActionIntent::Repository(intent) => (
+            intent.path(),
+            intent.expected_post_digest.as_str(),
+            intent.expected_target_mode,
+        ),
+    };
+    let target = execution_root.join(path);
+    let metadata = match fs::symlink_metadata(&target) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let Some(metadata) = metadata else {
+        return Ok(match intent {
+            DecodedPersistedActionIntent::Repository(PersistedRepositoryActionIntentV4 {
+                mutation: RepositoryMutationIntentV1::CreateFile { .. },
+                ..
+            }) => RecoveryFileTruth::EffectAbsent,
+            _ => RecoveryFileTruth::Ambiguous,
+        });
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(RecoveryFileTruth::Ambiguous);
+    }
+    let mode = permission_mode(&metadata);
+    let digest = sha256_prefixed(&fs::read(&target)?);
+    if digest == expected_post_digest && mode == expected_target_mode {
+        return Ok(RecoveryFileTruth::EffectObserved {
+            target_digest: digest,
+        });
+    }
+    let effect_absent = match intent {
+        DecodedPersistedActionIntent::Legacy { intent, .. } => {
+            digest == intent.expected_source_digest && mode == intent.expected_target_mode
+        }
+        DecodedPersistedActionIntent::Repository(repository_intent) => {
+            match &repository_intent.mutation {
+                RepositoryMutationIntentV1::CreateFile { .. } => false,
+                RepositoryMutationIntentV1::UpdateFile {
+                    expected_source_digest,
+                    expected_source_mode,
+                    ..
+                } => digest == *expected_source_digest && mode == *expected_source_mode,
+            }
+        }
+    };
+    Ok(if effect_absent {
+        RecoveryFileTruth::EffectAbsent
+    } else {
+        RecoveryFileTruth::Ambiguous
+    })
 }
 
 fn recover_unknown_external_transport_budget(
@@ -15664,8 +17240,7 @@ fn normalize_recovered_runtime(
         .state_records("controller.action_intent")?
         .into_iter()
         .map(|record| {
-            let raw: PersistedActionIntent = serde_json::from_str(&record.value_json)?;
-            let intent = normalize_persisted_action_intent(raw, &primary_root)?;
+            let intent = decode_persisted_action_intent(&record.value_json, &primary_root)?;
             Ok((record.key, intent))
         })
         .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
@@ -15700,12 +17275,12 @@ fn normalize_recovered_runtime(
         }
         let intent = intents
             .values()
-            .filter(|intent| intent.attempt_id == attempt_id)
-            .max_by(|left, right| left.action_id.cmp(&right.action_id));
+            .filter(|intent| intent.attempt_id() == attempt_id)
+            .max_by(|left, right| left.action_id().cmp(right.action_id()));
         let next = intent.and_then(|intent| {
             actions
-                .get(&intent.action_id)
-                .map(|action| (intent.action_id.clone(), action.state.clone()))
+                .get(intent.action_id())
+                .map(|action| (intent.action_id().to_owned(), action.state.clone()))
         });
         let (attempt_next, task_next) = match next.as_ref().map(|(_, state)| state.as_str()) {
             Some("committed") => {
@@ -15738,7 +17313,7 @@ fn normalize_recovered_runtime(
     }
     for action_id in &unknown {
         if let Some(intent) = intents.get(action_id)
-            && let Some(task) = controller.active_mut()?.tasks.get_mut(&intent.task_id)
+            && let Some(task) = controller.active_mut()?.tasks.get_mut(intent.task_id())
         {
             task.state = TaskState::ReconcilingUnknown;
         }
@@ -15753,7 +17328,7 @@ fn normalize_recovered_runtime(
 
 fn extend_pending_recovery_actions(
     controller: &Controller,
-    intents: &BTreeMap<String, PersistedActionIntent>,
+    intents: &BTreeMap<String, DecodedPersistedActionIntent>,
     actions: &BTreeMap<String, sovereign_state::PersistedActionRecord>,
     pending: &mut Vec<String>,
 ) -> Result<(), ControllerError> {
@@ -15769,13 +17344,13 @@ fn extend_pending_recovery_actions(
         };
         let origin_interrupted = active
             .attempts
-            .get(&intent.attempt_id)
+            .get(intent.attempt_id())
             .is_some_and(|attempt| {
-                attempt.task_id == intent.task_id && attempt.state == AttemptState::Interrupted
+                attempt.task_id == intent.task_id() && attempt.state == AttemptState::Interrupted
             });
         let task_planned = active
             .tasks
-            .get(&intent.task_id)
+            .get(intent.task_id())
             .is_some_and(|task| task.state == TaskState::Planned);
         if origin_interrupted && task_planned {
             pending.push(action_id.clone());
@@ -15820,6 +17395,55 @@ struct ValidatedReplace {
     expected_target_mode: u32,
 }
 
+enum PreparedRepositoryMutationGuard {
+    Create(AtomicCreateGuard),
+    Update(AtomicUpdateGuard),
+}
+
+impl PreparedRepositoryMutationGuard {
+    fn commit(&self, bytes: &[u8], mode: u32) -> Result<(), ToolError> {
+        match self {
+            Self::Create(guard) => guard.commit(bytes, mode),
+            Self::Update(guard) => guard.commit(bytes, mode),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepositoryMutationReceiptV1 {
+    schema_version: u32,
+    action_id: String,
+    payload_digest: String,
+    policy_digest: String,
+    execution_epoch: i64,
+    repository_id: String,
+    path: String,
+    preimage: RepositoryPreimageV1,
+    post_digest: String,
+    post_mode: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedVerificationCommandIntentV1 {
+    schema_version: u32,
+    plan_id: String,
+    plan_revision: u32,
+    plan_digest: String,
+    task_id: String,
+    task_contract_digest: String,
+    attempt_id: String,
+    step_id: String,
+    step_digest: String,
+    resource_lease_id: String,
+    action_id: String,
+    payload_digest: String,
+    policy_digest: String,
+    execution_epoch: i64,
+    artifact_store_root: PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PersistedActionIntent {
     schema_version: u32,
@@ -15846,6 +17470,176 @@ struct PersistedActionIntent {
     expected_post_digest: String,
     expected_target_mode: u32,
     artifact_store_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedRepositoryActionIntentV4 {
+    schema_version: u32,
+    action_id: String,
+    plan_id: String,
+    plan_revision: u32,
+    plan_digest: String,
+    task_id: String,
+    task_contract_digest: String,
+    attempt_id: String,
+    execution_epoch: i64,
+    payload_digest: String,
+    action_nonce: String,
+    policy_digest: String,
+    repository_id: String,
+    worktree_lease_id: Option<String>,
+    execution_root: PathBuf,
+    mutation: RepositoryMutationIntentV1,
+    expected_post_digest: String,
+    expected_target_mode: u32,
+    postimage_artifact_digest: String,
+    artifact_store_root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+enum DecodedPersistedActionIntent {
+    Legacy {
+        intent: PersistedActionIntent,
+        legacy_primary_recovery: bool,
+    },
+    Repository(PersistedRepositoryActionIntentV4),
+}
+
+impl DecodedPersistedActionIntent {
+    fn action_id(&self) -> &str {
+        match self {
+            Self::Legacy { intent, .. } => &intent.action_id,
+            Self::Repository(intent) => &intent.action_id,
+        }
+    }
+
+    fn plan_id(&self) -> &str {
+        match self {
+            Self::Legacy { intent, .. } => &intent.plan_id,
+            Self::Repository(intent) => &intent.plan_id,
+        }
+    }
+
+    fn plan_revision(&self) -> u32 {
+        match self {
+            Self::Legacy { intent, .. } => intent.plan_revision,
+            Self::Repository(intent) => intent.plan_revision,
+        }
+    }
+
+    fn plan_digest(&self) -> &str {
+        match self {
+            Self::Legacy { intent, .. } => &intent.plan_digest,
+            Self::Repository(intent) => &intent.plan_digest,
+        }
+    }
+
+    fn task_id(&self) -> &str {
+        match self {
+            Self::Legacy { intent, .. } => &intent.task_id,
+            Self::Repository(intent) => &intent.task_id,
+        }
+    }
+
+    fn task_contract_digest(&self) -> &str {
+        match self {
+            Self::Legacy { intent, .. } => &intent.task_contract_digest,
+            Self::Repository(intent) => &intent.task_contract_digest,
+        }
+    }
+
+    fn attempt_id(&self) -> &str {
+        match self {
+            Self::Legacy { intent, .. } => &intent.attempt_id,
+            Self::Repository(intent) => &intent.attempt_id,
+        }
+    }
+
+    fn payload_digest(&self) -> &str {
+        match self {
+            Self::Legacy { intent, .. } => &intent.payload_digest,
+            Self::Repository(intent) => &intent.payload_digest,
+        }
+    }
+
+    fn policy_digest(&self) -> &str {
+        match self {
+            Self::Legacy { intent, .. } => &intent.policy_digest,
+            Self::Repository(intent) => &intent.policy_digest,
+        }
+    }
+
+    fn execution_epoch(&self) -> i64 {
+        match self {
+            Self::Legacy { intent, .. } => intent.execution_epoch,
+            Self::Repository(intent) => intent.execution_epoch,
+        }
+    }
+
+    fn repository_id(&self) -> &str {
+        match self {
+            Self::Legacy { intent, .. } => &intent.repository_id,
+            Self::Repository(intent) => &intent.repository_id,
+        }
+    }
+
+    fn execution_root(&self) -> &Path {
+        match self {
+            Self::Legacy { intent, .. } => &intent.execution_root,
+            Self::Repository(intent) => &intent.execution_root,
+        }
+    }
+
+    fn worktree_lease_id(&self) -> Option<&str> {
+        match self {
+            Self::Legacy { intent, .. } => intent.worktree_lease_id.as_deref(),
+            Self::Repository(intent) => intent.worktree_lease_id.as_deref(),
+        }
+    }
+
+    fn artifact_store_root(&self) -> &Path {
+        match self {
+            Self::Legacy { intent, .. } => &intent.artifact_store_root,
+            Self::Repository(intent) => &intent.artifact_store_root,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RepositoryMutationIntentV1 {
+    CreateFile {
+        path: String,
+    },
+    UpdateFile {
+        path: String,
+        expected_source_digest: String,
+        expected_source_mode: u32,
+    },
+}
+
+impl PersistedRepositoryActionIntentV4 {
+    fn path(&self) -> &str {
+        match &self.mutation {
+            RepositoryMutationIntentV1::CreateFile { path }
+            | RepositoryMutationIntentV1::UpdateFile { path, .. } => path,
+        }
+    }
+
+    fn preimage(&self) -> RepositoryPreimageV1 {
+        match &self.mutation {
+            RepositoryMutationIntentV1::CreateFile { .. } => RepositoryPreimageV1::Absent,
+            RepositoryMutationIntentV1::UpdateFile {
+                expected_source_digest,
+                expected_source_mode,
+                ..
+            } => RepositoryPreimageV1::ExactFile {
+                digest: expected_source_digest.clone(),
+                mode: *expected_source_mode,
+            },
+        }
+    }
 }
 
 fn normalize_persisted_action_intent(
@@ -15881,6 +17675,83 @@ fn normalize_persisted_action_intent(
     Ok(intent)
 }
 
+fn normalize_persisted_repository_action_intent(
+    intent: PersistedRepositoryActionIntentV4,
+) -> Result<PersistedRepositoryActionIntentV4, ControllerError> {
+    if intent.schema_version != REPOSITORY_ACTION_INTENT_SCHEMA_VERSION
+        || intent.action_id.trim().is_empty()
+        || intent.plan_id.trim().is_empty()
+        || intent.task_id.trim().is_empty()
+        || intent.attempt_id.trim().is_empty()
+        || intent.repository_id.trim().is_empty()
+        || intent.execution_root.as_os_str().is_empty()
+        || !valid_repo_relative_path(intent.path())
+        || repository_path_is_internal(intent.path())
+        || !is_sha256_digest(&intent.plan_digest)
+        || !is_sha256_digest(&intent.task_contract_digest)
+        || !is_sha256_digest(&intent.payload_digest)
+        || !is_sha256_digest(&intent.policy_digest)
+        || !is_sha256_digest(&intent.expected_post_digest)
+        || !is_sha256_hex_digest(&intent.postimage_artifact_digest)
+        || !artifact_digest_matches_sha256_prefixed(
+            &intent.postimage_artifact_digest,
+            &intent.expected_post_digest,
+        )
+        || intent.expected_target_mode > 0o777
+        || intent.execution_epoch < 0
+    {
+        return Err(ControllerError::NotReady(
+            "v4 repository action intent has malformed exact-binding fields".to_owned(),
+        ));
+    }
+    if let RepositoryMutationIntentV1::UpdateFile {
+        expected_source_digest,
+        expected_source_mode,
+        ..
+    } = &intent.mutation
+        && (!is_sha256_digest(expected_source_digest) || *expected_source_mode > 0o777)
+    {
+        return Err(ControllerError::NotReady(
+            "v4 repository update intent has malformed preimage binding".to_owned(),
+        ));
+    }
+    let seed = repository_intent_action_seed(&intent)?;
+    if intent.action_id != format!("action.{}", &seed[7..27])
+        || intent.action_nonce != format!("nonce.{}", &seed[27..47])
+    {
+        return Err(ControllerError::NotReady(
+            "v4 repository action intent semantics do not re-derive its durable action identity"
+                .to_owned(),
+        ));
+    }
+    Ok(intent)
+}
+
+fn decode_persisted_action_intent(
+    raw: &str,
+    primary_root: &Path,
+) -> Result<DecodedPersistedActionIntent, ControllerError> {
+    let value: Value = serde_json::from_str(raw)?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            ControllerError::NotReady("recovery action intent schema version is missing".to_owned())
+        })?;
+    if schema_version == u64::from(REPOSITORY_ACTION_INTENT_SCHEMA_VERSION) {
+        let intent: PersistedRepositoryActionIntentV4 = serde_json::from_value(value)?;
+        return Ok(DecodedPersistedActionIntent::Repository(
+            normalize_persisted_repository_action_intent(intent)?,
+        ));
+    }
+    let raw_intent: PersistedActionIntent = serde_json::from_value(value)?;
+    let legacy_primary_recovery = raw_intent.schema_version == LEGACY_ACTION_INTENT_SCHEMA_VERSION;
+    Ok(DecodedPersistedActionIntent::Legacy {
+        intent: normalize_persisted_action_intent(raw_intent, primary_root)?,
+        legacy_primary_recovery,
+    })
+}
+
 fn persisted_intent_action_seed(intent: &PersistedActionIntent) -> Result<String, ControllerError> {
     let proposal = ReplaceLiteral {
         kind: ReplaceLiteralKind::ReplaceLiteral,
@@ -15899,6 +17770,27 @@ fn persisted_intent_action_seed(intent: &PersistedActionIntent) -> Result<String
     }))?)
 }
 
+fn repository_intent_action_seed(
+    intent: &PersistedRepositoryActionIntentV4,
+) -> Result<String, ControllerError> {
+    let mutation_kind = match intent.mutation {
+        RepositoryMutationIntentV1::CreateFile { .. } => "create_file",
+        RepositoryMutationIntentV1::UpdateFile { .. } => "update_file",
+    };
+    Ok(digest_json(&json!({
+        "domain": "repository_mutation_v1",
+        "plan": intent.plan_digest,
+        "task": intent.task_contract_digest,
+        "attempt": intent.attempt_id,
+        "repository_id": intent.repository_id,
+        "path": intent.path(),
+        "mutation_kind": mutation_kind,
+        "preimage": intent.preimage(),
+        "post_digest": intent.expected_post_digest,
+        "mode": intent.expected_target_mode,
+    }))?)
+}
+
 #[derive(Debug, Clone)]
 struct VerificationLeaseBinding {
     plan_id: String,
@@ -15909,6 +17801,19 @@ struct VerificationLeaseBinding {
     baseline_digest: String,
     execution_epoch: i64,
     legacy_primary_recovery: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequiredCommandVerificationStep {
+    step_id: String,
+    step_digest: String,
+    tool_id: String,
+    program: String,
+    args: Vec<String>,
+    repository_id: String,
+    timeout_ms: u64,
+    output_limit_bytes: u64,
+    expected_exit_codes: Vec<i32>,
 }
 
 impl From<&ReadyLease> for VerificationLeaseBinding {
@@ -16073,6 +17978,148 @@ impl DeterministicVerifier {
             expected_target_mode: validated.expected_target_mode,
             observed_target_mode,
             evidence_ids,
+            command_results: Vec::new(),
+            passed: failure_code.is_none(),
+            failure_code,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
+    fn verify_repository_action(
+        state: &StateStore,
+        active: &ActivePlan,
+        registry: &ProjectRegistry,
+        lease: &VerificationLeaseBinding,
+        attempt_id: &str,
+        action_id: &str,
+        validated: &ValidatedRepositoryActionV1,
+    ) -> Result<VerificationResultV1, ControllerError> {
+        let task = active.tasks.get(&lease.task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan("repository verification task disappeared".to_owned())
+        })?;
+        let attempt = active.attempts.get(attempt_id).ok_or_else(|| {
+            ControllerError::InvalidPlan("repository verification attempt disappeared".to_owned())
+        })?;
+        let (evaluator, acceptance_contract_digest) = compiled_acceptance_contract(&task.task)?;
+        if evaluator != "builtin.diff.scoped_change.v1"
+            && evaluator != "builtin.command.exit_codes.v1"
+        {
+            return Err(ControllerError::InvalidPlan(
+                "general repository actions require scoped diff and/or governed command acceptance"
+                    .to_owned(),
+            ));
+        }
+        let current_epoch = state.current_execution_epoch()?;
+        let execution_lease = if lease.legacy_primary_recovery {
+            None
+        } else {
+            active_task_execution_lease(active, &lease.task_id)?
+        };
+        let execution_root = execution_lease.map_or(active.repository_root.as_path(), |worktree| {
+            worktree.worktree_path.as_path()
+        });
+        let post_snapshot = match execution_lease {
+            Some(worktree) => registry.worktree_snapshot(worktree)?,
+            None => registry.snapshot(&active.repository_id)?,
+        };
+        let post_snapshot_digest = snapshot_digest(&post_snapshot)?;
+        let file = match execution_lease {
+            Some(worktree) => {
+                registry.read_worktree_path(worktree, Path::new(validated.action.path()), None)?
+            }
+            None => ExactRetriever::new(registry).read_path(
+                &active.repository_id,
+                Path::new(validated.action.path()),
+                None,
+            )?,
+        };
+        let target_metadata = fs::symlink_metadata(execution_root.join(validated.action.path()))?;
+        let observed_target_mode = permission_mode(&target_metadata);
+        let target_identity_ok =
+            target_metadata.is_file() && !target_metadata.file_type().is_symlink();
+        let diff = match execution_lease {
+            Some(worktree) => registry.worktree_diff(worktree)?,
+            None => ExactRetriever::new(registry).current_diff(&active.repository_id)?,
+        };
+        let action_record = state.action_record(action_id)?;
+        let action_committed = action_record
+            .as_ref()
+            .is_some_and(|record| record.state == "committed" && record.result_digest.is_some());
+        let expected_path = PathBuf::from(validated.action.path());
+        let repository_failure = repository_verification_failure(
+            active,
+            attempt,
+            lease,
+            &post_snapshot,
+            &expected_path,
+            execution_root,
+            execution_lease.is_some(),
+        );
+        let freshness_ok = required_array(&task.task, "/acceptance_criteria")?
+            .iter()
+            .all(|criterion| {
+                matches!(
+                    criterion.get("evidence_freshness").and_then(Value::as_str),
+                    Some(
+                        "current_attempt"
+                            | "current_task_revision"
+                            | "carry_forward_if_inputs_unchanged"
+                    )
+                )
+            });
+        let bindings_ok = active.validity == PlanValidity::Current
+            && active.plan_id == lease.plan_id
+            && active.plan_digest == lease.plan_digest
+            && active.revision == lease.plan_revision
+            && task.task_contract_digest == lease.task_contract_digest
+            && current_epoch == lease.execution_epoch;
+        let postimage_ok = file.digest == validated.expected_post_digest;
+        let failure_code = verification_failure_code(&[
+            (action_committed, "action_not_committed"),
+            (bindings_ok, "stale_verification_binding"),
+            (freshness_ok, "acceptance_not_current_attempt"),
+        ])
+        .or(repository_failure)
+        .or_else(|| {
+            verification_failure_code(&[
+                (target_identity_ok, "target_not_regular_file"),
+                (
+                    observed_target_mode == validated.expected_target_mode,
+                    "target_mode_changed",
+                ),
+                (postimage_ok, "postimage_digest_mismatch"),
+            ])
+        });
+        let evidence_ids = action_record
+            .and_then(|record| record.result_digest)
+            .into_iter()
+            .chain([diff.digest.clone(), file.digest.clone()])
+            .collect::<Vec<_>>();
+        let verification_id = verification_id(
+            &active.plan_digest,
+            &lease.task_contract_digest,
+            attempt_id,
+            &diff.digest,
+        );
+        Ok(VerificationResultV1 {
+            schema_version: VERIFICATION_RESULT_SCHEMA_VERSION,
+            verification_id,
+            plan_id: active.plan_id.clone(),
+            plan_revision: active.revision,
+            plan_digest: active.plan_digest.clone(),
+            task_id: lease.task_id.clone(),
+            task_contract_digest: lease.task_contract_digest.clone(),
+            attempt_id: attempt_id.to_owned(),
+            execution_epoch: current_epoch,
+            evaluator,
+            acceptance_contract_digest,
+            diff_digest: diff.digest,
+            post_snapshot_digest,
+            expected_target_mode: validated.expected_target_mode,
+            observed_target_mode,
+            evidence_ids,
+            command_results: Vec::new(),
             passed: failure_code.is_none(),
             failure_code,
         })
@@ -16153,6 +18200,88 @@ fn verification_failure_code(checks: &[(bool, &str)]) -> Option<String> {
     checks
         .iter()
         .find_map(|(passed, code)| (!passed).then(|| (*code).to_owned()))
+}
+
+fn command_resource_limit_name(limit: ResourceLimitKind) -> &'static str {
+    match limit {
+        ResourceLimitKind::Timeout => "timeout",
+        ResourceLimitKind::OutputBytes => "output_bytes",
+        ResourceLimitKind::DiskBytes => "disk_bytes",
+        ResourceLimitKind::Subprocesses => "subprocesses",
+    }
+}
+
+fn command_verification_failure_code(
+    result: &RawToolResult,
+    expected_exit_codes: &[i32],
+) -> Option<String> {
+    if !result.process_group_reaped {
+        return Some("command_process_group_not_reaped".to_owned());
+    }
+    if let Some(limit) = result.terminated_for_limit {
+        return Some(format!(
+            "command_resource_limit_{}",
+            command_resource_limit_name(limit)
+        ));
+    }
+    let Some(exit_code) = result.exit_code else {
+        return Some("command_missing_exit_code".to_owned());
+    };
+    if !expected_exit_codes.contains(&exit_code) {
+        return Some("command_unexpected_exit".to_owned());
+    }
+    None
+}
+
+fn command_verification_receipt_failure_code(
+    receipt: &ActionReceipt,
+    expected_exit_codes: &[i32],
+) -> Option<String> {
+    if !receipt.process_group_reaped {
+        return Some("command_process_group_not_reaped".to_owned());
+    }
+    if let Some(limit) = receipt.terminated_for_limit {
+        return Some(format!(
+            "command_resource_limit_{}",
+            command_resource_limit_name(limit)
+        ));
+    }
+    let Some(exit_code) = receipt.exit_code else {
+        return Some("command_missing_exit_code".to_owned());
+    };
+    if !expected_exit_codes.contains(&exit_code) {
+        return Some("command_unexpected_exit".to_owned());
+    }
+    None
+}
+
+fn aggregate_command_verification(
+    mut verification: VerificationResultV1,
+    command_results: Vec<CommandVerificationResultV1>,
+) -> VerificationResultV1 {
+    for result_digest in command_results
+        .iter()
+        .filter_map(|result| result.result_digest.as_ref())
+    {
+        if !verification.evidence_ids.contains(result_digest) {
+            verification.evidence_ids.push(result_digest.clone());
+        }
+    }
+    if verification.failure_code.is_none() {
+        verification.failure_code = command_results
+            .iter()
+            .find(|result| !result.passed)
+            .and_then(|result| result.failure_code.clone())
+            .or_else(|| {
+                command_results
+                    .iter()
+                    .any(|result| !result.passed)
+                    .then(|| "command_verification_failed".to_owned())
+            });
+    }
+    verification.passed = verification.passed && command_results.iter().all(|result| result.passed);
+    verification.command_results = command_results;
+    verification
 }
 
 fn verification_id(
@@ -16907,6 +19036,14 @@ fn authority_record_matches_plan_revision(
         ACTION_RECONCILIATION_NAMESPACE => {
             let binding: PersistedActionReconciliationBindingV1 = serde_json::from_str(value_json)?;
             Ok(binding.plan_id == plan_id && binding.plan_revision == plan_revision)
+        }
+        VERIFICATION_COMMAND_INTENT_NAMESPACE => {
+            let intent: PersistedVerificationCommandIntentV1 = serde_json::from_str(value_json)?;
+            Ok(
+                intent.schema_version == VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION
+                    && intent.plan_id == plan_id
+                    && intent.plan_revision == plan_revision,
+            )
         }
         _ => Ok(false),
     }
@@ -17964,6 +20101,38 @@ fn valid_repo_relative_path(path: &str) -> bool {
             .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
+fn repository_path_is_internal(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .next()
+        .is_some_and(|component| component.as_os_str() == ".git")
+}
+
+fn scope_contains_path(task: &Value, pointer: &str, path: &str) -> Result<bool, ControllerError> {
+    Ok(required_array(task, pointer)?
+        .iter()
+        .any(|value| value.as_str() == Some(path)))
+}
+
+fn task_write_root_allows(
+    task: &Value,
+    repository_id: &str,
+    path: &str,
+) -> Result<bool, ControllerError> {
+    let target = Path::new(path);
+    let target_parent = target.parent().unwrap_or_else(|| Path::new("."));
+    for root in required_array(task, "/action_policy/write_roots")? {
+        if required_str(root, "/repository_id")? != repository_id {
+            continue;
+        }
+        let root_path = required_str(root, "/path")?;
+        if root_path == "." || target_parent.starts_with(Path::new(root_path)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn evidence_repo_relative_path<'a>(repository_id: &str, item: &'a EvidenceItem) -> Option<&'a str> {
     item.source_uri
         .strip_prefix(&format!("repo://{repository_id}/"))
@@ -18131,6 +20300,7 @@ fn validate_evidence_selection(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn compiled_acceptance_contract(task: &Value) -> Result<(String, String), ControllerError> {
     let criteria = required_array(task, "/acceptance_criteria")?;
     let steps = required_array(task, "/verification/steps")?;
@@ -18186,30 +20356,54 @@ fn compiled_acceptance_contract(task: &Value) -> Result<(String, String), Contro
                     "verification step {step_id} does not bind criterion {criterion_id}"
                 )));
             }
-            if required_str(step, "/kind")? != "diff"
-                || required_str(step, "/evidence_type")? != evidence_type
-            {
+            if required_str(step, "/evidence_type")? != evidence_type {
                 return Err(ControllerError::InvalidPlan(
-                    "M1 acceptance criterion/verification step contract mismatch".to_owned(),
+                    "acceptance criterion/verification step evidence type mismatch".to_owned(),
                 ));
             }
-            let step_evaluator = required_str(step, "/evaluator")?;
-            if step_evaluator != "builtin.diff.scope_and_literal.v1"
-                && step_evaluator != "builtin.diff.scoped_change.v1"
-            {
-                return Err(ControllerError::InvalidPlan(format!(
-                    "unsupported deterministic M1 evaluator {step_evaluator}"
-                )));
+            match required_str(step, "/kind")? {
+                "diff" => {
+                    if required_str(criterion, "/kind")? != "diff" {
+                        return Err(ControllerError::InvalidPlan(
+                            "diff verification step must bind a diff acceptance criterion"
+                                .to_owned(),
+                        ));
+                    }
+                    let step_evaluator = required_str(step, "/evaluator")?;
+                    if step_evaluator != "builtin.diff.scope_and_literal.v1"
+                        && step_evaluator != "builtin.diff.scoped_change.v1"
+                    {
+                        return Err(ControllerError::InvalidPlan(format!(
+                            "unsupported deterministic diff evaluator {step_evaluator}"
+                        )));
+                    }
+                    if let Some(previous) = evaluator.as_deref()
+                        && previous != step_evaluator
+                    {
+                        return Err(ControllerError::InvalidPlan(
+                            "required diff acceptance steps must use one deterministic evaluator"
+                                .to_owned(),
+                        ));
+                    }
+                    evaluator = Some(step_evaluator.to_owned());
+                }
+                "command" => {
+                    if required_str(criterion, "/kind")? != "command"
+                        || evidence_type != "test_result"
+                    {
+                        return Err(ControllerError::InvalidPlan(
+                            "command verification step must bind a test_result command criterion"
+                                .to_owned(),
+                        ));
+                    }
+                    let _ = parse_required_command_verification_step(step)?;
+                }
+                kind => {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "unsupported required verification step kind {kind}"
+                    )));
+                }
             }
-            if let Some(previous) = evaluator.as_deref()
-                && previous != step_evaluator
-            {
-                return Err(ControllerError::InvalidPlan(
-                    "M1 required acceptance steps must use one deterministic diff evaluator"
-                        .to_owned(),
-                ));
-            }
-            evaluator = Some(step_evaluator.to_owned());
             bound_steps.insert(step_id.to_owned(), (*step).clone());
         }
         bound_evidence_types.insert(evidence_type.to_owned());
@@ -18220,9 +20414,7 @@ fn compiled_acceptance_contract(task: &Value) -> Result<(String, String), Contro
             "M1 task has no required acceptance criterion".to_owned(),
         ));
     }
-    let evaluator = evaluator.ok_or_else(|| {
-        ControllerError::InvalidPlan("M1 task has no deterministic acceptance evaluator".to_owned())
-    })?;
+    let evaluator = evaluator.unwrap_or_else(|| "builtin.command.exit_codes.v1".to_owned());
     validate_required_evidence_types(required_evidence_types, &bound_evidence_types)?;
     let contract_digest = digest_json(&json!({
         "criteria": bound_criteria,
@@ -18243,6 +20435,166 @@ fn verification_steps_by_id(steps: &[Value]) -> Result<BTreeMap<String, &Value>,
         }
     }
     Ok(step_by_id)
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_required_command_verification_step(
+    step: &Value,
+) -> Result<RequiredCommandVerificationStep, ControllerError> {
+    if required_str(step, "/kind")? != "command"
+        || required_str(step, "/evidence_type")? != "test_result"
+    {
+        return Err(ControllerError::InvalidPlan(
+            "required command verification step has an invalid kind/evidence type".to_owned(),
+        ));
+    }
+    let command = step.pointer("/command_spec").ok_or_else(|| {
+        ControllerError::InvalidPlan("command verification step lacks command_spec".to_owned())
+    })?;
+    if required_str(command, "/mode")? != "exec" {
+        return Err(ControllerError::InvalidPlan(
+            "command verification requires direct exec mode".to_owned(),
+        ));
+    }
+    if required_str(command, "/working_dir_relative")? != "." {
+        return Err(ControllerError::InvalidPlan(
+            "command verification working directory must be the exact task root".to_owned(),
+        ));
+    }
+    let literal_env = command
+        .pointer("/literal_env")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "command verification literal_env must be an object".to_owned(),
+            )
+        })?;
+    let secret_env = command
+        .pointer("/secret_env")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "command verification secret_env must be an object".to_owned(),
+            )
+        })?;
+    if !literal_env.is_empty() || !secret_env.is_empty() {
+        return Err(ControllerError::InvalidPlan(
+            "command verification requires an empty environment".to_owned(),
+        ));
+    }
+    if !command
+        .pointer("/stdin_artifact_id")
+        .is_some_and(Value::is_null)
+    {
+        return Err(ControllerError::InvalidPlan(
+            "command verification requires null stdin".to_owned(),
+        ));
+    }
+    let args = required_array(command, "/args")?
+        .iter()
+        .map(|arg| {
+            arg.as_str().map(str::to_owned).ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "command verification argument must be a string".to_owned(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let timeout_ms = required_u64(command, "/timeout_seconds")?
+        .checked_mul(1_000)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan("command verification timeout overflows".to_owned())
+        })?;
+    if timeout_ms == 0 {
+        return Err(ControllerError::InvalidPlan(
+            "command verification timeout must be positive".to_owned(),
+        ));
+    }
+    let output_limit_bytes = required_u64(command, "/output_limit_bytes")?;
+    if output_limit_bytes == 0 {
+        return Err(ControllerError::InvalidPlan(
+            "command verification output limit must be positive".to_owned(),
+        ));
+    }
+    let mut expected_exit_codes = required_array(step, "/expected_exit_codes")?
+        .iter()
+        .map(|code| {
+            code.as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "command verification expected exit code must fit i32".to_owned(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    expected_exit_codes.sort_unstable();
+    expected_exit_codes.dedup();
+    if expected_exit_codes.is_empty() {
+        return Err(ControllerError::InvalidPlan(
+            "command verification requires at least one expected exit code".to_owned(),
+        ));
+    }
+    let program = required_str(command, "/program")?;
+    if program.is_empty()
+        || program == "."
+        || program == ".."
+        || program.contains('/')
+        || program.contains('\\')
+        || program.contains(':')
+    {
+        return Err(ControllerError::InvalidPlan(
+            "command verification program must be a basename".to_owned(),
+        ));
+    }
+    Ok(RequiredCommandVerificationStep {
+        step_id: required_str(step, "/step_id")?.to_owned(),
+        step_digest: digest_json(step)?,
+        tool_id: required_str(command, "/tool_id")?.to_owned(),
+        program: program.to_owned(),
+        args,
+        repository_id: required_str(command, "/repository_id")?.to_owned(),
+        timeout_ms,
+        output_limit_bytes,
+        expected_exit_codes,
+    })
+}
+
+fn required_command_verification_steps(
+    task: &Value,
+) -> Result<Vec<RequiredCommandVerificationStep>, ControllerError> {
+    let steps = required_array(task, "/verification/steps")?;
+    let step_by_id = verification_steps_by_id(steps)?;
+    let mut required_step_ids = BTreeSet::new();
+    for criterion in required_array(task, "/acceptance_criteria")?
+        .iter()
+        .filter(|criterion| criterion.get("required").and_then(Value::as_bool) == Some(true))
+    {
+        for step_id in required_array(criterion, "/verification_step_ids")? {
+            let step_id = step_id.as_str().ok_or_else(|| {
+                ControllerError::InvalidPlan("verification step ID must be a string".to_owned())
+            })?;
+            let step = step_by_id.get(step_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "acceptance criterion references unknown verification step {step_id}"
+                ))
+            })?;
+            if required_str(step, "/kind")? == "command" {
+                required_step_ids.insert(step_id.to_owned());
+            }
+        }
+    }
+    required_step_ids
+        .into_iter()
+        .map(|step_id| {
+            let step = step_by_id.get(&step_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "required command verification step {step_id} disappeared"
+                ))
+            })?;
+            parse_required_command_verification_step(step)
+        })
+        .collect()
 }
 
 fn validate_required_evidence_types(
@@ -18346,6 +20698,13 @@ fn is_sha256_hex_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn artifact_digest_matches_sha256_prefixed(artifact_digest: &str, digest: &str) -> bool {
+    is_sha256_hex_digest(artifact_digest)
+        && digest
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| hex == artifact_digest)
+}
+
 fn heavy_build_action_id(resource_lease_id: &str) -> String {
     let digest = sha256_prefixed(format!("build-heavy-action\0{resource_lease_id}").as_bytes());
     format!("resource-build-action.{}", &digest[7..31])
@@ -18354,6 +20713,23 @@ fn heavy_build_action_id(resource_lease_id: &str) -> String {
 fn heavy_build_attempt_id(resource_lease_id: &str) -> String {
     let digest = sha256_prefixed(format!("build-heavy-attempt\0{resource_lease_id}").as_bytes());
     format!("resource-build-attempt.{}", &digest[7..31])
+}
+
+fn verification_build_lease_id(
+    plan_id: &str,
+    plan_revision: u32,
+    task_id: &str,
+    attempt_id: &str,
+    step_id: &str,
+    execution_epoch: i64,
+) -> String {
+    let digest = sha256_prefixed(
+        format!(
+            "verification-build\0{plan_id}\0{plan_revision}\0{task_id}\0{attempt_id}\0{step_id}\0{execution_epoch}"
+        )
+        .as_bytes(),
+    );
+    format!("verify-build.{}", &digest[7..31])
 }
 
 fn inject_build_parallel_job_cap(
@@ -18676,20 +21052,26 @@ mod tests {
     use super::{
         ACTION_INTENT_SCHEMA_VERSION, APPROVAL_REQUEST_NAMESPACE, ActivePlan, ApprovalDecisionV1,
         ApprovalRequestStatusV1, CancellationScopeKindV1, CancellationScopeV1, CancellationTree,
-        Controller, ControllerError, ExactRequirementProbe, FailureClassification,
-        FailureClassificationKind, LEGACY_ACTION_INTENT_SCHEMA_VERSION, PlanValidity, ReadyLease,
-        RecoveryIntegrityGate, RecoveryProcessLease, ResourceResidencyStateV1, ResourceResidencyV1,
+        CommandVerificationResultV1, Controller, ControllerError, DecodedPersistedActionIntent,
+        ExactRequirementProbe, FailureClassification, FailureClassificationKind,
+        LEGACY_ACTION_INTENT_SCHEMA_VERSION, PersistedActionIntent,
+        PersistedVerificationCommandIntentV1, PlanValidity, ReadyLease, RecoveryIntegrityGate,
+        RecoveryProcessLease, ResourceResidencyStateV1, ResourceResidencyV1,
         TaskCarryExecutionProvenanceV1, TaskCarryFingerprintV1, TaskRuntime, TaskState,
+        VERIFICATION_COMMAND_INTENT_NAMESPACE, VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION,
         VerificationResultV1, VerifiedOutputBindingV1, WorktreeLifecycle,
-        acceptance_permits_cross_revision_carry, build_superseding_runtime,
+        acceptance_permits_cross_revision_carry, aggregate_command_verification,
+        build_superseding_runtime, command_verification_failure_code,
         compilation_inputs_are_fresh_for_carry, compiled_acceptance_contract,
         dependency_bindings_permit_cross_revision_carry, digest_json, exact_requirement_probe,
         explicit_replace_relation, fresh_task_runtime, has_unresolved_process_lease,
-        initial_task_autonomy_budget, inject_build_parallel_job_cap,
-        lineage_records_for_supersession, normalize_persisted_action_intent,
-        normalized_failure_signature, output_binding_key, plan_instruction_fingerprint_digest,
-        process_lease_is_terminal, ready_lease_digest, rebase_goal_autonomy_budget, repair_allowed,
-        revision_record_key, revision_scoped_key, scope_lineage_id,
+        heavy_build_action_id, heavy_build_attempt_id, initial_task_autonomy_budget,
+        inject_build_parallel_job_cap, lineage_records_for_supersession,
+        normalize_persisted_action_intent, normalized_failure_signature, output_binding_key,
+        plan_instruction_fingerprint_digest, process_lease_is_terminal, ready_lease_digest,
+        rebase_goal_autonomy_budget, repair_allowed, required_command_verification_steps,
+        revision_record_key, revision_scoped_key, scope_lineage_id, sha256_prefixed,
+        validate_post_checkpoint_action_authority_correlation, verification_build_lease_id,
     };
     use serde_json::{Value, json};
     use sovereign_evidence::ArtifactStore;
@@ -18708,10 +21090,11 @@ mod tests {
     use sovereign_repo::{
         ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot, WorktreeLease,
     };
-    use sovereign_state::{SecurityAuditEventV1, StateStore};
+    use sovereign_state::{ActionTransition, NewActionRecord, SecurityAuditEventV1, StateStore};
     use sovereign_tools::{
-        APPROVAL_CLAIM_NAMESPACE, ApprovalClaim, AuthorizedAction, PermissionClass,
-        ReconciliationMode, ToolManifest,
+        ACTION_RECEIPT_SCHEMA, ACTION_RECEIPT_SCHEMA_VERSION, APPROVAL_CLAIM_NAMESPACE,
+        ApprovalClaim, AuthorizedAction, PermissionClass, RawToolResult, ReconciliationMode,
+        ResourceLimitKind, ToolManifest,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
@@ -19948,6 +22331,538 @@ mod tests {
     }
 
     #[test]
+    fn mixed_diff_and_command_acceptance_compiles_one_aggregate_contract() {
+        let task = json!({
+            "acceptance_criteria": [
+                {
+                    "criterion_id": "AC.diff",
+                    "description": "scoped change",
+                    "kind": "diff",
+                    "verification_step_ids": ["verify.diff"],
+                    "evidence_type": "diff_result",
+                    "evidence_freshness": "current_attempt",
+                    "required": true
+                },
+                {
+                    "criterion_id": "AC.command",
+                    "description": "tests pass",
+                    "kind": "command",
+                    "verification_step_ids": ["verify.command"],
+                    "evidence_type": "test_result",
+                    "evidence_freshness": "current_attempt",
+                    "required": true
+                }
+            ],
+            "verification": {
+                "steps": [
+                    {
+                        "step_id": "verify.diff",
+                        "criterion_ids": ["AC.diff"],
+                        "kind": "diff",
+                        "evidence_type": "diff_result",
+                        "evaluator": "builtin.diff.scoped_change.v1"
+                    },
+                    {
+                        "step_id": "verify.command",
+                        "criterion_ids": ["AC.command"],
+                        "kind": "command",
+                        "evidence_type": "test_result",
+                        "command_spec": {
+                            "tool_id": "tool.fixture",
+                            "mode": "exec",
+                            "program": "cargo",
+                            "args": ["test", "-p", "fixture"],
+                            "repository_id": "repo.app",
+                            "working_dir_relative": ".",
+                            "literal_env": {},
+                            "secret_env": {},
+                            "stdin_artifact_id": null,
+                            "timeout_seconds": 30,
+                            "output_limit_bytes": 65536
+                        },
+                        "expected_exit_codes": [0]
+                    }
+                ],
+                "required_evidence_types": ["diff_result", "test_result"]
+            }
+        });
+        let (evaluator, digest) = compiled_acceptance_contract(&task)
+            .unwrap_or_else(|error| panic!("mixed acceptance contract: {error}"));
+        assert_eq!(evaluator, "builtin.diff.scoped_change.v1");
+        assert!(digest.starts_with("sha256:"));
+        let commands = required_command_verification_steps(&task)
+            .unwrap_or_else(|error| panic!("required commands: {error}"));
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].step_id, "verify.command");
+        assert!(commands[0].step_digest.starts_with("sha256:"));
+        assert_eq!(commands[0].program, "cargo");
+        assert_eq!(commands[0].expected_exit_codes, vec![0]);
+    }
+
+    #[test]
+    fn command_verification_expected_exit_limit_and_unreaped_results_fail_closed() {
+        let result = RawToolResult {
+            exit_code: Some(1),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            elapsed_ms: 5,
+            terminated_for_limit: None,
+            process_group_reaped: true,
+        };
+        assert_eq!(command_verification_failure_code(&result, &[0, 1]), None);
+        assert_eq!(
+            command_verification_failure_code(&result, &[0]).as_deref(),
+            Some("command_unexpected_exit")
+        );
+
+        let mut limited = result.clone();
+        limited.exit_code = None;
+        limited.terminated_for_limit = Some(ResourceLimitKind::Timeout);
+        assert_eq!(
+            command_verification_failure_code(&limited, &[0]).as_deref(),
+            Some("command_resource_limit_timeout")
+        );
+
+        let mut unreaped = result;
+        unreaped.exit_code = Some(0);
+        unreaped.process_group_reaped = false;
+        assert_eq!(
+            command_verification_failure_code(&unreaped, &[0]).as_deref(),
+            Some("command_process_group_not_reaped")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn command_verification_recovery_reuses_exact_committed_receipt_and_rejects_step_drift() {
+        let (base, state) = temp_state("command-verification-recovery-receipt");
+        let mut controller = Controller::new(state);
+        let execution_epoch = controller
+            .state
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("execution epoch: {error}"));
+        let plan_digest = sha256_prefixed(b"plan.command-recovery");
+        let task_contract_digest = sha256_prefixed(b"task.command-recovery");
+        let policy_digest = sha256_prefixed(b"policy.command-recovery");
+        let payload_digest = sha256_prefixed(b"payload.command-recovery");
+        let artifact_store_root = base.join("cas");
+        let task = json!({
+            "acceptance_criteria": [{
+                "criterion_id": "AC.command",
+                "description": "governed verification command",
+                "kind": "command",
+                "verification_step_ids": ["verify.command"],
+                "evidence_type": "test_result",
+                "evidence_freshness": "current_attempt",
+                "required": true
+            }],
+            "verification": {
+                "steps": [{
+                    "step_id": "verify.command",
+                    "criterion_ids": ["AC.command"],
+                    "kind": "command",
+                    "evidence_type": "test_result",
+                    "command_spec": {
+                        "tool_id": "tool.fixture",
+                        "mode": "exec",
+                        "program": "cargo",
+                        "args": ["test", "-p", "fixture"],
+                        "repository_id": "repo.app",
+                        "working_dir_relative": ".",
+                        "literal_env": {},
+                        "secret_env": {},
+                        "stdin_artifact_id": null,
+                        "timeout_seconds": 30,
+                        "output_limit_bytes": 65536
+                    },
+                    "expected_exit_codes": [0, 1]
+                }],
+                "required_evidence_types": ["test_result"]
+            }
+        });
+        let step = required_command_verification_steps(&task)
+            .unwrap_or_else(|error| panic!("parse command verification: {error}"))
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("required command step missing"));
+        let intent = DecodedPersistedActionIntent::Legacy {
+            intent: PersistedActionIntent {
+                schema_version: ACTION_INTENT_SCHEMA_VERSION,
+                action_id: "action.repository.fixture".to_owned(),
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 1,
+                plan_digest: plan_digest.clone(),
+                task_id: "task.fixture".to_owned(),
+                task_contract_digest: task_contract_digest.clone(),
+                attempt_id: "attempt.fixture.1".to_owned(),
+                execution_epoch,
+                payload_digest: sha256_prefixed(b"repository.payload"),
+                action_nonce: "nonce.repository.fixture".to_owned(),
+                policy_digest: policy_digest.clone(),
+                repository_id: "repo.app".to_owned(),
+                worktree_lease_id: None,
+                execution_root: base.clone(),
+                path: "src/lib.rs".to_owned(),
+                expected_source_digest: sha256_prefixed(b"preimage"),
+                old_literal: "old".to_owned(),
+                new_literal: "new".to_owned(),
+                expected_post_digest: sha256_prefixed(b"postimage"),
+                expected_target_mode: 0o644,
+                artifact_store_root: artifact_store_root.clone(),
+            },
+            legacy_primary_recovery: false,
+        };
+        let resource_lease_id = verification_build_lease_id(
+            intent.plan_id(),
+            intent.plan_revision(),
+            intent.task_id(),
+            intent.attempt_id(),
+            &step.step_id,
+            execution_epoch,
+        );
+        let action_id = heavy_build_action_id(&resource_lease_id);
+        let receipt_bytes = serde_json::to_vec(&json!({
+            "schema": ACTION_RECEIPT_SCHEMA,
+            "schema_version": ACTION_RECEIPT_SCHEMA_VERSION,
+            "action_id": action_id,
+            "payload_digest": payload_digest,
+            "policy_digest": policy_digest,
+            "execution_epoch": execution_epoch,
+            "exit_code": 1,
+            "elapsed_ms": 17,
+            "terminated_for_limit": null,
+            "process_group_reaped": true,
+            "stdout": {
+                "sha256": sha256_prefixed(b"stdout"),
+                "retained_bytes": 0
+            },
+            "stderr": {
+                "sha256": sha256_prefixed(b"stderr"),
+                "retained_bytes": 0
+            }
+        }))
+        .unwrap_or_else(|error| panic!("receipt json: {error}"));
+        let artifacts = ArtifactStore::open(&artifact_store_root)
+            .unwrap_or_else(|error| panic!("artifact store: {error}"));
+        let receipt_artifact = artifacts
+            .put(&mut controller.state, &receipt_bytes)
+            .unwrap_or_else(|error| panic!("store action receipt: {error}"));
+
+        controller
+            .state
+            .insert_action_record(NewActionRecord {
+                action_id: &action_id,
+                state: "authorized",
+                payload_digest: &payload_digest,
+                policy_digest: &policy_digest,
+                execution_epoch,
+                event_id: "event.command-recovery.authorized",
+                event_kind: "authorized",
+                payload_json: "{}",
+            })
+            .unwrap_or_else(|error| panic!("insert command action: {error}"));
+        for (expected, next, event_id) in [
+            (
+                "authorized",
+                "dispatched",
+                "event.command-recovery.dispatched",
+            ),
+            ("dispatched", "observed", "event.command-recovery.observed"),
+            ("observed", "committed", "event.command-recovery.committed"),
+        ] {
+            controller
+                .state
+                .transition_action_with_event(ActionTransition {
+                    action_id: &action_id,
+                    expected_state: expected,
+                    next_state: next,
+                    expected_epoch: execution_epoch,
+                    event_id,
+                    event_kind: next,
+                    payload_json: "{}",
+                    result_digest: (next == "committed")
+                        .then_some(receipt_artifact.digest.as_str()),
+                })
+                .unwrap_or_else(|error| panic!("transition command action to {next}: {error}"));
+        }
+        let process_lease = RecoveryProcessLease {
+            schema_version: super::RECOVERY_PROCESS_LEASE_SCHEMA_VERSION,
+            lease_id: format!("process.{action_id}"),
+            task_id: intent.task_id().to_owned(),
+            attempt_id: heavy_build_attempt_id(&resource_lease_id),
+            action_id: action_id.clone(),
+            process_group_id: None,
+            leader_identity: None,
+            state: "reaped".to_owned(),
+        };
+        controller
+            .state
+            .put_state(
+                "controller.process_lease",
+                &action_id,
+                &serde_json::to_string(&process_lease)
+                    .unwrap_or_else(|error| panic!("process lease json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist process lease: {error}"));
+        let command_intent = PersistedVerificationCommandIntentV1 {
+            schema_version: VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION,
+            plan_id: intent.plan_id().to_owned(),
+            plan_revision: intent.plan_revision(),
+            plan_digest: intent.plan_digest().to_owned(),
+            task_id: intent.task_id().to_owned(),
+            task_contract_digest: intent.task_contract_digest().to_owned(),
+            attempt_id: intent.attempt_id().to_owned(),
+            step_id: step.step_id.clone(),
+            step_digest: step.step_digest.clone(),
+            resource_lease_id,
+            action_id: action_id.clone(),
+            payload_digest,
+            policy_digest,
+            execution_epoch,
+            artifact_store_root,
+        };
+        controller
+            .state
+            .put_state(
+                VERIFICATION_COMMAND_INTENT_NAMESPACE,
+                &action_id,
+                &serde_json::to_string(&command_intent)
+                    .unwrap_or_else(|error| panic!("command intent json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist command intent: {error}"));
+
+        let seeded_action = controller
+            .state
+            .action_record(&action_id)
+            .unwrap_or_else(|error| panic!("read seeded command action: {error}"))
+            .unwrap_or_else(|| panic!("seeded command action missing"));
+        assert_eq!(seeded_action.state, "committed");
+        assert_eq!(seeded_action.payload_digest, command_intent.payload_digest);
+        assert_eq!(seeded_action.policy_digest, command_intent.policy_digest);
+        assert_eq!(
+            seeded_action.execution_epoch,
+            command_intent.execution_epoch
+        );
+        assert_eq!(
+            seeded_action.result_digest.as_deref(),
+            Some(receipt_artifact.digest.as_str())
+        );
+
+        let recovered = controller
+            .recover_required_command_verification(&intent, &task)
+            .unwrap_or_else(|error| panic!("recover committed command receipt: {error}"));
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].action_id, action_id);
+        assert_eq!(recovered[0].exit_code, Some(1));
+        assert!(
+            recovered[0].passed,
+            "expected nonzero exit must be accepted"
+        );
+        assert_eq!(
+            recovered[0].result_digest.as_deref(),
+            Some(receipt_artifact.digest.as_str())
+        );
+
+        let mut drifted = command_intent;
+        drifted.step_digest = sha256_prefixed(b"drifted-plan-step");
+        controller
+            .state
+            .put_state(
+                VERIFICATION_COMMAND_INTENT_NAMESPACE,
+                &action_id,
+                &serde_json::to_string(&drifted)
+                    .unwrap_or_else(|error| panic!("drifted command intent json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist drifted command intent: {error}"));
+        let error = controller
+            .recover_required_command_verification(&intent, &task)
+            .err()
+            .unwrap_or_else(|| panic!("step-digest drift must fail closed"));
+        assert!(
+            error
+                .to_string()
+                .contains("drifted from immutable Plan/action authority")
+        );
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn post_checkpoint_command_intent_requires_exact_journal_correlated_postimage() {
+        let (base, state) = temp_state("command-intent-post-checkpoint-correlation");
+        let mut controller = Controller::new(state);
+        let plan_digest = sha256_prefixed(b"plan.command-intent-correlation");
+        controller.active = Some(active_fixture(&base, 1, &plan_digest));
+        let manifest = controller
+            .checkpoint_manifest()
+            .unwrap_or_else(|error| panic!("checkpoint manifest: {error}"));
+        let checkpoint_sequence = manifest.action_journal_sequence;
+        let intent = PersistedVerificationCommandIntentV1 {
+            schema_version: VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION,
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            plan_digest,
+            task_id: "task.fixture".to_owned(),
+            task_contract_digest: sha256_prefixed(b"task.command-intent-correlation"),
+            attempt_id: "attempt.fixture.1".to_owned(),
+            step_id: "verify.command".to_owned(),
+            step_digest: sha256_prefixed(b"step.command-intent-correlation"),
+            resource_lease_id: "resource-build.fixture".to_owned(),
+            action_id: "resource-build-action.fixture".to_owned(),
+            payload_digest: sha256_prefixed(b"payload.command-intent-correlation"),
+            policy_digest: sha256_prefixed(b"policy.command-intent-correlation"),
+            execution_epoch: controller
+                .state
+                .current_execution_epoch()
+                .unwrap_or_else(|error| panic!("execution epoch: {error}")),
+            artifact_store_root: base.join("cas"),
+        };
+        let value_json = serde_json::to_string(&intent)
+            .unwrap_or_else(|error| panic!("command intent json: {error}"));
+        let binding_key = format!(
+            "{VERIFICATION_COMMAND_INTENT_NAMESPACE}:{}",
+            intent.action_id
+        );
+        controller
+            .persist_runtime_records_with_events(
+                &[(
+                    VERIFICATION_COMMAND_INTENT_NAMESPACE.to_owned(),
+                    intent.action_id.clone(),
+                    value_json.clone(),
+                )],
+                &[(
+                    "verification_command_intent_bound".to_owned(),
+                    intent.action_id.clone(),
+                    json!({
+                        "post_image_digests": {
+                            binding_key: sha256_prefixed(value_json.as_bytes())
+                        }
+                    }),
+                )],
+            )
+            .unwrap_or_else(|error| panic!("persist command intent event: {error}"));
+        validate_post_checkpoint_action_authority_correlation(
+            &controller.state,
+            &manifest,
+            checkpoint_sequence,
+        )
+        .unwrap_or_else(|error| panic!("correlated command intent: {error}"));
+
+        let mut drifted = intent;
+        drifted.step_digest = sha256_prefixed(b"drifted-step");
+        controller
+            .state
+            .put_state(
+                VERIFICATION_COMMAND_INTENT_NAMESPACE,
+                &drifted.action_id,
+                &serde_json::to_string(&drifted)
+                    .unwrap_or_else(|error| panic!("drifted command intent json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("tamper command intent: {error}"));
+        assert!(
+            validate_post_checkpoint_action_authority_correlation(
+                &controller.state,
+                &manifest,
+                checkpoint_sequence,
+            )
+            .is_err(),
+            "an unjournaled command-intent postimage must fail closed"
+        );
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn mixed_diff_and_command_evidence_persists_as_one_aggregate_verification() {
+        let (base, mut state) = temp_state("mixed-command-aggregate");
+        let command_digest = format!("sha256:{}", "9".repeat(64));
+        let base_verification = VerificationResultV1 {
+            schema_version: super::VERIFICATION_RESULT_SCHEMA_VERSION,
+            verification_id: "verification.mixed".to_owned(),
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            plan_digest: format!("sha256:{}", "1".repeat(64)),
+            task_id: "task.mixed".to_owned(),
+            task_contract_digest: format!("sha256:{}", "2".repeat(64)),
+            attempt_id: "attempt.mixed.1".to_owned(),
+            execution_epoch: 1,
+            evaluator: "builtin.diff.scoped_change.v1".to_owned(),
+            acceptance_contract_digest: format!("sha256:{}", "3".repeat(64)),
+            diff_digest: format!("sha256:{}", "4".repeat(64)),
+            post_snapshot_digest: format!("sha256:{}", "5".repeat(64)),
+            expected_target_mode: 0o644,
+            observed_target_mode: 0o644,
+            evidence_ids: vec![format!("sha256:{}", "6".repeat(64))],
+            command_results: Vec::new(),
+            passed: true,
+            failure_code: None,
+        };
+        let command_result = CommandVerificationResultV1 {
+            step_id: "verify.command".to_owned(),
+            action_id: "resource-build-action.fixture".to_owned(),
+            result_digest: Some(command_digest.clone()),
+            expected_exit_codes: vec![0],
+            exit_code: Some(0),
+            elapsed_ms: 7,
+            terminated_for_limit: None,
+            process_group_reaped: true,
+            stdout_digest: Some(format!("sha256:{}", "7".repeat(64))),
+            stderr_digest: Some(format!("sha256:{}", "8".repeat(64))),
+            passed: true,
+            failure_code: None,
+        };
+        let verification =
+            aggregate_command_verification(base_verification.clone(), vec![command_result]);
+        assert!(verification.passed);
+        assert_eq!(verification.command_results.len(), 1);
+        assert!(verification.evidence_ids.contains(&command_digest));
+
+        let failed_command = CommandVerificationResultV1 {
+            step_id: "verify.command".to_owned(),
+            action_id: "resource-build-action.failed".to_owned(),
+            result_digest: Some(format!("sha256:{}", "a".repeat(64))),
+            expected_exit_codes: vec![0],
+            exit_code: Some(1),
+            elapsed_ms: 8,
+            terminated_for_limit: None,
+            process_group_reaped: true,
+            stdout_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            stderr_digest: Some(format!("sha256:{}", "c".repeat(64))),
+            passed: false,
+            failure_code: Some("command_unexpected_exit".to_owned()),
+        };
+        let failed = aggregate_command_verification(base_verification, vec![failed_command]);
+        assert!(!failed.passed);
+        assert_eq!(
+            failed.failure_code.as_deref(),
+            Some("command_unexpected_exit")
+        );
+
+        state
+            .put_state(
+                "controller.verification",
+                &revision_scoped_key(
+                    &verification.plan_id,
+                    verification.plan_revision,
+                    &verification.verification_id,
+                ),
+                &serde_json::to_string(&verification)
+                    .unwrap_or_else(|error| panic!("aggregate json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist aggregate verification: {error}"));
+        assert_eq!(
+            state
+                .state_records("controller.verification")
+                .unwrap_or_else(|error| panic!("read aggregate verification: {error}"))
+                .len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn dependency_binding_same_plan_revision_is_never_cross_revision_carry_authority() {
         let task = |freshness: &str| {
             json!({
@@ -20011,6 +22926,7 @@ mod tests {
             expected_target_mode: 0o644,
             observed_target_mode: 0o644,
             evidence_ids: vec!["ev.N".to_owned()],
+            command_results: Vec::new(),
             passed: true,
             failure_code: None,
         };
@@ -20282,6 +23198,7 @@ mod tests {
             expected_target_mode: 0o644,
             observed_target_mode: 0o644,
             evidence_ids: vec!["ev.N".to_owned()],
+            command_results: Vec::new(),
             passed: true,
             failure_code: None,
         };
@@ -20630,6 +23547,7 @@ mod tests {
                 expected_target_mode: 0o644,
                 observed_target_mode: 0o644,
                 evidence_ids: vec!["ev.N".to_owned()],
+                command_results: Vec::new(),
                 passed: true,
                 failure_code: None,
             };

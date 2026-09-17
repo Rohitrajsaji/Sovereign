@@ -46,6 +46,113 @@ fn command(executable: &Path, cwd: &Path, args: &[&str]) -> CommandSpec {
     }
 }
 
+#[test]
+fn pinned_program_resolution_returns_unique_configured_basename() {
+    let temp = TestDir::new("pinned-program-unique");
+    let bin = temp.0.join("bin");
+    fs::create_dir_all(&bin).unwrap_or_else(|error| panic!("bin: {error}"));
+    let tool_path = bin.join("fixture-tool");
+    fs::write(&tool_path, b"fixture executable").unwrap_or_else(|error| panic!("tool: {error}"));
+    let pin = PinnedExecutable::from_path(&tool_path, "fixture-v1")
+        .unwrap_or_else(|error| panic!("pin: {error}"));
+    let expected_path = pin.path.clone();
+    let expected_digest = pin.sha256.clone();
+    let policy =
+        CommandPolicy::new([pin], [bin]).unwrap_or_else(|error| panic!("command policy: {error}"));
+
+    let resolved = policy
+        .resolve_pinned_program("fixture-tool")
+        .unwrap_or_else(|error| panic!("resolve: {error}"));
+    assert_eq!(resolved.path, expected_path);
+    assert_eq!(resolved.sha256, expected_digest);
+}
+
+#[test]
+fn pinned_program_resolution_rejects_missing_basename() {
+    let temp = TestDir::new("pinned-program-missing");
+    let bin = temp.0.join("bin");
+    fs::create_dir_all(&bin).unwrap_or_else(|error| panic!("bin: {error}"));
+    let tool_path = bin.join("fixture-tool");
+    fs::write(&tool_path, b"fixture executable").unwrap_or_else(|error| panic!("tool: {error}"));
+    let pin = PinnedExecutable::from_path(&tool_path, "fixture-v1")
+        .unwrap_or_else(|error| panic!("pin: {error}"));
+    let policy =
+        CommandPolicy::new([pin], [bin]).unwrap_or_else(|error| panic!("command policy: {error}"));
+
+    assert!(policy.resolve_pinned_program("missing-tool").is_err());
+    assert!(
+        policy.resolve_pinned_program("sh").is_err(),
+        "resolver must not fall back to ambient PATH"
+    );
+}
+
+#[test]
+fn pinned_program_resolution_rejects_ambiguous_basename() {
+    let temp = TestDir::new("pinned-program-ambiguous");
+    let left_bin = temp.0.join("left-bin");
+    let right_bin = temp.0.join("right-bin");
+    fs::create_dir_all(&left_bin).unwrap_or_else(|error| panic!("left bin: {error}"));
+    fs::create_dir_all(&right_bin).unwrap_or_else(|error| panic!("right bin: {error}"));
+    let left_path = left_bin.join("fixture-tool");
+    let right_path = right_bin.join("fixture-tool");
+    fs::write(&left_path, b"left executable").unwrap_or_else(|error| panic!("left tool: {error}"));
+    fs::write(&right_path, b"right executable")
+        .unwrap_or_else(|error| panic!("right tool: {error}"));
+    let left = PinnedExecutable::from_path(&left_path, "left-v1")
+        .unwrap_or_else(|error| panic!("left pin: {error}"));
+    let right = PinnedExecutable::from_path(&right_path, "right-v1")
+        .unwrap_or_else(|error| panic!("right pin: {error}"));
+    let policy = CommandPolicy::new([left, right], [left_bin, right_bin])
+        .unwrap_or_else(|error| panic!("command policy: {error}"));
+
+    assert!(policy.resolve_pinned_program("fixture-tool").is_err());
+}
+
+#[test]
+fn pinned_program_resolution_rejects_path_like_input() {
+    let temp = TestDir::new("pinned-program-path-like");
+    let bin = temp.0.join("bin");
+    fs::create_dir_all(&bin).unwrap_or_else(|error| panic!("bin: {error}"));
+    let tool_path = bin.join("fixture-tool");
+    fs::write(&tool_path, b"fixture executable").unwrap_or_else(|error| panic!("tool: {error}"));
+    let pin = PinnedExecutable::from_path(&tool_path, "fixture-v1")
+        .unwrap_or_else(|error| panic!("pin: {error}"));
+    let policy =
+        CommandPolicy::new([pin], [bin]).unwrap_or_else(|error| panic!("command policy: {error}"));
+
+    for program in [
+        "./fixture-tool",
+        "bin/fixture-tool",
+        "bin\\fixture-tool",
+        "C:fixture-tool",
+        "/usr/bin/fixture-tool",
+        ".",
+        "..",
+    ] {
+        assert!(
+            policy.resolve_pinned_program(program).is_err(),
+            "path-like program must be denied: {program}"
+        );
+    }
+}
+
+#[test]
+fn pinned_program_resolution_reverifies_digest_after_policy_construction() {
+    let temp = TestDir::new("pinned-program-drift");
+    let bin = temp.0.join("bin");
+    fs::create_dir_all(&bin).unwrap_or_else(|error| panic!("bin: {error}"));
+    let tool_path = bin.join("fixture-tool");
+    fs::write(&tool_path, b"fixture executable").unwrap_or_else(|error| panic!("tool: {error}"));
+    let pin = PinnedExecutable::from_path(&tool_path, "fixture-v1")
+        .unwrap_or_else(|error| panic!("pin: {error}"));
+    let policy =
+        CommandPolicy::new([pin], [bin]).unwrap_or_else(|error| panic!("command policy: {error}"));
+
+    fs::write(&tool_path, b"drifted executable")
+        .unwrap_or_else(|error| panic!("drift tool: {error}"));
+    assert!(policy.resolve_pinned_program("fixture-tool").is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn security_path_ticket_detects_swaps_and_hard_link_in_place_hazard() {

@@ -12,8 +12,8 @@ pub use sovereign_policy::{
 };
 use sovereign_policy::{
     CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, IsolatedCommand,
-    IsolationRequest, PolicyError, SecretInjection, SecretLease, SecretScope,
-    sanitized_environment,
+    IsolationRequest, PathAuthorizationTicket, PathCommitMode, PathPolicy, PolicyError,
+    SecretInjection, SecretLease, SecretScope, sanitized_environment,
 };
 use sovereign_state::{
     ActionTransition, NewActionRecord, PersistedActionRecord, StateError, StateStore,
@@ -25,7 +25,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -119,6 +119,30 @@ struct FileIdentity {
     inode: u64,
     file_type: u32,
     content_digest: String,
+}
+
+/// Prepared mechanics for creating one repository file exactly once.
+///
+/// Authority remains external: callers supply an already configured [`PathPolicy`]. This guard
+/// only preserves that path-policy decision across staging and publishes with an atomic no-clobber
+/// directory-entry operation, so a target that appears after prepare is never overwritten.
+#[derive(Debug, Clone)]
+pub struct AtomicCreateGuard {
+    path_policy: PathPolicy,
+    ticket: PathAuthorizationTicket,
+    path_guard: AtomicReplaceGuard,
+}
+
+/// Prepared mechanics for replacing one existing regular repository file from an exact preimage.
+///
+/// This composes [`PathPolicy`] with the existing [`AtomicReplaceGuard`]; it does not grant write
+/// authority or choose protected roots.
+#[derive(Debug, Clone)]
+pub struct AtomicUpdateGuard {
+    path_policy: PathPolicy,
+    ticket: PathAuthorizationTicket,
+    path_guard: AtomicReplaceGuard,
+    expected_source_mode: Option<u32>,
 }
 
 impl AtomicReplaceGuard {
@@ -233,6 +257,215 @@ impl AtomicReplaceGuard {
             ));
         }
         Ok(())
+    }
+}
+
+impl AtomicCreateGuard {
+    /// Captures a create-only mutation binding for one currently absent repository-relative target.
+    ///
+    /// The supplied [`PathPolicy`] is the complete mechanics policy input; this layer does not add
+    /// repository authority or protected paths of its own.
+    ///
+    /// # Errors
+    /// Returns fail-closed for traversal, protected paths, symlinked parents, unstable parents,
+    /// non-regular targets, or a target that already exists.
+    pub fn prepare(
+        path_policy: &PathPolicy,
+        relative_path: impl AsRef<Path>,
+    ) -> Result<Self, ToolError> {
+        let relative_path = relative_path.as_ref();
+        let ticket = path_policy.authorize_mutation(relative_path)?;
+        if ticket.target_identity().is_some() {
+            return Err(ToolError::Authority(
+                "atomic create requires the target to be absent at prepare".to_owned(),
+            ));
+        }
+        let path_guard = AtomicReplaceGuard::prepare(path_policy.repository_root(), relative_path)?;
+        if path_guard.target_identity.is_some() {
+            return Err(ToolError::Authority(
+                "atomic create target appeared while prepare was establishing path identity"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self {
+            path_policy: path_policy.clone(),
+            ticket,
+            path_guard,
+        })
+    }
+
+    #[must_use]
+    pub fn relative_path(&self) -> &Path {
+        self.path_guard.relative_path()
+    }
+
+    /// Publishes staged bytes atomically without replacing any entry that already exists.
+    ///
+    /// Staging occurs in the authorized parent. The final `hard_link` is the no-clobber publish:
+    /// the kernel either creates the target directory entry pointing at the fully written inode or
+    /// fails because an entry already exists. No ordinary overwrite-capable rename is used.
+    ///
+    /// # Errors
+    /// Returns fail-closed if policy/path identity changed, the target appeared, staging failed, or
+    /// the atomic no-clobber publish/cleanup could not be completed.
+    pub fn commit(&self, bytes: &[u8], mode: u32) -> Result<(), ToolError> {
+        self.revalidate_absent()?;
+        let target = self
+            .path_policy
+            .revalidate_for_commit(&self.ticket, PathCommitMode::AtomicReplace)?;
+        let file_name = target.file_name().ok_or_else(|| {
+            ToolError::Authority("atomic create target has no file name".to_owned())
+        })?;
+        let nonce = ATOMIC_REPLACE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let temp = self.path_guard.parent.join(format!(
+            ".{}.sovereign-create-tmp-{}-{nonce}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+
+        let mut published = false;
+        let result = (|| -> Result<(), ToolError> {
+            let mut staged = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            staged.write_all(bytes)?;
+            staged.set_permissions(fs::Permissions::from_mode(mode & 0o777))?;
+            staged.sync_all()?;
+
+            // Revalidate immediately before the publish attempt. A last-moment target creation is
+            // still fenced by hard_link's atomic EEXIST/no-replace semantics.
+            self.revalidate_absent()?;
+            self.path_policy
+                .revalidate_for_commit(&self.ticket, PathCommitMode::AtomicReplace)?;
+            fs::hard_link(&temp, &target)?;
+            published = true;
+            fs::remove_file(&temp)?;
+            File::open(&self.path_guard.parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() && !published {
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    }
+
+    fn revalidate_absent(&self) -> Result<(), ToolError> {
+        self.path_guard.revalidate()?;
+        if self.path_guard.target_identity.is_some() {
+            return Err(ToolError::Authority(
+                "atomic create guard was prepared for an existing target".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AtomicUpdateGuard {
+    /// Captures an update-only mutation binding for one exact existing preimage digest.
+    ///
+    /// # Errors
+    /// Returns fail-closed for traversal, protected paths, symlinked parents/targets, a missing or
+    /// non-regular target, or a preimage digest mismatch.
+    pub fn prepare(
+        path_policy: &PathPolicy,
+        relative_path: impl AsRef<Path>,
+        expected_source_digest: &str,
+    ) -> Result<Self, ToolError> {
+        Self::prepare_internal(
+            path_policy,
+            relative_path.as_ref(),
+            expected_source_digest,
+            None,
+        )
+    }
+
+    /// Captures an update-only mutation binding for one exact existing preimage digest and mode.
+    ///
+    /// # Errors
+    /// Returns fail-closed for the same conditions as [`AtomicUpdateGuard::prepare`] plus a source
+    /// mode mismatch or mode drift observed immediately before commit.
+    pub fn prepare_exact(
+        path_policy: &PathPolicy,
+        relative_path: impl AsRef<Path>,
+        expected_source_digest: &str,
+        expected_source_mode: u32,
+    ) -> Result<Self, ToolError> {
+        if expected_source_mode > 0o777 {
+            return Err(ToolError::Authority(
+                "atomic update expected source mode is outside permission bits".to_owned(),
+            ));
+        }
+        Self::prepare_internal(
+            path_policy,
+            relative_path.as_ref(),
+            expected_source_digest,
+            Some(expected_source_mode),
+        )
+    }
+
+    fn prepare_internal(
+        path_policy: &PathPolicy,
+        relative_path: &Path,
+        expected_source_digest: &str,
+        expected_source_mode: Option<u32>,
+    ) -> Result<Self, ToolError> {
+        let ticket = path_policy.authorize_mutation(relative_path)?;
+        if ticket.target_identity().is_none() {
+            return Err(ToolError::Authority(
+                "atomic update requires an existing regular target".to_owned(),
+            ));
+        }
+        let path_guard = AtomicReplaceGuard::prepare(path_policy.repository_root(), relative_path)?;
+        let Some(identity) = path_guard.target_identity.as_ref() else {
+            return Err(ToolError::Authority(
+                "atomic update target disappeared while prepare was establishing path identity"
+                    .to_owned(),
+            ));
+        };
+        if identity.content_digest != expected_source_digest {
+            return Err(ToolError::Authority(
+                "atomic update preimage digest does not match expected source digest".to_owned(),
+            ));
+        }
+        if let Some(expected_mode) = expected_source_mode {
+            let metadata = fs::symlink_metadata(ticket.authorized_target())?;
+            if metadata.permissions().mode() & 0o777 != expected_mode {
+                return Err(ToolError::Authority(
+                    "atomic update preimage mode does not match expected source mode".to_owned(),
+                ));
+            }
+        }
+        Ok(Self {
+            path_policy: path_policy.clone(),
+            ticket,
+            path_guard,
+            expected_source_mode,
+        })
+    }
+
+    #[must_use]
+    pub fn relative_path(&self) -> &Path {
+        self.path_guard.relative_path()
+    }
+
+    /// Replaces the exact prepared preimage after policy and identity revalidation.
+    ///
+    /// # Errors
+    /// Returns fail-closed if the parent/target changed after prepare or the underlying atomic
+    /// replacement fails.
+    pub fn commit(&self, bytes: &[u8], mode: u32) -> Result<(), ToolError> {
+        self.path_policy
+            .revalidate_for_commit(&self.ticket, PathCommitMode::AtomicReplace)?;
+        if let Some(expected_mode) = self.expected_source_mode {
+            let metadata = fs::symlink_metadata(self.ticket.authorized_target())?;
+            if metadata.permissions().mode() & 0o777 != expected_mode {
+                return Err(ToolError::Authority(
+                    "atomic update preimage mode changed after prepare".to_owned(),
+                ));
+            }
+        }
+        self.path_guard.commit(bytes, mode)
     }
 }
 
@@ -458,6 +691,104 @@ impl ReconciliationMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryMutationKind {
+    Create,
+    Update,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepositoryMutationPrecondition {
+    Absent,
+    ExactFile { digest: String, mode: u32 },
+}
+
+/// Controller-authorized, in-process repository mutation.
+///
+/// This is deliberately a sibling of [`AuthorizedAction`], not a synthetic process action. It
+/// binds the exact repository-relative path plus pre/post image contract while retaining the same
+/// durable journal, policy/epoch, tool identity, and reconciliation authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorizedRepositoryMutation {
+    pub action_id: String,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub task_id: String,
+    pub attempt_id: String,
+    pub tool_id: String,
+    pub tool_version: String,
+    pub tool_digest: String,
+    pub repository_id: String,
+    pub relative_path: PathBuf,
+    pub kind: RepositoryMutationKind,
+    pub precondition: RepositoryMutationPrecondition,
+    pub expected_post_digest: String,
+    pub expected_target_mode: u32,
+    pub execution_epoch: i64,
+    pub policy_digest: String,
+    pub permission_decision_digest: String,
+    pub isolation_policy_digest: String,
+    pub nonce: String,
+    pub expires_at_ms: i64,
+    pub action_deadline_ms: u64,
+    pub disk_write_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalActionReservation {
+    pub tool_actions: u32,
+    pub subprocesses: u32,
+    pub wall_ms: u64,
+    pub output_bytes: u64,
+    pub disk_write_bytes: u64,
+}
+
+/// Common immutable authority consumed by the single canonical action journal.
+///
+/// Process-only execution details intentionally remain on [`AuthorizedAction`]. Repository
+/// mutations expose only the common identity/policy surface required by authorization, durable
+/// lifecycle transitions, approvals, reconciliation, and Controller metering.
+pub trait JournalActionAuthority {
+    fn action_id(&self) -> &str;
+    fn plan_id(&self) -> &str;
+    fn plan_revision(&self) -> u32;
+    fn task_id(&self) -> &str;
+    fn attempt_id(&self) -> &str;
+    fn tool_id(&self) -> &str;
+    fn tool_version(&self) -> &str;
+    fn tool_digest(&self) -> &str;
+    fn repository_id(&self) -> &str;
+    fn destination_digest(&self) -> Option<&str>;
+    fn permission_class(&self) -> PermissionClass;
+    fn execution_epoch(&self) -> i64;
+    fn policy_digest(&self) -> &str;
+    fn permission_decision_digest(&self) -> &str;
+    fn isolation_policy_digest(&self) -> &str;
+    fn nonce(&self) -> &str;
+    fn expires_at_ms(&self) -> i64;
+    fn approval_required(&self) -> bool;
+    fn reconciliation_mode(&self) -> ReconciliationMode;
+    fn declared_risk(&self) -> CommandRisk;
+    fn approval_execution_identity_digest(&self) -> Option<&str>;
+    fn payload_digest(&self) -> String;
+    /// Validates immutable authority shape and expiry.
+    ///
+    /// # Errors
+    /// Returns fail-closed when the action binding is malformed, stale, or expired.
+    fn validate(&self, now_ms: i64) -> Result<(), ToolError>;
+    /// Verifies this exact action against one frozen Controller permission decision.
+    ///
+    /// # Errors
+    /// Returns fail-closed when task/tool/policy/capability bindings differ.
+    fn verify_permission_decision(&self, decision: &PermissionDecision) -> Result<(), ToolError>;
+    /// Verifies a durable exact approval claim when this action class permits approval.
+    ///
+    /// # Errors
+    /// Returns fail-closed for malformed/stale claims or action classes that cannot use approval.
+    fn verify_approval_claim(&self, claim: &ApprovalClaim, now_ms: i64) -> Result<(), ToolError>;
+    fn reservation(&self) -> JournalActionReservation;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthorizedAction {
     pub action_id: String,
@@ -646,6 +977,312 @@ impl AuthorizedAction {
     }
 }
 
+impl AuthorizedRepositoryMutation {
+    /// Computes the domain-separated exact payload digest for one in-process repository mutation.
+    #[must_use]
+    pub fn payload_digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        digest_field(&mut hasher, "sovereign.authorized_repository_mutation.v1");
+        digest_field(&mut hasher, &self.action_id);
+        digest_field(&mut hasher, &self.plan_id);
+        hasher.update(self.plan_revision.to_be_bytes());
+        digest_field(&mut hasher, &self.task_id);
+        digest_field(&mut hasher, &self.attempt_id);
+        digest_field(&mut hasher, &self.tool_id);
+        digest_field(&mut hasher, &self.tool_version);
+        digest_field(&mut hasher, &self.tool_digest);
+        digest_field(&mut hasher, &self.repository_id);
+        digest_field(&mut hasher, &self.relative_path.display().to_string());
+        digest_field(
+            &mut hasher,
+            match self.kind {
+                RepositoryMutationKind::Create => "create",
+                RepositoryMutationKind::Update => "update",
+            },
+        );
+        match &self.precondition {
+            RepositoryMutationPrecondition::Absent => digest_field(&mut hasher, "absent"),
+            RepositoryMutationPrecondition::ExactFile { digest, mode } => {
+                digest_field(&mut hasher, "exact_file");
+                digest_field(&mut hasher, digest);
+                hasher.update(mode.to_be_bytes());
+            }
+        }
+        digest_field(&mut hasher, &self.expected_post_digest);
+        hasher.update(self.expected_target_mode.to_be_bytes());
+        digest_field(
+            &mut hasher,
+            permission_name(PermissionClass::RepositoryWrite),
+        );
+        hasher.update(self.execution_epoch.to_be_bytes());
+        digest_field(&mut hasher, &self.policy_digest);
+        digest_field(&mut hasher, &self.permission_decision_digest);
+        digest_field(&mut hasher, &self.isolation_policy_digest);
+        digest_field(&mut hasher, &self.nonce);
+        hasher.update(self.expires_at_ms.to_be_bytes());
+        digest_field(
+            &mut hasher,
+            command_risk_name(CommandRisk::RepositoryMutation),
+        );
+        digest_field(&mut hasher, "unsafe_side_effect");
+        hasher.update(self.action_deadline_ms.to_be_bytes());
+        hasher.update(self.disk_write_bytes.to_be_bytes());
+        format!("sha256:{:x}", hasher.finalize())
+    }
+
+    /// Validates exact immutable fields before journal authorization.
+    ///
+    /// # Errors
+    /// Returns fail-closed for malformed identities, path/precondition mismatches, or expiry.
+    pub fn validate(&self, now_ms: i64) -> Result<(), ToolError> {
+        validate_commit_relative_path(&self.relative_path)?;
+        let precondition_valid = match (&self.kind, &self.precondition) {
+            (RepositoryMutationKind::Create, RepositoryMutationPrecondition::Absent) => true,
+            (
+                RepositoryMutationKind::Update,
+                RepositoryMutationPrecondition::ExactFile { digest, mode },
+            ) => digest.starts_with("sha256:") && *mode <= 0o777,
+            _ => false,
+        };
+        if self.action_id.trim().is_empty()
+            || self.plan_id.trim().is_empty()
+            || self.task_id.trim().is_empty()
+            || self.attempt_id.trim().is_empty()
+            || self.tool_id.trim().is_empty()
+            || self.tool_version.trim().is_empty()
+            || self.repository_id.trim().is_empty()
+            || self.nonce.trim().is_empty()
+            || !self.tool_digest.starts_with("sha256:")
+            || !self.expected_post_digest.starts_with("sha256:")
+            || !self.policy_digest.starts_with("sha256:")
+            || !self.permission_decision_digest.starts_with("sha256:")
+            || !self.isolation_policy_digest.starts_with("sha256:")
+            || self.expected_target_mode > 0o777
+            || self.execution_epoch < 0
+            || self.action_deadline_ms == 0
+            || !precondition_valid
+        {
+            return Err(ToolError::Authority(
+                "authorized repository mutation has incomplete exact-binding fields".to_owned(),
+            ));
+        }
+        if self.expires_at_ms < now_ms {
+            return Err(ToolError::Authority(
+                "authorized repository mutation expired".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Verifies exact task/tool/policy authority for repository-write capability.
+    ///
+    /// # Errors
+    /// Returns an authority error on any permission-decision drift.
+    pub fn verify_permission_decision(
+        &self,
+        decision: &PermissionDecision,
+    ) -> Result<(), ToolError> {
+        decision
+            .validate()
+            .map_err(|error| ToolError::Authority(error.to_string()))?;
+        if self.permission_decision_digest != decision.digest()
+            || self.plan_id != decision.plan_id
+            || self.plan_revision != decision.plan_revision
+            || self.task_id != decision.task_id
+            || self.policy_digest != decision.policy_digest
+            || self.tool_id != decision.tool_id
+            || self.tool_version != decision.tool_version
+            || self.tool_digest != decision.tool_digest
+            || !decision
+                .effective
+                .contains(PermissionClass::RepositoryWrite)
+        {
+            return Err(ToolError::Authority(
+                "authorized repository mutation does not match exact permission decision"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl JournalActionAuthority for AuthorizedAction {
+    fn action_id(&self) -> &str {
+        &self.action_id
+    }
+    fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+    fn plan_revision(&self) -> u32 {
+        self.plan_revision
+    }
+    fn task_id(&self) -> &str {
+        &self.task_id
+    }
+    fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+    fn tool_id(&self) -> &str {
+        &self.tool_id
+    }
+    fn tool_version(&self) -> &str {
+        &self.tool_version
+    }
+    fn tool_digest(&self) -> &str {
+        &self.tool_digest
+    }
+    fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+    fn destination_digest(&self) -> Option<&str> {
+        self.destination_digest.as_deref()
+    }
+    fn permission_class(&self) -> PermissionClass {
+        self.permission_class
+    }
+    fn execution_epoch(&self) -> i64 {
+        self.execution_epoch
+    }
+    fn policy_digest(&self) -> &str {
+        &self.policy_digest
+    }
+    fn permission_decision_digest(&self) -> &str {
+        &self.permission_decision_digest
+    }
+    fn isolation_policy_digest(&self) -> &str {
+        &self.isolation_policy_digest
+    }
+    fn nonce(&self) -> &str {
+        &self.nonce
+    }
+    fn expires_at_ms(&self) -> i64 {
+        self.expires_at_ms
+    }
+    fn approval_required(&self) -> bool {
+        self.approval_required
+    }
+    fn reconciliation_mode(&self) -> ReconciliationMode {
+        self.reconciliation_mode
+    }
+    fn declared_risk(&self) -> CommandRisk {
+        self.command.declared_risk
+    }
+    fn approval_execution_identity_digest(&self) -> Option<&str> {
+        Some(&self.executable_digest)
+    }
+    fn payload_digest(&self) -> String {
+        AuthorizedAction::payload_digest(self)
+    }
+    fn validate(&self, now_ms: i64) -> Result<(), ToolError> {
+        AuthorizedAction::validate(self, now_ms)
+    }
+    fn verify_permission_decision(&self, decision: &PermissionDecision) -> Result<(), ToolError> {
+        AuthorizedAction::verify_permission_decision(self, decision)
+    }
+    fn verify_approval_claim(&self, claim: &ApprovalClaim, now_ms: i64) -> Result<(), ToolError> {
+        AuthorizedAction::verify_approval_claim(self, claim, now_ms)
+    }
+    fn reservation(&self) -> JournalActionReservation {
+        JournalActionReservation {
+            tool_actions: 1,
+            subprocesses: 1,
+            wall_ms: self.command.timeout_ms,
+            output_bytes: self.command.output_limit_bytes,
+            disk_write_bytes: self.command.disk_write_limit_bytes,
+        }
+    }
+}
+
+impl JournalActionAuthority for AuthorizedRepositoryMutation {
+    fn action_id(&self) -> &str {
+        &self.action_id
+    }
+    fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+    fn plan_revision(&self) -> u32 {
+        self.plan_revision
+    }
+    fn task_id(&self) -> &str {
+        &self.task_id
+    }
+    fn attempt_id(&self) -> &str {
+        &self.attempt_id
+    }
+    fn tool_id(&self) -> &str {
+        &self.tool_id
+    }
+    fn tool_version(&self) -> &str {
+        &self.tool_version
+    }
+    fn tool_digest(&self) -> &str {
+        &self.tool_digest
+    }
+    fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+    fn destination_digest(&self) -> Option<&str> {
+        Some(&self.expected_post_digest)
+    }
+    fn permission_class(&self) -> PermissionClass {
+        PermissionClass::RepositoryWrite
+    }
+    fn execution_epoch(&self) -> i64 {
+        self.execution_epoch
+    }
+    fn policy_digest(&self) -> &str {
+        &self.policy_digest
+    }
+    fn permission_decision_digest(&self) -> &str {
+        &self.permission_decision_digest
+    }
+    fn isolation_policy_digest(&self) -> &str {
+        &self.isolation_policy_digest
+    }
+    fn nonce(&self) -> &str {
+        &self.nonce
+    }
+    fn expires_at_ms(&self) -> i64 {
+        self.expires_at_ms
+    }
+    fn approval_required(&self) -> bool {
+        false
+    }
+    fn reconciliation_mode(&self) -> ReconciliationMode {
+        ReconciliationMode::UnsafeSideEffect
+    }
+    fn declared_risk(&self) -> CommandRisk {
+        CommandRisk::RepositoryMutation
+    }
+    fn approval_execution_identity_digest(&self) -> Option<&str> {
+        None
+    }
+    fn payload_digest(&self) -> String {
+        AuthorizedRepositoryMutation::payload_digest(self)
+    }
+    fn validate(&self, now_ms: i64) -> Result<(), ToolError> {
+        AuthorizedRepositoryMutation::validate(self, now_ms)
+    }
+    fn verify_permission_decision(&self, decision: &PermissionDecision) -> Result<(), ToolError> {
+        AuthorizedRepositoryMutation::verify_permission_decision(self, decision)
+    }
+    fn verify_approval_claim(&self, _claim: &ApprovalClaim, _now_ms: i64) -> Result<(), ToolError> {
+        Err(ToolError::Authority(
+            "repository mutation actions cannot carry approval claims under Plan IR v1.2"
+                .to_owned(),
+        ))
+    }
+    fn reservation(&self) -> JournalActionReservation {
+        JournalActionReservation {
+            tool_actions: 1,
+            subprocesses: 0,
+            wall_ms: self.action_deadline_ms,
+            output_bytes: 0,
+            disk_write_bytes: self.disk_write_bytes,
+        }
+    }
+}
+
 pub struct ActionJournal<'a> {
     store: &'a mut StateStore,
 }
@@ -660,16 +1297,16 @@ impl<'a> ActionJournal<'a> {
     ///
     /// # Errors
     /// Returns an authority or persistence error for malformed or duplicate actions.
-    pub fn prepare(&mut self, action: &AuthorizedAction) -> Result<i64, ToolError> {
+    pub fn prepare(&mut self, action: &dyn JournalActionAuthority) -> Result<i64, ToolError> {
         action.validate(unix_millis()?)?;
         let payload_digest = action.payload_digest();
         Ok(self.store.insert_action_record(NewActionRecord {
-            action_id: &action.action_id,
+            action_id: action.action_id(),
             state: ActionState::Prepared.as_str(),
             payload_digest: &payload_digest,
-            policy_digest: &action.policy_digest,
-            execution_epoch: action.execution_epoch,
-            event_id: &event_id(&action.action_id, ActionState::Prepared.as_str()),
+            policy_digest: action.policy_digest(),
+            execution_epoch: action.execution_epoch(),
+            event_id: &event_id(action.action_id(), ActionState::Prepared.as_str()),
             event_kind: ActionState::Prepared.as_str(),
             payload_json: "{}",
         })?)
@@ -681,7 +1318,7 @@ impl<'a> ActionJournal<'a> {
     /// Returns an authority or persistence error when the exact action cannot be recorded.
     pub fn authorize(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
         manifest: &ToolManifest,
         permission_decision: &PermissionDecision,
     ) -> Result<i64, ToolError> {
@@ -691,20 +1328,22 @@ impl<'a> ActionJournal<'a> {
         manifest.validate()?;
         if !manifest
             .reconciliation_policy
-            .permits_candidate(action.reconciliation_mode.policy())
+            .permits_candidate(action.reconciliation_mode().policy())
         {
             return Err(ToolError::Authority(
                 "authorized action reconciliation policy weakens tool/adapter declaration"
                     .to_owned(),
             ));
         }
-        if manifest.tool_id != action.tool_id {
+        if manifest.tool_id != action.tool_id() {
             return Err(ToolError::Authority(format!(
                 "action tool {} does not match manifest {}",
-                action.tool_id, manifest.tool_id
+                action.tool_id(),
+                manifest.tool_id
             )));
         }
-        if manifest.version != action.tool_version || manifest.content_digest != action.tool_digest
+        if manifest.version != action.tool_version()
+            || manifest.content_digest != action.tool_digest()
         {
             return Err(ToolError::Authority(format!(
                 "action tool identity does not match manifest {}@{}",
@@ -713,41 +1352,42 @@ impl<'a> ActionJournal<'a> {
         }
         if !manifest
             .permission_ceiling
-            .contains(&action.permission_class)
+            .contains(&action.permission_class())
         {
             return Err(ToolError::Authority(format!(
                 "tool manifest does not permit {:?}",
-                action.permission_class
+                action.permission_class()
             )));
         }
-        if action.command.declared_risk < manifest.declared_risk_floor {
+        if action.declared_risk() < manifest.declared_risk_floor {
             return Err(ToolError::Authority(format!(
                 "action risk {:?} is below tool manifest floor {:?}",
-                action.command.declared_risk, manifest.declared_risk_floor
+                action.declared_risk(),
+                manifest.declared_risk_floor
             )));
         }
         let current_epoch = self.store.current_execution_epoch()?;
-        if current_epoch != action.execution_epoch {
+        if current_epoch != action.execution_epoch() {
             return Err(ToolError::Authority(format!(
                 "authorization epoch mismatch: action={}, controller={current_epoch}",
-                action.execution_epoch
+                action.execution_epoch()
             )));
         }
-        if self.store.action_record(&action.action_id)?.is_none() {
+        if self.store.action_record(action.action_id())?.is_none() {
             self.prepare(action)?;
         }
         let prepared = self
             .store
-            .action_record(&action.action_id)?
+            .action_record(action.action_id())?
             .ok_or_else(|| ToolError::Authority("prepared action disappeared".to_owned()))?;
         if prepared.state != ActionState::Prepared.as_str()
             || prepared.payload_digest != action.payload_digest()
-            || prepared.policy_digest != action.policy_digest
-            || prepared.execution_epoch != action.execution_epoch
+            || prepared.policy_digest != action.policy_digest()
+            || prepared.execution_epoch != action.execution_epoch()
         {
             return Err(ToolError::Authority(format!(
                 "prepared action does not match exact authorization {}",
-                action.action_id
+                action.action_id()
             )));
         }
         self.transition(action, ActionState::Prepared, ActionState::Authorized)
@@ -759,27 +1399,27 @@ impl<'a> ActionJournal<'a> {
     /// Returns an authority error for missing, stale, mutated, or expired authorization.
     pub fn verify_authorized(
         &self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
     ) -> Result<PersistedActionRecord, ToolError> {
         action.validate(unix_millis()?)?;
         let record = self
             .store
-            .action_record(&action.action_id)?
+            .action_record(action.action_id())?
             .ok_or_else(|| {
                 ToolError::Authority(format!(
                     "missing durable authorization for {}",
-                    action.action_id
+                    action.action_id()
                 ))
             })?;
         if record.state != "authorized"
             || record.payload_digest != action.payload_digest()
-            || record.policy_digest != action.policy_digest
-            || record.execution_epoch != action.execution_epoch
-            || self.store.current_execution_epoch()? != action.execution_epoch
+            || record.policy_digest != action.policy_digest()
+            || record.execution_epoch != action.execution_epoch()
+            || self.store.current_execution_epoch()? != action.execution_epoch()
         {
             return Err(ToolError::Authority(format!(
                 "durable authorization no longer matches exact action {}",
-                action.action_id
+                action.action_id()
             )));
         }
         Ok(record)
@@ -791,7 +1431,7 @@ impl<'a> ActionJournal<'a> {
     /// Returns a transition or persistence error for illegal/stale transitions.
     pub fn transition(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
         expected: ActionState,
         next: ActionState,
     ) -> Result<i64, ToolError> {
@@ -806,11 +1446,11 @@ impl<'a> ActionJournal<'a> {
             self.verify_dispatch_approval(action)?;
         }
         Ok(self.store.transition_action_with_event(ActionTransition {
-            action_id: &action.action_id,
+            action_id: action.action_id(),
             expected_state: expected.as_str(),
             next_state: next.as_str(),
-            expected_epoch: action.execution_epoch,
-            event_id: &event_id(&action.action_id, next.as_str()),
+            expected_epoch: action.execution_epoch(),
+            event_id: &event_id(action.action_id(), next.as_str()),
             event_kind: next.as_str(),
             payload_json: "{}",
             result_digest: None,
@@ -823,18 +1463,18 @@ impl<'a> ActionJournal<'a> {
     /// Returns an evidence/state error when publication or durable observation fails.
     pub fn observe_with_receipt(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
         artifacts: &ArtifactStore,
         receipt: &[u8],
     ) -> Result<String, ToolError> {
         let artifact = artifacts.put(self.store, receipt)?;
         let digest = artifact.digest;
         self.store.transition_action_with_event(ActionTransition {
-            action_id: &action.action_id,
+            action_id: action.action_id(),
             expected_state: ActionState::Dispatched.as_str(),
             next_state: ActionState::Observed.as_str(),
-            expected_epoch: action.execution_epoch,
-            event_id: &event_id(&action.action_id, ActionState::Observed.as_str()),
+            expected_epoch: action.execution_epoch(),
+            event_id: &event_id(action.action_id(), ActionState::Observed.as_str()),
             event_kind: ActionState::Observed.as_str(),
             payload_json: "{}",
             result_digest: Some(&digest),
@@ -848,7 +1488,7 @@ impl<'a> ActionJournal<'a> {
     /// Returns an authority/state error when evidence is missing or state is stale.
     pub fn commit_with_bound_result(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
         expected: ActionState,
     ) -> Result<i64, ToolError> {
         if !matches!(expected, ActionState::Observed | ActionState::Reconciled) {
@@ -858,7 +1498,7 @@ impl<'a> ActionJournal<'a> {
         }
         let record = self
             .store
-            .action_record(&action.action_id)?
+            .action_record(action.action_id())?
             .ok_or_else(|| ToolError::Authority("missing action for commit".to_owned()))?;
         if record.state != expected.as_str() || record.result_digest.is_none() {
             return Err(ToolError::Authority(
@@ -874,7 +1514,7 @@ impl<'a> ActionJournal<'a> {
     /// Returns a transition or persistence error when durable state does not match.
     pub fn recover_dispatched_as_unknown(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
     ) -> Result<i64, ToolError> {
         self.transition(action, ActionState::Dispatched, ActionState::Unknown)
     }
@@ -886,10 +1526,10 @@ impl<'a> ActionJournal<'a> {
     /// Returns a transition or persistence error when the durable action state is stale.
     pub fn reconcile_unknown(
         &mut self,
-        action: &AuthorizedAction,
+        action: &dyn JournalActionAuthority,
         proof: Option<ReconciliationProof>,
     ) -> Result<Reconciliation, ToolError> {
-        let decision = reconcile(action.reconciliation_mode, proof);
+        let decision = reconcile(action.reconciliation_mode(), proof);
         match decision {
             Reconciliation::BlockedUnsafeUnknown => {}
             Reconciliation::SafeToRetry => {
@@ -922,17 +1562,20 @@ impl<'a> ActionJournal<'a> {
     ///
     /// # Errors
     /// Returns an authority/state error when a required current exact claim is unavailable.
-    pub fn verify_dispatch_approval(&self, action: &AuthorizedAction) -> Result<(), ToolError> {
-        if !action.approval_required {
+    pub fn verify_dispatch_approval(
+        &self,
+        action: &dyn JournalActionAuthority,
+    ) -> Result<(), ToolError> {
+        if !action.approval_required() {
             return Ok(());
         }
         let raw = self
             .store
-            .get_state(APPROVAL_CLAIM_NAMESPACE, &action.action_id)?
+            .get_state(APPROVAL_CLAIM_NAMESPACE, action.action_id())?
             .ok_or_else(|| {
                 ToolError::Authority(format!(
                     "approval-required action {} has no durable approval claim",
-                    action.action_id
+                    action.action_id()
                 ))
             })?;
         let claim: ApprovalClaim = serde_json::from_str(&raw)

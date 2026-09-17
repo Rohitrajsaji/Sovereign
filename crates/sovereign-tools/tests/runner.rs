@@ -2,17 +2,19 @@ use sovereign_evidence::ArtifactStore;
 use sovereign_policy::{
     CommandMode, CommandPolicy, CommandRisk, CommandSpec, ControllerSecretLocator,
     ExecutionIsolationBackend, FakeSecretProvider, IsolatedCommand, IsolationCapabilities,
-    IsolationRequest, MacSandboxExecBackend, PinnedExecutable, PolicyError, SecretBroker,
-    SecretInjection, SecretProviderKind, SecretRef, SecretScope,
+    IsolationRequest, MacSandboxExecBackend, PathPolicy, PinnedExecutable, PolicyError,
+    SecretBroker, SecretInjection, SecretProviderKind, SecretRef, SecretScope,
 };
 use sovereign_state::StateStore;
 use sovereign_tools::{
     ACTION_RECEIPT_SCHEMA_VERSION, APPROVAL_CLAIM_NAMESPACE, ActionJournal, ActionReceipt,
-    ActionState, ApprovalClaim, AtomicReplaceGuard, AuthorizedAction, CapabilityLayers,
-    CapabilitySet, PermissionClass, PermissionDecision, ProcessCancellationToken, ProcessRunner,
-    RawToolResult, Reconciliation, ReconciliationMode, ReconciliationPolicy, ResourceLimitKind,
-    SecretCleanupProof, ToolManifest, ToolSchemaV1, filter_authorized_tool_schemas,
-    process_group_leader_identity, reap_owned_process_group,
+    ActionState, ApprovalClaim, AtomicCreateGuard, AtomicReplaceGuard, AtomicUpdateGuard,
+    AuthorizedAction, AuthorizedRepositoryMutation, CapabilityLayers, CapabilitySet,
+    JournalActionAuthority, PermissionClass, PermissionDecision, ProcessCancellationToken,
+    ProcessRunner, RawToolResult, Reconciliation, ReconciliationMode, ReconciliationPolicy,
+    RepositoryMutationKind, RepositoryMutationPrecondition, ResourceLimitKind, SecretCleanupProof,
+    ToolManifest, ToolSchemaV1, filter_authorized_tool_schemas, process_group_leader_identity,
+    reap_owned_process_group,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -20,7 +22,7 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -171,6 +173,68 @@ fn authorize(
     journal.authorize(action, tool_manifest, &permission_decision(action))
 }
 
+fn repository_manifest() -> ToolManifest {
+    ToolManifest {
+        tool_id: "tool_repo".to_owned(),
+        version: "1".to_owned(),
+        content_digest: test_digest('4'),
+        permission_ceiling: BTreeSet::from([PermissionClass::RepositoryWrite]),
+        declared_risk_floor: CommandRisk::RepositoryMutation,
+        reconciliation_policy: ReconciliationPolicy::proof_required_local(),
+    }
+}
+
+fn repository_mutation(id: &str, path: &str) -> AuthorizedRepositoryMutation {
+    let mut action = AuthorizedRepositoryMutation {
+        action_id: id.to_owned(),
+        plan_id: "plan_m1".to_owned(),
+        plan_revision: 1,
+        task_id: "task_t04".to_owned(),
+        attempt_id: format!("attempt-{id}"),
+        tool_id: "tool_repo".to_owned(),
+        tool_version: "1".to_owned(),
+        tool_digest: test_digest('4'),
+        repository_id: "repo_fixture".to_owned(),
+        relative_path: PathBuf::from(path),
+        kind: RepositoryMutationKind::Create,
+        precondition: RepositoryMutationPrecondition::Absent,
+        expected_post_digest: test_digest('5'),
+        expected_target_mode: 0o644,
+        execution_epoch: 0,
+        policy_digest: test_digest('2'),
+        permission_decision_digest: "sha256:pending-decision".to_owned(),
+        isolation_policy_digest: test_digest('6'),
+        nonce: format!("nonce-{id}"),
+        expires_at_ms: now_ms() + 60_000,
+        action_deadline_ms: 5_000,
+        disk_write_bytes: 1_024,
+    };
+    action.permission_decision_digest = repository_permission_decision(&action).digest();
+    action
+}
+
+fn repository_permission_decision(action: &AuthorizedRepositoryMutation) -> PermissionDecision {
+    PermissionDecision::new(
+        action.plan_id.clone(),
+        action.plan_revision,
+        action.task_id.clone(),
+        test_digest('3'),
+        action.policy_digest.clone(),
+        action.tool_id.clone(),
+        action.tool_version.clone(),
+        action.tool_digest.clone(),
+        CapabilityLayers {
+            global: CapabilitySet::all(),
+            project: CapabilitySet::all(),
+            task: CapabilitySet::new([PermissionClass::RepositoryWrite]),
+            role: CapabilitySet::all(),
+            tool: CapabilitySet::new([PermissionClass::RepositoryWrite]),
+            user: CapabilitySet::all(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("repository permission decision: {error}"))
+}
+
 fn approval_claim(action: &AuthorizedAction, issued_at_ms: i64) -> ApprovalClaim {
     ApprovalClaim {
         schema_version: 1,
@@ -278,6 +342,156 @@ fn atomic_replace_does_not_mutate_external_hard_link_inode() {
             .unwrap_or_else(|error| panic!("target meta: {error}"));
         assert_ne!(outside_meta.ino(), target_meta.ino());
     }
+}
+
+#[test]
+fn atomic_create_is_no_clobber_if_target_appears_after_prepare() {
+    let temp = TestDir::under(&std::env::temp_dir(), "atomic-create-race");
+    let repo = temp.0.join("repo");
+    fs::create_dir_all(&repo).unwrap_or_else(|error| panic!("repo: {error}"));
+    let policy = PathPolicy::new(&repo, std::iter::empty::<PathBuf>())
+        .unwrap_or_else(|error| panic!("policy: {error}"));
+    let guard = AtomicCreateGuard::prepare(&policy, "created.txt")
+        .unwrap_or_else(|error| panic!("prepare create: {error}"));
+
+    fs::write(repo.join("created.txt"), b"racing-writer")
+        .unwrap_or_else(|error| panic!("race target: {error}"));
+    let Err(error) = guard.commit(b"must-not-clobber", 0o644) else {
+        panic!("appeared target must fail create commit");
+    };
+
+    assert!(error.to_string().contains("target"));
+    assert_eq!(
+        fs::read(repo.join("created.txt")).unwrap_or_default(),
+        b"racing-writer"
+    );
+}
+
+#[test]
+fn atomic_create_concurrent_publish_allows_exactly_one_writer() {
+    let temp = TestDir::under(&std::env::temp_dir(), "atomic-create-concurrent");
+    let repo = temp.0.join("repo");
+    fs::create_dir_all(&repo).unwrap_or_else(|error| panic!("repo: {error}"));
+    let policy = PathPolicy::new(&repo, std::iter::empty::<PathBuf>())
+        .unwrap_or_else(|error| panic!("policy: {error}"));
+    let left = AtomicCreateGuard::prepare(&policy, "created.txt")
+        .unwrap_or_else(|error| panic!("left prepare: {error}"));
+    let right = AtomicCreateGuard::prepare(&policy, "created.txt")
+        .unwrap_or_else(|error| panic!("right prepare: {error}"));
+    let barrier = Arc::new(Barrier::new(3));
+    let left_barrier = Arc::clone(&barrier);
+    let right_barrier = Arc::clone(&barrier);
+    let left_thread = thread::spawn(move || {
+        left_barrier.wait();
+        left.commit(b"left-writer", 0o644)
+    });
+    let right_thread = thread::spawn(move || {
+        right_barrier.wait();
+        right.commit(b"right-writer", 0o644)
+    });
+    barrier.wait();
+    let left_result = left_thread.join().unwrap_or_else(|_| panic!("left thread"));
+    let right_result = right_thread
+        .join()
+        .unwrap_or_else(|_| panic!("right thread"));
+
+    assert_ne!(left_result.is_ok(), right_result.is_ok());
+    let bytes = fs::read(repo.join("created.txt")).unwrap_or_default();
+    assert!(bytes == b"left-writer" || bytes == b"right-writer");
+}
+
+#[cfg(unix)]
+#[test]
+fn atomic_create_rejects_symlink_parent_and_target_at_prepare() {
+    let temp = TestDir::under(&std::env::temp_dir(), "atomic-create-symlinks");
+    let repo = temp.0.join("repo");
+    let real_dir = repo.join("real");
+    fs::create_dir_all(&real_dir).unwrap_or_else(|error| panic!("real dir: {error}"));
+    std::os::unix::fs::symlink(&real_dir, repo.join("linked"))
+        .unwrap_or_else(|error| panic!("parent symlink: {error}"));
+    fs::write(real_dir.join("real-target.txt"), b"existing")
+        .unwrap_or_else(|error| panic!("real target: {error}"));
+    std::os::unix::fs::symlink(
+        real_dir.join("real-target.txt"),
+        repo.join("target-link.txt"),
+    )
+    .unwrap_or_else(|error| panic!("target symlink: {error}"));
+    let policy = PathPolicy::new(&repo, std::iter::empty::<PathBuf>())
+        .unwrap_or_else(|error| panic!("policy: {error}"));
+
+    assert!(AtomicCreateGuard::prepare(&policy, "linked/new.txt").is_err());
+    assert!(AtomicCreateGuard::prepare(&policy, "target-link.txt").is_err());
+}
+
+#[test]
+fn atomic_create_respects_supplied_path_policy_and_never_invents_scope() {
+    let temp = TestDir::under(&std::env::temp_dir(), "atomic-create-policy");
+    let repo = temp.0.join("repo");
+    fs::create_dir_all(repo.join("protected")).unwrap_or_else(|error| panic!("protected: {error}"));
+    let policy = PathPolicy::new(&repo, [repo.join("protected")])
+        .unwrap_or_else(|error| panic!("policy: {error}"));
+
+    assert!(AtomicCreateGuard::prepare(&policy, "../escape.txt").is_err());
+    assert!(AtomicCreateGuard::prepare(&policy, "protected/new.txt").is_err());
+
+    let guard = AtomicCreateGuard::prepare(&policy, "allowed.txt")
+        .unwrap_or_else(|error| panic!("allowed prepare: {error}"));
+    guard
+        .commit(b"created", 0o640)
+        .unwrap_or_else(|error| panic!("allowed commit: {error}"));
+    assert_eq!(
+        fs::read(repo.join("allowed.txt")).unwrap_or_default(),
+        b"created"
+    );
+}
+
+#[test]
+fn atomic_update_rejects_stale_preimage_without_overwriting_it() {
+    let temp = TestDir::under(&std::env::temp_dir(), "atomic-update-stale");
+    let repo = temp.0.join("repo");
+    fs::create_dir_all(&repo).unwrap_or_else(|error| panic!("repo: {error}"));
+    fs::write(repo.join("target.txt"), b"authorized-preimage")
+        .unwrap_or_else(|error| panic!("target: {error}"));
+    let expected = {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}", Sha256::digest(b"authorized-preimage"))
+    };
+    let policy = PathPolicy::new(&repo, std::iter::empty::<PathBuf>())
+        .unwrap_or_else(|error| panic!("policy: {error}"));
+    let guard = AtomicUpdateGuard::prepare(&policy, "target.txt", &expected)
+        .unwrap_or_else(|error| panic!("prepare update: {error}"));
+
+    fs::write(repo.join("target.txt"), b"newer-preimage")
+        .unwrap_or_else(|error| panic!("stale target: {error}"));
+    assert!(guard.commit(b"must-not-land", 0o644).is_err());
+    assert_eq!(
+        fs::read(repo.join("target.txt")).unwrap_or_default(),
+        b"newer-preimage"
+    );
+}
+
+#[test]
+fn atomic_update_requires_exact_preimage_digest_and_preserves_replace_behavior() {
+    let temp = TestDir::under(&std::env::temp_dir(), "atomic-update-success");
+    let repo = temp.0.join("repo");
+    fs::create_dir_all(&repo).unwrap_or_else(|error| panic!("repo: {error}"));
+    fs::write(repo.join("target.txt"), b"before").unwrap_or_else(|error| panic!("target: {error}"));
+    let policy = PathPolicy::new(&repo, std::iter::empty::<PathBuf>())
+        .unwrap_or_else(|error| panic!("policy: {error}"));
+    assert!(AtomicUpdateGuard::prepare(&policy, "target.txt", "sha256:deadbeef").is_err());
+    let expected = {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}", Sha256::digest(b"before"))
+    };
+    let guard = AtomicUpdateGuard::prepare(&policy, "target.txt", &expected)
+        .unwrap_or_else(|error| panic!("prepare: {error}"));
+    guard
+        .commit(b"after", 0o644)
+        .unwrap_or_else(|error| panic!("commit: {error}"));
+    assert_eq!(
+        fs::read(repo.join("target.txt")).unwrap_or_default(),
+        b"after"
+    );
 }
 
 #[cfg(unix)]
@@ -1079,6 +1293,120 @@ fn observed_receipt_survives_restart_and_can_then_commit() {
         .unwrap_or_else(|| panic!("missing committed action"));
     assert_eq!(committed.state, "committed");
     assert_eq!(committed.result_digest.as_deref(), Some(digest.as_str()));
+}
+
+#[test]
+fn repository_mutation_authority_is_domain_separated_and_exactly_bound() {
+    let (_temp, repo, _home, _store) = fixture("repo-mutation-payload");
+    let process = shell_action(
+        "action_repo_mutation_payload",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 5_000,
+            output_bytes: 0,
+            disk_bytes: 1_024,
+            subprocesses: 0,
+        },
+        ReconciliationMode::UnsafeSideEffect,
+    );
+    let create = repository_mutation("action_repo_mutation_payload", "src/new.rs");
+    assert_ne!(process.payload_digest(), create.payload_digest());
+
+    let mut changed_post = create.clone();
+    changed_post.expected_post_digest = test_digest('7');
+    assert_ne!(create.payload_digest(), changed_post.payload_digest());
+
+    let mut update = create.clone();
+    update.kind = RepositoryMutationKind::Update;
+    update.precondition = RepositoryMutationPrecondition::ExactFile {
+        digest: test_digest('8'),
+        mode: 0o644,
+    };
+    assert_ne!(create.payload_digest(), update.payload_digest());
+    assert!(create.validate(now_ms()).is_ok());
+    assert!(update.validate(now_ms()).is_ok());
+
+    let mut invalid_update = update;
+    invalid_update.precondition = RepositoryMutationPrecondition::Absent;
+    assert!(invalid_update.validate(now_ms()).is_err());
+}
+
+#[test]
+fn repository_mutation_uses_canonical_journal_without_process_charge() {
+    let (temp, _repo, _home, mut store) = fixture("repo-mutation-journal");
+    let artifact_store = artifacts(&temp);
+    let action = repository_mutation("action_repo_mutation_journal", "src/new.rs");
+    let decision = repository_permission_decision(&action);
+    let reservation = action.reservation();
+    assert_eq!(reservation.tool_actions, 1);
+    assert_eq!(reservation.subprocesses, 0);
+    assert_eq!(reservation.output_bytes, 0);
+    assert_eq!(reservation.wall_ms, 5_000);
+    assert_eq!(reservation.disk_write_bytes, 1_024);
+    assert!(!action.approval_required());
+
+    let mut journal = ActionJournal::new(&mut store);
+    journal
+        .authorize(&action, &repository_manifest(), &decision)
+        .unwrap_or_else(|error| panic!("authorize repository mutation: {error}"));
+    journal
+        .transition(&action, ActionState::Authorized, ActionState::Dispatched)
+        .unwrap_or_else(|error| panic!("dispatch repository mutation: {error}"));
+    let receipt_digest = journal
+        .observe_with_receipt(
+            &action,
+            &artifact_store,
+            b"{\"kind\":\"repository_mutation\",\"result\":\"known\"}",
+        )
+        .unwrap_or_else(|error| panic!("observe repository mutation: {error}"));
+    journal
+        .commit_with_bound_result(&action, ActionState::Observed)
+        .unwrap_or_else(|error| panic!("commit repository mutation: {error}"));
+    let record = journal
+        .record(&action.action_id)
+        .unwrap_or_else(|error| panic!("repository mutation record: {error}"))
+        .unwrap_or_else(|| panic!("missing repository mutation record"));
+    assert_eq!(record.state, "committed");
+    assert_eq!(
+        record.result_digest.as_deref(),
+        Some(receipt_digest.as_str())
+    );
+}
+
+#[test]
+fn repository_mutation_journal_fails_closed_on_manifest_permission_epoch_and_risk_drift() {
+    let (_temp, _repo, _home, mut store) = fixture("repo-mutation-authority");
+    let action = repository_mutation("action_repo_mutation_authority", "src/new.rs");
+    let decision = repository_permission_decision(&action);
+
+    let mut wrong_permission = repository_manifest();
+    wrong_permission.permission_ceiling = BTreeSet::from([PermissionClass::ProcessExec]);
+    let mut journal = ActionJournal::new(&mut store);
+    assert!(
+        journal
+            .authorize(&action, &wrong_permission, &decision)
+            .is_err()
+    );
+    assert!(journal.record(&action.action_id).unwrap_or(None).is_none());
+
+    let mut too_high_risk = repository_manifest();
+    too_high_risk.declared_risk_floor = CommandRisk::Destructive;
+    assert!(
+        journal
+            .authorize(&action, &too_high_risk, &decision)
+            .is_err()
+    );
+
+    store
+        .advance_execution_epoch()
+        .unwrap_or_else(|error| panic!("advance epoch: {error}"));
+    let mut journal = ActionJournal::new(&mut store);
+    assert!(
+        journal
+            .authorize(&action, &repository_manifest(), &decision)
+            .is_err()
+    );
 }
 
 #[test]

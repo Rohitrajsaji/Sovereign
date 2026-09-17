@@ -564,6 +564,11 @@ fn compiler_m3_unknown_path_is_evidence_not_executable_scope() {
     let task = &result.plan().as_value()["tasks"][0];
 
     assert!(task["scope"]["files"].as_array().is_some_and(Vec::is_empty));
+    assert!(
+        task["scope"]["allow_create"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
     assert_eq!(
         task["scope"]["scope_resolution"],
         json!("bounded_discovery")
@@ -580,6 +585,212 @@ fn compiler_m3_unknown_path_is_evidence_not_executable_scope() {
                         && requirement["satisfaction"] == json!("exactly_one")
                 })
             })
+    );
+}
+
+#[test]
+fn compiler_m3_explicit_create_is_bounded_scope_with_parent_write_root() {
+    let mut proposed = task("create", "repo.app", "src/api.rs", &[]);
+    proposed["files"] = json!([]);
+    proposed["create_files"] = json!(["src/new_module.rs"]);
+    let backend = RecordingBackend::new(vec![response(json!({"tasks": [proposed]}).to_string())]);
+    let validator = validator();
+    let input = compilation_input();
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let result = compiler(&backend, &validator)
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile explicit create: {error}"));
+    let compiled = &result.plan().as_value()["tasks"][0];
+
+    assert_eq!(compiled["scope"]["files"], json!([]));
+    assert_eq!(
+        compiled["scope"]["allow_create"],
+        json!(["src/new_module.rs"])
+    );
+    assert_eq!(compiled["scope"]["scope_resolution"], json!("exact"));
+    assert_eq!(
+        compiled["permissions"],
+        json!(["read", "repo_write", "process_exec"])
+    );
+    assert!(
+        compiled["action_policy"]["write_roots"]
+            .as_array()
+            .is_some_and(|roots| roots.iter().any(|root| {
+                root["repository_id"] == json!("repo.app") && root["path"] == json!("src")
+            }))
+    );
+}
+
+#[test]
+fn compiler_m3_create_cannot_overlap_update_or_claim_known_path() {
+    let validator = validator();
+
+    let mut overlap = task("overlap", "repo.app", "src/api.rs", &[]);
+    overlap["create_files"] = json!(["src/api.rs"]);
+    let backend = RecordingBackend::new(vec![response(json!({"tasks": [overlap]}).to_string())]);
+    let mut input = compilation_input();
+    input.max_model_calls = 1;
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    assert!(matches!(
+        compiler(&backend, &validator).compile(&input, &mut budget),
+        Err(PlanCompilationError::ProposalRejected { .. })
+    ));
+
+    let mut known_create = task("known-create", "repo.app", "src/api.rs", &[]);
+    known_create["files"] = json!([]);
+    known_create["create_files"] = json!(["src/api.rs"]);
+    let backend =
+        RecordingBackend::new(vec![response(json!({"tasks": [known_create]}).to_string())]);
+    let mut input = compilation_input();
+    input.max_model_calls = 1;
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    assert!(matches!(
+        compiler(&backend, &validator).compile(&input, &mut budget),
+        Err(PlanCompilationError::InvalidInput(message))
+            if message.contains("create authority for a path already present")
+    ));
+}
+
+#[test]
+fn compiler_m3_invalid_create_path_fails_closed() {
+    let mut proposed = task("escape", "repo.app", "src/api.rs", &[]);
+    proposed["files"] = json!([]);
+    proposed["create_files"] = json!(["../escape.rs"]);
+    let backend = RecordingBackend::new(vec![response(json!({"tasks": [proposed]}).to_string())]);
+    let validator = validator();
+    let mut input = compilation_input();
+    input.max_model_calls = 1;
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    assert!(matches!(
+        compiler(&backend, &validator).compile(&input, &mut budget),
+        Err(PlanCompilationError::ProposalRejected { .. })
+    ));
+}
+
+#[test]
+fn compiler_m3_command_only_task_gets_process_exec_without_repo_write() {
+    let mut proposed = task("command-only", "repo.app", "src/api.rs", &[]);
+    proposed["files"] = json!([]);
+    proposed["acceptance"] = json!([{
+        "kind": "command",
+        "description": "Run the bounded Rust test suite.",
+        "manual_gate_id": Value::Null,
+        "command_spec": {
+            "tool_id": "tool.process",
+            "mode": "exec",
+            "program": "cargo",
+            "args": ["test", "-p", "fixture"],
+            "repository_id": "repo.app",
+            "working_dir_relative": ".",
+            "literal_env": {},
+            "secret_env": {},
+            "timeout_seconds": 180,
+            "output_limit_bytes": 1_048_576
+        },
+        "expected_exit_codes": [0]
+    }]);
+    let backend = RecordingBackend::new(vec![response(json!({"tasks": [proposed]}).to_string())]);
+    let validator = validator();
+    let mut input = compilation_input();
+    input.tools.push(pinned("tool.process"));
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let result = compiler(&backend, &validator)
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile command-only acceptance: {error}"));
+    let compiled = &result.plan().as_value()["tasks"][0];
+
+    assert_eq!(compiled["scope"]["files"], json!([]));
+    assert_eq!(compiled["scope"]["allow_create"], json!([]));
+    assert_eq!(compiled["permissions"], json!(["read", "process_exec"]));
+    assert!(
+        compiled["resource_budget"]["heavy_leases"]
+            .as_array()
+            .is_some_and(|leases| leases.iter().any(|lease| lease == "BUILD_HEAVY"))
+    );
+    assert!(
+        compiled["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["id"] == json!("tool.process")))
+    );
+}
+
+#[test]
+fn compiler_m3_command_acceptance_requires_global_build_heavy_authority() {
+    let mut proposed = task("command-heavy", "repo.app", "src/api.rs", &[]);
+    proposed["files"] = json!([]);
+    proposed["acceptance"] = json!([{
+        "kind": "command",
+        "description": "Run the bounded Rust test suite.",
+        "manual_gate_id": Value::Null,
+        "command_spec": {
+            "tool_id": "tool.process",
+            "mode": "exec",
+            "program": "cargo",
+            "args": ["test", "-p", "fixture"],
+            "repository_id": "repo.app",
+            "working_dir_relative": ".",
+            "literal_env": {},
+            "secret_env": {},
+            "timeout_seconds": 180,
+            "output_limit_bytes": 1_048_576
+        },
+        "expected_exit_codes": [0]
+    }]);
+    let backend = RecordingBackend::new(vec![response(json!({"tasks": [proposed]}).to_string())]);
+    let validator = validator();
+    let mut input = compilation_input();
+    input.tools.push(pinned("tool.process"));
+    input.policy["resources"]["heavy_leases"] = json!(["MODEL"]);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+
+    assert!(matches!(
+        compiler(&backend, &validator).compile(&input, &mut budget),
+        Err(PlanCompilationError::InvalidInput(message))
+            if message.contains("without global BUILD_HEAVY resource authority")
+    ));
+}
+
+#[test]
+fn compiler_m3_command_acceptance_emits_frozen_command_spec_and_task_tool() {
+    let mut proposed = task("command", "repo.app", "src/api.rs", &[]);
+    proposed["acceptance"] = json!([{
+        "kind": "command",
+        "description": "Run the bounded Rust test suite.",
+        "manual_gate_id": Value::Null,
+        "command_spec": {
+            "tool_id": "tool.process",
+            "mode": "exec",
+            "program": "cargo",
+            "args": ["test", "-p", "fixture"],
+            "repository_id": "repo.app",
+            "working_dir_relative": ".",
+            "literal_env": {},
+            "secret_env": {},
+            "timeout_seconds": 180,
+            "output_limit_bytes": 1_048_576
+        },
+        "expected_exit_codes": [0]
+    }]);
+    let backend = RecordingBackend::new(vec![response(json!({"tasks": [proposed]}).to_string())]);
+    let validator = validator();
+    let mut input = compilation_input();
+    input.tools.push(pinned("tool.process"));
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let result = compiler(&backend, &validator)
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile command acceptance: {error}"));
+    let compiled = &result.plan().as_value()["tasks"][0];
+    let step = &compiled["verification"]["steps"][0];
+
+    assert_eq!(step["kind"], json!("command"));
+    assert_eq!(step["command_spec"]["tool_id"], json!("tool.process"));
+    assert_eq!(step["command_spec"]["program"], json!("cargo"));
+    assert_eq!(step["command_spec"]["working_dir_relative"], json!("."));
+    assert_eq!(step["expected_exit_codes"], json!([0]));
+    assert!(
+        compiled["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["id"] == json!("tool.process")))
     );
 }
 

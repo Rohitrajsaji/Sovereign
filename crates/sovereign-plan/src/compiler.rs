@@ -1586,6 +1586,8 @@ struct M3TaskProposal {
     objective: String,
     rationale: String,
     files: Vec<String>,
+    #[serde(default)]
+    create_files: Vec<String>,
     symbols: Vec<String>,
     dependencies: Vec<String>,
     evidence_needs: Vec<M3EvidenceNeedProposal>,
@@ -1645,6 +1647,7 @@ struct M3EvidenceNeedProposal {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum M3AcceptanceKind {
+    Command,
     Diff,
     Artifact,
     Manual,
@@ -1656,6 +1659,27 @@ struct M3AcceptanceProposal {
     kind: M3AcceptanceKind,
     description: String,
     manual_gate_id: Option<String>,
+    #[serde(default)]
+    command_spec: Option<M3CommandSpecProposal>,
+    #[serde(default)]
+    expected_exit_codes: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct M3CommandSpecProposal {
+    tool_id: String,
+    mode: String,
+    program: String,
+    args: Vec<String>,
+    repository_id: String,
+    working_dir_relative: String,
+    #[serde(default)]
+    literal_env: BTreeMap<String, String>,
+    #[serde(default)]
+    secret_env: BTreeMap<String, String>,
+    timeout_seconds: u64,
+    output_limit_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1664,6 +1688,50 @@ struct M3NormalizedIds {
     task_id: String,
     artifact_id: String,
     primary_criterion_id: String,
+}
+
+fn m3_command_proposal_schema() -> Value {
+    json!({
+        "type": ["object", "null"],
+        "additionalProperties": false,
+        "required": [
+            "tool_id", "mode", "program", "args", "repository_id", "working_dir_relative",
+            "literal_env", "secret_env", "timeout_seconds", "output_limit_bytes"
+        ],
+        "properties": {
+            "tool_id": {"type": "string", "minLength": 1, "maxLength": 127},
+            "mode": {"enum": ["exec", "shell_explicit"]},
+            "program": {"type": "string", "minLength": 1, "maxLength": 512},
+            "args": {"type": "array", "maxItems": 64, "items": {"type": "string", "maxLength": 1024}},
+            "repository_id": {"type": "string", "minLength": 3, "maxLength": 127},
+            "working_dir_relative": {"type": "string", "minLength": 1, "maxLength": 512},
+            "literal_env": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": "string", "maxLength": 4096}},
+            "secret_env": {"type": "object", "maxProperties": 16, "additionalProperties": {"type": "string", "minLength": 3, "maxLength": 127}},
+            "timeout_seconds": {"type": "integer", "minimum": 1},
+            "output_limit_bytes": {"type": "integer", "minimum": 1024}
+        }
+    })
+}
+
+fn m3_acceptance_proposal_schema() -> Value {
+    let command_schema = m3_command_proposal_schema();
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "maxItems": MAX_M3_ACCEPTANCE,
+        "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind", "description", "manual_gate_id"],
+            "properties": {
+                "kind": {"enum": ["command", "diff", "artifact", "manual"]},
+                "description": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "manual_gate_id": {"type": ["string", "null"], "maxLength": 127},
+                "command_spec": command_schema,
+                "expected_exit_codes": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "integer", "minimum": 0, "maximum": 255}}
+            }
+        }
+    })
 }
 
 fn m3_proposal_schema(max_tasks: usize) -> Value {
@@ -1682,6 +1750,7 @@ fn m3_proposal_schema(max_tasks: usize) -> Value {
             }
         }
     });
+    let acceptance_schema = m3_acceptance_proposal_schema();
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -1706,6 +1775,7 @@ fn m3_proposal_schema(max_tasks: usize) -> Value {
                         "objective": {"type": "string", "minLength": 1, "maxLength": MAX_PROPOSAL_TEXT_BYTES},
                         "rationale": {"type": "string", "minLength": 1, "maxLength": MAX_PROPOSAL_TEXT_BYTES},
                         "files": {"type": "array", "maxItems": MAX_PROPOSAL_FILES, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 512}},
+                        "create_files": {"type": "array", "maxItems": MAX_PROPOSAL_FILES, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 512}},
                         "symbols": {"type": "array", "maxItems": MAX_PROPOSAL_SYMBOLS, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 256}},
                         "dependencies": {"type": "array", "maxItems": max_tasks.saturating_sub(1), "uniqueItems": true, "items": {"type": "string", "minLength": 3, "maxLength": 127}},
                         "evidence_needs": {
@@ -1724,21 +1794,7 @@ fn m3_proposal_schema(max_tasks: usize) -> Value {
                         },
                         "assumptions": assumption_schema,
                         "expected_change": {"type": "string", "minLength": 1, "maxLength": MAX_PROPOSAL_TEXT_BYTES},
-                        "acceptance": {
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": MAX_M3_ACCEPTANCE,
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "required": ["kind", "description", "manual_gate_id"],
-                                "properties": {
-                                    "kind": {"enum": ["diff", "artifact", "manual"]},
-                                    "description": {"type": "string", "minLength": 1, "maxLength": 1024},
-                                    "manual_gate_id": {"type": ["string", "null"], "maxLength": 127}
-                                }
-                            }
-                        }
+                        "acceptance": acceptance_schema
                     }
                 }
             }
@@ -1809,12 +1865,21 @@ fn parse_and_bound_m3_proposal(
             || task.rationale.len() > MAX_PROPOSAL_TEXT_BYTES
             || task.expected_change.len() > MAX_PROPOSAL_TEXT_BYTES
             || task.files.len() > MAX_PROPOSAL_FILES
+            || task.create_files.len() > MAX_PROPOSAL_FILES
             || task.symbols.len() > MAX_PROPOSAL_SYMBOLS
             || task.evidence_needs.len() > MAX_M3_EVIDENCE_NEEDS
             || task.assumptions.len() > MAX_M3_ASSUMPTIONS
             || task.acceptance.is_empty()
             || task.acceptance.len() > MAX_M3_ACCEPTANCE
             || task.files.iter().any(|path| !valid_relative_path(path))
+            || task
+                .create_files
+                .iter()
+                .any(|path| !valid_relative_path(path))
+            || task
+                .files
+                .iter()
+                .any(|path| task.create_files.contains(path))
             || task.dependencies.len() >= cap
             || !local_ids.insert(task.local_id.clone())
         {
@@ -1855,20 +1920,57 @@ fn parse_and_bound_m3_proposal(
                 return Err("M3 acceptance description exceeds deterministic bounds".to_owned());
             }
             match acceptance.kind {
+                M3AcceptanceKind::Command => {
+                    if acceptance.manual_gate_id.is_some()
+                        || acceptance.expected_exit_codes.is_empty()
+                        || acceptance.command_spec.as_ref().is_none_or(|command| {
+                            command.repository_id != task.repository_id
+                                || !matches!(command.mode.as_str(), "exec" | "shell_explicit")
+                                || !valid_working_dir_relative(&command.working_dir_relative)
+                                || command.program.trim().is_empty()
+                                || command.program.len() > 512
+                                || command.args.len() > 64
+                                || command.args.iter().any(|arg| arg.len() > 1_024)
+                                || command.literal_env.len() > 16
+                                || command
+                                    .literal_env
+                                    .iter()
+                                    .any(|(name, value)| name.is_empty() || value.len() > 4_096)
+                                || command.secret_env.len() > 16
+                                || command.secret_env.iter().any(|(name, secret_ref)| {
+                                    name.is_empty() || !valid_plan_id(secret_ref)
+                                })
+                                || command.timeout_seconds == 0
+                                || command.output_limit_bytes < 1_024
+                        })
+                    {
+                        return Err(
+                            "command acceptance requires one bounded typed command for the task repository"
+                                .to_owned(),
+                        );
+                    }
+                }
                 M3AcceptanceKind::Manual => {
                     let Some(gate_id) = acceptance.manual_gate_id.as_deref() else {
                         return Err("manual acceptance requires a preauthorized gate id".to_owned());
                     };
-                    if !manual_gates.contains(gate_id) {
+                    if !manual_gates.contains(gate_id)
+                        || acceptance.command_spec.is_some()
+                        || !acceptance.expected_exit_codes.is_empty()
+                    {
                         return Err(format!(
-                            "manual acceptance gate {gate_id} was not preauthorized by the caller"
+                            "manual acceptance gate {gate_id} was not preauthorized or carried command fields"
                         ));
                     }
                 }
                 M3AcceptanceKind::Diff | M3AcceptanceKind::Artifact => {
-                    if acceptance.manual_gate_id.is_some() {
+                    if acceptance.manual_gate_id.is_some()
+                        || acceptance.command_spec.is_some()
+                        || !acceptance.expected_exit_codes.is_empty()
+                    {
                         return Err(
-                            "non-manual acceptance cannot carry a manual gate id".to_owned()
+                            "non-command machine acceptance cannot carry command or manual-gate fields"
+                                .to_owned(),
                         );
                     }
                 }
@@ -2303,6 +2405,16 @@ fn build_m3_task(
         .filter(|path| known_paths.contains(path.as_str()))
         .cloned()
         .collect::<Vec<_>>();
+    let create_files = proposal.create_files.clone();
+    if create_files
+        .iter()
+        .any(|path| known_paths.contains(path.as_str()))
+    {
+        return Err(PlanCompilationError::InvalidInput(format!(
+            "M3 task {} proposed create authority for a path already present in bounded repository evidence",
+            proposal.local_id
+        )));
+    }
     let unknown_files = proposal
         .files
         .iter()
@@ -2310,23 +2422,48 @@ fn build_m3_task(
         .cloned()
         .collect::<Vec<_>>();
     let global_capabilities = string_set(input.policy.pointer("/capability_ceiling"));
-    let write_capable = !known_files.is_empty() && global_capabilities.contains("repo_write");
-    let discovery_only = known_files.is_empty() && !unknown_files.is_empty();
+    if !create_files.is_empty() && !global_capabilities.contains("repo_write") {
+        return Err(PlanCompilationError::InvalidInput(format!(
+            "M3 task {} requested create authority outside the global repo_write ceiling",
+            proposal.local_id
+        )));
+    }
+    let has_command_acceptance = proposal
+        .acceptance
+        .iter()
+        .any(|acceptance| matches!(acceptance.kind, M3AcceptanceKind::Command));
+    if has_command_acceptance && !global_capabilities.contains("process_exec") {
+        return Err(PlanCompilationError::InvalidInput(format!(
+            "M3 task {} requested command verification outside the global process_exec ceiling",
+            proposal.local_id
+        )));
+    }
+    if has_command_acceptance
+        && !string_set(input.policy.pointer("/resources/heavy_leases"))
+            .contains(PlanHeavyLeaseClass::BuildHeavy.as_plan_ir_str())
+    {
+        return Err(PlanCompilationError::InvalidInput(format!(
+            "M3 task {} requested command verification without global BUILD_HEAVY resource authority",
+            proposal.local_id
+        )));
+    }
+    let write_capable = (!known_files.is_empty() || !create_files.is_empty())
+        && global_capabilities.contains("repo_write");
+    let discovery_only =
+        known_files.is_empty() && create_files.is_empty() && !unknown_files.is_empty();
     let permissions = if write_capable {
         json!(["read", "repo_write", "process_exec"])
+    } else if has_command_acceptance {
+        json!(["read", "process_exec"])
     } else {
         json!(["read"])
     };
-    let tool_id = if write_capable {
+    let base_tool_id = if write_capable {
         &input.write_tool_id
     } else {
         &input.read_tool_id
     };
-    let tool = capability_by_id(&input.tools, tool_id).ok_or_else(|| {
-        PlanCompilationError::InvalidInput(format!(
-            "Controller-supplied tool id {tool_id} no longer resolves"
-        ))
-    })?;
+    let mut task_tool_ids = BTreeSet::from([base_tool_id.as_str()]);
 
     let mut evidence_requirements = Vec::new();
     let task_fragment = sanitize_id_fragment(&ids.task_id);
@@ -2390,6 +2527,38 @@ fn build_m3_task(
         };
         let step_id = format!("verify.{task_fragment}.{:02}", index + 1);
         let (kind, evidence_type, verification_step) = match acceptance.kind {
+            M3AcceptanceKind::Command => {
+                let command = acceptance.command_spec.as_ref().ok_or_else(|| {
+                    PlanCompilationError::InvalidInput(
+                        "command acceptance lost its typed command_spec".to_owned(),
+                    )
+                })?;
+                task_tool_ids.insert(command.tool_id.as_str());
+                (
+                    "command",
+                    "test_result",
+                    json!({
+                        "step_id": step_id,
+                        "criterion_ids": [criterion_id],
+                        "kind": "command",
+                        "evidence_type": "test_result",
+                        "command_spec": {
+                            "tool_id": command.tool_id,
+                            "mode": command.mode,
+                            "program": command.program,
+                            "args": command.args,
+                            "repository_id": command.repository_id,
+                            "working_dir_relative": command.working_dir_relative,
+                            "literal_env": command.literal_env,
+                            "secret_env": command.secret_env,
+                            "stdin_artifact_id": Value::Null,
+                            "timeout_seconds": command.timeout_seconds,
+                            "output_limit_bytes": command.output_limit_bytes
+                        },
+                        "expected_exit_codes": acceptance.expected_exit_codes
+                    }),
+                )
+            }
             M3AcceptanceKind::Diff => (
                 "diff",
                 "diff_result",
@@ -2432,7 +2601,7 @@ fn build_m3_task(
             }
         };
         let evidence_freshness = match acceptance.kind {
-            M3AcceptanceKind::Manual => "current_attempt",
+            M3AcceptanceKind::Command | M3AcceptanceKind::Manual => "current_attempt",
             M3AcceptanceKind::Diff | M3AcceptanceKind::Artifact => {
                 "carry_forward_if_inputs_unchanged"
             }
@@ -2561,11 +2730,24 @@ fn build_m3_task(
         "bounded_discovery"
     };
     let levels = context_levels_for_depth(extension.depth.mode);
+    let mut mutable_files = known_files.clone();
+    mutable_files.extend(create_files.iter().cloned());
     let write_roots = if write_capable {
-        write_roots(&known_files, &repository.repository_id)
+        write_roots(&mutable_files, &repository.repository_id)
     } else {
         Vec::new()
     };
+    let tools = task_tool_ids
+        .into_iter()
+        .map(|tool_id| {
+            capability_by_id(&input.tools, tool_id).cloned().ok_or_else(|| {
+                PlanCompilationError::InvalidInput(format!(
+                    "M3 task {} references tool id {tool_id} outside Controller-supplied tool capabilities",
+                    proposal.local_id
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, PlanCompilationError>>()?;
 
     let task = json!({
         "task_id": ids.task_id,
@@ -2579,14 +2761,14 @@ fn build_m3_task(
             "repositories": [repository.repository_id],
             "files": known_files,
             "symbols": proposal.symbols,
-            "allow_create": [],
+            "allow_create": create_files,
             "allow_delete": [],
             "scope_resolution": scope_resolution
         },
         "evidence_requirements": evidence_requirements,
         "role": input.role,
         "skills": input.skills,
-        "tools": [tool],
+        "tools": tools,
         "permissions": permissions,
         "action_policy": {
             "write_roots": write_roots,
@@ -3608,6 +3790,15 @@ fn valid_relative_path(value: &str) -> bool {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn valid_working_dir_relative(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.is_empty()
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
 }
 
 fn string_set(value: Option<&Value>) -> BTreeSet<&str> {

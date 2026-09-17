@@ -283,12 +283,121 @@ fn validate_semantics(
             diagnostics,
         );
         validate_evidence_and_acceptance(task, &path, diagnostics);
+        validate_command_specs(task, &path, document, diagnostics);
         validate_permissions(task, &path, &global_permissions, document, diagnostics);
         validate_resources(task, &path, global_resources, environment, diagnostics);
         validate_deadlines(task, &path, diagnostics);
         validate_isolation(task, &path, environment, diagnostics);
         validate_rollback(task, &path, diagnostics);
         validate_failure_routing(task, &path, diagnostics);
+    }
+}
+
+fn validate_command_specs(
+    task: &Value,
+    path: &str,
+    document: &Value,
+    diagnostics: &mut Vec<ValidationDiagnostic>,
+) {
+    let task_tools = task
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| tool.get("id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    let scoped_repositories = strings_at(task, &["scope", "repositories"])
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let task_permissions = strings_at(task, &["permissions"])
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let allowed_literal_env = strings_at(document, &["policy", "process", "allowed_env_names"])
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let shell_mode = document
+        .pointer("/policy/process/shell_mode")
+        .and_then(Value::as_str);
+    let secret_refs = task
+        .pointer("/action_policy/secret_refs")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|secret| secret.get("secret_ref_id").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+
+    for (index, step) in task
+        .pointer("/verification/steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let Some(command) = step.get("command_spec") else {
+            continue;
+        };
+        let command_path = format!("{path}/verification/steps/{index}/command_spec");
+        if !task_permissions.contains("process_exec") {
+            diagnostics.push(ValidationDiagnostic::new(
+                DiagnosticCode::PermissionPolicy,
+                &command_path,
+                "command verification requires process_exec permission",
+            ));
+        }
+        if let Some(tool_id) = command.get("tool_id").and_then(Value::as_str)
+            && !task_tools.contains(tool_id)
+        {
+            diagnostics.push(ValidationDiagnostic::new(
+                DiagnosticCode::MissingReference,
+                format!("{command_path}/tool_id"),
+                format!("command tool {tool_id} does not resolve to one of task.tools"),
+            ));
+        }
+        if let Some(repository_id) = command.get("repository_id").and_then(Value::as_str)
+            && !scoped_repositories.contains(repository_id)
+        {
+            diagnostics.push(ValidationDiagnostic::new(
+                DiagnosticCode::MissingReference,
+                format!("{command_path}/repository_id"),
+                format!("command repository {repository_id} is outside task scope"),
+            ));
+        }
+        if command.get("mode").and_then(Value::as_str) == Some("shell_explicit")
+            && shell_mode != Some("explicit_task_only")
+        {
+            diagnostics.push(ValidationDiagnostic::new(
+                DiagnosticCode::PermissionPolicy,
+                format!("{command_path}/mode"),
+                "shell_explicit command is forbidden by the global process shell policy",
+            ));
+        }
+        if let Some(literal_env) = command.get("literal_env").and_then(Value::as_object) {
+            for name in literal_env.keys() {
+                if !allowed_literal_env.contains(name.as_str()) {
+                    diagnostics.push(ValidationDiagnostic::new(
+                        DiagnosticCode::PermissionPolicy,
+                        format!("{command_path}/literal_env/{name}"),
+                        format!(
+                            "literal environment name {name} is outside the global process policy"
+                        ),
+                    ));
+                }
+            }
+        }
+        if let Some(secret_env) = command.get("secret_env").and_then(Value::as_object) {
+            for (name, secret_ref) in secret_env {
+                if secret_ref
+                    .as_str()
+                    .is_none_or(|secret_ref| !secret_refs.contains(secret_ref))
+                {
+                    diagnostics.push(ValidationDiagnostic::new(
+                        DiagnosticCode::MissingReference,
+                        format!("{command_path}/secret_env/{name}"),
+                        "command secret environment reference does not resolve to task action_policy.secret_refs",
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -877,6 +986,24 @@ fn validate_resources(
     let Some(task_resources) = task.get("resource_budget") else {
         return;
     };
+    let has_command_verification = task
+        .pointer("/verification/steps")
+        .and_then(Value::as_array)
+        .is_some_and(|steps| {
+            steps
+                .iter()
+                .any(|step| step.get("kind").and_then(Value::as_str) == Some("command"))
+        });
+    let task_heavy_leases = strings_at(task_resources, &["heavy_leases"])
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if has_command_verification && !task_heavy_leases.contains("BUILD_HEAVY") {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::ResourcePolicy,
+            format!("{path}/resource_budget/heavy_leases"),
+            "command verification requires BUILD_HEAVY task resource authority",
+        ));
+    }
     let scalar_fields = [
         "max_wall_seconds",
         "max_model_calls",

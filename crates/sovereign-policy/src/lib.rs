@@ -2923,6 +2923,48 @@ impl CommandPolicy {
         pin.verify()?;
         Ok(pin)
     }
+
+    /// Resolves one basename-only program name against the configured executable pins.
+    ///
+    /// Resolution never consults ambient `PATH`: exactly one configured pin must have the
+    /// requested file name. The selected executable is re-hashed before it is returned so a pin
+    /// whose bytes changed after [`Self::new`] fails closed.
+    ///
+    /// # Errors
+    /// Returns a denial for path-like input, a missing or ambiguous configured basename, or a pin
+    /// whose current executable digest/version provenance no longer verifies.
+    pub fn resolve_pinned_program(&self, program: &str) -> Result<&PinnedExecutable, PolicyError> {
+        if program.is_empty()
+            || program == "."
+            || program == ".."
+            || program.contains('/')
+            || program.contains('\\')
+            || program.contains(':')
+        {
+            return Err(PolicyError::Denied(
+                "program resolution requires a basename-only executable name".to_owned(),
+            ));
+        }
+
+        let mut matches = self.pinned.values().filter(|pin| {
+            pin.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == program)
+        });
+        let pin = matches.next().ok_or_else(|| {
+            PolicyError::Denied(format!(
+                "program is not configured as a pinned executable: {program}"
+            ))
+        })?;
+        if matches.next().is_some() {
+            return Err(PolicyError::Denied(format!(
+                "program basename resolves to multiple configured executable pins: {program}"
+            )));
+        }
+        pin.verify()?;
+        Ok(pin)
+    }
 }
 
 fn command_requests_keychain_access(executable: &Path, args: &[String]) -> bool {
