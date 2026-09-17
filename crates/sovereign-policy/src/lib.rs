@@ -22,12 +22,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter, Write as _};
 use std::fs::{self, OpenOptions};
-use std::io::Write as IoWrite;
+use std::io::{Read as IoRead, Write as IoWrite};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -2576,6 +2578,33 @@ impl NetworkPolicy {
         Ok(())
     }
 
+    /// Performs the governed destination check before any DNS or network I/O occurs.
+    ///
+    /// The returned destination is canonical and must be used for DNS and later resolved/peer
+    /// authorization so allowlist comparison and resolution use the same hostname identity.
+    ///
+    /// # Errors
+    /// Returns a denial for malformed/unsafe destinations or destinations absent from the active
+    /// task allowlist.
+    pub fn authorize_destination(
+        &self,
+        destination: &NetworkDestination,
+    ) -> Result<NetworkDestination, PolicyError> {
+        let key = normalize_destination(&destination.scheme, &destination.host, destination.port)?;
+        reject_unsafe_host_literal(&key.1)?;
+        if !self.allowed.contains(&key) {
+            return Err(PolicyError::Denied(format!(
+                "network destination not task-authorized: {}://{}:{}",
+                destination.scheme, destination.host, destination.port
+            )));
+        }
+        Ok(NetworkDestination {
+            scheme: key.0,
+            host: key.1,
+            port: key.2,
+        })
+    }
+
     /// Authorizes one destination together with caller-supplied DNS resolution results.
     ///
     /// This method performs no DNS or network I/O. The caller must supply the complete set it
@@ -2588,14 +2617,8 @@ impl NetworkPolicy {
         destination: &NetworkDestination,
         resolved_ips: impl IntoIterator<Item = IpAddr>,
     ) -> Result<NetworkAuthorization, PolicyError> {
-        let key = normalize_destination(&destination.scheme, &destination.host, destination.port)?;
-        reject_unsafe_host_literal(&key.1)?;
-        if !self.allowed.contains(&key) {
-            return Err(PolicyError::Denied(format!(
-                "network destination not task-authorized: {}://{}:{}",
-                destination.scheme, destination.host, destination.port
-            )));
-        }
+        let destination = self.authorize_destination(destination)?;
+        let key = (destination.scheme, destination.host, destination.port);
         let resolved_ips: BTreeSet<_> = resolved_ips.into_iter().collect();
         if resolved_ips.is_empty() {
             return Err(PolicyError::Denied(
@@ -2669,16 +2692,123 @@ fn normalize_destination(
     {
         return Err(PolicyError::Denied("invalid network scheme".to_owned()));
     }
-    if !host.is_ascii() {
+    let host = canonicalize_network_host(host)?;
+    Ok((scheme.to_ascii_lowercase(), host, port))
+}
+
+fn canonicalize_network_host(host: &str) -> Result<String, PolicyError> {
+    if host.is_empty() {
+        return Err(PolicyError::Denied("invalid network host".to_owned()));
+    }
+
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(address) = literal.parse::<IpAddr>() {
+        return Ok(match address {
+            IpAddr::V4(address) => address.to_string(),
+            IpAddr::V6(address) if host.starts_with('[') => format!("[{address}]"),
+            IpAddr::V6(address) => address.to_string(),
+        });
+    }
+    if host.contains(['[', ']', ':']) {
+        return Err(PolicyError::Denied("invalid network host".to_owned()));
+    }
+    if host.len() > 4_096 {
         return Err(PolicyError::Denied(
-            "non-ASCII host requires normalized IDNA form before policy".to_owned(),
+            "network host exceeds IDNA input bound".to_owned(),
         ));
     }
-    Ok((
-        scheme.to_ascii_lowercase(),
-        host.trim_end_matches('.').to_ascii_lowercase(),
-        port,
-    ))
+
+    let canonical = canonicalize_idna_uts46(host)?;
+    let canonical = canonical.strip_suffix('.').unwrap_or(&canonical).to_owned();
+    if canonical.len() > 253 {
+        return Err(PolicyError::Denied(
+            "network host exceeds DNS name bound".to_owned(),
+        ));
+    }
+    for label in canonical.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(PolicyError::Denied("invalid DNS label".to_owned()));
+        }
+    }
+    Ok(canonical)
+}
+
+fn canonicalize_idna_uts46(host: &str) -> Result<String, PolicyError> {
+    const MAX_OUTPUT_BYTES: usize = 253;
+    const HELPER_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let helper = Path::new(env!("SOVEREIGN_IDNA_UTS46_HELPER"));
+    if !helper.is_absolute() || !helper.is_file() {
+        return Err(PolicyError::Denied(
+            "standards IDNA canonicalizer is unavailable on this target".to_owned(),
+        ));
+    }
+
+    let deadline = Instant::now() + HELPER_TIMEOUT;
+    let mut child = Command::new(helper)
+        .env_clear()
+        .arg(host)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| {
+            PolicyError::Denied(format!(
+                "failed to launch standards IDNA canonicalizer: {error}"
+            ))
+        })?;
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(PolicyError::Denied(
+                    "standards IDNA canonicalizer timed out".to_owned(),
+                ));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(1)),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(PolicyError::Io(error));
+            }
+        }
+    };
+
+    let mut stdout = child.stdout.take().ok_or_else(|| {
+        PolicyError::Denied("standards IDNA canonicalizer stdout was unavailable".to_owned())
+    })?;
+    let mut output = Vec::with_capacity(MAX_OUTPUT_BYTES + 1);
+    stdout
+        .by_ref()
+        .take(u64::try_from(MAX_OUTPUT_BYTES + 1).map_err(|_| {
+            PolicyError::Denied("IDNA output bound is not representable".to_owned())
+        })?)
+        .read_to_end(&mut output)?;
+    if !status.success() {
+        return Err(PolicyError::Denied(
+            "invalid hostname under UTS #46/IDNA rules".to_owned(),
+        ));
+    }
+    if output.is_empty() || output.len() > MAX_OUTPUT_BYTES {
+        return Err(PolicyError::Denied(
+            "standards IDNA canonicalizer exceeded DNS output bound".to_owned(),
+        ));
+    }
+    let canonical = String::from_utf8(output).map_err(|_| {
+        PolicyError::Denied("IDNA canonicalizer returned non-ASCII output".to_owned())
+    })?;
+    if !canonical.is_ascii() {
+        return Err(PolicyError::Denied(
+            "IDNA canonicalizer returned non-ASCII output".to_owned(),
+        ));
+    }
+    Ok(canonical.to_ascii_lowercase())
 }
 
 fn reject_unsafe_host_literal(host: &str) -> Result<(), PolicyError> {

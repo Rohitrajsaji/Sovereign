@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "task_id": "M7-T02",
+  "title": "Add Controller-governed HTTP plus optional Scrapling parsing/acquisition adapter",
+  "status": "completed",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "3054d40fcba54f71e30a6aeadb2a8c65a49a529f",
+  "completed_at": "2026-09-17T18:36:04Z",
+  "verified_at": "2026-09-17T18:36:04Z",
+  "dependencies": [
+    "M6-T02",
+    "M6-T01"
+  ],
+  "interfaces": [
+    "WebAcquireAdapter"
+  ],
+  "objective": "Acquire allowed public/static content only after Sovereign-owned Controller network authorization, with bounded manual redirects, DNS and connected-peer validation, raw-response evidence, and an optional static Scrapling base parser that adds no browser or network authority.",
+  "frozen_tree": {
+    "head": "3054d40fcba54f71e30a6aeadb2a8c65a49a529f",
+    "dirty_path_count": 7,
+    "git_status": [
+      "M crates/sovereign-policy/src/lib.rs",
+      "M crates/sovereign-policy/tests/security.rs",
+      "M crates/sovereign-tools/src/lib.rs",
+      "?? adapters/scrapling/parser_worker.py",
+      "?? crates/sovereign-eval/tests/web_acquire.rs",
+      "?? crates/sovereign-policy/build.rs",
+      "?? crates/sovereign-policy/idna_uts46_helper.c"
+    ],
+    "git_diff_check": "passed"
+  },
+  "source_hashes": {
+    "crates/sovereign-policy/src/lib.rs": "sha256:4441c2e39d83a600a53d60a8195d1dd0d1e72a2cb72d14d142d1aaf5fa15eeab",
+    "crates/sovereign-policy/tests/security.rs": "sha256:636a32989b0b8059a00da4e5056efb353c4b5637a749b361c9df9fe0b665f74d",
+    "crates/sovereign-policy/build.rs": "sha256:51b889a419e6642b25e87bcd888e310826f94a584825da6b64b038133fca049e",
+    "crates/sovereign-policy/idna_uts46_helper.c": "sha256:a77e06e86f296fafb34db5282a1d6ffb247629d0183c5d9009d8bbf8e5deb730",
+    "crates/sovereign-tools/src/lib.rs": "sha256:90afce7a1977f282b80f941a825a2a90f5ab7883a148367195f6011d5d5f4de1",
+    "crates/sovereign-eval/tests/web_acquire.rs": "sha256:ea08ffae51b1840b66f69f53e4e77937e347f6686f935405127a6fab69db33e5",
+    "adapters/scrapling/parser_worker.py": "sha256:b1d26817d7c6b1fc05b43647a156ed126f9c167fbd0f045b15ce1638101e7f14"
+  },
+  "network_authority_contract": {
+    "controller_network_policy_is_sole_network_authority": true,
+    "allowlist_authorization_precedes_dns": true,
+    "offline_denial_occurs_before_dns_or_transport": true,
+    "offline_denial_resolver_calls": 0,
+    "offline_denial_transport_calls": 0,
+    "complete_dns_set_validated_before_transport": true,
+    "private_loopback_link_local_metadata_destinations_denied": true,
+    "connected_peer_must_match_authorized_dns_set": true,
+    "redirects_are_manual_and_reauthorized": true,
+    "blocked_redirect_resolver_calls": 1,
+    "blocked_redirect_transport_calls": 1,
+    "ambient_proxy_environment_cleared": true,
+    "curl_automatic_redirects_disabled": true,
+    "transport_socket_is_pinned_to_authorized_ip": true,
+    "raw_response_headers_sha256_evidence": true,
+    "raw_response_body_sha256_evidence": true,
+    "response_byte_bound_enforced": true,
+    "network_authority_added_by_scrapling": false
+  },
+  "idna_contract": {
+    "implementation": "macOS ICU UTS #46 helper compiled through sovereign-policy build.rs",
+    "unsafe_rust_added": false,
+    "network_package_install_required": false,
+    "nfc_nfd_equivalence_verified": true,
+    "unicode_dot_mapping_verified": true,
+    "uts46_fullwidth_mapping_verified": true,
+    "valid_alabel_roundtrip_verified": true,
+    "malformed_alabel_denied": true,
+    "dns_name_and_label_bounds_enforced": true,
+    "helper_input_bound_enforced": true,
+    "helper_output_bound_enforced": true,
+    "helper_deadline_seconds": 2,
+    "helper_timeout_kills_and_reaps": true
+  },
+  "scrapling_contract": {
+    "vendored_path": "research/tools/Scrapling",
+    "version": "0.4.15",
+    "validated_python_runtime": "/Users/rohitrajsaji/Desktop/Ravonci/.venv/bin/python",
+    "virtualenv_interpreter_symlink_canonicalized": false,
+    "parser_import": "scrapling.parser.Selector",
+    "fetcher_loaded": false,
+    "browser_extras_loaded": false,
+    "package_install_performed": false,
+    "worker_environment_cleared": true,
+    "python_user_site_disabled": true,
+    "input_bound_bytes": 8388608,
+    "stdout_bound_bytes": 262144,
+    "stderr_bound_bytes": 262144,
+    "deadline_covers_stdin_backpressure": true,
+    "stdout_overflow_kills_and_reaps": true,
+    "stderr_overflow_kills_and_reaps": true,
+    "timeout_kills_and_reaps": true,
+    "worker_crash_fails_closed": true
+  },
+  "frozen_tests": {
+    "offline_denied": true,
+    "allowed_host_controller_http_read": true,
+    "idna_dns_connected_peer_rebinding_denied": true,
+    "redirect_reauthorization": true,
+    "ambient_proxy_bypass_denied": true,
+    "scrapling_base_parser_without_browser_extras": true,
+    "optional_fetcher_dependencies_not_required": true,
+    "adapter_crash_fail_closed": true,
+    "raw_response_evidence": true,
+    "parser_stdin_stdout_stderr_and_reap_bounds": true
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test --workspace --all-targets --offline",
+      "result": "passed",
+      "details": [
+        "sovereign-policy security 12/12 passed",
+        "sovereign-eval web_acquire 8/8 passed",
+        "all non-ignored workspace tests passed",
+        "compiler_real_local_8k_smoke remained intentionally ignored for mandatory final-tree qualification",
+        "m1_real_qwen_implementation_repair_restart_qualification remained intentionally ignored for mandatory final-tree qualification"
+      ]
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "env -i PYTHONPATH=/Users/rohitrajsaji/Desktop/Sovereign/research/tools/Scrapling PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1 /Users/rohitrajsaji/Desktop/Ravonci/.venv/bin/python -s -c <base-parser dependency/import probe>",
+      "result": "passed",
+      "detail": "vendored Scrapling reported version 0.4.15 and scrapling.parser.Selector constructed successfully"
+    }
+  ],
+  "independent_audit": {
+    "worker": "worker-67",
+    "mode": "fresh exact-tree read-only closure audit",
+    "result": "CLOSABLE",
+    "verdict": "M7-T02 frozen task: CLOSABLE",
+    "blockers": [],
+    "exact_tree_reverified": true,
+    "independent_focused_validation": [
+      "sovereign-policy security 12/12 passed",
+      "sovereign-eval web_acquire 8/8 passed"
+    ]
+  },
+  "state_authority": {
+    "controller_sole_execution_and_lifecycle_authority": true,
+    "network_policy_remains_single_network_authority": true,
+    "state_store_remains_single_authoritative_execution_database": true,
+    "second_authority_database_created": false
+  },
+  "intentional_final_release_tests_deferred": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false,
+    "network_package_install": false
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  }
+}

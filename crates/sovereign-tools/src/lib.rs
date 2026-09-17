@@ -12,8 +12,8 @@ pub use sovereign_policy::{
 };
 use sovereign_policy::{
     CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, IsolatedCommand,
-    IsolationRequest, PathAuthorizationTicket, PathCommitMode, PathPolicy, PolicyError,
-    SecretInjection, SecretLease, SecretScope, sanitized_environment,
+    IsolationRequest, NetworkDestination, NetworkPolicy, PathAuthorizationTicket, PathCommitMode,
+    PathPolicy, PolicyError, SecretInjection, SecretLease, SecretScope, sanitized_environment,
 };
 use sovereign_state::{
     ActionTransition, NewActionRecord, PersistedActionRecord, StateError, StateStore,
@@ -23,6 +23,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -2973,4 +2974,963 @@ fn wait_group_absent(pgid: u32, timeout: Duration) -> Result<bool, ToolError> {
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+pub const WEB_ACQUIRE_SCHEMA_VERSION: u32 = 1;
+const WEB_ACQUIRE_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const WEB_ACQUIRE_MAX_REDIRECTS: u8 = 8;
+const WEB_ACQUIRE_MAX_TIMEOUT_MS: u64 = 60_000;
+
+/// Controller-owned input contract for one bounded static HTTP acquisition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebAcquireRequestV1 {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub url: String,
+    pub max_response_bytes: usize,
+    pub max_redirects: u8,
+    pub timeout_ms: u64,
+    pub parse_html: bool,
+}
+
+impl WebAcquireRequestV1 {
+    /// Validates only shape and resource bounds. Network authority remains exclusively in
+    /// [`NetworkPolicy`].
+    ///
+    /// # Errors
+    /// Returns an authority error for unsupported schemas or unbounded requests.
+    pub fn validate(&self) -> Result<(), ToolError> {
+        if self.schema_version != WEB_ACQUIRE_SCHEMA_VERSION {
+            return Err(ToolError::Authority(
+                "unsupported web-acquire request schema version".to_owned(),
+            ));
+        }
+        if self.request_id.trim().is_empty() || self.url.trim().is_empty() {
+            return Err(ToolError::Authority(
+                "web-acquire request requires request_id and url".to_owned(),
+            ));
+        }
+        if self.max_response_bytes == 0
+            || self.max_response_bytes > WEB_ACQUIRE_MAX_RESPONSE_BYTES
+            || self.max_redirects > WEB_ACQUIRE_MAX_REDIRECTS
+            || self.timeout_ms == 0
+            || self.timeout_ms > WEB_ACQUIRE_MAX_TIMEOUT_MS
+        {
+            return Err(ToolError::ResourceLimit(
+                "web-acquire request exceeds static acquisition bounds".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebRawResponseEvidenceV1 {
+    pub url: String,
+    pub status_code: u16,
+    pub connected_peer: IpAddr,
+    pub headers_sha256: String,
+    pub body_sha256: String,
+    pub body_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebParsedDocumentV1 {
+    pub parser_name: String,
+    pub parser_version: String,
+    pub title: Option<String>,
+    pub text: String,
+    pub links: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebAcquireResultV1 {
+    pub schema_version: u32,
+    pub request_id: String,
+    pub final_url: String,
+    pub status_code: u16,
+    pub headers: BTreeMap<String, String>,
+    pub body: Vec<u8>,
+    pub responses: Vec<WebRawResponseEvidenceV1>,
+    pub parsed: Option<WebParsedDocumentV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebTransportRequestV1 {
+    pub url: String,
+    pub destination: NetworkDestination,
+    pub connect_ip: IpAddr,
+    pub max_response_bytes: usize,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebTransportResponseV1 {
+    pub status_code: u16,
+    pub connected_peer: IpAddr,
+    pub headers: BTreeMap<String, String>,
+    pub raw_headers: Vec<u8>,
+    pub body: Vec<u8>,
+}
+
+pub trait WebDnsResolver: Send + Sync {
+    /// Returns the complete address set intended for the next connection attempt.
+    ///
+    /// # Errors
+    /// Returns an I/O/policy error when the name cannot be resolved deterministically.
+    fn resolve(&self, destination: &NetworkDestination) -> Result<BTreeSet<IpAddr>, ToolError>;
+}
+
+pub trait WebHttpTransport: Send + Sync {
+    /// Executes one already-authorized, non-redirecting GET. Implementations must connect only to
+    /// `request.connect_ip`; redirect following is deliberately owned by [`WebAcquireAdapter`].
+    ///
+    /// # Errors
+    /// Returns an error for transport failure, timeout, or bounded-response failure.
+    fn get(&self, request: &WebTransportRequestV1) -> Result<WebTransportResponseV1, ToolError>;
+}
+
+pub trait WebHtmlParser: Send + Sync {
+    /// Parses already-acquired bytes. Parsing never grants network/browser/tool authority.
+    ///
+    /// # Errors
+    /// Returns an error when the parser is unavailable, crashes, times out, or violates bounds.
+    fn parse(&self, html: &[u8], timeout_ms: u64) -> Result<WebParsedDocumentV1, ToolError>;
+}
+
+/// Sovereign-owned static HTTP acquisition flow. `NetworkPolicy` is always consulted before the
+/// resolver result may reach a transport; redirects repeat the same authorization sequence.
+pub struct WebAcquireAdapter<'a> {
+    network_policy: &'a NetworkPolicy,
+    resolver: &'a dyn WebDnsResolver,
+    transport: &'a dyn WebHttpTransport,
+    parser: Option<&'a dyn WebHtmlParser>,
+}
+
+impl<'a> WebAcquireAdapter<'a> {
+    #[must_use]
+    pub const fn new(
+        network_policy: &'a NetworkPolicy,
+        resolver: &'a dyn WebDnsResolver,
+        transport: &'a dyn WebHttpTransport,
+    ) -> Self {
+        Self {
+            network_policy,
+            resolver,
+            transport,
+            parser: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_parser(mut self, parser: &'a dyn WebHtmlParser) -> Self {
+        self.parser = Some(parser);
+        self
+    }
+
+    /// Acquires one static resource under exact Controller-owned network policy.
+    ///
+    /// # Errors
+    /// Fails closed for offline policy, malformed/unauthorized destinations, unsafe DNS sets,
+    /// connected-peer mismatch, disallowed redirects, resource limits, or parser failure.
+    pub fn acquire(&self, request: &WebAcquireRequestV1) -> Result<WebAcquireResultV1, ToolError> {
+        request.validate()?;
+        if self.network_policy.is_offline() {
+            return Err(ToolError::Policy(PolicyError::Denied(
+                "web acquisition denied by offline network policy".to_owned(),
+            )));
+        }
+
+        let mut current_url = request.url.clone();
+        let mut responses = Vec::new();
+        let mut redirects = 0_u8;
+
+        loop {
+            let parsed_url = ParsedWebUrl::parse(&current_url)?;
+            let canonical_destination = self
+                .network_policy
+                .authorize_destination(&parsed_url.destination)?;
+            let parsed_url = parsed_url.with_destination(canonical_destination);
+            let resolved = self.resolver.resolve(&parsed_url.destination)?;
+            let authorization = if redirects == 0 {
+                self.network_policy
+                    .authorize_resolved(&parsed_url.destination, resolved)?
+            } else {
+                self.network_policy
+                    .authorize_redirect(&parsed_url.destination, resolved)?
+            };
+            let connect_ip = authorization.resolved_ips().next().ok_or_else(|| {
+                ToolError::Authority("authorized web destination has no connect IP".to_owned())
+            })?;
+            let transport_request = WebTransportRequestV1 {
+                url: parsed_url.canonical_url.clone(),
+                destination: authorization.destination(),
+                connect_ip,
+                max_response_bytes: request.max_response_bytes,
+                timeout_ms: request.timeout_ms,
+            };
+            let response = self.transport.get(&transport_request)?;
+            self.network_policy
+                .authorize_connected_peer(&authorization, response.connected_peer)?;
+            if response.body.len() > request.max_response_bytes {
+                return Err(ToolError::ResourceLimit(
+                    "web response exceeded authorized byte bound".to_owned(),
+                ));
+            }
+            let evidence = raw_web_response_evidence(
+                &transport_request.url,
+                response.status_code,
+                response.connected_peer,
+                &response.raw_headers,
+                &response.body,
+            );
+            responses.push(evidence);
+
+            if is_redirect_status(response.status_code)
+                && let Some(location) = response.headers.get("location")
+            {
+                if redirects >= request.max_redirects {
+                    return Err(ToolError::ResourceLimit(
+                        "web redirect limit exhausted".to_owned(),
+                    ));
+                }
+                current_url = resolve_redirect_url(&parsed_url, location)?;
+                redirects = redirects.saturating_add(1);
+                continue;
+            }
+
+            let parsed = if request.parse_html {
+                let parser = self.parser.ok_or_else(|| {
+                    ToolError::Authority(
+                        "static HTML parsing requested without an admitted parser".to_owned(),
+                    )
+                })?;
+                Some(parser.parse(&response.body, request.timeout_ms)?)
+            } else {
+                None
+            };
+            return Ok(WebAcquireResultV1 {
+                schema_version: WEB_ACQUIRE_SCHEMA_VERSION,
+                request_id: request.request_id.clone(),
+                final_url: transport_request.url,
+                status_code: response.status_code,
+                headers: response.headers,
+                body: response.body,
+                responses,
+                parsed,
+            });
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemWebDnsResolver;
+
+impl WebDnsResolver for SystemWebDnsResolver {
+    fn resolve(&self, destination: &NetworkDestination) -> Result<BTreeSet<IpAddr>, ToolError> {
+        let addresses = (destination.host.as_str(), destination.port)
+            .to_socket_addrs()?
+            .map(|address| address.ip())
+            .collect::<BTreeSet<_>>();
+        if addresses.is_empty() {
+            return Err(ToolError::Authority(
+                "web DNS resolver returned no addresses".to_owned(),
+            ));
+        }
+        Ok(addresses)
+    }
+}
+
+/// Fixed system-curl transport used only after [`WebAcquireAdapter`] has authorized the complete
+/// DNS set. It disables curl config, ambient proxies and automatic redirects, and pins the socket
+/// connection to the exact public IP selected from that authorized set.
+#[derive(Debug, Clone)]
+pub struct CurlWebHttpTransport {
+    curl_path: PathBuf,
+}
+
+impl Default for CurlWebHttpTransport {
+    fn default() -> Self {
+        Self {
+            curl_path: PathBuf::from("/usr/bin/curl"),
+        }
+    }
+}
+
+impl CurlWebHttpTransport {
+    #[must_use]
+    pub fn system() -> Self {
+        Self::default()
+    }
+
+    fn execute(
+        &self,
+        request: &WebTransportRequestV1,
+    ) -> Result<WebTransportResponseV1, ToolError> {
+        if !self.curl_path.is_absolute() || self.curl_path != Path::new("/usr/bin/curl") {
+            return Err(ToolError::Authority(
+                "web transport requires pinned /usr/bin/curl".to_owned(),
+            ));
+        }
+        let nonce = ATOMIC_REPLACE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let base =
+            std::env::temp_dir().join(format!("sovereign-web-{}-{nonce}", std::process::id()));
+        fs::create_dir(&base)?;
+        let header_path = base.join("headers");
+        let body_path = base.join("body");
+        let cleanup = || {
+            let _ = fs::remove_dir_all(&base);
+        };
+        let connect_ip = match request.connect_ip {
+            IpAddr::V4(address) => address.to_string(),
+            IpAddr::V6(address) => format!("[{address}]"),
+        };
+        let resolve_host = request
+            .destination
+            .host
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        let resolve = format!(
+            "{}:{}:{}",
+            resolve_host, request.destination.port, connect_ip
+        );
+        let max_seconds = request.timeout_ms.div_ceil(1_000).max(1).to_string();
+        let output = Command::new(&self.curl_path)
+            .env_clear()
+            .args([
+                "--disable",
+                "--silent",
+                "--show-error",
+                "--http1.1",
+                "--noproxy",
+                "*",
+                "--proxy",
+                "",
+                "--proto",
+                "=http,https",
+                "--max-redirs",
+                "0",
+                "--max-time",
+                &max_seconds,
+                "--max-filesize",
+                &request.max_response_bytes.to_string(),
+                "--resolve",
+                &resolve,
+                "--dump-header",
+                header_path.to_string_lossy().as_ref(),
+                "--output",
+                body_path.to_string_lossy().as_ref(),
+                "--write-out",
+                "%{http_code}\n%{remote_ip}\n",
+                &request.url,
+            ])
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                cleanup();
+                return Err(error.into());
+            }
+        };
+        let body_len = fs::metadata(&body_path).map_or(0, |metadata| metadata.len());
+        let max_response_bytes = u64::try_from(request.max_response_bytes).map_err(|_| {
+            ToolError::ResourceLimit("web response byte bound is not representable".to_owned())
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            cleanup();
+            if body_len >= max_response_bytes {
+                return Err(ToolError::ResourceLimit(
+                    "curl web response reached authorized byte bound".to_owned(),
+                ));
+            }
+            return Err(ToolError::Authority(format!(
+                "pinned curl transport failed: {}",
+                stderr.trim().chars().take(512).collect::<String>()
+            )));
+        }
+        let (status_code, connected_peer) = parse_curl_metadata(output.stdout)?;
+        let raw_headers = fs::read(&header_path)?;
+        let body = fs::read(&body_path)?;
+        cleanup();
+        if body.len() > request.max_response_bytes {
+            return Err(ToolError::ResourceLimit(
+                "curl web response exceeded authorized byte bound".to_owned(),
+            ));
+        }
+        let headers = parse_http_headers(&raw_headers)?;
+        Ok(WebTransportResponseV1 {
+            status_code,
+            connected_peer,
+            headers,
+            raw_headers,
+            body,
+        })
+    }
+}
+
+impl WebHttpTransport for CurlWebHttpTransport {
+    fn get(&self, request: &WebTransportRequestV1) -> Result<WebTransportResponseV1, ToolError> {
+        self.execute(request)
+    }
+}
+
+fn parse_curl_metadata(stdout: Vec<u8>) -> Result<(u16, IpAddr), ToolError> {
+    let stdout = String::from_utf8(stdout).map_err(|_| {
+        ToolError::Authority("curl transport returned non-UTF8 metadata".to_owned())
+    })?;
+    let mut lines = stdout.lines();
+    let status_code = lines
+        .next()
+        .ok_or_else(|| ToolError::Authority("curl omitted HTTP status".to_owned()))?
+        .parse::<u16>()
+        .map_err(|_| ToolError::Authority("curl returned invalid HTTP status".to_owned()))?;
+    let connected_peer = lines
+        .next()
+        .ok_or_else(|| ToolError::Authority("curl omitted connected peer".to_owned()))?
+        .parse::<IpAddr>()
+        .map_err(|_| ToolError::Authority("curl returned invalid connected peer".to_owned()))?;
+    Ok((status_code, connected_peer))
+}
+
+/// Demand-loaded static parser worker backed by vendored Scrapling. The worker is invoked with an
+/// explicit Python runtime chosen by the Controller/operator; no package installation or browser
+/// setup is performed here.
+#[derive(Debug, Clone)]
+pub struct ScraplingStaticParser {
+    python_path: PathBuf,
+    worker_path: PathBuf,
+    vendored_scrapling_root: PathBuf,
+    max_output_bytes: usize,
+}
+
+impl ScraplingStaticParser {
+    #[must_use]
+    pub fn new(
+        python_path: impl Into<PathBuf>,
+        worker_path: impl Into<PathBuf>,
+        vendored_scrapling_root: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            python_path: python_path.into(),
+            worker_path: worker_path.into(),
+            vendored_scrapling_root: vendored_scrapling_root.into(),
+            max_output_bytes: 256 * 1024,
+        }
+    }
+
+    fn run_worker(
+        &self,
+        html: &[u8],
+        timeout_ms: u64,
+        python: &Path,
+        worker: &Path,
+        vendor: &Path,
+    ) -> Result<Vec<u8>, ToolError> {
+        if html.len() > WEB_ACQUIRE_MAX_RESPONSE_BYTES {
+            return Err(ToolError::ResourceLimit(
+                "Scrapling parser input exceeded static acquisition bound".to_owned(),
+            ));
+        }
+        let timeout_ms = timeout_ms.clamp(1, WEB_ACQUIRE_MAX_TIMEOUT_MS);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut process = ParserWorkerProcess::spawn(
+            python,
+            worker,
+            vendor,
+            html.to_vec(),
+            self.max_output_bytes,
+        )?;
+        let stop = process.wait_until(deadline);
+        process.finish(stop)
+    }
+}
+
+struct ParserWorkerProcess {
+    child: Child,
+    writer: thread::JoinHandle<std::io::Result<()>>,
+    stdout_reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_reader: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stdout_overflow: Arc<AtomicBool>,
+    stderr_overflow: Arc<AtomicBool>,
+}
+
+impl ParserWorkerProcess {
+    fn spawn(
+        python: &Path,
+        worker: &Path,
+        vendor: &Path,
+        input: Vec<u8>,
+        max_output_bytes: usize,
+    ) -> Result<Self, ToolError> {
+        let mut child = Command::new(python)
+            .env_clear()
+            .env("PYTHONPATH", vendor)
+            .env("PYTHONDONTWRITEBYTECODE", "1")
+            .env("PYTHONNOUSERSITE", "1")
+            .arg("-s")
+            .arg(worker)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let Some(mut stdin) = child.stdin.take() else {
+            terminate_and_reap_parser_child(&mut child)?;
+            return Err(ToolError::Authority(
+                "Scrapling parser stdin was unavailable".to_owned(),
+            ));
+        };
+        let Some(stdout) = child.stdout.take() else {
+            terminate_and_reap_parser_child(&mut child)?;
+            return Err(ToolError::Authority(
+                "Scrapling parser stdout was unavailable".to_owned(),
+            ));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            terminate_and_reap_parser_child(&mut child)?;
+            return Err(ToolError::Authority(
+                "Scrapling parser stderr was unavailable".to_owned(),
+            ));
+        };
+        let writer = thread::spawn(move || stdin.write_all(&input));
+        let stdout_overflow = Arc::new(AtomicBool::new(false));
+        let stderr_overflow = Arc::new(AtomicBool::new(false));
+        let stdout_reader =
+            spawn_bounded_pipe_reader(stdout, max_output_bytes, Arc::clone(&stdout_overflow));
+        let stderr_reader =
+            spawn_bounded_pipe_reader(stderr, max_output_bytes, Arc::clone(&stderr_overflow));
+        Ok(Self {
+            child,
+            writer,
+            stdout_reader,
+            stderr_reader,
+            stdout_overflow,
+            stderr_overflow,
+        })
+    }
+
+    fn wait_until(&mut self, deadline: Instant) -> ParserWorkerStop {
+        loop {
+            if self.stdout_overflow.load(Ordering::Acquire) {
+                break ParserWorkerStop::StdoutOverflow;
+            }
+            if self.stderr_overflow.load(Ordering::Acquire) {
+                break ParserWorkerStop::StderrOverflow;
+            }
+            if Instant::now() >= deadline {
+                break ParserWorkerStop::Timeout;
+            }
+            match self.child.try_wait() {
+                Ok(Some(status)) => break ParserWorkerStop::Exited(status),
+                Ok(None) => thread::sleep(Duration::from_millis(5)),
+                Err(error) => break ParserWorkerStop::PollError(error),
+            }
+        }
+    }
+
+    fn finish(mut self, stop: ParserWorkerStop) -> Result<Vec<u8>, ToolError> {
+        let cleanup = match stop {
+            ParserWorkerStop::Exited(_) => Ok(()),
+            _ => terminate_and_reap_parser_child(&mut self.child),
+        };
+        let writer_result = join_parser_io_thread(self.writer, "stdin writer")?;
+        let stdout_result = join_parser_io_thread(self.stdout_reader, "stdout reader")?;
+        let stderr_result = join_parser_io_thread(self.stderr_reader, "stderr reader")?;
+        cleanup?;
+
+        if self.stdout_overflow.load(Ordering::Acquire) {
+            return Err(ToolError::ResourceLimit(
+                "Scrapling static parser stdout exceeded bound".to_owned(),
+            ));
+        }
+        if self.stderr_overflow.load(Ordering::Acquire) {
+            return Err(ToolError::ResourceLimit(
+                "Scrapling static parser stderr exceeded bound".to_owned(),
+            ));
+        }
+
+        match stop {
+            ParserWorkerStop::Timeout => Err(ToolError::ResourceLimit(
+                "Scrapling static parser timed out".to_owned(),
+            )),
+            ParserWorkerStop::StdoutOverflow => Err(ToolError::ResourceLimit(
+                "Scrapling static parser stdout exceeded bound".to_owned(),
+            )),
+            ParserWorkerStop::StderrOverflow => Err(ToolError::ResourceLimit(
+                "Scrapling static parser stderr exceeded bound".to_owned(),
+            )),
+            ParserWorkerStop::PollError(error) => Err(ToolError::Io(error)),
+            ParserWorkerStop::Exited(status) => {
+                let stdout = stdout_result?;
+                let stderr = stderr_result?;
+                if !status.success() {
+                    return Err(ToolError::Authority(format!(
+                        "Scrapling static parser failed: {}",
+                        String::from_utf8_lossy(&stderr)
+                            .trim()
+                            .chars()
+                            .take(512)
+                            .collect::<String>()
+                    )));
+                }
+                writer_result?;
+                Ok(stdout)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ParserWorkerStop {
+    Exited(std::process::ExitStatus),
+    Timeout,
+    StdoutOverflow,
+    StderrOverflow,
+    PollError(std::io::Error),
+}
+
+fn spawn_bounded_pipe_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    max_bytes: usize,
+    overflow: Arc<AtomicBool>,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut captured = Vec::with_capacity(max_bytes.min(8 * 1024));
+        let mut chunk = [0_u8; 8 * 1024];
+        loop {
+            let read = reader.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            let remaining = max_bytes.saturating_sub(captured.len());
+            let retained = remaining.min(read);
+            captured.extend_from_slice(&chunk[..retained]);
+            if retained < read {
+                overflow.store(true, Ordering::Release);
+            }
+        }
+        Ok(captured)
+    })
+}
+
+fn join_parser_io_thread<T>(
+    handle: thread::JoinHandle<std::io::Result<T>>,
+    label: &str,
+) -> Result<std::io::Result<T>, ToolError> {
+    handle.join().map_err(|_| {
+        ToolError::RecoveryBlocked(format!("Scrapling parser {label} thread panicked"))
+    })
+}
+
+fn terminate_and_reap_parser_child(child: &mut Child) -> Result<(), ToolError> {
+    let kill_error = match child.kill() {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => None,
+        Err(error) => Some(error),
+    };
+    let wait_result = child.wait();
+    if let Some(error) = kill_error {
+        return Err(ToolError::RecoveryBlocked(format!(
+            "failed to kill Scrapling parser child before cleanup: {error}"
+        )));
+    }
+    wait_result.map_err(|error| {
+        ToolError::RecoveryBlocked(format!(
+            "failed to reap Scrapling parser child after cleanup: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
+impl WebHtmlParser for ScraplingStaticParser {
+    fn parse(&self, html: &[u8], timeout_ms: u64) -> Result<WebParsedDocumentV1, ToolError> {
+        if !self.python_path.is_absolute() || !fs::metadata(&self.python_path)?.is_file() {
+            return Err(ToolError::Authority(
+                "Scrapling static parser requires an absolute Python executable path".to_owned(),
+            ));
+        }
+        // Do not canonicalize a virtualenv's interpreter symlink: invoking that symlink path is
+        // what makes Python select the virtualenv prefix and its already-installed site-packages.
+        let python = self.python_path.clone();
+        let worker = self.worker_path.canonicalize()?;
+        let vendor = self.vendored_scrapling_root.canonicalize()?;
+        if !python.is_file() || !worker.is_file() || !vendor.is_dir() {
+            return Err(ToolError::Authority(
+                "Scrapling static parser paths are not stable files/directories".to_owned(),
+            ));
+        }
+        let stdout = self.run_worker(html, timeout_ms, &python, &worker, &vendor)?;
+        let value: serde_json::Value = serde_json::from_slice(&stdout).map_err(|error| {
+            ToolError::Authority(format!("invalid Scrapling parser JSON: {error}"))
+        })?;
+        if value
+            .get("fetcher_or_browser_modules_loaded")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true)
+        {
+            return Err(ToolError::Authority(
+                "Scrapling static parser loaded forbidden fetcher/browser extras".to_owned(),
+            ));
+        }
+        let parser_version = value
+            .get("parser_version")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ToolError::Authority("Scrapling parser omitted version".to_owned()))?
+            .to_owned();
+        let text = value
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| ToolError::Authority("Scrapling parser omitted text".to_owned()))?
+            .to_owned();
+        let title = value
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+        let links = value
+            .get("links")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| ToolError::Authority("Scrapling parser omitted links".to_owned()))?
+            .iter()
+            .map(|item| {
+                item.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    ToolError::Authority("Scrapling parser returned non-string link".to_owned())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(WebParsedDocumentV1 {
+            parser_name: "scrapling.parser.Selector".to_owned(),
+            parser_version,
+            title,
+            text,
+            links,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ParsedWebUrl {
+    canonical_url: String,
+    scheme: String,
+    authority: String,
+    path_and_query: String,
+    destination: NetworkDestination,
+}
+
+impl ParsedWebUrl {
+    fn parse(url: &str) -> Result<Self, ToolError> {
+        if url
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+        {
+            return Err(ToolError::Authority(
+                "web URL contains whitespace/control bytes".to_owned(),
+            ));
+        }
+        let without_fragment = url.split('#').next().unwrap_or(url);
+        let (scheme, rest) = without_fragment.split_once("://").ok_or_else(|| {
+            ToolError::Authority("web URL must be absolute http/https".to_owned())
+        })?;
+        let scheme = scheme.to_ascii_lowercase();
+        if !matches!(scheme.as_str(), "http" | "https") {
+            return Err(ToolError::Authority(
+                "web acquisition permits only http/https schemes".to_owned(),
+            ));
+        }
+        let split_at = rest.find(['/', '?']).unwrap_or(rest.len());
+        let authority = &rest[..split_at];
+        if authority.is_empty() || authority.contains('@') {
+            return Err(ToolError::Authority(
+                "web URL requires host and forbids userinfo".to_owned(),
+            ));
+        }
+        let tail = &rest[split_at..];
+        let path_and_query = if tail.is_empty() {
+            "/".to_owned()
+        } else if tail.starts_with('?') {
+            format!("/{tail}")
+        } else {
+            tail.to_owned()
+        };
+        let default_port = if scheme == "https" { 443 } else { 80 };
+        let (host, port) = parse_web_authority(authority, default_port)?;
+        let host = if host.starts_with('[') {
+            host.to_ascii_lowercase()
+        } else {
+            host.trim_end_matches('.').to_ascii_lowercase()
+        };
+        let authority = canonical_authority(&host, port, default_port);
+        let canonical_url = format!("{scheme}://{authority}{path_and_query}");
+        Ok(Self {
+            canonical_url,
+            scheme: scheme.clone(),
+            authority,
+            path_and_query,
+            destination: NetworkDestination { scheme, host, port },
+        })
+    }
+
+    fn with_destination(mut self, destination: NetworkDestination) -> Self {
+        let default_port = if destination.scheme == "https" {
+            443
+        } else {
+            80
+        };
+        self.scheme.clone_from(&destination.scheme);
+        self.authority = canonical_authority(&destination.host, destination.port, default_port);
+        self.canonical_url = format!(
+            "{}://{}{}",
+            destination.scheme, self.authority, self.path_and_query
+        );
+        self.destination = destination;
+        self
+    }
+}
+
+fn parse_web_authority(authority: &str, default_port: u16) -> Result<(String, u16), ToolError> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let close = rest.find(']').ok_or_else(|| {
+            ToolError::Authority("invalid bracketed IPv6 web authority".to_owned())
+        })?;
+        let host = format!("[{}]", &rest[..close]);
+        let suffix = &rest[close + 1..];
+        let port = if suffix.is_empty() {
+            default_port
+        } else {
+            suffix
+                .strip_prefix(':')
+                .ok_or_else(|| ToolError::Authority("invalid IPv6 web port".to_owned()))?
+                .parse::<u16>()
+                .map_err(|_| ToolError::Authority("invalid web port".to_owned()))?
+        };
+        if port == 0 {
+            return Err(ToolError::Authority("invalid web port".to_owned()));
+        }
+        return Ok((host, port));
+    }
+    if authority.matches(':').count() > 1 {
+        return Err(ToolError::Authority(
+            "IPv6 web hosts must use bracket notation".to_owned(),
+        ));
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port))
+            if !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| ToolError::Authority("invalid web port".to_owned()))?;
+            (host, port)
+        }
+        _ => (authority, default_port),
+    };
+    if host.is_empty() || port == 0 {
+        return Err(ToolError::Authority(
+            "invalid web host/port authority".to_owned(),
+        ));
+    }
+    Ok((host.to_owned(), port))
+}
+
+fn canonical_authority(host: &str, port: u16, default_port: u16) -> String {
+    if port == default_port {
+        host.to_owned()
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+fn resolve_redirect_url(base: &ParsedWebUrl, location: &str) -> Result<String, ToolError> {
+    if location
+        .bytes()
+        .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
+        return Err(ToolError::Authority(
+            "redirect location contains whitespace/control bytes".to_owned(),
+        ));
+    }
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return Ok(location.to_owned());
+    }
+    if let Some(rest) = location.strip_prefix("//") {
+        return Ok(format!("{}://{rest}", base.scheme));
+    }
+    if location.starts_with('/') {
+        return Ok(format!("{}://{}{}", base.scheme, base.authority, location));
+    }
+    if location.starts_with('?') {
+        let path = base.path_and_query.split('?').next().unwrap_or("/");
+        return Ok(format!(
+            "{}://{}{}{}",
+            base.scheme, base.authority, path, location
+        ));
+    }
+    let path = base.path_and_query.split('?').next().unwrap_or("/");
+    let directory = path.rsplit_once('/').map_or(
+        "/",
+        |(prefix, _)| {
+            if prefix.is_empty() { "/" } else { prefix }
+        },
+    );
+    let separator = if directory.ends_with('/') { "" } else { "/" };
+    Ok(format!(
+        "{}://{}{}{}{}",
+        base.scheme, base.authority, directory, separator, location
+    ))
+}
+
+fn is_redirect_status(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
+
+fn raw_web_response_evidence(
+    url: &str,
+    status_code: u16,
+    connected_peer: IpAddr,
+    raw_headers: &[u8],
+    body: &[u8],
+) -> WebRawResponseEvidenceV1 {
+    let mut headers_hasher = Sha256::new();
+    headers_hasher.update(raw_headers);
+    let mut body_hasher = Sha256::new();
+    body_hasher.update(body);
+    WebRawResponseEvidenceV1 {
+        url: url.to_owned(),
+        status_code,
+        connected_peer,
+        headers_sha256: format!("sha256:{:x}", headers_hasher.finalize()),
+        body_sha256: format!("sha256:{:x}", body_hasher.finalize()),
+        body_bytes: body.len(),
+    }
+}
+
+fn parse_http_headers(raw: &[u8]) -> Result<BTreeMap<String, String>, ToolError> {
+    if raw.len() > 256 * 1024 {
+        return Err(ToolError::ResourceLimit(
+            "HTTP response headers exceeded bound".to_owned(),
+        ));
+    }
+    let text = std::str::from_utf8(raw)
+        .map_err(|_| ToolError::Authority("HTTP response headers are not UTF-8".to_owned()))?;
+    let block = text
+        .split("\r\n\r\n")
+        .filter(|part| part.trim_start().starts_with("HTTP/"))
+        .last()
+        .ok_or_else(|| ToolError::Authority("HTTP response omitted header block".to_owned()))?;
+    let mut headers = BTreeMap::new();
+    for line in block.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            let name = name.trim().to_ascii_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            headers
+                .entry(name)
+                .and_modify(|existing: &mut String| {
+                    existing.push_str(", ");
+                    existing.push_str(value.trim());
+                })
+                .or_insert_with(|| value.trim().to_owned());
+        }
+    }
+    Ok(headers)
 }

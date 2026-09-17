@@ -446,6 +446,54 @@ fn security_package_policy_requires_local_target_denies_global_and_defaults_scri
 }
 
 #[test]
+fn security_network_policy_uses_uts46_idna_identity() {
+    let mut policy = NetworkPolicy::offline();
+    policy
+        .allow("https", "éxample.com", 443)
+        .unwrap_or_else(|error| panic!("allow IDNA host: {error}"));
+    let canonical_idna = policy
+        .authorize_destination(&NetworkDestination {
+            scheme: "HTTPS".to_owned(),
+            host: "XN--XAMPLE-9UA.COM.".to_owned(),
+            port: 443,
+        })
+        .unwrap_or_else(|error| panic!("authorize canonical IDNA host: {error}"));
+    assert_eq!(canonical_idna.scheme, "https");
+    assert_eq!(canonical_idna.host, "xn--xample-9ua.com");
+    let unicode_idna = policy
+        .authorize_destination(&NetworkDestination {
+            scheme: "https".to_owned(),
+            host: "éxample。com".to_owned(),
+            port: 443,
+        })
+        .unwrap_or_else(|error| panic!("authorize Unicode IDNA host: {error}"));
+    assert_eq!(unicode_idna.host, "xn--xample-9ua.com");
+    let decomposed_idna = policy
+        .authorize_destination(&NetworkDestination {
+            scheme: "https".to_owned(),
+            host: "e\u{301}xample.com".to_owned(),
+            port: 443,
+        })
+        .unwrap_or_else(|error| panic!("authorize NFD-equivalent IDNA host: {error}"));
+    assert_eq!(decomposed_idna.host, "xn--xample-9ua.com");
+    let mut fullwidth_policy = NetworkPolicy::offline();
+    fullwidth_policy
+        .allow("https", "ｅxample.com", 443)
+        .unwrap_or_else(|error| panic!("allow UTS #46 mapped host: {error}"));
+    let fullwidth = fullwidth_policy
+        .authorize_destination(&NetworkDestination {
+            scheme: "https".to_owned(),
+            host: "example.com".to_owned(),
+            port: 443,
+        })
+        .unwrap_or_else(|error| panic!("authorize UTS #46 mapped host: {error}"));
+    assert_eq!(fullwidth.host, "example.com");
+    assert!(policy.allow("https", "xn--abc", 443).is_err());
+    assert!(policy.allow("https", "bad_host.example", 443).is_err());
+    assert!(policy.allow("https", "bad_éxample.com", 443).is_err());
+}
+
+#[test]
 fn security_network_policy_rejects_private_rebinding_redirect_and_peer_mismatch() {
     let mut policy = NetworkPolicy::offline();
     policy
