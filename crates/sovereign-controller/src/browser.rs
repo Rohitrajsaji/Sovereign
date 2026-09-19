@@ -646,16 +646,18 @@ impl Controller {
         grant
             .validate(now_ms)
             .map_err(|error| ControllerError::Policy(PolicyError::Denied(error.to_string())))?;
-        let (project_id, repository_id, policy_digest) = {
+        let (project_id, policy_digest) = {
             let active = self.active_ref()?;
             (
                 required_str(&active.plan_document, "/project/project_id")?.to_owned(),
-                active.repository_id.clone(),
                 active.policy_digest.clone(),
             )
         };
         if grant.project_id != project_id
-            || grant.repository_id != repository_id
+            || !self
+                .active_ref()?
+                .repositories
+                .contains_key(&grant.repository_id)
             || grant.policy_digest != policy_digest
         {
             return Err(ControllerError::Policy(PolicyError::Denied(
@@ -1094,9 +1096,10 @@ impl Controller {
     ) -> Result<(BrowserProfileAuthority, BrowserProfileRoot), ControllerError> {
         let active = self.active_ref()?;
         let project_id = required_str(&active.plan_document, "/project/project_id")?;
+        let repository = active.single_task_repository(task_id)?;
         let profile_policy = BrowserProfilePolicy::new(
             project_id,
-            active.repository_id.as_str(),
+            repository.repository_id.as_str(),
             active.policy_digest.as_str(),
         )
         .map_err(|error| ControllerError::Policy(PolicyError::Denied(error.to_string())))?;
@@ -1106,7 +1109,7 @@ impl Controller {
                 .map_err(|error| ControllerError::Policy(PolicyError::Denied(error.to_string())))?;
             return Ok((profile_authority, BrowserProfileRoot::Ephemeral));
         }
-        let profile_id = profile_id_for(project_id, &active.repository_id, task_id);
+        let profile_id = profile_id_for(project_id, &repository.repository_id, task_id);
         let raw = self
             .state
             .get_state(BROWSER_PROFILE_GRANT_NAMESPACE, &profile_id)?
@@ -2753,8 +2756,9 @@ impl Controller {
             let task = active.tasks.get(&session.task_id).ok_or_else(|| {
                 ControllerError::NotReady("browser action task disappeared".to_owned())
             })?;
+            let repository = active.single_task_repository(&session.task_id)?;
             (
-                active.repository_id.clone(),
+                repository.repository_id.clone(),
                 active.policy_digest.clone(),
                 task.autonomy_budget.clone().ok_or_else(|| {
                     ControllerError::NotReady(
@@ -4933,8 +4937,9 @@ mod browser_download_terminal_tests {
         Controller, ControllerBrowserSession,
     };
     use crate::{
-        ActivePlan, AttemptRuntime, AttemptState, PlanValidity, ResourceResidencyStateV1,
-        ResourceResidencyV1, TaskRuntime, TaskState,
+        ActivePlan, ActiveRepositoryState, AttemptRuntime, AttemptState, PlanValidity,
+        ResourceResidencyStateV1, ResourceResidencyV1, TaskRuntime, TaskState,
+        valid_plan_ir_fixture, valid_task_fixture,
     };
     use serde_json::json;
     use sovereign_context::{ContextLevel, EvidenceKind, PacketSection, TrustClass};
@@ -5062,6 +5067,28 @@ mod browser_download_terminal_tests {
     struct HandoffModelBackend {
         unloaded: AtomicBool,
         prove_absent: bool,
+    }
+
+    fn fixture_resource_policy(budget: &AutonomyBudgetV1) -> serde_json::Value {
+        assert_eq!(budget.max_wall_ms % 1_000, 0);
+        assert_eq!(budget.max_model_call_ms % 1_000, 0);
+        assert_eq!(budget.max_single_tool_action_ms % 1_000, 0);
+        assert_eq!(budget.max_child_cpu_ms % 1_000, 0);
+        json!({
+            "max_wall_seconds": budget.max_wall_ms / 1_000,
+            "max_model_calls": budget.max_model_calls,
+            "max_model_call_seconds": budget.max_model_call_ms / 1_000,
+            "max_tool_actions": budget.max_tool_actions,
+            "max_single_tool_action_seconds": budget.max_single_tool_action_ms / 1_000,
+            "max_peak_rss_mb": 4096,
+            "max_output_bytes": budget.max_output_bytes,
+            "max_retained_raw_bytes": budget.max_output_bytes,
+            "max_disk_write_mb": budget.max_disk_write_bytes / (1024 * 1024),
+            "max_network_bytes": budget.max_network_bytes,
+            "max_subprocesses": budget.max_subprocesses,
+            "max_child_cpu_seconds": budget.max_child_cpu_ms / 1_000,
+            "heavy_leases": ["MODEL", "BUILD_HEAVY"]
+        })
     }
 
     impl HandoffModelBackend {
@@ -5249,6 +5276,20 @@ mod browser_download_terminal_tests {
         let state = StateStore::open(root.join("state.sqlite"))
             .unwrap_or_else(|error| panic!("open fixture state: {error}"));
         let mut controller = Controller::new(state);
+        let mut task = valid_task_fixture("task.browser", &["repo.browser"], false);
+        task["resource_budget"] = fixture_resource_policy(&task_budget);
+        let mut plan_document = valid_plan_ir_fixture();
+        plan_document["plan_id"] = json!("plan.browser");
+        plan_document["revision"] = json!(1);
+        plan_document["supersedes_revision"] = serde_json::Value::Null;
+        plan_document["compiled_at"] = json!("2026-09-19T05:00:00Z");
+        plan_document["goal"]["goal_id"] = json!("goal.browser");
+        plan_document["policy"]["resources"] = fixture_resource_policy(&goal_budget);
+        plan_document["repositories"][0]["repository_id"] = json!("repo.browser");
+        plan_document["repositories"][0]["root"] = json!(root);
+        plan_document["repositories"][0]["instructions"] = json!([]);
+        plan_document["tasks"] = json!([task.clone()]);
+        plan_document["edges"] = json!([]);
         let task_runtime = TaskRuntime {
             state: crate::TaskState::Running,
             attempts_started: 1,
@@ -5267,11 +5308,12 @@ mod browser_download_terminal_tests {
             worktree_baseline: None,
             worktree_composition: Vec::new(),
             worktree_conflict: None,
+            integration_views: BTreeMap::new(),
             task_contract_digest: "sha256:task-contract".to_owned(),
-            task: json!({}),
+            task,
         };
         controller.active = Some(ActivePlan {
-            plan_document: json!({}),
+            plan_document,
             compiler_plan_digest: "sha256:compiler-plan".to_owned(),
             plan_id: "plan.browser".to_owned(),
             goal_id: "goal.browser".to_owned(),
@@ -5279,11 +5321,16 @@ mod browser_download_terminal_tests {
             plan_digest: "sha256:plan".to_owned(),
             compilation_evidence_digest: "sha256:compile".to_owned(),
             policy_digest: "sha256:policy".to_owned(),
-            repository_id: "repo.browser".to_owned(),
-            repository_root: root.clone(),
-            baseline: empty_snapshot(&root),
-            baseline_diff_digest: "sha256:diff".to_owned(),
-            baseline_diff_content: String::new(),
+            repositories: BTreeMap::from([(
+                "repo.browser".to_owned(),
+                ActiveRepositoryState {
+                    repository_id: "repo.browser".to_owned(),
+                    repository_root: root.clone(),
+                    baseline: empty_snapshot(&root),
+                    baseline_diff_digest: "sha256:diff".to_owned(),
+                    baseline_diff_content: String::new(),
+                },
+            )]),
             validity: PlanValidity::Current,
             goal_autonomy_budget: goal_budget,
             tasks: BTreeMap::from([("task.browser".to_owned(), task_runtime)]),
@@ -5315,31 +5362,11 @@ mod browser_download_terminal_tests {
             || panic!("fixture active plan disappeared"),
             |active| active.goal_autonomy_budget.clone(),
         );
-        assert_eq!(budget.max_wall_ms % 1_000, 0);
-        assert_eq!(budget.max_model_call_ms % 1_000, 0);
-        assert_eq!(budget.max_single_tool_action_ms % 1_000, 0);
-        assert_eq!(budget.max_disk_write_bytes % (1024 * 1024), 0);
-        assert_eq!(budget.max_child_cpu_ms % 1_000, 0);
         controller
             .active
             .as_mut()
             .unwrap_or_else(|| panic!("fixture active plan disappeared"))
-            .plan_document = json!({
-        "policy": {
-            "resources": {
-                "max_wall_seconds": budget.max_wall_ms / 1_000,
-                "max_model_calls": budget.max_model_calls,
-                "max_model_call_seconds": budget.max_model_call_ms / 1_000,
-                "max_tool_actions": budget.max_tool_actions,
-                "max_single_tool_action_seconds": budget.max_single_tool_action_ms / 1_000,
-                "max_output_bytes": budget.max_output_bytes,
-                "max_disk_write_mb": budget.max_disk_write_bytes / (1024 * 1024),
-                "max_network_bytes": budget.max_network_bytes,
-                "max_subprocesses": budget.max_subprocesses,
-                "max_child_cpu_seconds": budget.max_child_cpu_ms / 1_000
-            }
-        }
-        });
+            .plan_document["policy"]["resources"] = fixture_resource_policy(&budget);
     }
 
     fn seed_running_attempt(controller: &mut Controller) {

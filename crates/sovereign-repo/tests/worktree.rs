@@ -1,6 +1,6 @@
 use sovereign_repo::{
-    ChangeSetCompositionInput, ComposeChangeSetsOutcome, ProjectRegistry, RepoError,
-    RepositoryIntelligence,
+    ChangeSet, ChangeSetCompositionInput, ComposeChangeSetsOutcome, ProjectRegistry, RepoError,
+    RepositoryIntelligence, WorktreeLease,
 };
 use std::fs;
 use std::io::Write;
@@ -741,6 +741,143 @@ fn worktree_composition_preserves_binary_untracked_and_join_deduplicates_shared_
         .unwrap_or_else(|error| panic!("joined local delta: {error}"));
     assert!(empty.diff_content.is_empty());
     assert!(empty.untracked_deltas.is_empty());
+}
+
+fn multi_repo_registry(repo_a: &Fixture, repo_b: &Fixture) -> ProjectRegistry {
+    let mut registry = ProjectRegistry::new();
+    registry
+        .register("repo.a", &repo_a.primary)
+        .unwrap_or_else(|error| panic!("register repo A: {error}"));
+    registry
+        .register("repo.b", &repo_b.primary)
+        .unwrap_or_else(|error| panic!("register repo B: {error}"));
+    registry
+}
+
+fn prepare_multi_repo_lease(
+    registry: &ProjectRegistry,
+    integration_root: &Path,
+    repository_id: &str,
+    task_id: &str,
+) -> WorktreeLease {
+    registry
+        .prepare_worktree_lease(
+            repository_id,
+            integration_root,
+            "plan.multi-repo",
+            1,
+            task_id,
+            &format!("sha256:{task_id}-contract"),
+        )
+        .unwrap_or_else(|error| panic!("prepare {repository_id}/{task_id}: {error}"))
+}
+
+fn capture_multi_repo_change(
+    registry: &ProjectRegistry,
+    lease: &WorktreeLease,
+    path: &str,
+    value: &str,
+    repository_label: &str,
+) -> ChangeSet {
+    let baseline = registry
+        .capture_worktree_baseline(lease)
+        .unwrap_or_else(|error| panic!("{repository_label} source baseline: {error}"));
+    fs::write(lease.worktree_path.join(path), value)
+        .unwrap_or_else(|error| panic!("write {repository_label} source: {error}"));
+    registry
+        .capture_change_set_from_baseline(lease, &baseline)
+        .unwrap_or_else(|error| panic!("capture {repository_label} ChangeSet: {error}"))
+}
+
+fn assert_multi_repo_composed_files(target_a: &WorktreeLease, target_b: &WorktreeLease) {
+    assert_eq!(
+        fs::read_to_string(target_a.worktree_path.join("tracked.txt"))
+            .unwrap_or_else(|error| panic!("read repo A composed tracked file: {error}")),
+        "repo-a\n"
+    );
+    assert_eq!(
+        fs::read_to_string(target_a.worktree_path.join("other.txt"))
+            .unwrap_or_else(|error| panic!("read repo A untouched file: {error}")),
+        "other\n"
+    );
+    assert_eq!(
+        fs::read_to_string(target_b.worktree_path.join("tracked.txt"))
+            .unwrap_or_else(|error| panic!("read repo B untouched file: {error}")),
+        "base\n"
+    );
+    assert_eq!(
+        fs::read_to_string(target_b.worktree_path.join("other.txt"))
+            .unwrap_or_else(|error| panic!("read repo B composed file: {error}")),
+        "repo-b\n"
+    );
+}
+
+#[test]
+fn worktree_multi_repo_leases_share_controller_root_without_cross_repo_composition() {
+    let repo_a = Fixture::new("multi-repo-a");
+    let repo_b = Fixture::new("multi-repo-b");
+    let integration_root = repo_a.base.join("integration/worktrees");
+    let registry = multi_repo_registry(&repo_a, &repo_b);
+
+    let source_a = prepare_multi_repo_lease(&registry, &integration_root, "repo.a", "A-source");
+    let source_b = prepare_multi_repo_lease(&registry, &integration_root, "repo.b", "B-source");
+    assert_eq!(source_a.controller_root, source_b.controller_root);
+    assert_eq!(
+        source_a.worktree_path.parent(),
+        source_b.worktree_path.parent()
+    );
+    assert_ne!(source_a.lease_id, source_b.lease_id);
+    assert_ne!(source_a.worktree_path, source_b.worktree_path);
+    registry
+        .materialize_worktree(&source_a)
+        .unwrap_or_else(|error| panic!("materialize repo A source: {error}"));
+    registry
+        .materialize_worktree(&source_b)
+        .unwrap_or_else(|error| panic!("materialize repo B source: {error}"));
+    assert!(source_a.worktree_path.exists());
+    assert!(source_b.worktree_path.exists());
+
+    let change_a =
+        capture_multi_repo_change(&registry, &source_a, "tracked.txt", "repo-a\n", "repo A");
+    let change_b =
+        capture_multi_repo_change(&registry, &source_b, "other.txt", "repo-b\n", "repo B");
+
+    let target_a = prepare_multi_repo_lease(&registry, &integration_root, "repo.a", "A-target");
+    let target_b = prepare_multi_repo_lease(&registry, &integration_root, "repo.b", "B-target");
+    registry
+        .materialize_worktree(&target_a)
+        .unwrap_or_else(|error| panic!("materialize repo A target: {error}"));
+    registry
+        .materialize_worktree(&target_b)
+        .unwrap_or_else(|error| panic!("materialize repo B target: {error}"));
+
+    assert!(matches!(
+        registry.compose_change_sets(
+            &target_b,
+            &[ChangeSetCompositionInput::current(change_a.clone())]
+        ),
+        Err(RepoError::InvalidWorktreeLease(_))
+    ));
+    assert_eq!(
+        fs::read_to_string(target_b.worktree_path.join("tracked.txt")).unwrap_or_else(
+            |error| panic!("read repo B after rejected cross-repo compose: {error}")
+        ),
+        "base\n"
+    );
+
+    assert!(matches!(
+        registry
+            .compose_change_sets(&target_a, &[ChangeSetCompositionInput::current(change_a)])
+            .unwrap_or_else(|error| panic!("compose repo A ChangeSet: {error}")),
+        ComposeChangeSetsOutcome::Ready(_)
+    ));
+    assert!(matches!(
+        registry
+            .compose_change_sets(&target_b, &[ChangeSetCompositionInput::current(change_b)])
+            .unwrap_or_else(|error| panic!("compose repo B ChangeSet: {error}")),
+        ComposeChangeSetsOutcome::Ready(_)
+    ));
+    assert_multi_repo_composed_files(&target_a, &target_b);
 }
 
 #[test]

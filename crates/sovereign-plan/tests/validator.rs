@@ -71,6 +71,16 @@ fn add_second_task(value: &mut Value, task_id: &str) {
     tasks.push(task);
 }
 
+fn add_repository(value: &mut Value, repository_id: &str, root: &str) {
+    let mut repository = value["repositories"][0].clone();
+    repository["repository_id"] = json!(repository_id);
+    repository["root"] = json!(root);
+    let Some(repositories) = value["repositories"].as_array_mut() else {
+        panic!("fixture repositories must be an array");
+    };
+    repositories.push(repository);
+}
+
 fn binding(upstream_task_id: &str) -> Value {
     json!({
         "upstream_task_id": upstream_task_id,
@@ -253,6 +263,57 @@ fn command_tool_and_repository_must_resolve_within_task_scope() {
     assert_code(
         &diagnostics(wrong_repository),
         DiagnosticCode::MissingReference,
+    );
+}
+
+#[test]
+fn cross_repo_dependency_and_read_process_integration_scope_validate() {
+    let mut cross_repo = fixture();
+    add_repository(&mut cross_repo, "repo.other", "../other");
+    add_second_task(&mut cross_repo, "task.other-producer");
+    task_mut(&mut cross_repo, 1)["scope"]["repositories"] = json!(["repo.other"]);
+    task_mut(&mut cross_repo, 1)["action_policy"]["write_roots"][0]["repository_id"] =
+        json!("repo.other");
+    task_mut(&mut cross_repo, 1)["verification"]["steps"][1]["command_spec"]["repository_id"] =
+        json!("repo.other");
+    task_mut(&mut cross_repo, 0)["dependencies"] = json!(["task.other-producer"]);
+    task_mut(&mut cross_repo, 0)["dependency_bindings"] = json!([binding("task.other-producer")]);
+    assert!(diagnostics(cross_repo).is_empty());
+
+    let mut integration = fixture();
+    add_repository(&mut integration, "repo.other", "../other");
+    integration["depth"]["mode"] = json!("D4");
+    task_mut(&mut integration, 0)["scope"]["repositories"] = json!(["repo.app", "repo.other"]);
+    task_mut(&mut integration, 0)["permissions"] = json!(["read", "process_exec"]);
+    task_mut(&mut integration, 0)["action_policy"]["write_roots"] = json!([]);
+    task_mut(&mut integration, 0)["rollback"] = json!({
+        "mode": "none",
+        "procedure": "Integration gate is read-only.",
+        "reason_no_rollback": "No repository mutation is authorized."
+    });
+    assert!(diagnostics(integration).is_empty());
+}
+
+#[test]
+fn multi_repo_scope_rejects_unknown_repository_and_mutation_authority() {
+    let mut unknown = fixture();
+    task_mut(&mut unknown, 0)["scope"]["repositories"] = json!(["repo.app", "repo.missing"]);
+    let unknown_diagnostics = diagnostics(unknown);
+    assert_diagnostic_at(
+        &unknown_diagnostics,
+        DiagnosticCode::MissingReference,
+        "/tasks/0/scope/repositories",
+        "repo.missing",
+    );
+
+    let mut mutating = fixture();
+    add_repository(&mut mutating, "repo.other", "../other");
+    task_mut(&mut mutating, 0)["scope"]["repositories"] = json!(["repo.app", "repo.other"]);
+    assert_diagnostic_at(
+        &diagnostics(mutating),
+        DiagnosticCode::PermissionPolicy,
+        "/tasks/0/scope/repositories",
+        "read/process-only",
     );
 }
 

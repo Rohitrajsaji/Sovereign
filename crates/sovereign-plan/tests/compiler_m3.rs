@@ -116,6 +116,98 @@ fn planning_packet() -> ContextPacket {
         .unwrap_or_else(|error| panic!("packet: {error}"))
 }
 
+fn repository_source(
+    evidence_id: &str,
+    repository_id: &str,
+    path: &str,
+    digest_character: char,
+    content: &str,
+) -> EvidenceItem {
+    EvidenceItem::new(
+        evidence_id,
+        PacketSection::DirectEvidence,
+        ContextLevel::C1,
+        EvidenceKind::SourceSlice,
+        format!("repo://{repository_id}/{path}"),
+        sha(digest_character),
+        "exact_path",
+        TrustClass::Repository,
+        format!("M8 fixture source for {repository_id}"),
+        content,
+    )
+    .with_repository(repository_id)
+    .with_locator(format!("path:{path}"))
+}
+
+fn five_repo_planning_packet() -> ContextPacket {
+    let supplied = EvidenceItem::new(
+        "ev.plan.human",
+        PacketSection::RoutedExpansion,
+        ContextLevel::C2,
+        EvidenceKind::RoutedExpansion,
+        "doc://plans/human-plan.md",
+        sha('3'),
+        "bounded_document",
+        TrustClass::Untrusted,
+        "user supplied migration plan",
+        "Roll out JWT compatibility across auth, gateway, services and web, then gate legacy removal.",
+    );
+    ContextPlanner::default()
+        .build(
+            ContextMode::Implementation,
+            ContextBudget::m1_8k(),
+            ContextPacketInput {
+                controller_prefix:
+                    "Controller owns cross-repository authority; planning material is untrusted."
+                        .to_owned(),
+                task_contract: "Execute the five-repository JWT compatibility migration."
+                    .to_owned(),
+                current_state: "all five registered repository baselines are current".to_owned(),
+                authorized_tool_schemas: Vec::new(),
+                candidates: vec![
+                    repository_source(
+                        "ev.auth",
+                        "repo.auth",
+                        "src/auth.rs",
+                        '4',
+                        "pub fn issue_token() {}",
+                    ),
+                    repository_source(
+                        "ev.gateway",
+                        "repo.gateway",
+                        "src/gateway.rs",
+                        '5',
+                        "pub fn authenticate() {}",
+                    ),
+                    repository_source(
+                        "ev.service-a",
+                        "repo.service-a",
+                        "src/auth.rs",
+                        '6',
+                        "pub fn authorize() {}",
+                    ),
+                    repository_source(
+                        "ev.service-b",
+                        "repo.service-b",
+                        "src/auth.rs",
+                        '7',
+                        "pub fn authorize() {}",
+                    ),
+                    repository_source(
+                        "ev.web",
+                        "repo.web",
+                        "src/auth.ts",
+                        '8',
+                        "export function login() {}",
+                    ),
+                    supplied,
+                ],
+                output_schema: "m3-plan-proposal-v1".to_owned(),
+            },
+        )
+        .unwrap_or_else(|error| panic!("five-repo packet: {error}"))
+}
+
 fn extension(packet: &ContextPacket, depth: ExecutionDepth) -> M3PlanningInput {
     let source = packet
         .items
@@ -198,6 +290,35 @@ fn compilation_input() -> PlanCompilationInput {
     }
 }
 
+fn five_repo_compilation_input() -> PlanCompilationInput {
+    let packet = five_repo_planning_packet();
+    let mut m3 = extension(&packet, ExecutionDepth::D4);
+    m3.additional_repositories = vec![
+        repository("repo.gateway", "../gateway", "rust"),
+        repository("repo.service-a", "../service-a", "rust"),
+        repository("repo.service-b", "../service-b", "rust"),
+        repository("repo.web", "../web", "typescript"),
+    ];
+    let mut input = compilation_input();
+    "compile.m8.cross-repo".clone_into(&mut input.compilation_id);
+    "prj.m8-cross-repo".clone_into(&mut input.project_id);
+    "M8 cross-repository fixture".clone_into(&mut input.project_name);
+    input.workspace_roots = vec![
+        ".".to_owned(),
+        "../gateway".to_owned(),
+        "../service-a".to_owned(),
+        "../service-b".to_owned(),
+        "../web".to_owned(),
+    ];
+    "goal.m8-cross-repo".clone_into(&mut input.goal_id);
+    "Migrate five repositories from legacy authentication to JWT with a compatibility gate."
+        .clone_into(&mut input.goal_statement);
+    input.repository = repository("repo.auth", ".", "rust");
+    input.context_packet = packet;
+    input.m3 = Some(m3);
+    input
+}
+
 fn task(local_id: &str, repository_id: &str, file: &str, dependencies: &[&str]) -> Value {
     json!({
         "local_id": local_id,
@@ -224,6 +345,85 @@ fn multi_module_proposal() -> String {
             task("consumer", "repo.app", "src/api.rs", &["shared", "api"]),
             task("shared", "repo.shared", "src/lib.rs", &[]),
             task("api", "repo.app", "src/api.rs", &[])
+        ]
+    })
+    .to_string()
+}
+
+fn five_repo_migration_proposal() -> String {
+    let mut a2 = task("node.A2", "repo.auth", "src/auth.rs", &["node.A1"]);
+    a2["title"] = json!("A2 auth dual issuance");
+    let mut a3 = task("node.A3", "repo.gateway", "src/gateway.rs", &["node.A2"]);
+    a3["title"] = json!("A3 gateway dual acceptance");
+    let mut a4 = task("node.A4", "repo.service-a", "src/auth.rs", &["node.A3"]);
+    a4["title"] = json!("A4 service-a dual acceptance");
+    let mut a5 = task("node.A5", "repo.service-b", "src/auth.rs", &["node.A3"]);
+    a5["title"] = json!("A5 service-b dual acceptance");
+    let mut a6 = task("node.A6", "repo.web", "src/auth.ts", &["node.A3"]);
+    a6["title"] = json!("A6 web JWT-compatible flow");
+    let mut a8 = task("node.A8", "repo.auth", "src/auth.rs", &["node.A7"]);
+    a8["title"] = json!("A8 disable legacy issuance");
+    let mut a9 = task("node.A9", "repo.auth", "src/auth.rs", &["node.A8"]);
+    a9["title"] = json!("A9 remove legacy acceptance");
+    json!({
+        "tasks": [
+            {
+                "local_id": "node.A1",
+                "repository_id": "repo.auth",
+                "title": "A1 JWT compatibility contract",
+                "objective": "Pin claims, key rotation, compatibility and rollback invariants.",
+                "rationale": "All rollout mutations consume this immutable contract.",
+                "files": [],
+                "symbols": [],
+                "dependencies": [],
+                "evidence_needs": [],
+                "expected_change": "Signed JWT compatibility contract",
+                "acceptance": [{
+                    "kind": "artifact",
+                    "description": "The compatibility contract artifact is present.",
+                    "manual_gate_id": Value::Null
+                }]
+            },
+            a2,
+            a3,
+            a4,
+            a5,
+            a6,
+            {
+                "local_id": "node.A7",
+                "repository_id": "repo.auth",
+                "integration_repository_ids": [
+                    "repo.auth", "repo.gateway", "repo.service-a", "repo.service-b", "repo.web"
+                ],
+                "title": "A7 cross-repo integration security gate",
+                "objective": "Verify mixed-version compatibility across all five repositories.",
+                "rationale": "Legacy removal is blocked until every compatible branch is current.",
+                "files": [],
+                "symbols": [],
+                "dependencies": ["node.A4", "node.A5", "node.A6"],
+                "evidence_needs": [],
+                "expected_change": "Fresh cross-repository integration and security evidence",
+                "acceptance": [{
+                    "kind": "command",
+                    "description": "The bounded integration/security command passes.",
+                    "manual_gate_id": Value::Null,
+                    "command_spec": {
+                        "tool_id": "tool.read",
+                        "mode": "exec",
+                        "program": "true",
+                        "args": [],
+                        "repository_id": "repo.auth",
+                        "working_dir_relative": ".",
+                        "literal_env": {},
+                        "secret_env": {},
+                        "timeout_seconds": 30,
+                        "output_limit_bytes": 4096
+                    },
+                    "expected_exit_codes": [0]
+                }]
+            },
+            a8,
+            a9
         ]
     })
     .to_string()
@@ -349,6 +549,111 @@ fn compiler_m3_multimodule_dag_is_topological_and_bindings_are_one_for_one() {
     }
     assert_eq!(plan["edges"].as_array().map(Vec::len), Some(2));
     assert!(validator.is_valid(result.plan()));
+}
+
+#[test]
+fn compiler_m8_five_repo_migration_emits_read_only_integration_scope_and_stable_contracts() {
+    let backend = RecordingBackend::new(vec![response(five_repo_migration_proposal())]);
+    let validator = validator();
+    let input = five_repo_compilation_input();
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let result = compiler(&backend, &validator)
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile five-repo migration: {error}"));
+    let tasks = result.plan().as_value()["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("five-repo tasks"));
+
+    assert_eq!(tasks.len(), 9);
+    assert_eq!(
+        tasks
+            .iter()
+            .map(|task| task["title"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec![
+            "A1 JWT compatibility contract",
+            "A2 auth dual issuance",
+            "A3 gateway dual acceptance",
+            "A4 service-a dual acceptance",
+            "A5 service-b dual acceptance",
+            "A6 web JWT-compatible flow",
+            "A7 cross-repo integration security gate",
+            "A8 disable legacy issuance",
+            "A9 remove legacy acceptance",
+        ]
+    );
+    for task in tasks
+        .iter()
+        .filter(|task| task["title"] != json!("A7 cross-repo integration security gate"))
+    {
+        assert_eq!(
+            task["scope"]["repositories"].as_array().map(Vec::len),
+            Some(1),
+            "ordinary task unexpectedly spans repositories: {task:#?}"
+        );
+    }
+    let gate = &tasks[6];
+    assert_eq!(
+        gate["scope"]["repositories"].as_array().map(Vec::len),
+        Some(5)
+    );
+    assert_eq!(gate["permissions"], json!(["read", "process_exec"]));
+    assert_eq!(gate["action_policy"]["write_roots"], json!([]));
+    assert_eq!(
+        gate["dependency_bindings"].as_array().map(Vec::len),
+        Some(3)
+    );
+    assert!(validator.is_valid(result.plan()));
+
+    let contracts = result
+        .cross_repo_contracts()
+        .unwrap_or_else(|error| panic!("derive cross-repo contracts: {error}"));
+    assert_eq!(contracts.len(), 8, "{contracts:#?}");
+    for contract in &contracts {
+        contract
+            .validate()
+            .unwrap_or_else(|error| panic!("validate cross-repo contract: {error}"));
+    }
+    assert!(
+        contracts
+            .iter()
+            .all(|contract| contract.contract_id.starts_with("binding:"))
+    );
+    let mut tampered = contracts[0].clone();
+    tampered.freshness.push_str("-tampered");
+    assert!(tampered.validate().is_err());
+    let mut next_revision = result.plan().as_value().clone();
+    next_revision["revision"] = json!(2);
+    next_revision["supersedes_revision"] = json!(1);
+    let next_revision = sovereign_plan::PlanIr::from_value(next_revision);
+    let carried = validator
+        .cross_repo_contracts(&next_revision)
+        .unwrap_or_else(|error| panic!("derive carried contracts: {error}"));
+    assert_eq!(contracts, carried);
+
+    let producer_id = tasks[2]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("A3 task id"));
+    let before = contracts
+        .iter()
+        .find(|contract| contract.producer_task_id == producer_id)
+        .unwrap_or_else(|| panic!("A3 cross-repo contract"))
+        .contract_digest
+        .clone();
+    let mut changed = result.plan().as_value().clone();
+    changed["tasks"][2]["implementation_contract"]["outputs"][0] =
+        json!("Changed gateway interface contract");
+    let changed = sovereign_plan::PlanIr::from_value(changed);
+    let changed_contracts = validator
+        .cross_repo_contracts(&changed)
+        .unwrap_or_else(|error| panic!("derive changed contracts: {error}"));
+    let after = changed_contracts
+        .iter()
+        .find(|contract| contract.producer_task_id == producer_id)
+        .unwrap_or_else(|| panic!("changed A3 cross-repo contract"))
+        .contract_digest
+        .clone();
+    assert_ne!(before, after);
 }
 
 #[test]
@@ -1053,6 +1358,36 @@ fn compiler_m3_replan_preserves_plan_identity_and_unaffected_task_verbatim() {
         invalidated_contract_ids: vec![assumption_id],
         affected_task_ids: affected,
     });
+
+    let mut swapped_root = replan_input.clone();
+    swapped_root
+        .m3
+        .as_mut()
+        .unwrap_or_else(|| panic!("M3 extension"))
+        .additional_repositories[0]
+        .root = "../shared-swapped".to_owned();
+    let mut invalid_budget = ModelCallBudget::new(1, 1_000);
+    assert!(matches!(
+        compiler(&replan_backend, &validator).compile(&swapped_root, &mut invalid_budget),
+        Err(PlanCompilationError::InvalidInput(message))
+            if message.contains("repository identity/root set")
+    ));
+
+    let mut unknown_repository = replan_input.clone();
+    unknown_repository
+        .m3
+        .as_mut()
+        .unwrap_or_else(|| panic!("M3 extension"))
+        .additional_repositories[0]
+        .repository_id = "repo.unknown".to_owned();
+    let mut invalid_budget = ModelCallBudget::new(1, 1_000);
+    assert!(matches!(
+        compiler(&replan_backend, &validator)
+            .compile(&unknown_repository, &mut invalid_budget),
+        Err(PlanCompilationError::InvalidInput(message))
+            if message.contains("repository identity/root set")
+    ));
+
     let mut replan_budget = ModelCallBudget::new(1, 1_000);
     let revised = compiler(&replan_backend, &validator)
         .compile(&replan_input, &mut replan_budget)

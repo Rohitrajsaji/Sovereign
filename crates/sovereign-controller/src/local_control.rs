@@ -6,10 +6,11 @@
 use super::{
     APPROVAL_REQUEST_NAMESPACE, APPROVAL_REQUEST_SCHEMA_VERSION, ApprovalDecisionV1,
     ApprovalRequestStatusV1, ApprovalRequestV1, AttemptState, Controller, ControllerError,
-    ControllerStatusView, ExecutionControlV1, GoalIntentV1, PersistedRepositoryBaseline,
-    RECOVERY_PROCESS_LEASE_SCHEMA_VERSION, RecoveryManager, RecoveryProcessLease, RollbackStatusV1,
-    TaskState, WorktreeLifecycle, decode_verification_records, process_lease_is_terminal,
-    rollback_records, sha256_prefixed, unix_millis, validate_durable_action_lifecycle_states,
+    ControllerStatusView, ExecutionControlV1, GoalIntentV1, RECOVERY_PROCESS_LEASE_SCHEMA_VERSION,
+    RecoveryManager, RecoveryProcessLease, RollbackStatusV1, TaskState, WorktreeLifecycle,
+    decode_persisted_repository_baseline_set, decode_verification_records,
+    process_lease_is_terminal, rollback_records, unix_millis,
+    validate_durable_action_lifecycle_states,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,6 +88,14 @@ impl Controller {
         }
 
         state.recovery_integrity_check()?;
+        let raw_document = state
+            .get_state("controller.plan_document", "active")?
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "active local control restart lacks durable canonical plan document".to_owned(),
+                )
+            })?;
+        let plan_document: Value = serde_json::from_str(&raw_document)?;
         let baseline_json = state
             .get_state("controller.repository_baseline", "active")?
             .ok_or_else(|| {
@@ -94,17 +103,12 @@ impl Controller {
                     "active local control restart lacks durable repository baseline".to_owned(),
                 )
             })?;
-        let baseline: PersistedRepositoryBaseline = serde_json::from_str(&baseline_json)?;
-        if sha256_prefixed(baseline.diff_content.as_bytes()) != baseline.diff_digest {
-            return Err(ControllerError::InvalidPlan(
-                "durable repository baseline diff content does not match its digest".to_owned(),
-            ));
-        }
+        let baseline_set =
+            decode_persisted_repository_baseline_set(&baseline_json, &plan_document)?;
         let mut registry = ProjectRegistry::new();
-        registry.register(
-            baseline.snapshot.repository_id.clone(),
-            &baseline.snapshot.root,
-        )?;
+        for (repository_id, baseline) in baseline_set.repositories {
+            registry.register(repository_id, &baseline.snapshot.root)?;
+        }
         let (controller, _) = RecoveryManager::recover(state, &registry)?;
         Ok(controller)
     }
@@ -220,7 +224,7 @@ struct DurableActiveRead {
     revision: u32,
     plan_digest: String,
     policy_digest: String,
-    repository_root: PathBuf,
+    repository_roots: BTreeMap<String, PathBuf>,
     tasks: BTreeMap<String, super::TaskRuntime>,
     attempts: BTreeMap<String, super::AttemptRuntime>,
 }
@@ -300,24 +304,18 @@ fn durable_active_read(
         .ok_or_else(|| {
             ControllerError::InvalidPlan("durable repository baseline is missing".to_owned())
         })?;
-    let baseline: PersistedRepositoryBaseline = serde_json::from_str(&baseline_raw)?;
-    if sha256_prefixed(baseline.diff_content.as_bytes()) != baseline.diff_digest {
-        return Err(ControllerError::InvalidPlan(
-            "durable repository baseline diff content does not match its digest".to_owned(),
-        ));
-    }
-    let repository_id = super::required_str(&plan_document, "/repositories/0/repository_id")?;
-    if baseline.snapshot.repository_id != repository_id {
-        return Err(ControllerError::InvalidPlan(
-            "durable repository baseline is bound to another repository".to_owned(),
-        ));
-    }
+    let baseline_set = decode_persisted_repository_baseline_set(&baseline_raw, &plan_document)?;
+    let repository_roots = baseline_set
+        .repositories
+        .into_iter()
+        .map(|(repository_id, baseline)| (repository_id, baseline.snapshot.root))
+        .collect();
     Ok(Some(DurableActiveRead {
         plan_id,
         revision,
         plan_digest: plan_digest.to_owned(),
         policy_digest,
-        repository_root: baseline.snapshot.root,
+        repository_roots,
         tasks,
         attempts,
     }))
@@ -512,7 +510,13 @@ fn pending_recovery_actions(
         .into_iter()
         .map(|record| {
             let raw: super::PersistedActionIntent = serde_json::from_str(&record.value_json)?;
-            let intent = super::normalize_persisted_action_intent(raw, &active.repository_root)?;
+            let repository_root = active.repository_roots.get(&raw.repository_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "durable action intent {} references repository {} outside the active baseline set",
+                    raw.action_id, raw.repository_id
+                ))
+            })?;
+            let intent = super::normalize_persisted_action_intent(raw, repository_root)?;
             Ok((record.key, intent))
         })
         .collect::<Result<std::collections::BTreeMap<_, _>, ControllerError>>()?;

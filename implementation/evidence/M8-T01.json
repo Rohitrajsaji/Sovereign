@@ -1,0 +1,329 @@
+{
+  "schema_version": 1,
+  "task_id": "M8-T01",
+  "title": "Implement cross-repository dependency contracts and checkpoints",
+  "status": "completed",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "0ed73ec337c2dd7bb9fcffe53c3769314cee8d36",
+  "completed_at": "2026-09-19T10:56:59Z",
+  "verified_at": "2026-09-19T10:56:59Z",
+  "dependencies": [
+    "M3-T03",
+    "M3-T04"
+  ],
+  "interfaces": [
+    "CrossRepoContract",
+    "IntegrationCheckpoint"
+  ],
+  "objective": "Compile and execute multi-repository DAGs with version/interface contracts, serial local mutations, and integration checkpoints without creating a second execution authority.",
+  "frozen_tree": {
+    "head": "0ed73ec337c2dd7bb9fcffe53c3769314cee8d36",
+    "dirty_path_count": 12,
+    "git_status": [
+      "M crates/sovereign-controller/src/browser.rs",
+      "M crates/sovereign-controller/src/lib.rs",
+      "M crates/sovereign-controller/src/local_control.rs",
+      "M crates/sovereign-controller/tests/t07.rs",
+      "M crates/sovereign-eval/tests/crash_resume.rs",
+      "M crates/sovereign-eval/tests/m3_scenario_gate.rs",
+      "M crates/sovereign-plan/src/compiler.rs",
+      "M crates/sovereign-plan/src/lib.rs",
+      "M crates/sovereign-plan/tests/compiler_m3.rs",
+      "M crates/sovereign-plan/tests/validator.rs",
+      "M crates/sovereign-repo/tests/worktree.rs",
+      "?? crates/sovereign-eval/tests/cross_repo.rs"
+    ],
+    "git_diff_check": "passed"
+  },
+  "source_hashes": {
+    "crates/sovereign-controller/src/lib.rs": "sha256:48dff31e5b4c8139a26d647d4ed711e4c38d47689f26768e9a63404da49e39fa",
+    "crates/sovereign-controller/src/local_control.rs": "sha256:6b71825b63def9c67de6baa2f639cee8292c3813a14200add8b2ba1d18829c20",
+    "crates/sovereign-controller/src/browser.rs": "sha256:3b5e968108a6bbd2de9199ec5c2308314a67eaa1c9b9eb00178307e6a52df8cc",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:5a30e59dc8db3ccccbbbadb716d191d4cb8d83d7cd797b539e5fc9cbf944313a",
+    "crates/sovereign-eval/tests/cross_repo.rs": "sha256:4450771a30a18b78d49eca86fcb157935b07b7dcef749a10da24e95cc8a50f55",
+    "crates/sovereign-eval/tests/crash_resume.rs": "sha256:df826f04c1e80c1aeffac4f39631a0c6cd3a106799f0d5ee1ac28553533e2175",
+    "crates/sovereign-eval/tests/m3_scenario_gate.rs": "sha256:f2552e5a8b978ca4999b549f07cf4fcb359c220313c800cb00e9150dfc62f998",
+    "crates/sovereign-plan/src/lib.rs": "sha256:2dac40f0a4d608ea52893f2f88866f558d62e0ab13fba73388788636b784c5b6",
+    "crates/sovereign-plan/src/compiler.rs": "sha256:4937c6a448ca2521d03eb8b3870adf36b7015f106a25f8edd75dc81c50059442",
+    "crates/sovereign-plan/tests/compiler_m3.rs": "sha256:2320d6fed7b61362d23571eeca6cbef7f5557ddaea5f058fc964eef8cdcf5d9c",
+    "crates/sovereign-plan/tests/validator.rs": "sha256:278d1d969ec479f3b866c986219d87c1f7b071ad77165f8b325d67a9b53de0de",
+    "crates/sovereign-repo/tests/worktree.rs": "sha256:64694e92ed4bf300c5941a001445b1cf65fca78ffc95b41a95530bbef322bb23"
+  },
+  "cross_repository_migration_fixture_report": {
+    "fixture": "Frozen Scenario 3 authentication migration",
+    "repository_count": 5,
+    "repositories": [
+      "repo.auth",
+      "repo.gateway",
+      "repo.service-a",
+      "repo.service-b",
+      "repo.web"
+    ],
+    "task_order": [
+      "A1 JWT compatibility contract",
+      "A2 auth dual issuance",
+      "A3 gateway dual acceptance",
+      "A4 service-a dual acceptance",
+      "A5 service-b dual acceptance",
+      "A6 web JWT-compatible flow",
+      "A7 cross-repo integration security gate",
+      "A8 disable legacy issuance",
+      "A9 remove legacy acceptance"
+    ],
+    "dependency_dag": {
+      "A1": [],
+      "A2": [
+        "A1"
+      ],
+      "A3": [
+        "A2"
+      ],
+      "A4": [
+        "A3"
+      ],
+      "A5": [
+        "A3"
+      ],
+      "A6": [
+        "A3"
+      ],
+      "A7": [
+        "A4",
+        "A5",
+        "A6"
+      ],
+      "A8": [
+        "A7"
+      ],
+      "A9": [
+        "A8"
+      ]
+    },
+    "migration_order_backward_compatible": true,
+    "producer_contract_drift_invalidates_consumer": true,
+    "revision_only_recompile_preserves_contract_digest": true,
+    "one_repository_restart_recovers_without_replay": true,
+    "integration_gate_is_read_process_only": true,
+    "integration_gate_materializes_current_multi_repo_views": true,
+    "integration_gate_publishes_canonical_checkpoint": true,
+    "consumer_requires_current_checkpoint": true,
+    "missing_tampered_or_stale_checkpoint_fails_closed": true,
+    "five_logical_repositories_still_use_serial_local_model_admission": true,
+    "cross_repository_changesets_are_never_composed": true
+  },
+  "per_repository_final_revision_interface_contract_checkpoint_manifests": [
+    {
+      "repository_id": "repo.auth",
+      "scenario_tasks": [
+        "A1",
+        "A2",
+        "A7",
+        "A8",
+        "A9"
+      ],
+      "final_revision_binding": "current registered repo.auth baseline plus only ordered same-repository ChangeSets",
+      "interface_contracts": [
+        "A2 producer contract is consumed by cross-repository A3",
+        "A7 consumes exact inbound contracts and current views before A8 can become ready"
+      ],
+      "checkpoint_binding": "A7 IntegrationCheckpoint is revision/task/verification/CAS bound and includes repo.auth current integration-view state",
+      "verified_by": [
+        "backward_compatible_migration_order_and_producer_contract_drift_are_bound",
+        "integration_gate_executes_read_only_publishes_checkpoint_and_unblocks_consumer",
+        "integration_gate_checkpoint_survives_recovery_and_unblocks_consumer_without_rerun"
+      ]
+    },
+    {
+      "repository_id": "repo.gateway",
+      "scenario_tasks": [
+        "A3"
+      ],
+      "final_revision_binding": "current registered repo.gateway baseline plus only ordered same-repository ChangeSets",
+      "interface_contracts": [
+        "A3 exact producer contract is consumed independently by A4, A5, and A6",
+        "producer interface drift changes the CrossRepoContract digest and invalidates affected consumers"
+      ],
+      "checkpoint_binding": "A7 checkpoint includes repo.gateway current integration-view state and its exact inbound/outbound contract correlation",
+      "verified_by": [
+        "backward_compatible_migration_order_and_producer_contract_drift_are_bound",
+        "a8_blocks_after_repository_baseline_drifts_from_the_a7_checkpoint"
+      ]
+    },
+    {
+      "repository_id": "repo.service-a",
+      "scenario_tasks": [
+        "A4"
+      ],
+      "final_revision_binding": "current registered repo.service-a baseline plus only ordered same-repository ChangeSets",
+      "interface_contracts": [
+        "A4 consumes the current A3 producer contract",
+        "A4 accepted evidence is a hard dependency of A7"
+      ],
+      "checkpoint_binding": "A7 checkpoint includes the current repo.service-a integration view",
+      "verified_by": [
+        "integration_gate_executes_read_only_publishes_checkpoint_and_unblocks_consumer"
+      ]
+    },
+    {
+      "repository_id": "repo.service-b",
+      "scenario_tasks": [
+        "A5"
+      ],
+      "final_revision_binding": "current registered repo.service-b baseline plus only ordered same-repository ChangeSets",
+      "interface_contracts": [
+        "A5 consumes the current A3 producer contract",
+        "A5 accepted evidence is a hard dependency of A7"
+      ],
+      "checkpoint_binding": "A7 checkpoint includes the current repo.service-b integration view",
+      "verified_by": [
+        "integration_gate_executes_read_only_publishes_checkpoint_and_unblocks_consumer"
+      ]
+    },
+    {
+      "repository_id": "repo.web",
+      "scenario_tasks": [
+        "A6"
+      ],
+      "final_revision_binding": "current registered repo.web baseline plus only ordered same-repository ChangeSets",
+      "interface_contracts": [
+        "A6 consumes the current A3 producer contract",
+        "A6 accepted evidence is a hard dependency of A7"
+      ],
+      "checkpoint_binding": "A7 checkpoint includes the current repo.web integration view",
+      "verified_by": [
+        "integration_gate_executes_read_only_publishes_checkpoint_and_unblocks_consumer"
+      ]
+    }
+  ],
+  "integration_checkpoint_contract": {
+    "single_authority_namespace": "controller.integration_checkpoint",
+    "revision_scoped_key": true,
+    "canonical_cas_bound": true,
+    "binds_plan_id_revision_digest": true,
+    "binds_gate_task_and_task_contract": true,
+    "binds_verification_id_digest_and_artifact": true,
+    "binds_integration_view_set_digest": true,
+    "binds_sorted_current_inbound_cross_repo_contract_digests": true,
+    "binds_per_repository_primary_snapshot_current_view_baseline_and_changesets": true,
+    "journal_event": "integration_checkpoint_published",
+    "exact_republication_is_idempotent": true,
+    "conflicting_republication_fails_closed": true,
+    "duplicate_authority_created": false
+  },
+  "checkpoint_v3_and_recovery_contract": {
+    "v3_repository_baselines_exact": true,
+    "v3_cross_repo_contract_digest_map_exact": true,
+    "v3_integration_checkpoint_digest_map_exact": true,
+    "v1_v2_legacy_compatibility_preserved": true,
+    "v2_autonomy_and_security_governance_preserved": true,
+    "ordered_post_checkpoint_publication_replay_required": true,
+    "superseding_revision_checkpoint_rows_blocked_before_trusted_reanchor": true,
+    "a7_pre_epoch_command_recovery_preserved": true,
+    "a7_dispatched_or_observed_command_becomes_unknown": true,
+    "a7_committed_command_prefix_is_never_blindly_replayed": true,
+    "a7_exact_historical_success_reuse_is_idempotent": true
+  },
+  "acceptance": {
+    "five_repo_plan_does_not_imply_five_concurrent_models": true,
+    "single_resident_model_authority_preserved": true,
+    "serial_local_mutations_preserved": true,
+    "controller_remains_sole_execution_and_lifecycle_authority": true,
+    "state_store_remains_single_authoritative_execution_database": true,
+    "action_journal_remains_single_authoritative_action_journal": true,
+    "resource_governor_remains_single_resource_authority": true
+  },
+  "verification": [
+    {
+      "name": "M8 public cross-repository acceptance suite",
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-eval --test cross_repo --offline",
+      "result": "pass",
+      "details": "9 passed, 0 failed"
+    },
+    {
+      "name": "M8 public cross-repository strict lint",
+      "command": "CARGO_NET_OFFLINE=true cargo clippy -p sovereign-eval --test cross_repo --offline -- -D warnings",
+      "result": "pass"
+    },
+    {
+      "name": "workspace format",
+      "command": "cargo fmt --all -- --check",
+      "result": "pass"
+    },
+    {
+      "name": "workspace all-targets check",
+      "command": "CARGO_NET_OFFLINE=true cargo check --workspace --all-targets --offline",
+      "result": "pass"
+    },
+    {
+      "name": "workspace all-targets tests",
+      "command": "CARGO_NET_OFFLINE=true cargo test --workspace --all-targets --offline",
+      "result": "pass",
+      "details": [
+        "sovereign-controller lib: 81 passed",
+        "m6_t06_resilience: 6 passed including controller_inflight_model_cancellation_interrupts_backend_and_keeps_call_consumed",
+        "controller t07: 63 passed",
+        "cross_repo: 9 passed",
+        "crash_resume: 30 passed",
+        "m3_scenario_gate: 7 passed",
+        "browser_policy: 12 passed",
+        "real-Qwen qualification tests remain intentionally ignored here and are reserved for final-tree explicit execution"
+      ]
+    },
+    {
+      "name": "workspace strict Clippy",
+      "command": "CARGO_NET_OFFLINE=true cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "pass"
+    },
+    {
+      "name": "diff integrity",
+      "command": "git diff --check",
+      "result": "pass"
+    }
+  ],
+  "independent_audit": {
+    "worker": "worker-85",
+    "mode": "fresh exact-tree read-only M8-T01 closure audit",
+    "result": "CLOSABLE",
+    "verdict": "M8-T01 frozen task: CLOSABLE",
+    "blockers": [],
+    "notes": [
+      "Frozen M8-T01 acceptance is covered by current unit and public regressions.",
+      "An A7-specific public SIGKILL wrapper is test-depth debt, not a frozen M8-T01 acceptance blocker.",
+      "The post-audit changes were test-only lint refactors in cross_repo.rs and did not change production authority semantics."
+    ]
+  },
+  "state_authority": {
+    "controller_sole_execution_and_lifecycle_authority": true,
+    "state_store_remains_single_authoritative_execution_database": true,
+    "action_journal_remains_single_authoritative_action_journal": true,
+    "resource_governor_remains_single_resource_authority": true,
+    "second_authority_database_created": false,
+    "second_action_journal_created": false,
+    "second_resource_governor_created": false,
+    "second_network_budget_ledger_created": false,
+    "second_disk_budget_ledger_created": false
+  },
+  "intentional_final_release_tests_deferred": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false,
+    "network_package_install": false
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  }
+}

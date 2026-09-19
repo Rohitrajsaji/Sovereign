@@ -17,6 +17,7 @@ pub use replan::{
     smallest_replan_scope_tasks,
 };
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -27,6 +28,7 @@ use std::path::{Component, Path};
 
 const PLAN_SCHEMA: &str = include_str!("../../../schemas/plan-ir-v1.json");
 pub const PLAN_IR_VERSION: &str = "1.2";
+pub const CROSS_REPO_CONTRACT_SCHEMA_VERSION: u32 = 1;
 
 /// Candidate immutable Plan IR document. Authority is gained only after a
 /// [`PlanValidator`] accepts it and the Controller activates it.
@@ -81,6 +83,228 @@ impl PlanIr {
         hasher.update(self.canonical_bytes()?);
         Ok(format!("sha256:{:x}", hasher.finalize()))
     }
+}
+
+/// Deterministic dependency contract for one Plan IR edge that crosses
+/// repository scopes. The digest intentionally excludes plan revision so an
+/// unchanged producer/consumer contract can carry across N -> N+1 replans.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrossRepoContract {
+    pub schema_version: u32,
+    pub contract_id: String,
+    pub producer_task_id: String,
+    pub producer_repository_ids: Vec<String>,
+    pub producer_task_contract_digest: String,
+    pub consumer_task_id: String,
+    pub consumer_repository_ids: Vec<String>,
+    pub consumer_task_contract_digest: String,
+    pub required_artifact_ids: Vec<String>,
+    pub required_acceptance_criterion_ids: Vec<String>,
+    pub freshness: String,
+    pub contract_digest: String,
+}
+
+impl CrossRepoContract {
+    /// Validates the stable identity, canonical ordering, and digest binding of
+    /// a serialized cross-repository contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed error for unsupported schema versions, malformed
+    /// edge identity/scope, or a digest mismatch.
+    pub fn validate(&self) -> Result<(), CrossRepoContractError> {
+        if self.schema_version != CROSS_REPO_CONTRACT_SCHEMA_VERSION {
+            return Err(CrossRepoContractError(format!(
+                "unsupported cross-repository contract schema {}",
+                self.schema_version
+            )));
+        }
+        let expected_id = format!(
+            "binding:{}:{}",
+            self.consumer_task_id, self.producer_task_id
+        );
+        if self.contract_id != expected_id
+            || !is_sorted_unique_nonempty(&self.producer_repository_ids)
+            || !is_sorted_unique_nonempty(&self.consumer_repository_ids)
+            || !is_sorted_unique_nonempty(&self.required_artifact_ids)
+            || !is_sorted_unique_nonempty(&self.required_acceptance_criterion_ids)
+            || self.freshness.is_empty()
+        {
+            return Err(CrossRepoContractError(
+                "cross-repository contract identity or bounded scope is invalid".to_owned(),
+            ));
+        }
+        let expected_digest = cross_repo_contract_digest(self)?;
+        if self.contract_digest != expected_digest {
+            return Err(CrossRepoContractError(
+                "cross-repository contract digest mismatch".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Error returned when deterministic cross-repository contracts cannot be
+/// derived from a Plan IR document that was expected to be validated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CrossRepoContractError(String);
+
+impl Display for CrossRepoContractError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl Error for CrossRepoContractError {}
+
+/// Derives stable cross-repository dependency contracts from Plan IR task
+/// dependency bindings. Callers that do not already hold a validated compiler
+/// result should prefer [`PlanValidator::cross_repo_contracts`].
+///
+/// # Errors
+///
+/// Returns a fail-closed structural error when task identities, repository
+/// scopes, dependencies, or their one-for-one bindings cannot be resolved.
+fn derive_cross_repo_contracts(
+    plan: &PlanIr,
+) -> Result<Vec<CrossRepoContract>, CrossRepoContractError> {
+    let tasks = plan
+        .as_value()
+        .get("tasks")
+        .and_then(Value::as_array)
+        .ok_or_else(|| CrossRepoContractError("Plan IR lacks tasks[]".to_owned()))?;
+    let mut task_map = BTreeMap::<&str, &Value>::new();
+    for task in tasks {
+        let task_id = task
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CrossRepoContractError("Plan IR task lacks task_id".to_owned()))?;
+        if task_map.insert(task_id, task).is_some() {
+            return Err(CrossRepoContractError(format!(
+                "Plan IR contains duplicate task {task_id}"
+            )));
+        }
+    }
+
+    let mut contracts = Vec::new();
+    for consumer in tasks {
+        let consumer_task_id = consumer
+            .get("task_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CrossRepoContractError("Plan IR task lacks task_id".to_owned()))?;
+        let consumer_repository_ids = canonical_task_repository_ids(consumer)?;
+        let consumer_task_contract_digest = canonical_value_digest(consumer)?;
+        let mut dependencies = strings_at(consumer, &["dependencies"]);
+        dependencies.sort_unstable();
+        for producer_task_id in dependencies {
+            let producer = task_map.get(producer_task_id).copied().ok_or_else(|| {
+                CrossRepoContractError(format!(
+                    "dependency {producer_task_id} for {consumer_task_id} does not resolve"
+                ))
+            })?;
+            let producer_repository_ids = canonical_task_repository_ids(producer)?;
+            if producer_repository_ids == consumer_repository_ids {
+                continue;
+            }
+            contracts.push(cross_repo_contract_for_dependency(
+                consumer,
+                consumer_task_id,
+                &consumer_repository_ids,
+                &consumer_task_contract_digest,
+                producer,
+                producer_task_id,
+                producer_repository_ids,
+            )?);
+        }
+    }
+    contracts.sort_by(|left, right| left.contract_id.cmp(&right.contract_id));
+    Ok(contracts)
+}
+
+fn cross_repo_contract_for_dependency(
+    consumer: &Value,
+    consumer_task_id: &str,
+    consumer_repository_ids: &[String],
+    consumer_task_contract_digest: &str,
+    producer: &Value,
+    producer_task_id: &str,
+    producer_repository_ids: Vec<String>,
+) -> Result<CrossRepoContract, CrossRepoContractError> {
+    let matching_bindings = consumer
+        .get("dependency_bindings")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|binding| {
+            binding.get("upstream_task_id").and_then(Value::as_str) == Some(producer_task_id)
+        })
+        .collect::<Vec<_>>();
+    let [binding] = matching_bindings.as_slice() else {
+        return Err(CrossRepoContractError(format!(
+            "dependency {producer_task_id} for {consumer_task_id} requires exactly one binding"
+        )));
+    };
+    let mut required_artifact_ids = strings_at(binding, &["required_artifact_ids"])
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    required_artifact_ids.sort();
+    required_artifact_ids.dedup();
+    let mut required_acceptance_criterion_ids =
+        strings_at(binding, &["required_acceptance_criterion_ids"])
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+    required_acceptance_criterion_ids.sort();
+    required_acceptance_criterion_ids.dedup();
+    let freshness = binding
+        .get("freshness")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            CrossRepoContractError(format!(
+                "dependency binding {consumer_task_id} <- {producer_task_id} lacks freshness"
+            ))
+        })?
+        .to_owned();
+    let contract_id = format!("binding:{consumer_task_id}:{producer_task_id}");
+    let mut contract = CrossRepoContract {
+        schema_version: CROSS_REPO_CONTRACT_SCHEMA_VERSION,
+        contract_id,
+        producer_task_id: producer_task_id.to_owned(),
+        producer_repository_ids,
+        producer_task_contract_digest: canonical_value_digest(producer)?,
+        consumer_task_id: consumer_task_id.to_owned(),
+        consumer_repository_ids: consumer_repository_ids.to_vec(),
+        consumer_task_contract_digest: consumer_task_contract_digest.to_owned(),
+        required_artifact_ids,
+        required_acceptance_criterion_ids,
+        freshness,
+        contract_digest: String::new(),
+    };
+    contract.contract_digest = cross_repo_contract_digest(&contract)?;
+    Ok(contract)
+}
+
+fn cross_repo_contract_digest(
+    contract: &CrossRepoContract,
+) -> Result<String, CrossRepoContractError> {
+    canonical_value_digest(&serde_json::json!({
+        "schema_version": contract.schema_version,
+        "contract_id": contract.contract_id,
+        "producer_task_id": contract.producer_task_id,
+        "producer_repository_ids": contract.producer_repository_ids,
+        "producer_task_contract_digest": contract.producer_task_contract_digest,
+        "consumer_task_id": contract.consumer_task_id,
+        "consumer_repository_ids": contract.consumer_repository_ids,
+        "consumer_task_contract_digest": contract.consumer_task_contract_digest,
+        "required_artifact_ids": contract.required_artifact_ids,
+        "required_acceptance_criterion_ids": contract.required_acceptance_criterion_ids,
+        "freshness": contract.freshness,
+    }))
+}
+
+fn is_sorted_unique_nonempty(values: &[String]) -> bool {
+    !values.is_empty() && values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 /// Stable diagnostic categories returned by deterministic Plan validation.
@@ -241,6 +465,26 @@ impl PlanValidator {
     pub fn is_valid(&self, plan: &PlanIr) -> bool {
         self.validate(plan).is_empty()
     }
+
+    /// Derives cross-repository contracts only after the complete Plan IR
+    /// structural and semantic validation gate succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first validation failure, or a fail-closed structural error
+    /// from deterministic contract derivation.
+    pub fn cross_repo_contracts(
+        &self,
+        plan: &PlanIr,
+    ) -> Result<Vec<CrossRepoContract>, CrossRepoContractError> {
+        if let Some(diagnostic) = self.validate(plan).first() {
+            return Err(CrossRepoContractError(format!(
+                "Plan IR must validate before cross-repository contract derivation: {}:{}:{}",
+                diagnostic.code, diagnostic.path, diagnostic.message
+            )));
+        }
+        derive_cross_repo_contracts(plan)
+    }
 }
 
 fn validate_semantics(
@@ -274,6 +518,7 @@ fn validate_semantics(
 
     let global_permissions = string_set_at(document, &["policy", "capability_ceiling"]);
     let global_resources = document.pointer("/policy/resources");
+    let depth_mode = document.pointer("/depth/mode").and_then(Value::as_str);
     for (index, task) in tasks.iter().enumerate() {
         let path = format!("/tasks/{index}");
         validate_task_references(
@@ -282,6 +527,7 @@ fn validate_semantics(
             &task_map,
             &requirements,
             &repositories,
+            depth_mode,
             diagnostics,
         );
         validate_evidence_and_acceptance(task, &path, diagnostics);
@@ -523,6 +769,7 @@ fn validate_task_references<'a>(
     task_map: &BTreeMap<&'a str, &'a Value>,
     requirements: &BTreeSet<&str>,
     repositories: &BTreeSet<&str>,
+    depth_mode: Option<&str>,
     diagnostics: &mut Vec<ValidationDiagnostic>,
 ) {
     for requirement in strings_at(task, &["requirement_ids"]) {
@@ -534,7 +781,8 @@ fn validate_task_references<'a>(
             ));
         }
     }
-    for repository in strings_at(task, &["scope", "repositories"]) {
+    let scoped_repositories = strings_at(task, &["scope", "repositories"]);
+    for repository in &scoped_repositories {
         if !repositories.contains(repository) {
             diagnostics.push(ValidationDiagnostic::new(
                 DiagnosticCode::MissingReference,
@@ -543,6 +791,7 @@ fn validate_task_references<'a>(
             ));
         }
     }
+    validate_multi_repository_task_scope(task, path, &scoped_repositories, depth_mode, diagnostics);
 
     let dependencies: BTreeSet<_> = strings_at(task, &["dependencies"]).into_iter().collect();
     let Some(bindings) = task.get("dependency_bindings").and_then(Value::as_array) else {
@@ -613,6 +862,45 @@ fn validate_task_references<'a>(
                 format!("dependency {dependency} requires exactly one binding"),
             ));
         }
+    }
+}
+
+fn validate_multi_repository_task_scope(
+    task: &Value,
+    path: &str,
+    scoped_repositories: &[&str],
+    depth_mode: Option<&str>,
+    diagnostics: &mut Vec<ValidationDiagnostic>,
+) {
+    if scoped_repositories.len() <= 1 {
+        return;
+    }
+    if depth_mode != Some("D4") {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/scope/repositories"),
+            "multi-repository task scope requires D4 planning depth",
+        ));
+    }
+    let permissions = string_set_at(task, &["permissions"]);
+    let has_non_integration_permission = permissions
+        .iter()
+        .any(|permission| !matches!(*permission, "read" | "process_exec"));
+    let write_roots_present = task
+        .pointer("/action_policy/write_roots")
+        .and_then(Value::as_array)
+        .is_some_and(|roots| !roots.is_empty());
+    let create_or_delete_present = ["allow_create", "allow_delete"].iter().any(|field| {
+        task.pointer(&format!("/scope/{field}"))
+            .and_then(Value::as_array)
+            .is_some_and(|paths| !paths.is_empty())
+    });
+    if has_non_integration_permission || write_roots_present || create_or_delete_present {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/scope/repositories"),
+            "multi-repository task scope must remain read/process-only with no repository mutation authority",
+        ));
     }
 }
 
@@ -1636,6 +1924,32 @@ fn canonicalize(value: &Value) -> Value {
         }
         _ => value.clone(),
     }
+}
+
+fn canonical_task_repository_ids(task: &Value) -> Result<Vec<String>, CrossRepoContractError> {
+    let mut repository_ids = strings_at(task, &["scope", "repositories"])
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    repository_ids.sort();
+    repository_ids.dedup();
+    if repository_ids.is_empty() {
+        return Err(CrossRepoContractError(
+            "Plan IR task lacks scope.repositories[]".to_owned(),
+        ));
+    }
+    Ok(repository_ids)
+}
+
+fn canonical_value_digest(value: &Value) -> Result<String, CrossRepoContractError> {
+    let bytes = serde_json::to_vec(&canonicalize(value)).map_err(|error| {
+        CrossRepoContractError(format!(
+            "canonical cross-repository contract encoding: {error}"
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn strings_at<'a>(value: &'a Value, path: &[&str]) -> Vec<&'a str> {

@@ -146,6 +146,36 @@ impl Drop for Fixture {
     }
 }
 
+fn sole_persisted_repository_baseline(value: &Value) -> &Value {
+    let repositories = value["repositories"]
+        .as_object()
+        .unwrap_or_else(|| panic!("repository baseline set missing repositories"));
+    assert_eq!(
+        repositories.len(),
+        1,
+        "crash-resume fixture expects exactly one repository baseline"
+    );
+    repositories
+        .values()
+        .next()
+        .unwrap_or_else(|| panic!("repository baseline set unexpectedly empty"))
+}
+
+fn sole_persisted_repository_baseline_mut(value: &mut Value) -> &mut Value {
+    let repositories = value["repositories"]
+        .as_object_mut()
+        .unwrap_or_else(|| panic!("repository baseline set missing repositories"));
+    assert_eq!(
+        repositories.len(),
+        1,
+        "crash-resume fixture expects exactly one repository baseline"
+    );
+    repositories
+        .values_mut()
+        .next()
+        .unwrap_or_else(|| panic!("repository baseline set unexpectedly empty"))
+}
+
 struct Prepared {
     registry: ProjectRegistry,
     packet: ContextPacket,
@@ -666,8 +696,9 @@ fn install_uncheckpointed_supersession(
         .get_state("controller.repository_baseline", "active")
         .unwrap_or_else(|error| panic!("read baseline: {error}"))
         .unwrap_or_else(|| panic!("baseline missing"));
-    let baseline: Value = serde_json::from_str(&baseline_raw)
+    let baseline_set: Value = serde_json::from_str(&baseline_raw)
         .unwrap_or_else(|error| panic!("baseline json: {error}"));
+    let baseline = sole_persisted_repository_baseline(&baseline_set);
     let baseline_snapshot: RepositorySnapshot =
         serde_json::from_value(baseline["snapshot"].clone())
             .unwrap_or_else(|error| panic!("baseline snapshot json: {error}"));
@@ -1741,14 +1772,15 @@ fn unjournaled_repository_baseline_and_validity_drift_is_rejected_during_recover
         .get_state("controller.repository_baseline", "active")
         .unwrap_or_else(|error| panic!("read repository baseline: {error}"))
         .unwrap_or_else(|| panic!("repository baseline missing"));
-    let mut baseline: Value = serde_json::from_str(&raw_baseline)
+    let mut baseline_set: Value = serde_json::from_str(&raw_baseline)
         .unwrap_or_else(|error| panic!("baseline json: {error}"));
+    let baseline = sole_persisted_repository_baseline_mut(&mut baseline_set);
     baseline["diff_digest"] = Value::String(format!("sha256:{}", "b".repeat(64)));
     state
         .put_state(
             "controller.repository_baseline",
             "active",
-            &baseline.to_string(),
+            &baseline_set.to_string(),
         )
         .unwrap_or_else(|error| panic!("write unjournaled baseline drift: {error}"));
 
@@ -1770,11 +1802,8 @@ fn unjournaled_repository_baseline_and_validity_drift_is_rejected_during_recover
     let Err(error) = RecoveryManager::recover(state, &registry) else {
         panic!("unjournaled baseline/validity drift must not recover");
     };
-    assert!(
-        error
-            .to_string()
-            .contains("durable repository baseline diff content does not match its digest")
-    );
+    assert!(error.to_string().contains("durable repository baseline"));
+    assert!(error.to_string().contains("corrupt or misbound"));
 }
 
 #[test]
@@ -1788,8 +1817,9 @@ fn fallback_rejects_baseline_diff_content_tamper_before_reconstruction() {
         .get_state("controller.repository_baseline", "active")
         .unwrap_or_else(|error| panic!("read repository baseline: {error}"))
         .unwrap_or_else(|| panic!("repository baseline missing"));
-    let mut baseline: Value = serde_json::from_str(&raw_baseline)
+    let mut baseline_set: Value = serde_json::from_str(&raw_baseline)
         .unwrap_or_else(|error| panic!("baseline json: {error}"));
+    let baseline = sole_persisted_repository_baseline_mut(&mut baseline_set);
     let content = baseline["diff_content"]
         .as_str()
         .unwrap_or_else(|| panic!("baseline diff content missing"));
@@ -1799,7 +1829,7 @@ fn fallback_rejects_baseline_diff_content_tamper_before_reconstruction() {
         .put_state(
             "controller.repository_baseline",
             "active",
-            &baseline.to_string(),
+            &baseline_set.to_string(),
         )
         .unwrap_or_else(|error| panic!("write baseline-content tamper: {error}"));
     drop(state);
@@ -1826,11 +1856,8 @@ fn fallback_rejects_baseline_diff_content_tamper_before_reconstruction() {
     let Err(error) = RecoveryManager::recover(state, &registry) else {
         panic!("fallback must reject baseline diff content tamper");
     };
-    assert!(
-        error
-            .to_string()
-            .contains("durable repository baseline diff content does not match its digest")
-    );
+    assert!(error.to_string().contains("durable repository baseline"));
+    assert!(error.to_string().contains("corrupt or misbound"));
 }
 
 #[test]

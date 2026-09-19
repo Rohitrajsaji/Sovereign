@@ -314,7 +314,7 @@ fn scenario_2_multi_module_feature_compiles_and_validates() {
 }
 
 #[test]
-fn scenario_3_cross_repository_auth_migration_compiles_validates_and_execution_stays_deferred() {
+fn scenario_3_cross_repository_auth_migration_compiles_and_reaches_m8_repository_authority() {
     let goal = "Migrate five services from a legacy internal session token to signed JWTs without downtime.";
     let input = compilation_input(
         "3",
@@ -352,9 +352,14 @@ fn scenario_3_cross_repository_auth_migration_compiles_validates_and_execution_s
     let activation = controller.activate(result, &ProjectRegistry::new());
     match activation {
         Err(ControllerError::InvalidPlan(message)) => {
-            assert!(message.contains("exactly one active repository"));
+            assert!(
+                message.contains("is not registered"),
+                "multi-repo activation must reach repository authority rather than the removed pre-M8 singleton guard: {message}"
+            );
         }
-        other => panic!("Scenario 3 execution must remain deferred to M8, got {other:?}"),
+        other => panic!(
+            "Scenario 3 empty-registry activation must fail at repository authority, got {other:?}"
+        ),
     }
     let _ = std::fs::remove_file(state_path);
 }

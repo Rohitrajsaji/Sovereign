@@ -23,8 +23,8 @@ use sovereign_model::{
     ModelMessage, ModelMessageRole, ModelOutputContract, ModelRequest, ModelResidencyProof,
 };
 use sovereign_plan::{
-    PlanCompilationResult, PlanReplanInput, PlanRevisionDiff, ReplanScope,
-    smallest_replan_scope_tasks,
+    CrossRepoContract, PlanCompilationResult, PlanIr, PlanReplanInput, PlanRevisionDiff,
+    PlanValidator, ReplanScope, ValidationEnvironment, smallest_replan_scope_tasks,
 };
 use sovereign_policy::{
     APPROVAL_CLAIM_SCHEMA_VERSION, AUTONOMY_BUDGET_SCHEMA_VERSION, AdmissionStatus,
@@ -116,8 +116,11 @@ const MAX_REPOSITORY_PROPOSAL_BYTES: usize = 64 * 1_024;
 const EVIDENCE_SATISFACTION_SCHEMA_VERSION: u32 = 1;
 const VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION: u32 = 1;
 const TASK_CARRY_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
+pub const INTEGRATION_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+const INTEGRATION_CHECKPOINT_NAMESPACE: &str = "controller.integration_checkpoint";
 pub const LEGACY_CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 1;
-pub const CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const AUTONOMY_SECURITY_CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 2;
+pub const CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 3;
 pub const RECOVERY_PROCESS_LEASE_SCHEMA_VERSION: u32 = 1;
 pub const EXECUTION_CONTROL_SCHEMA_VERSION: u32 = 1;
 pub const GOAL_INTENT_SCHEMA_VERSION: u32 = 1;
@@ -909,6 +912,48 @@ pub struct ReadyLease {
     lease_digest: String,
 }
 
+/// Ephemeral Controller authority for a D4 multi-repository read/process-only integration gate.
+/// Unlike [`ReadyLease`], this lease never grants repository mutation or MODEL residency.
+#[derive(Debug)]
+pub struct IntegrationGateLeaseV1 {
+    plan_id: String,
+    plan_revision: u32,
+    plan_digest: String,
+    task_id: String,
+    task_contract_digest: String,
+    integration_view_set_digest: String,
+    evidence_binding_digest: String,
+    checkpoint_generation: i64,
+    checkpoint_action_sequence: i64,
+    checkpoint_hash: String,
+    permission_decision: PermissionDecision,
+    resource_digest: String,
+    execution_epoch: i64,
+    lease_digest: String,
+}
+
+impl IntegrationGateLeaseV1 {
+    #[must_use]
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    #[must_use]
+    pub fn integration_view_set_digest(&self) -> &str {
+        &self.integration_view_set_digest
+    }
+
+    #[must_use]
+    pub const fn execution_epoch(&self) -> i64 {
+        self.execution_epoch
+    }
+
+    #[must_use]
+    pub fn lease_digest(&self) -> &str {
+        &self.lease_digest
+    }
+}
+
 /// Controller-owned lease for one deterministic heavy phase after MODEL has been proven absent.
 #[derive(Debug)]
 pub struct HeavyPhaseLease {
@@ -1538,8 +1583,104 @@ pub struct ExecutionSuccess {
     pub verification: VerificationResultV1,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrationGateSuccessV1 {
+    pub task_id: String,
+    pub attempt_id: String,
+    pub verification_evidence_id: String,
+    pub verification: VerificationResultV1,
+    pub checkpoint: IntegrationCheckpointV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationRepositoryCheckpointV1 {
+    pub repository_id: String,
+    pub base_head: String,
+    pub primary_snapshot_digest: String,
+    pub snapshot_digest: String,
+    pub baseline_digest: String,
+    pub composed_change_set_digests: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntegrationCheckpointV1 {
+    pub schema_version: u32,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub plan_digest: String,
+    pub gate_task_id: String,
+    pub gate_task_contract_digest: String,
+    pub verification_id: String,
+    pub verification_digest: String,
+    pub verification_artifact_digest: String,
+    pub integration_view_set_digest: String,
+    pub cross_repo_contract_digests: Vec<String>,
+    pub repository_views: BTreeMap<String, IntegrationRepositoryCheckpointV1>,
+    pub checkpoint_digest: String,
+}
+
+impl IntegrationCheckpointV1 {
+    fn canonical_value(&self) -> Value {
+        json!({
+            "schema_version": self.schema_version,
+            "plan_id": self.plan_id,
+            "plan_revision": self.plan_revision,
+            "plan_digest": self.plan_digest,
+            "gate_task_id": self.gate_task_id,
+            "gate_task_contract_digest": self.gate_task_contract_digest,
+            "verification_id": self.verification_id,
+            "verification_digest": self.verification_digest,
+            "verification_artifact_digest": self.verification_artifact_digest,
+            "integration_view_set_digest": self.integration_view_set_digest,
+            "cross_repo_contract_digests": self.cross_repo_contract_digests,
+            "repository_views": self.repository_views,
+        })
+    }
+
+    fn canonical_digest(&self) -> Result<String, ControllerError> {
+        Ok(digest_json(&self.canonical_value())?)
+    }
+
+    fn validate(&self) -> Result<(), ControllerError> {
+        if self.schema_version != INTEGRATION_CHECKPOINT_SCHEMA_VERSION
+            || self.repository_views.len() < 2
+            || !is_sha256_digest(&self.integration_view_set_digest)
+            || self
+                .cross_repo_contract_digests
+                .iter()
+                .any(String::is_empty)
+            || self
+                .cross_repo_contract_digests
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || self
+                .repository_views
+                .iter()
+                .any(|(repository_id, view)| repository_id != &view.repository_id)
+            || self.canonical_digest()? != self.checkpoint_digest
+        {
+            return Err(ControllerError::InvalidPlan(
+                "integration checkpoint is malformed, unordered, or digest-misbound".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Durable checkpoint body published to the Controller checkpoint CAS. The immutable
 /// checkpoint-integrity row stores this manifest's CAS digest and journal sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointRepositoryBaselineV1 {
+    pub repository_root: PathBuf,
+    pub repository_snapshot: RepositorySnapshot,
+    pub repository_snapshot_digest: String,
+    pub baseline_diff_digest: String,
+    pub baseline_diff_content: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckpointManifest {
     pub schema_version: u32,
@@ -1551,12 +1692,24 @@ pub struct CheckpointManifest {
     pub compiler_plan_digest: String,
     pub compilation_evidence_digest: String,
     pub policy_digest: String,
-    pub repository_id: String,
-    pub repository_root: PathBuf,
-    pub repository_snapshot: RepositorySnapshot,
-    pub repository_snapshot_digest: String,
-    pub baseline_diff_digest: String,
-    pub baseline_diff_content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_snapshot: Option<RepositorySnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_snapshot_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_diff_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_diff_content: Option<String>,
+    #[serde(default)]
+    pub repository_baselines: BTreeMap<String, CheckpointRepositoryBaselineV1>,
+    #[serde(default)]
+    pub cross_repo_contract_digests: BTreeMap<String, String>,
+    #[serde(default)]
+    pub integration_checkpoint_digests: BTreeMap<String, String>,
     pub plan_validity: PlanValidity,
     pub task_records: BTreeMap<String, Value>,
     pub attempt_records: BTreeMap<String, Value>,
@@ -1804,8 +1957,22 @@ struct TaskRuntime {
     worktree_composition: Vec<ComposedChangeSetBindingV1>,
     #[serde(default)]
     worktree_conflict: Option<CompositionConflictEvidence>,
+    #[serde(default)]
+    integration_views: BTreeMap<String, IntegrationViewRuntimeV1>,
     task_contract_digest: String,
     task: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct IntegrationViewRuntimeV1 {
+    lease: WorktreeLease,
+    state: WorktreeLifecycle,
+    #[serde(default)]
+    baseline: Option<WorktreeBaseline>,
+    #[serde(default)]
+    composition: Vec<ComposedChangeSetBindingV1>,
+    #[serde(default)]
+    conflict: Option<CompositionConflictEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1860,6 +2027,24 @@ struct PersistedRepositoryBaseline {
     diff_content: String,
 }
 
+const PERSISTED_REPOSITORY_BASELINE_SET_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedRepositoryBaselineSet {
+    schema_version: u32,
+    repositories: BTreeMap<String, PersistedRepositoryBaseline>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActiveRepositoryState {
+    repository_id: String,
+    repository_root: PathBuf,
+    baseline: RepositorySnapshot,
+    baseline_diff_digest: String,
+    baseline_diff_content: String,
+}
+
 struct ActivePlan {
     plan_document: Value,
     compiler_plan_digest: String,
@@ -1869,15 +2054,353 @@ struct ActivePlan {
     plan_digest: String,
     compilation_evidence_digest: String,
     policy_digest: String,
-    repository_id: String,
-    repository_root: PathBuf,
-    baseline: RepositorySnapshot,
-    baseline_diff_digest: String,
-    baseline_diff_content: String,
+    repositories: BTreeMap<String, ActiveRepositoryState>,
     validity: PlanValidity,
     goal_autonomy_budget: AutonomyBudgetV1,
     tasks: BTreeMap<String, TaskRuntime>,
     attempts: BTreeMap<String, AttemptRuntime>,
+}
+
+impl ActivePlan {
+    fn repository(&self, repository_id: &str) -> Result<&ActiveRepositoryState, ControllerError> {
+        self.repositories.get(repository_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "active repository {repository_id} is missing from Controller authority"
+            ))
+        })
+    }
+
+    fn task_repository_ids(&self, task_id: &str) -> Result<Vec<String>, ControllerError> {
+        let task = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        let repositories = required_array(&task.task, "/scope/repositories")?;
+        if repositories.is_empty() {
+            return Err(ControllerError::InvalidPlan(format!(
+                "task {task_id} has an empty repository scope"
+            )));
+        }
+        let mut repository_ids = Vec::with_capacity(repositories.len());
+        let mut seen = BTreeSet::new();
+        for repository in repositories {
+            let repository_id = repository.as_str().ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "task {task_id} repository scope contains a non-string id"
+                ))
+            })?;
+            if !seen.insert(repository_id) {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "task {task_id} repository scope contains duplicate {repository_id}"
+                )));
+            }
+            self.repository(repository_id)?;
+            repository_ids.push(repository_id.to_owned());
+        }
+        repository_ids.sort();
+        Ok(repository_ids)
+    }
+
+    fn single_task_repository(
+        &self,
+        task_id: &str,
+    ) -> Result<&ActiveRepositoryState, ControllerError> {
+        let repository_ids = self.task_repository_ids(task_id)?;
+        if repository_ids.len() != 1 {
+            return Err(ControllerError::NotReady(format!(
+                "task {task_id} spans multiple repositories and has no single mutation root"
+            )));
+        }
+        self.repository(&repository_ids[0])
+    }
+}
+
+fn persisted_repository_baseline_set(
+    repositories: &BTreeMap<String, ActiveRepositoryState>,
+) -> PersistedRepositoryBaselineSet {
+    PersistedRepositoryBaselineSet {
+        schema_version: PERSISTED_REPOSITORY_BASELINE_SET_SCHEMA_VERSION,
+        repositories: repositories
+            .iter()
+            .map(|(repository_id, repository)| {
+                (
+                    repository_id.clone(),
+                    PersistedRepositoryBaseline {
+                        snapshot: repository.baseline.clone(),
+                        diff_digest: repository.baseline_diff_digest.clone(),
+                        diff_content: repository.baseline_diff_content.clone(),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+fn checkpoint_has_autonomy_security(schema_version: u32) -> bool {
+    matches!(
+        schema_version,
+        AUTONOMY_SECURITY_CHECKPOINT_MANIFEST_SCHEMA_VERSION | CHECKPOINT_MANIFEST_SCHEMA_VERSION
+    )
+}
+
+fn checkpoint_repository_baselines(
+    active: &ActivePlan,
+) -> Result<BTreeMap<String, CheckpointRepositoryBaselineV1>, ControllerError> {
+    active
+        .repositories
+        .iter()
+        .map(|(repository_id, repository)| {
+            Ok((
+                repository_id.clone(),
+                CheckpointRepositoryBaselineV1 {
+                    repository_root: repository.repository_root.clone(),
+                    repository_snapshot: repository.baseline.clone(),
+                    repository_snapshot_digest: snapshot_digest(&repository.baseline)?,
+                    baseline_diff_digest: repository.baseline_diff_digest.clone(),
+                    baseline_diff_content: repository.baseline_diff_content.clone(),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn normalized_checkpoint_repository_baselines(
+    manifest: &CheckpointManifest,
+) -> Result<BTreeMap<String, CheckpointRepositoryBaselineV1>, ControllerError> {
+    if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+        if manifest.repository_id.is_some()
+            || manifest.repository_root.is_some()
+            || manifest.repository_snapshot.is_some()
+            || manifest.repository_snapshot_digest.is_some()
+            || manifest.baseline_diff_digest.is_some()
+            || manifest.baseline_diff_content.is_some()
+            || manifest.repository_baselines.is_empty()
+        {
+            return Err(ControllerError::InvalidPlan(
+                "checkpoint v3 must use only canonical repository_baselines authority".to_owned(),
+            ));
+        }
+        return Ok(manifest.repository_baselines.clone());
+    }
+    if !manifest.repository_baselines.is_empty()
+        || !manifest.cross_repo_contract_digests.is_empty()
+        || !manifest.integration_checkpoint_digests.is_empty()
+    {
+        return Err(ControllerError::InvalidPlan(
+            "checkpoint v1/v2 may not claim v3 repository or cross-repo bindings".to_owned(),
+        ));
+    }
+    let repository_id = manifest.repository_id.clone().ok_or_else(|| {
+        ControllerError::InvalidPlan("legacy checkpoint repository_id is missing".to_owned())
+    })?;
+    let repository = CheckpointRepositoryBaselineV1 {
+        repository_root: manifest.repository_root.clone().ok_or_else(|| {
+            ControllerError::InvalidPlan("legacy checkpoint repository_root is missing".to_owned())
+        })?,
+        repository_snapshot: manifest.repository_snapshot.clone().ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "legacy checkpoint repository_snapshot is missing".to_owned(),
+            )
+        })?,
+        repository_snapshot_digest: manifest.repository_snapshot_digest.clone().ok_or_else(
+            || {
+                ControllerError::InvalidPlan(
+                    "legacy checkpoint repository_snapshot_digest is missing".to_owned(),
+                )
+            },
+        )?,
+        baseline_diff_digest: manifest.baseline_diff_digest.clone().ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "legacy checkpoint baseline_diff_digest is missing".to_owned(),
+            )
+        })?,
+        baseline_diff_content: manifest.baseline_diff_content.clone().ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "legacy checkpoint baseline_diff_content is missing".to_owned(),
+            )
+        })?,
+    };
+    Ok(BTreeMap::from([(repository_id, repository)]))
+}
+
+fn canonical_plan_repository_roots(
+    plan: &Value,
+) -> Result<BTreeMap<String, PathBuf>, ControllerError> {
+    let mut roots = BTreeMap::new();
+    for repository in required_array(plan, "/repositories")? {
+        let repository_id = required_str(repository, "/repository_id")?.to_owned();
+        let root = PathBuf::from(required_str(repository, "/root")?).canonicalize()?;
+        if roots.insert(repository_id.clone(), root).is_some() {
+            return Err(ControllerError::InvalidPlan(format!(
+                "canonical plan contains duplicate repository {repository_id}"
+            )));
+        }
+    }
+    if roots.is_empty() {
+        return Err(ControllerError::InvalidPlan(
+            "canonical plan repository set is empty".to_owned(),
+        ));
+    }
+    Ok(roots)
+}
+
+fn decode_persisted_repository_baseline_set(
+    raw: &str,
+    plan: &Value,
+) -> Result<PersistedRepositoryBaselineSet, ControllerError> {
+    let value: Value = serde_json::from_str(raw)?;
+    let plan_roots = canonical_plan_repository_roots(plan)?;
+    let mut set = if value.get("schema_version").is_some() || value.get("repositories").is_some() {
+        let decoded: PersistedRepositoryBaselineSet = serde_json::from_value(value)?;
+        if decoded.schema_version != PERSISTED_REPOSITORY_BASELINE_SET_SCHEMA_VERSION {
+            return Err(ControllerError::InvalidPlan(
+                "durable repository baseline set has unsupported schema".to_owned(),
+            ));
+        }
+        decoded
+    } else {
+        if plan_roots.len() != 1 {
+            return Err(ControllerError::InvalidPlan(
+                "legacy singleton repository baseline cannot recover a multi-repository plan"
+                    .to_owned(),
+            ));
+        }
+        let legacy: PersistedRepositoryBaseline = serde_json::from_value(value)?;
+        let repository_id = plan_roots.keys().next().cloned().ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "legacy repository baseline has no plan repository".to_owned(),
+            )
+        })?;
+        PersistedRepositoryBaselineSet {
+            schema_version: PERSISTED_REPOSITORY_BASELINE_SET_SCHEMA_VERSION,
+            repositories: BTreeMap::from([(repository_id, legacy)]),
+        }
+    };
+    if set.repositories.len() != plan_roots.len() || set.repositories.keys().ne(plan_roots.keys()) {
+        return Err(ControllerError::InvalidPlan(
+            "durable repository baseline set does not match canonical plan repository set"
+                .to_owned(),
+        ));
+    }
+    for (repository_id, baseline) in &mut set.repositories {
+        if sha256_prefixed(baseline.diff_content.as_bytes()) != baseline.diff_digest
+            || baseline.snapshot.repository_id != *repository_id
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "durable repository baseline {repository_id} is corrupt or misbound"
+            )));
+        }
+        let expected_root = plan_roots.get(repository_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "canonical root is missing for repository {repository_id}"
+            ))
+        })?;
+        if baseline.snapshot.root.canonicalize()? != *expected_root {
+            return Err(ControllerError::InvalidPlan(format!(
+                "durable repository baseline {repository_id} is bound to another root"
+            )));
+        }
+    }
+    Ok(set)
+}
+
+fn active_repositories_from_plan(
+    plan: &Value,
+    registry: &ProjectRegistry,
+) -> Result<BTreeMap<String, ActiveRepositoryState>, ControllerError> {
+    let repositories = required_array(plan, "/repositories")?;
+    if repositories.is_empty() {
+        return Err(ControllerError::InvalidPlan(
+            "active plan requires at least one repository".to_owned(),
+        ));
+    }
+    let mut active_repositories = BTreeMap::new();
+    for repository in repositories {
+        let repository_id = required_str(repository, "/repository_id")?.to_owned();
+        if active_repositories.contains_key(&repository_id) {
+            return Err(ControllerError::InvalidPlan(format!(
+                "duplicate active repository {repository_id}"
+            )));
+        }
+        let registered = registry.repository(&repository_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!("repository {repository_id} is not registered"))
+        })?;
+        let repository_root = registered.root.clone();
+        let plan_root = PathBuf::from(required_str(repository, "/root")?);
+        let canonical_plan_root = plan_root.canonicalize()?;
+        if canonical_plan_root != repository_root {
+            return Err(ControllerError::InvalidPlan(format!(
+                "compiled repository root differs from registered root for {repository_id}"
+            )));
+        }
+        let baseline = registry.snapshot(&repository_id)?;
+        if baseline.head.as_deref() != optional_str(repository, "/baseline/head")
+            || baseline.branch.as_deref() != optional_str(repository, "/baseline/branch")
+            || baseline.dirty_digest != required_str(repository, "/baseline/dirty_digest")?
+        {
+            return Err(ControllerError::NotReady(format!(
+                "compiled repository baseline is stale at activation for {repository_id}"
+            )));
+        }
+        let baseline_diff = ExactRetriever::new(registry).current_diff(&repository_id)?;
+        active_repositories.insert(
+            repository_id.clone(),
+            ActiveRepositoryState {
+                repository_id,
+                repository_root,
+                baseline,
+                baseline_diff_digest: baseline_diff.digest,
+                baseline_diff_content: baseline_diff.content,
+            },
+        );
+    }
+    Ok(active_repositories)
+}
+
+fn cross_repo_contracts_for_plan(
+    plan: &Value,
+) -> Result<BTreeMap<String, CrossRepoContract>, ControllerError> {
+    let validator = PlanValidator::new(ValidationEnvironment::default()).map_err(|error| {
+        ControllerError::InvalidPlan(format!("Plan IR validator initialization failed: {error}"))
+    })?;
+    let plan_ir = PlanIr::from_value(plan.clone());
+    validator
+        .cross_repo_contracts(&plan_ir)
+        .map_err(|error| ControllerError::InvalidPlan(error.to_string()))?
+        .into_iter()
+        .map(|contract| {
+            contract
+                .validate()
+                .map_err(|error| ControllerError::InvalidPlan(error.to_string()))?;
+            Ok((contract.contract_id.clone(), contract))
+        })
+        .collect()
+}
+
+fn plan_task_is_multi_repo_integration_gate(
+    plan: &Value,
+    task: &Value,
+) -> Result<bool, ControllerError> {
+    let repositories = required_array(task, "/scope/repositories")?;
+    if repositories.len() < 2 {
+        return Ok(false);
+    }
+    let task_id = required_str(task, "/task_id")?;
+    if required_str(plan, "/depth/mode")? != "D4" {
+        return Err(ControllerError::InvalidPlan(format!(
+            "multi-repository task {task_id} is not a D4 integration gate"
+        )));
+    }
+    if !required_array(task, "/scope/files")?.is_empty()
+        || !required_array(task, "/scope/allow_create")?.is_empty()
+        || !required_array(task, "/scope/allow_delete")?.is_empty()
+        || !required_array(task, "/action_policy/write_roots")?.is_empty()
+    {
+        return Err(ControllerError::InvalidPlan(format!(
+            "multi-repository task {task_id} carries repository mutation authority"
+        )));
+    }
+    Ok(true)
 }
 
 fn cancellation_scope(
@@ -1936,6 +2459,17 @@ pub struct Controller {
     resource_probe: Box<dyn ResourcePressureProbe>,
     permission_context: PermissionContext,
     trusted_recovery_intent_digests: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutputBindingValidationRequest<'a> {
+    namespace: &'a str,
+    upstream_task_id: &'a str,
+    upstream_task_contract_digest: &'a str,
+    binding_id: &'a str,
+    downstream_task_id: &'a str,
+    current_snapshot_digest: &'a str,
+    requires_composed_view: bool,
 }
 
 impl Controller {
@@ -3674,9 +4208,593 @@ impl Controller {
         }
     }
 
+    fn task_is_multi_repo_integration_gate(&self, task_id: &str) -> Result<bool, ControllerError> {
+        let active = self.active_ref()?;
+        let repository_ids = active.task_repository_ids(task_id)?;
+        if repository_ids.len() < 2 {
+            return Ok(false);
+        }
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        plan_task_is_multi_repo_integration_gate(&active.plan_document, &task.task)
+    }
+
+    fn task_has_repository_mutation_authority(task: &Value) -> Result<bool, ControllerError> {
+        Ok(!required_array(task, "/scope/files")?.is_empty()
+            || !required_array(task, "/scope/allow_create")?.is_empty()
+            || !required_array(task, "/scope/allow_delete")?.is_empty()
+            || !required_array(task, "/action_policy/write_roots")?.is_empty())
+    }
+
+    fn integration_worktree_root(&self, task_id: &str) -> Result<PathBuf, ControllerError> {
+        if !self.task_is_multi_repo_integration_gate(task_id)? {
+            return Err(ControllerError::NotReady(format!(
+                "task {task_id} is not a multi-repository integration gate"
+            )));
+        }
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        let seed = sha256_prefixed(
+            format!(
+                "integration-root\0{}\0{}\0{}\0{}",
+                active.plan_id, active.revision, task_id, task.task_contract_digest
+            )
+            .as_bytes(),
+        );
+        Ok(self
+            .controller_worktree_root()?
+            .join(format!("integration.{}", &seed[7..27])))
+    }
+
+    fn integration_view_root(
+        &self,
+        task_id: &str,
+        repository_id: &str,
+    ) -> Result<PathBuf, ControllerError> {
+        let task = self
+            .active_ref()?
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        let view = task.integration_views.get(repository_id).ok_or_else(|| {
+            ControllerError::NotReady(format!(
+                "integration view {task_id}/{repository_id} is missing"
+            ))
+        })?;
+        if view.state != WorktreeLifecycle::Materialized || view.conflict.is_some() {
+            return Err(ControllerError::NotReady(format!(
+                "integration view {task_id}/{repository_id} is not materialized and conflict-free"
+            )));
+        }
+        Ok(view.lease.worktree_path.clone())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ensure_integration_views(
+        &mut self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+    ) -> Result<(), ControllerError> {
+        if !self.task_is_multi_repo_integration_gate(task_id)? {
+            return Err(ControllerError::NotReady(format!(
+                "task {task_id} is not a multi-repository integration gate"
+            )));
+        }
+        let (plan_id, revision, task_contract_digest, repository_ids) = {
+            let active = self.active_ref()?;
+            let task = active
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+            (
+                active.plan_id.clone(),
+                active.revision,
+                task.task_contract_digest.clone(),
+                active.task_repository_ids(task_id)?,
+            )
+        };
+        let integration_root = self.integration_worktree_root(task_id)?;
+        for repository_id in repository_ids {
+            let current = self
+                .active_ref()?
+                .tasks
+                .get(task_id)
+                .and_then(|task| task.integration_views.get(&repository_id))
+                .cloned();
+            if current.is_none() {
+                let lease = registry.prepare_worktree_lease(
+                    &repository_id,
+                    &integration_root,
+                    &plan_id,
+                    revision,
+                    task_id,
+                    &task_contract_digest,
+                )?;
+                self.validate_controller_worktree_lease_binding_for_repository(
+                    task_id,
+                    &repository_id,
+                    &integration_root,
+                    &lease,
+                )?;
+                self.active_mut()?
+                    .tasks
+                    .get_mut(task_id)
+                    .ok_or_else(|| ControllerError::NotReady("task disappeared".to_owned()))?
+                    .integration_views
+                    .insert(
+                        repository_id.clone(),
+                        IntegrationViewRuntimeV1 {
+                            lease: lease.clone(),
+                            state: WorktreeLifecycle::Prepared,
+                            baseline: None,
+                            composition: Vec::new(),
+                            conflict: None,
+                        },
+                    );
+                self.persist_worktree_task_state(
+                    task_id,
+                    "integration_view_prepared",
+                    &json!({"repository_id": repository_id, "lease_id": lease.lease_id}),
+                )?;
+            }
+
+            let view = self
+                .active_ref()?
+                .tasks
+                .get(task_id)
+                .and_then(|task| task.integration_views.get(&repository_id))
+                .cloned()
+                .ok_or_else(|| {
+                    ControllerError::NotReady("integration view disappeared".to_owned())
+                })?;
+            self.validate_controller_worktree_lease_binding_for_repository(
+                task_id,
+                &repository_id,
+                &integration_root,
+                &view.lease,
+            )?;
+            let (expected_composition, upstream_change_sets) =
+                self.ordered_upstream_change_sets_for_repository(task_id, &repository_id)?;
+            match view.state {
+                WorktreeLifecycle::Prepared => {
+                    if view.lease.worktree_path.exists() {
+                        registry.validate_worktree_lease(&view.lease)?;
+                    } else {
+                        registry.materialize_worktree(&view.lease)?;
+                    }
+                    match registry.compose_change_sets(&view.lease, &upstream_change_sets)? {
+                        ComposeChangeSetsOutcome::Ready(baseline) => {
+                            let runtime = self
+                                .active_mut()?
+                                .tasks
+                                .get_mut(task_id)
+                                .and_then(|task| task.integration_views.get_mut(&repository_id))
+                                .ok_or_else(|| {
+                                    ControllerError::NotReady(
+                                        "integration view disappeared".to_owned(),
+                                    )
+                                })?;
+                            runtime.state = WorktreeLifecycle::Materialized;
+                            runtime.baseline = Some(baseline.clone());
+                            runtime.composition.clone_from(&expected_composition);
+                            runtime.conflict = None;
+                            self.persist_worktree_task_state(
+                                task_id,
+                                "integration_view_materialized",
+                                &json!({
+                                    "repository_id": repository_id,
+                                    "lease_id": view.lease.lease_id,
+                                    "baseline_digest": baseline.digest,
+                                    "composition": expected_composition,
+                                }),
+                            )?;
+                        }
+                        ComposeChangeSetsOutcome::Conflict(conflict) => {
+                            let runtime = self
+                                .active_mut()?
+                                .tasks
+                                .get_mut(task_id)
+                                .and_then(|task| task.integration_views.get_mut(&repository_id))
+                                .ok_or_else(|| {
+                                    ControllerError::NotReady(
+                                        "integration view disappeared".to_owned(),
+                                    )
+                                })?;
+                            runtime.state = WorktreeLifecycle::Conflict;
+                            runtime.composition = expected_composition;
+                            runtime.conflict = Some(conflict.clone());
+                            self.persist_worktree_task_state(
+                                task_id,
+                                "integration_view_conflict",
+                                &json!({"repository_id": repository_id, "conflict": conflict}),
+                            )?;
+                            return Err(ControllerError::NotReady(format!(
+                                "integration view {task_id}/{repository_id} has a composition conflict"
+                            )));
+                        }
+                    }
+                }
+                WorktreeLifecycle::Materialized => {
+                    registry.validate_worktree_lease(&view.lease)?;
+                    if view.baseline.is_none()
+                        || view.composition != expected_composition
+                        || view.conflict.is_some()
+                    {
+                        return Err(ControllerError::NotReady(format!(
+                            "integration view {task_id}/{repository_id} has stale composition authority"
+                        )));
+                    }
+                }
+                WorktreeLifecycle::Conflict => {
+                    return Err(ControllerError::NotReady(format!(
+                        "integration view {task_id}/{repository_id} remains conflicted"
+                    )));
+                }
+                WorktreeLifecycle::Released => {
+                    return Err(ControllerError::NotReady(format!(
+                        "released integration view {task_id}/{repository_id} cannot authorize a new gate run"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn integration_view_set_digest(
+        &self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+    ) -> Result<String, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        let mut views = BTreeMap::new();
+        for repository_id in active.task_repository_ids(task_id)? {
+            let view = task.integration_views.get(&repository_id).ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "integration view {task_id}/{repository_id} is missing"
+                ))
+            })?;
+            if view.state != WorktreeLifecycle::Materialized || view.conflict.is_some() {
+                return Err(ControllerError::NotReady(format!(
+                    "integration view {task_id}/{repository_id} is not current"
+                )));
+            }
+            self.validate_controller_worktree_lease_binding_for_repository(
+                task_id,
+                &repository_id,
+                &self.integration_worktree_root(task_id)?,
+                &view.lease,
+            )?;
+            registry.validate_worktree_lease(&view.lease)?;
+            let snapshot = registry.worktree_snapshot(&view.lease)?;
+            views.insert(
+                repository_id,
+                json!({
+                    "lease_id": view.lease.lease_id,
+                    "base_head": view.lease.base_head,
+                    "snapshot_digest": snapshot_digest(&snapshot)?,
+                    "baseline_digest": view.baseline.as_ref().map(|baseline| baseline.digest.clone()),
+                    "composition": view.composition,
+                }),
+            );
+        }
+        digest_json(&serde_json::to_value(views)?).map_err(Into::into)
+    }
+
+    fn integration_repository_checkpoints(
+        &self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+    ) -> Result<BTreeMap<String, IntegrationRepositoryCheckpointV1>, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+        let integration_root = self.integration_worktree_root(task_id)?;
+        let mut repositories = BTreeMap::new();
+        for repository_id in active.task_repository_ids(task_id)? {
+            let repository = active.repository(&repository_id)?;
+            let view = task.integration_views.get(&repository_id).ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "integration view {task_id}/{repository_id} is missing"
+                ))
+            })?;
+            if view.state != WorktreeLifecycle::Materialized || view.conflict.is_some() {
+                return Err(ControllerError::NotReady(format!(
+                    "integration view {task_id}/{repository_id} is not checkpointable"
+                )));
+            }
+            self.validate_controller_worktree_lease_binding_for_repository(
+                task_id,
+                &repository_id,
+                &integration_root,
+                &view.lease,
+            )?;
+            registry.validate_worktree_lease(&view.lease)?;
+            let baseline = view.baseline.as_ref().ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "integration view {task_id}/{repository_id} lacks composed baseline"
+                ))
+            })?;
+            let (expected_composition, _) =
+                self.ordered_upstream_change_sets_for_repository(task_id, &repository_id)?;
+            if view.composition != expected_composition {
+                return Err(ControllerError::NotReady(format!(
+                    "integration view {task_id}/{repository_id} composition drifted before checkpoint"
+                )));
+            }
+            let snapshot = registry.worktree_snapshot(&view.lease)?;
+            repositories.insert(
+                repository_id.clone(),
+                IntegrationRepositoryCheckpointV1 {
+                    repository_id,
+                    base_head: view.lease.base_head.clone(),
+                    primary_snapshot_digest: snapshot_digest(&repository.baseline)?,
+                    snapshot_digest: snapshot_digest(&snapshot)?,
+                    baseline_digest: baseline.digest.clone(),
+                    composed_change_set_digests: view
+                        .composition
+                        .iter()
+                        .map(|binding| binding.change_set_digest.clone())
+                        .collect(),
+                },
+            );
+        }
+        Ok(repositories)
+    }
+
+    fn build_integration_checkpoint(
+        &self,
+        registry: &ProjectRegistry,
+        verification: &VerificationResultV1,
+        verification_artifact_digest: &str,
+    ) -> Result<IntegrationCheckpointV1, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active.tasks.get(&verification.task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan("integration checkpoint task disappeared".to_owned())
+        })?;
+        if !self.task_is_multi_repo_integration_gate(&verification.task_id)?
+            || !verification.passed
+            || verification.plan_id != active.plan_id
+            || verification.plan_revision != active.revision
+            || verification.plan_digest != active.plan_digest
+            || verification.task_contract_digest != task.task_contract_digest
+            || verification.post_snapshot_digest
+                != self.integration_view_set_digest(registry, &verification.task_id)?
+            || self
+                .state
+                .artifact_metadata(verification_artifact_digest)?
+                .is_none()
+        {
+            return Err(ControllerError::NotReady(
+                "integration checkpoint verification authority is stale or incomplete".to_owned(),
+            ));
+        }
+        let mut cross_repo_contract_digests = cross_repo_contracts_for_plan(&active.plan_document)?
+            .into_values()
+            .filter(|contract| contract.consumer_task_id == verification.task_id)
+            .map(|contract| contract.contract_digest)
+            .collect::<Vec<_>>();
+        cross_repo_contract_digests.sort();
+        cross_repo_contract_digests.dedup();
+        let mut checkpoint = IntegrationCheckpointV1 {
+            schema_version: INTEGRATION_CHECKPOINT_SCHEMA_VERSION,
+            plan_id: active.plan_id.clone(),
+            plan_revision: active.revision,
+            plan_digest: active.plan_digest.clone(),
+            gate_task_id: verification.task_id.clone(),
+            gate_task_contract_digest: task.task_contract_digest.clone(),
+            verification_id: verification.verification_id.clone(),
+            verification_digest: digest_json(&serde_json::to_value(verification)?)?,
+            verification_artifact_digest: verification_artifact_digest.to_owned(),
+            integration_view_set_digest: verification.post_snapshot_digest.clone(),
+            cross_repo_contract_digests,
+            repository_views: self
+                .integration_repository_checkpoints(registry, &verification.task_id)?,
+            checkpoint_digest: String::new(),
+        };
+        checkpoint.checkpoint_digest = checkpoint.canonical_digest()?;
+        checkpoint.validate()?;
+        Ok(checkpoint)
+    }
+
+    fn validated_integration_checkpoint_digest(
+        &self,
+        registry: &ProjectRegistry,
+        gate_task_id: &str,
+    ) -> Result<String, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active.tasks.get(gate_task_id).ok_or_else(|| {
+            ControllerError::NotReady(format!("integration gate {gate_task_id} disappeared"))
+        })?;
+        if !self.task_is_multi_repo_integration_gate(gate_task_id)?
+            || task.state != TaskState::Succeeded
+        {
+            return Err(ControllerError::NotReady(format!(
+                "integration gate {gate_task_id} is not a succeeded read/process gate"
+            )));
+        }
+        let key = active_scoped_key(active, gate_task_id);
+        let raw = self
+            .state
+            .get_state(INTEGRATION_CHECKPOINT_NAMESPACE, &key)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "integration gate {gate_task_id} lacks its durable checkpoint"
+                ))
+            })?;
+        let checkpoint: IntegrationCheckpointV1 = serde_json::from_str(&raw)?;
+        checkpoint.validate()?;
+        if checkpoint.plan_id != active.plan_id
+            || checkpoint.plan_revision != active.revision
+            || checkpoint.plan_digest != active.plan_digest
+            || checkpoint.gate_task_id != gate_task_id
+            || checkpoint.gate_task_contract_digest != task.task_contract_digest
+        {
+            return Err(ControllerError::NotReady(format!(
+                "integration checkpoint for {gate_task_id} is stale or misbound"
+            )));
+        }
+        let verification_raw = self
+            .state
+            .get_state(
+                "controller.verification",
+                &revision_scoped_key(
+                    &active.plan_id,
+                    active.revision,
+                    &checkpoint.verification_id,
+                ),
+            )?
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "integration checkpoint for {gate_task_id} lost its verification record"
+                ))
+            })?;
+        let verification: VerificationResultV1 = serde_json::from_str(&verification_raw)?;
+        if !verification.passed
+            || verification.plan_id != active.plan_id
+            || verification.plan_revision != active.revision
+            || verification.plan_digest != active.plan_digest
+            || verification.task_id != gate_task_id
+            || verification.task_contract_digest != task.task_contract_digest
+            || verification.verification_id != checkpoint.verification_id
+            || verification.post_snapshot_digest != checkpoint.integration_view_set_digest
+            || digest_json(&serde_json::to_value(&verification)?)? != checkpoint.verification_digest
+            || self
+                .state
+                .artifact_metadata(&checkpoint.verification_artifact_digest)?
+                .is_none()
+        {
+            return Err(ControllerError::NotReady(format!(
+                "integration checkpoint for {gate_task_id} lost exact passed verification authority"
+            )));
+        }
+        let mut current_contract_digests = cross_repo_contracts_for_plan(&active.plan_document)?
+            .into_values()
+            .filter(|contract| contract.consumer_task_id == gate_task_id)
+            .map(|contract| contract.contract_digest)
+            .collect::<Vec<_>>();
+        current_contract_digests.sort();
+        current_contract_digests.dedup();
+        if current_contract_digests != checkpoint.cross_repo_contract_digests
+            || self.integration_repository_checkpoints(registry, gate_task_id)?
+                != checkpoint.repository_views
+            || checkpoint.integration_view_set_digest
+                != self.integration_view_set_digest(registry, gate_task_id)?
+        {
+            return Err(ControllerError::NotReady(format!(
+                "integration checkpoint for {gate_task_id} is stale for current contracts or repository views"
+            )));
+        }
+        validate_integration_checkpoint_cas(&self.state, &checkpoint)?;
+        Ok(checkpoint.checkpoint_digest)
+    }
+
+    fn publish_integration_checkpoint(
+        &mut self,
+        registry: &ProjectRegistry,
+        verification: &VerificationResultV1,
+        verification_artifact_digest: &str,
+    ) -> Result<IntegrationCheckpointV1, ControllerError> {
+        let checkpoint = self.build_integration_checkpoint(
+            registry,
+            verification,
+            verification_artifact_digest,
+        )?;
+        let key = active_scoped_key(self.active_ref()?, &checkpoint.gate_task_id);
+        if let Some(existing_raw) = self
+            .state
+            .get_state(INTEGRATION_CHECKPOINT_NAMESPACE, &key)?
+        {
+            let existing: IntegrationCheckpointV1 = serde_json::from_str(&existing_raw)?;
+            if existing != checkpoint {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "integration checkpoint {} conflicts with durable authority",
+                    checkpoint.gate_task_id
+                )));
+            }
+            let active = self.active_ref()?;
+            let validated = validate_durable_integration_checkpoint(
+                &self.state,
+                &DurableIntegrationCheckpointExpectation {
+                    plan_document: &active.plan_document,
+                    plan_id: &active.plan_id,
+                    plan_revision: active.revision,
+                    plan_digest: &active.plan_digest,
+                    repository_baselines: None,
+                    gate_task_id: &checkpoint.gate_task_id,
+                    expected_checkpoint_digest: &checkpoint.checkpoint_digest,
+                },
+            )?;
+            if validated != checkpoint {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "integration checkpoint {} durable validation drifted",
+                    checkpoint.gate_task_id
+                )));
+            }
+            return Ok(existing);
+        }
+        let bytes = serde_json::to_vec(&canonicalize(&checkpoint.canonical_value()))?;
+        let store = checkpoint_artifact_store(self.state.path())?;
+        let artifact = store.put(&mut self.state, &bytes)?;
+        if format!("sha256:{}", artifact.digest) != checkpoint.checkpoint_digest {
+            return Err(ControllerError::InvalidPlan(
+                "integration checkpoint CAS identity differs from canonical checkpoint digest"
+                    .to_owned(),
+            ));
+        }
+        let value_json = serde_json::to_string(&checkpoint)?;
+        self.persist_control_record_with_event(
+            INTEGRATION_CHECKPOINT_NAMESPACE,
+            &key,
+            &value_json,
+            "integration_checkpoint_published",
+            &json!({
+                "plan_id": checkpoint.plan_id,
+                "plan_revision": checkpoint.plan_revision,
+                "gate_task_id": checkpoint.gate_task_id,
+                "checkpoint_digest": checkpoint.checkpoint_digest,
+                "artifact_digest": artifact.digest,
+            }),
+        )?;
+        self.state.add_artifact_reference(
+            &format!("integration.checkpoint.{}", checkpoint.gate_task_id),
+            &artifact.digest,
+        )?;
+        self.checkpoint_now()?;
+        Ok(checkpoint)
+    }
+
     fn validate_controller_worktree_lease_binding(
         &self,
         task_id: &str,
+        lease: &WorktreeLease,
+    ) -> Result<(), ControllerError> {
+        let active = self.active_ref()?;
+        let repository = active.single_task_repository(task_id)?;
+        let expected_root = self.controller_worktree_root()?;
+        self.validate_controller_worktree_lease_binding_for_repository(
+            task_id,
+            &repository.repository_id,
+            &expected_root,
+            lease,
+        )
+    }
+
+    fn validate_controller_worktree_lease_binding_for_repository(
+        &self,
+        task_id: &str,
+        repository_id: &str,
+        expected_root: &Path,
         lease: &WorktreeLease,
     ) -> Result<(), ControllerError> {
         let active = self.active_ref()?;
@@ -3684,14 +4802,23 @@ impl Controller {
             .tasks
             .get(task_id)
             .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
-        let expected_root = self.controller_worktree_root()?;
+        if !active
+            .task_repository_ids(task_id)?
+            .iter()
+            .any(|id| id == repository_id)
+        {
+            return Err(ControllerError::NotReady(format!(
+                "repository {repository_id} is outside task {task_id} scope"
+            )));
+        }
+        let repository = active.repository(repository_id)?;
         let expected_path = expected_root.join(&lease.lease_id);
         if lease.plan_id != active.plan_id
             || lease.plan_revision != active.revision
             || lease.task_id != task_id
             || lease.task_contract_digest != task.task_contract_digest
-            || lease.repository_id != active.repository_id
-            || lease.primary_root != active.repository_root
+            || lease.repository_id != repository.repository_id
+            || lease.primary_root != repository.repository_root
             || lease.controller_root != expected_root
             || lease.worktree_path != expected_path
         {
@@ -3714,6 +4841,35 @@ impl Controller {
         ControllerError,
     > {
         let active = self.active_ref()?;
+        let target_repository_id = active
+            .single_task_repository(task_id)?
+            .repository_id
+            .clone();
+        self.ordered_upstream_change_sets_for_repository(task_id, &target_repository_id)
+    }
+
+    fn ordered_upstream_change_sets_for_repository(
+        &self,
+        task_id: &str,
+        target_repository_id: &str,
+    ) -> Result<
+        (
+            Vec<ComposedChangeSetBindingV1>,
+            Vec<ChangeSetCompositionInput>,
+        ),
+        ControllerError,
+    > {
+        let active = self.active_ref()?;
+        active.repository(target_repository_id)?;
+        if !active
+            .task_repository_ids(task_id)?
+            .iter()
+            .any(|repository_id| repository_id == target_repository_id)
+        {
+            return Err(ControllerError::NotReady(format!(
+                "repository {target_repository_id} is outside task {task_id} integration scope"
+            )));
+        }
         let order = dependency_closure_order(&active.tasks, task_id)?;
         let mut bindings = Vec::with_capacity(order.len());
         let mut change_sets = Vec::with_capacity(order.len());
@@ -3727,6 +4883,19 @@ impl Controller {
                 return Err(ControllerError::NotReady(format!(
                     "composed dependency task {upstream_task_id} is not succeeded"
                 )));
+            }
+            let upstream_repositories = active.task_repository_ids(&upstream_task_id)?;
+            if upstream_repositories.len() != 1 || upstream_repositories[0] != target_repository_id
+            {
+                continue;
+            }
+            if upstream.change_set.is_none() {
+                if Self::task_has_repository_mutation_authority(&upstream.task)? {
+                    return Err(ControllerError::NotReady(format!(
+                        "mutating dependency task {upstream_task_id} lacks an immutable ChangeSet"
+                    )));
+                }
+                continue;
             }
             let record_key = active_scoped_key(active, &upstream_task_id);
             let change_set = validate_durable_change_set_binding(
@@ -3782,12 +4951,13 @@ impl Controller {
                 .tasks
                 .get(task_id)
                 .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+            let repository = active.single_task_repository(task_id)?;
             (
                 active.plan_id.clone(),
                 active.revision,
                 task.task_contract_digest.clone(),
-                active.repository_id.clone(),
-                active.repository_root.clone(),
+                repository.repository_id.clone(),
+                repository.repository_root.clone(),
             )
         };
         if self
@@ -4014,8 +5184,12 @@ impl Controller {
     fn task_execution_root(&self, task_id: &str) -> Result<PathBuf, ControllerError> {
         self.task_execution_lease(task_id)?.map_or_else(
             || {
-                self.active_ref()
-                    .map(|active| active.repository_root.clone())
+                self.active_ref().and_then(|active| {
+                    Ok(active
+                        .single_task_repository(task_id)?
+                        .repository_root
+                        .clone())
+                })
             },
             |lease| Ok(lease.worktree_path.clone()),
         )
@@ -4026,9 +5200,15 @@ impl Controller {
         registry: &ProjectRegistry,
         task_id: &str,
     ) -> Result<RepositorySnapshot, ControllerError> {
-        match self.task_execution_lease(task_id)? {
-            Some(lease) => Ok(registry.worktree_snapshot(lease)?),
-            None => Ok(registry.snapshot(&self.active_ref()?.repository_id)?),
+        if let Some(lease) = self.task_execution_lease(task_id)? {
+            Ok(registry.worktree_snapshot(lease)?)
+        } else {
+            let repository_id = self
+                .active_ref()?
+                .single_task_repository(task_id)?
+                .repository_id
+                .clone();
+            Ok(registry.snapshot(&repository_id)?)
         }
     }
 
@@ -4037,11 +5217,15 @@ impl Controller {
         registry: &ProjectRegistry,
         task_id: &str,
     ) -> Result<ExactDiffEvidence, ControllerError> {
-        match self.task_execution_lease(task_id)? {
-            Some(lease) => Ok(registry.worktree_diff(lease)?),
-            None => Ok(
-                ExactRetriever::new(registry).current_diff(&self.active_ref()?.repository_id)?
-            ),
+        if let Some(lease) = self.task_execution_lease(task_id)? {
+            Ok(registry.worktree_diff(lease)?)
+        } else {
+            let repository_id = self
+                .active_ref()?
+                .single_task_repository(task_id)?
+                .repository_id
+                .clone();
+            Ok(ExactRetriever::new(registry).current_diff(&repository_id)?)
         }
     }
 
@@ -4052,13 +5236,15 @@ impl Controller {
         path: &Path,
         expected_digest: Option<&str>,
     ) -> Result<ExactFileEvidence, ControllerError> {
-        match self.task_execution_lease(task_id)? {
-            Some(lease) => Ok(registry.read_worktree_path(lease, path, expected_digest)?),
-            None => Ok(ExactRetriever::new(registry).read_path(
-                &self.active_ref()?.repository_id,
-                path,
-                expected_digest,
-            )?),
+        if let Some(lease) = self.task_execution_lease(task_id)? {
+            Ok(registry.read_worktree_path(lease, path, expected_digest)?)
+        } else {
+            let repository_id = self
+                .active_ref()?
+                .single_task_repository(task_id)?
+                .repository_id
+                .clone();
+            Ok(ExactRetriever::new(registry).read_path(&repository_id, path, expected_digest)?)
         }
     }
 
@@ -5143,9 +6329,13 @@ impl Controller {
             ));
         }
         let project_id = required_str(&active.plan_document, "/project/project_id")?.to_owned();
+        let repository_id = active
+            .single_task_repository(&attempt.task_id)?
+            .repository_id
+            .clone();
         let scope = MemoryScope {
             project_id,
-            repository_id: Some(active.repository_id.clone()),
+            repository_id: Some(repository_id),
             kind: MemoryScopeKind::Project,
             agent_id: None,
             role_visibility: Vec::new(),
@@ -5429,8 +6619,12 @@ impl Controller {
                     "plan failure classification requires the current active revision".to_owned(),
                 ));
             }
+            let repository_id = active
+                .single_task_repository(task_id)?
+                .repository_id
+                .clone();
             (
-                active.repository_id.clone(),
+                repository_id,
                 active.plan_document.clone(),
                 active.plan_id.clone(),
                 active.revision,
@@ -5599,6 +6793,7 @@ impl Controller {
             revision_scoped_key(&plan_id, plan_revision, &format!("{task_id}:{attempt_id}"));
         let (plan_json, snapshot_digest_value, baseline_diff_digest) = {
             let active = self.active_ref()?;
+            let repository = active.single_task_repository(task_id)?;
             (
                 serde_json::to_string(&json!({
                     "plan_id": active.plan_id,
@@ -5608,8 +6803,8 @@ impl Controller {
                     "compilation_evidence_digest": active.compilation_evidence_digest,
                     "validity": active.validity,
                 }))?,
-                snapshot_digest(&active.baseline)?,
-                active.baseline_diff_digest.clone(),
+                snapshot_digest(&repository.baseline)?,
+                repository.baseline_diff_digest.clone(),
             )
         };
         let mut records = vec![
@@ -5773,7 +6968,11 @@ impl Controller {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let repository_id = self.active_ref()?.repository_id.clone();
+        let repository_id = self
+            .active_ref()?
+            .single_task_repository(task_id)?
+            .repository_id
+            .clone();
         for item in &selected {
             self.validate_task_exact_context_evidence(registry, task_id, &repository_id, item)?;
             self.validate_task_requirement_bound_evidence(
@@ -5888,38 +7087,22 @@ impl Controller {
         let goal_id = required_str(plan, "/goal/goal_id")?.to_owned();
         let goal_autonomy_budget = goal_autonomy_budget_from_plan(plan, 0)?;
         let revision = required_u32(plan, "/revision")?;
-        let repositories = required_array(plan, "/repositories")?;
-        if repositories.len() != 1 {
-            return Err(ControllerError::InvalidPlan(
-                "M1-T07 supports exactly one active repository".to_owned(),
-            ));
-        }
-        let repository = &repositories[0];
-        let repository_id = required_str(repository, "/repository_id")?.to_owned();
-        let registered = registry.repository(&repository_id).ok_or_else(|| {
-            ControllerError::InvalidPlan(format!("repository {repository_id} is not registered"))
-        })?;
-        let repository_root = registered.root.clone();
-        let plan_root = PathBuf::from(required_str(repository, "/root")?);
-        let canonical_plan_root = plan_root.canonicalize()?;
-        if canonical_plan_root != repository_root {
-            return Err(ControllerError::InvalidPlan(
-                "compiled repository root differs from registered root".to_owned(),
-            ));
-        }
-        let baseline = registry.snapshot(&repository_id)?;
-        if baseline.head.as_deref() != optional_str(repository, "/baseline/head")
-            || baseline.branch.as_deref() != optional_str(repository, "/baseline/branch")
-            || baseline.dirty_digest != required_str(repository, "/baseline/dirty_digest")?
-        {
-            return Err(ControllerError::NotReady(
-                "compiled repository baseline is stale at activation".to_owned(),
-            ));
-        }
-        let baseline_diff = ExactRetriever::new(registry).current_diff(&repository_id)?;
+        let repositories = active_repositories_from_plan(plan, registry)?;
         let mut tasks = BTreeMap::new();
         for task in required_array(plan, "/tasks")? {
             let task_id = required_str(task, "/task_id")?.to_owned();
+            for repository in required_array(task, "/scope/repositories")? {
+                let repository_id = repository.as_str().ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!(
+                        "task {task_id} repository scope contains a non-string id"
+                    ))
+                })?;
+                if !repositories.contains_key(repository_id) {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "task {task_id} references inactive repository {repository_id}"
+                    )));
+                }
+            }
             let task_contract_digest = digest_json(task)?;
             if tasks
                 .insert(
@@ -5942,6 +7125,7 @@ impl Controller {
                         worktree_baseline: None,
                         worktree_composition: Vec::new(),
                         worktree_conflict: None,
+                        integration_views: BTreeMap::new(),
                         task_contract_digest,
                         task: task.clone(),
                     },
@@ -5977,11 +7161,7 @@ impl Controller {
             plan_digest: plan_digest.clone(),
             compilation_evidence_digest,
             policy_digest,
-            repository_id,
-            repository_root,
-            baseline,
-            baseline_diff_digest: baseline_diff.digest,
-            baseline_diff_content: baseline_diff.content,
+            repositories,
             validity: PlanValidity::Current,
             goal_autonomy_budget,
             tasks,
@@ -6061,8 +7241,7 @@ impl Controller {
             previous_revision,
             previous_plan_digest,
             goal_id,
-            repository_id,
-            repository_root,
+            previous_repositories,
         ) = {
             let active = self.active_ref()?;
             if active.validity != PlanValidity::Invalidated {
@@ -6076,8 +7255,7 @@ impl Controller {
                 active.revision,
                 active.plan_digest.clone(),
                 active.goal_id.clone(),
-                active.repository_id.clone(),
-                active.repository_root.clone(),
+                active.repositories.clone(),
             )
         };
         if required_str(&next_plan, "/plan_id")? != previous_plan_id
@@ -6090,35 +7268,35 @@ impl Controller {
                 "superseding plan must be immutable N+1 directly over active N".to_owned(),
             ));
         }
-        let repositories = required_array(&next_plan, "/repositories")?;
-        if repositories.len() != 1
-            || required_str(&repositories[0], "/repository_id")? != repository_id
+        let next_repositories = active_repositories_from_plan(&next_plan, registry)?;
+        if previous_repositories.len() != next_repositories.len()
+            || previous_repositories.keys().ne(next_repositories.keys())
         {
             return Err(ControllerError::InvalidPlan(
-                "cross-repository execution remains fail-closed until M8".to_owned(),
+                "superseding plan changed the registered repository identity set".to_owned(),
             ));
         }
-        let registered = registry.repository(&repository_id).ok_or_else(|| {
-            ControllerError::InvalidPlan(format!("repository {repository_id} is not registered"))
-        })?;
-        if registered.root != repository_root {
-            return Err(ControllerError::InvalidPlan(
-                "registered repository root changed across plan revision".to_owned(),
-            ));
+        for (repository_id, previous_repository) in &previous_repositories {
+            let next_repository = next_repositories.get(repository_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "superseding plan lost repository {repository_id}"
+                ))
+            })?;
+            if previous_repository.repository_root != next_repository.repository_root {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "registered repository root changed across plan revision for {repository_id}"
+                )));
+            }
         }
-        let current_snapshot = registry.snapshot(&repository_id)?;
-        if current_snapshot.head.as_deref() != optional_str(&repositories[0], "/baseline/head")
-            || current_snapshot.branch.as_deref()
-                != optional_str(&repositories[0], "/baseline/branch")
-            || current_snapshot.dirty_digest
-                != required_str(&repositories[0], "/baseline/dirty_digest")?
-        {
-            return Err(ControllerError::NotReady(
-                "superseding compiler repository baseline is stale".to_owned(),
-            ));
-        }
-        let current_diff = ExactRetriever::new(registry).current_diff(&repository_id)?;
-        let current_snapshot_digest = snapshot_digest(&current_snapshot)?;
+        let current_snapshot_digests = next_repositories
+            .iter()
+            .map(|(repository_id, repository)| {
+                Ok((
+                    repository_id.clone(),
+                    snapshot_digest(&repository.baseline)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
         let diff = PlanRevisionDiff::between(
             &previous_plan,
             &next_plan,
@@ -6162,11 +7340,7 @@ impl Controller {
             plan_digest: previous_plan_digest.clone(),
             compilation_evidence_digest: self.active_ref()?.compilation_evidence_digest.clone(),
             policy_digest: self.active_ref()?.policy_digest.clone(),
-            repository_id: repository_id.clone(),
-            repository_root: repository_root.clone(),
-            baseline: self.active_ref()?.baseline.clone(),
-            baseline_diff_digest: self.active_ref()?.baseline_diff_digest.clone(),
-            baseline_diff_content: self.active_ref()?.baseline_diff_content.clone(),
+            repositories: previous_repositories,
             validity: PlanValidity::Invalidated,
             goal_autonomy_budget: self.active_ref()?.goal_autonomy_budget.clone(),
             tasks: self.active_ref()?.tasks.clone(),
@@ -6182,7 +7356,7 @@ impl Controller {
             &next_plan_digest,
             &next_compilation_evidence,
             &diff,
-            &current_snapshot_digest,
+            &current_snapshot_digests,
         )?;
         let policy_digest = digest_json(
             next_plan
@@ -6199,11 +7373,7 @@ impl Controller {
             plan_digest: next_plan_digest.clone(),
             compilation_evidence_digest: next_compilation_evidence_digest.clone(),
             policy_digest,
-            repository_id: repository_id.clone(),
-            repository_root,
-            baseline: current_snapshot.clone(),
-            baseline_diff_digest: current_diff.digest.clone(),
-            baseline_diff_content: current_diff.content.clone(),
+            repositories: next_repositories,
             validity: PlanValidity::Current,
             goal_autonomy_budget: next_goal_autonomy_budget.clone(),
             tasks: runtime_build.tasks,
@@ -6253,11 +7423,9 @@ impl Controller {
             "compilation_evidence_digest": next_active.compilation_evidence_digest,
             "validity": next_active.validity,
         }))?;
-        let baseline_json = serde_json::to_string(&PersistedRepositoryBaseline {
-            snapshot: current_snapshot,
-            diff_digest: current_diff.digest.clone(),
-            diff_content: current_diff.content,
-        })?;
+        let baseline_json = serde_json::to_string(&persisted_repository_baseline_set(
+            &next_active.repositories,
+        ))?;
         let revision_record_json = serde_json::to_string(&json!({
             "plan_id": previous_plan_id,
             "revision": next_revision,
@@ -6380,8 +7548,10 @@ impl Controller {
             "attempt_runtime_map_digest": attempt_runtime_map_digest,
             "task_capability_grant_map_digest": task_capability_grant_map_digest,
             "execution_epoch": epoch,
-            "repository_snapshot_digest": current_snapshot_digest,
-            "baseline_diff_digest": next_active.baseline_diff_digest,
+            "repository_snapshot_digests": current_snapshot_digests,
+            "baseline_diff_digests": next_active.repositories.iter().map(|(repository_id, repository)| {
+                (repository_id.clone(), repository.baseline_diff_digest.clone())
+            }).collect::<BTreeMap<_, _>>(),
             "plan_validity": PlanValidity::Current,
             "goal_autonomy_budget": next_goal_autonomy_budget,
             "goal_autonomy_budget_digest": digest_json(&serde_json::to_value(&next_active.goal_autonomy_budget)?)?,
@@ -6468,6 +7638,248 @@ impl Controller {
             tool_manifest,
             false,
         )
+    }
+
+    /// Derives read/process-only authority for a D4 multi-repository integration gate.
+    ///
+    /// # Errors
+    /// Returns a fail-closed error when any exact dependency, repository, permission,
+    /// cancellation, checkpoint, or resource guard is not current.
+    pub fn derive_integration_gate_lease(
+        &mut self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+        inputs: ReadinessInputs<'_>,
+        tool_manifest: &ToolManifest,
+    ) -> Result<IntegrationGateLeaseV1, ControllerError> {
+        self.require_execution_not_paused()?;
+        if self.cancellation_blocks_task(task_id)? {
+            return Err(ControllerError::NotReady(
+                "task is durably cancelled".to_owned(),
+            ));
+        }
+        let cancellation = self.task_cancellation_handle(task_id)?;
+        if cancellation.is_cancelled() {
+            self.persist_observed_cancellation(&cancellation)?;
+            return Err(ControllerError::NotReady(
+                "task cancellation blocks readiness".to_owned(),
+            ));
+        }
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
+        self.require_current_baseline(registry)?;
+        if !self.task_is_multi_repo_integration_gate(task_id)? {
+            return Err(ControllerError::NotReady(format!(
+                "task {task_id} is not a D4 multi-repository read/process integration gate"
+            )));
+        }
+        let (plan_id, plan_revision, plan_digest, task_contract_digest, task, validity) = {
+            let active = self.active_ref()?;
+            let task = active
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+            (
+                active.plan_id.clone(),
+                active.revision,
+                active.plan_digest.clone(),
+                task.task_contract_digest.clone(),
+                task.task.clone(),
+                active.validity,
+            )
+        };
+        if validity != PlanValidity::Current {
+            return Err(ControllerError::NotReady(
+                "active plan validity is not current".to_owned(),
+            ));
+        }
+        self.check_task_readiness(task_id, &task, inputs, TaskState::Planned)?;
+        self.ensure_integration_views(registry, task_id)?;
+        let integration_view_set_digest = self.integration_view_set_digest(registry, task_id)?;
+        let evidence_binding_digest = self.resolve_integration_readiness_evidence_digest(
+            registry,
+            task_id,
+            &task,
+            &integration_view_set_digest,
+        )?;
+        let permission_decision = self.permission_decision_for_task(task_id, tool_manifest)?;
+        permission_decision.validate()?;
+        if !permission_decision
+            .effective
+            .contains(PermissionClass::ProcessExec)
+            || permission_decision
+                .effective
+                .contains(PermissionClass::RepositoryWrite)
+        {
+            return Err(ControllerError::NotReady(
+                "integration gate requires process execution and forbids repository mutation"
+                    .to_owned(),
+            ));
+        }
+        let task_budget = self.task_resource_budget(task_id)?;
+        if task_budget.max_subprocesses == 0 {
+            return Err(ControllerError::Policy(PolicyError::ResourceDenied(
+                "integration gate resource contract has zero subprocess capacity".to_owned(),
+            )));
+        }
+        self.checkpoint_now()?;
+        let (checkpoint_generation, checkpoint_action_sequence, checkpoint_hash) =
+            self.current_checkpoint_binding()?;
+        let execution_epoch = self.state.current_execution_epoch()?;
+        let resource_digest = digest_json(&json!({
+            "input": inputs.resource_digest,
+            "task_budget": task_budget,
+            "integration_view_set_digest": integration_view_set_digest,
+        }))?;
+        let mut lease = IntegrationGateLeaseV1 {
+            plan_id,
+            plan_revision,
+            plan_digest,
+            task_id: task_id.to_owned(),
+            task_contract_digest,
+            integration_view_set_digest,
+            evidence_binding_digest,
+            checkpoint_generation,
+            checkpoint_action_sequence,
+            checkpoint_hash,
+            permission_decision,
+            resource_digest,
+            execution_epoch,
+            lease_digest: String::new(),
+        };
+        lease.lease_digest = integration_gate_lease_digest(&lease);
+        Ok(lease)
+    }
+
+    fn build_integration_gate_verification(
+        &self,
+        task_id: &str,
+        attempt_id: &str,
+        execution_epoch: i64,
+        integration_view_set_digest: &str,
+        command_results: Vec<CommandVerificationResultV1>,
+    ) -> Result<VerificationResultV1, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active.tasks.get(task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan("integration gate disappeared".to_owned())
+        })?;
+        let (evaluator, acceptance_contract_digest) = compiled_acceptance_contract(&task.task)?;
+        let diff_digest = sha256_prefixed(
+            format!("integration_read_only\0{integration_view_set_digest}").as_bytes(),
+        );
+        let verification = VerificationResultV1 {
+            schema_version: VERIFICATION_RESULT_SCHEMA_VERSION,
+            verification_id: verification_id(
+                &active.plan_digest,
+                &task.task_contract_digest,
+                attempt_id,
+                &diff_digest,
+            ),
+            plan_id: active.plan_id.clone(),
+            plan_revision: active.revision,
+            plan_digest: active.plan_digest.clone(),
+            task_id: task_id.to_owned(),
+            task_contract_digest: task.task_contract_digest.clone(),
+            attempt_id: attempt_id.to_owned(),
+            execution_epoch,
+            evaluator,
+            acceptance_contract_digest,
+            diff_digest,
+            post_snapshot_digest: integration_view_set_digest.to_owned(),
+            expected_target_mode: 0,
+            observed_target_mode: 0,
+            evidence_ids: Vec::new(),
+            command_results: Vec::new(),
+            passed: true,
+            failure_code: None,
+        };
+        Ok(aggregate_command_verification(
+            verification,
+            command_results,
+        ))
+    }
+
+    /// Executes the required deterministic command verification for one integration-gate lease.
+    ///
+    /// # Errors
+    /// Returns a fail-closed Controller error when the lease, integration views, required command
+    /// results, verification artifact, or integration checkpoint cannot be proven current.
+    pub fn execute_integration_gate<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        lease: IntegrationGateLeaseV1,
+        runtime: &ExecutionRuntime<'_, I>,
+    ) -> Result<IntegrationGateSuccessV1, ControllerError> {
+        self.validate_integration_gate_lease(&lease, runtime.registry, runtime.tool_manifest)?;
+        let attempt_id = self.start_integration_gate_attempt(&lease)?;
+        let command_results =
+            self.run_required_command_verification(runtime, &lease.task_id, &attempt_id)?;
+        if command_results.is_empty() {
+            return Err(ControllerError::InvalidPlan(
+                "integration gate has no required deterministic command verification".to_owned(),
+            ));
+        }
+        let current_view_digest =
+            self.integration_view_set_digest(runtime.registry, &lease.task_id)?;
+        if current_view_digest != lease.integration_view_set_digest {
+            return Err(ControllerError::NotReady(
+                "integration views changed during command verification".to_owned(),
+            ));
+        }
+        let verification = self.build_integration_gate_verification(
+            &lease.task_id,
+            &attempt_id,
+            lease.execution_epoch,
+            &current_view_digest,
+            command_results,
+        )?;
+        let (verification_artifact_digest, verification_evidence_id) = self
+            .persist_verification_result(
+                runtime.artifacts,
+                &verification,
+                "verification_recorded",
+            )?;
+        if !verification.passed {
+            let failure_code = verification
+                .failure_code
+                .clone()
+                .unwrap_or_else(|| "command_verification_failed".to_owned());
+            let failed = verification
+                .command_results
+                .iter()
+                .find(|result| !result.passed);
+            let failure = self.build_failure_record(FailureRecordInput {
+                task_id: lease.task_id.clone(),
+                attempt_id: attempt_id.clone(),
+                action_id: failed.map(|result| result.action_id.clone()),
+                result_digest: Some(verification_artifact_digest.clone()),
+                exit_code: failed.and_then(|result| result.exit_code),
+                category: "verification_failure".to_owned(),
+                diagnostic: format!("integration command verification failed: {failure_code}"),
+                failure_code,
+                failed_action_facts: failed.map_or_else(BTreeMap::new, |result| {
+                    BTreeMap::from([
+                        ("step_id".to_owned(), result.step_id.clone()),
+                        ("action_id".to_owned(), result.action_id.clone()),
+                    ])
+                }),
+                evidence_refs: vec![verification_evidence_id],
+            })?;
+            let _ = self.route_failure_record(failure)?;
+            return Err(ControllerError::VerificationFailed(Box::new(verification)));
+        }
+        self.record_verified_output_bindings(&verification, &verification_artifact_digest)?;
+        let checkpoint = self.publish_integration_checkpoint(
+            runtime.registry,
+            &verification,
+            &verification_artifact_digest,
+        )?;
+        self.apply_verified_success(&verification)?;
+        Ok(IntegrationGateSuccessV1 {
+            task_id: lease.task_id,
+            attempt_id,
+            verification_evidence_id,
+            verification,
+            checkpoint,
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7620,6 +9032,55 @@ impl Controller {
         Ok(())
     }
 
+    fn build_heavy_execution_authority(
+        &self,
+        task_id: &str,
+        working_directory: &Path,
+    ) -> Result<(String, PathBuf, PathBuf, bool), ControllerError> {
+        if self.task_is_multi_repo_integration_gate(task_id)? {
+            let active = self.active_ref()?;
+            let task = active
+                .tasks
+                .get(task_id)
+                .ok_or_else(|| ControllerError::NotReady(format!("unknown task {task_id}")))?;
+            let canonical_working_directory = working_directory.canonicalize()?;
+            let mut matched = None;
+            for (repository_id, view) in &task.integration_views {
+                if view.state != WorktreeLifecycle::Materialized || view.conflict.is_some() {
+                    continue;
+                }
+                if view.lease.worktree_path.canonicalize()? == canonical_working_directory {
+                    if matched.is_some() {
+                        return Err(ControllerError::InvalidPlan(
+                            "integration command working directory ambiguously matches multiple repository views"
+                                .to_owned(),
+                        ));
+                    }
+                    matched = Some((repository_id.clone(), view.lease.worktree_path.clone()));
+                }
+            }
+            let (repository_id, execution_root) = matched.ok_or_else(|| {
+                ControllerError::Policy(PolicyError::Denied(
+                    "integration command working directory is outside Controller-owned repository views"
+                        .to_owned(),
+                ))
+            })?;
+            return Ok((
+                repository_id,
+                execution_root,
+                self.integration_worktree_root(task_id)?,
+                true,
+            ));
+        }
+        let repository_id = self
+            .active_ref()?
+            .single_task_repository(task_id)?
+            .repository_id
+            .clone();
+        let execution_root = self.task_execution_root(task_id)?;
+        Ok((repository_id, execution_root.clone(), execution_root, false))
+    }
+
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn lower_build_heavy_action(
         &self,
@@ -7664,17 +9125,23 @@ impl Controller {
             )));
         }
 
-        let execution_root = self.task_execution_root(&lease.task_id)?;
+        let (repository_id, execution_root, isolation_root, integration_gate) =
+            self.build_heavy_execution_authority(&lease.task_id, &command.working_directory)?;
         if command.working_directory.canonicalize()? != execution_root.canonicalize()? {
             return Err(ControllerError::Policy(PolicyError::Denied(
                 "BUILD_HEAVY working directory must equal the exact task execution root".to_owned(),
             )));
         }
         if !isolation_request.network_offline
-            || isolation_request.repository_root.canonicalize()? != execution_root.canonicalize()?
+            || isolation_request.repository_root.canonicalize()? != isolation_root.canonicalize()?
         {
             return Err(ControllerError::Policy(PolicyError::Denied(
                 "BUILD_HEAVY requires exact offline task-root isolation".to_owned(),
+            )));
+        }
+        if integration_gate && isolation_request.allow_repository_write {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "multi-repository integration verification is read/process-only".to_owned(),
             )));
         }
         let permission_class = if isolation_request.allow_repository_write {
@@ -7708,10 +9175,7 @@ impl Controller {
             )));
         }
         let isolation_policy_digest = isolation_request.digest()?;
-        let (repository_id, policy_digest) = {
-            let active = self.active_ref()?;
-            (active.repository_id.clone(), active.policy_digest.clone())
-        };
+        let policy_digest = self.active_ref()?.policy_digest.clone();
         let action_id = heavy_build_action_id(&lease.resource_lease.lease_id);
         let now_ms = unix_millis()?;
         let timeout_i64 = i64::try_from(command.timeout_ms).unwrap_or(i64::MAX);
@@ -7800,13 +9264,24 @@ impl Controller {
             lease.execution_epoch,
         );
         let expected_action_id = heavy_build_action_id(&expected_lease_id);
+        let repository_ids = active.task_repository_ids(&lease.task_id)?;
+        if !repository_ids
+            .iter()
+            .any(|repository_id| repository_id == &step.repository_id)
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "verification command step {} targets repository {} outside task scope",
+                step.step_id, step.repository_id
+            )));
+        }
+        let repository_id = step.repository_id.clone();
         if lease.resource_lease.lease_id != expected_lease_id
             || action.action_id != expected_action_id
             || action.plan_id != active.plan_id
             || action.plan_revision != active.revision
             || action.task_id != lease.task_id
             || action.execution_epoch != lease.execution_epoch
-            || action.repository_id != active.repository_id
+            || action.repository_id != repository_id
             || action.policy_digest != active.policy_digest
         {
             return Err(ControllerError::InvalidPlan(
@@ -8147,8 +9622,8 @@ impl Controller {
         task_id: &str,
         commands_remaining: usize,
     ) -> Result<u64, ControllerError> {
-        let budget = self
-            .active_ref()?
+        let active = self.active_ref()?;
+        let budget = active
             .tasks
             .get(task_id)
             .and_then(|task| task.autonomy_budget.as_ref())
@@ -8158,6 +9633,7 @@ impl Controller {
                 )
             })?;
         budget.validate()?;
+        active.goal_autonomy_budget.validate()?;
         let commands_remaining = u64::try_from(commands_remaining).map_err(|_| {
             ControllerError::InvalidPlan(
                 "command verification step count does not fit resource arithmetic".to_owned(),
@@ -8168,10 +9644,14 @@ impl Controller {
                 "command verification resource allocation has no remaining command".to_owned(),
             ));
         }
-        let remaining = budget
+        let task_remaining = budget
             .max_disk_write_bytes
             .saturating_sub(budget.used_disk_write_bytes);
-        let limit = remaining / commands_remaining;
+        let goal_remaining = active
+            .goal_autonomy_budget
+            .max_disk_write_bytes
+            .saturating_sub(active.goal_autonomy_budget.used_disk_write_bytes);
+        let limit = task_remaining.min(goal_remaining) / commands_remaining;
         if limit == 0 {
             return Err(ControllerError::Policy(PolicyError::ResourceDenied(
                 "command verification has no remaining governed disk-write budget".to_owned(),
@@ -8187,7 +9667,7 @@ impl Controller {
         task_id: &str,
         attempt_id: &str,
     ) -> Result<Vec<CommandVerificationResultV1>, ControllerError> {
-        let (task, repository_id) = {
+        let (task, repository_ids, integration_gate) = {
             let active = self.active_ref()?;
             let task = active.tasks.get(task_id).ok_or_else(|| {
                 ControllerError::InvalidPlan(
@@ -8209,21 +9689,32 @@ impl Controller {
                         .to_owned(),
                 ));
             }
-            (task.task.clone(), active.repository_id.clone())
+            (
+                task.task.clone(),
+                active.task_repository_ids(task_id)?,
+                self.task_is_multi_repo_integration_gate(task_id)?,
+            )
         };
         let required_steps = required_command_verification_steps(&task)?;
         if required_steps.is_empty() {
             return Ok(Vec::new());
         }
 
-        let execution_root = self.task_execution_root(task_id)?;
         let mut resolved = Vec::with_capacity(required_steps.len());
         for step in required_steps {
-            if step.repository_id != repository_id {
+            if !repository_ids
+                .iter()
+                .any(|repository_id| repository_id == &step.repository_id)
+            {
                 return Err(ControllerError::InvalidPlan(format!(
-                    "command verification step {} targets repository {:?}, expected {:?}",
-                    step.step_id, step.repository_id, repository_id
+                    "command verification step {} targets repository {:?} outside task scope {:?}",
+                    step.step_id, step.repository_id, repository_ids
                 )));
+            }
+            if !integration_gate && repository_ids.len() != 1 {
+                return Err(ControllerError::InvalidPlan(
+                    "ordinary command verification requires exactly one repository".to_owned(),
+                ));
             }
             if step.tool_id != runtime.tool_manifest.tool_id {
                 return Err(ControllerError::InvalidPlan(format!(
@@ -8236,20 +9727,30 @@ impl Controller {
                 .resolve_pinned_program(&step.program)?
                 .path
                 .clone();
-            resolved.push((step, executable));
+            let execution_root = if integration_gate {
+                self.integration_view_root(task_id, &step.repository_id)?
+            } else {
+                self.task_execution_root(task_id)?
+            };
+            resolved.push((step, executable, execution_root));
         }
 
         let mut results = Vec::with_capacity(resolved.len());
         let total_steps = resolved.len();
-        for (index, (step, executable)) in resolved.into_iter().enumerate() {
+        for (index, (step, executable, execution_root)) in resolved.into_iter().enumerate() {
             let commands_remaining = total_steps.saturating_sub(index);
             let disk_write_limit_bytes =
                 self.verification_command_disk_write_limit(task_id, commands_remaining)?;
             let mut isolation_request = runtime.isolation_request.clone();
-            isolation_request
-                .repository_root
-                .clone_from(&execution_root);
+            isolation_request.repository_root = if integration_gate {
+                self.integration_worktree_root(task_id)?
+            } else {
+                execution_root.clone()
+            };
             isolation_request.network_offline = true;
+            if integration_gate {
+                isolation_request.allow_repository_write = false;
+            }
 
             let mut heavy = self.acquire_verification_build_heavy(
                 task_id,
@@ -8318,7 +9819,7 @@ impl Controller {
     #[allow(clippy::too_many_lines)]
     fn recover_required_command_verification(
         &self,
-        intent: &DecodedPersistedActionIntent,
+        binding: &VerificationCommandRecoveryBinding,
         task: &Value,
     ) -> Result<Vec<CommandVerificationResultV1>, ControllerError> {
         let required_steps = required_command_verification_steps(task)?;
@@ -8328,12 +9829,12 @@ impl Controller {
         let mut results = Vec::with_capacity(required_steps.len());
         for step in required_steps {
             let resource_lease_id = verification_build_lease_id(
-                intent.plan_id(),
-                intent.plan_revision(),
-                intent.task_id(),
-                intent.attempt_id(),
+                &binding.plan_id,
+                binding.plan_revision,
+                &binding.task_id,
+                &binding.attempt_id,
                 &step.step_id,
-                intent.execution_epoch(),
+                binding.execution_epoch,
             );
             let action_id = heavy_build_action_id(&resource_lease_id);
             let raw_command_intent = self
@@ -8347,18 +9848,18 @@ impl Controller {
             let command_intent: PersistedVerificationCommandIntentV1 =
                 serde_json::from_str(&raw_command_intent)?;
             if command_intent.schema_version != VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION
-                || command_intent.plan_id != intent.plan_id()
-                || command_intent.plan_revision != intent.plan_revision()
-                || command_intent.plan_digest != intent.plan_digest()
-                || command_intent.task_id != intent.task_id()
-                || command_intent.task_contract_digest != intent.task_contract_digest()
-                || command_intent.attempt_id != intent.attempt_id()
+                || command_intent.plan_id != binding.plan_id
+                || command_intent.plan_revision != binding.plan_revision
+                || command_intent.plan_digest != binding.plan_digest
+                || command_intent.task_id != binding.task_id
+                || command_intent.task_contract_digest != binding.task_contract_digest
+                || command_intent.attempt_id != binding.attempt_id
                 || command_intent.step_id != step.step_id
                 || command_intent.step_digest != step.step_digest
                 || command_intent.resource_lease_id != resource_lease_id
                 || command_intent.action_id != action_id
-                || command_intent.execution_epoch != intent.execution_epoch()
-                || command_intent.artifact_store_root != intent.artifact_store_root()
+                || command_intent.execution_epoch != binding.execution_epoch
+                || command_intent.artifact_store_root != binding.artifact_store_root
                 || !is_sha256_digest(&command_intent.payload_digest)
                 || !is_sha256_digest(&command_intent.policy_digest)
             {
@@ -8395,7 +9896,7 @@ impl Controller {
                 })?;
             let process: RecoveryProcessLease = serde_json::from_str(&raw_process)?;
             if process.action_id != action_id
-                || process.task_id != intent.task_id()
+                || process.task_id != binding.task_id
                 || process.attempt_id != heavy_build_attempt_id(&resource_lease_id)
                 || !process_lease_is_terminal(&process)
             {
@@ -8403,7 +9904,7 @@ impl Controller {
                     "recovery command verification action {action_id} has stale process reap proof"
                 )));
             }
-            let artifacts = ArtifactStore::open(&command_intent.artifact_store_root)?;
+            let artifacts = ArtifactStore::open(&binding.artifact_store_root)?;
             let mut receipt_bytes = Vec::new();
             artifacts
                 .open_artifact(&self.state, &result_digest)?
@@ -8443,6 +9944,130 @@ impl Controller {
             });
         }
         Ok(results)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn resume_recovered_integration_gate(
+        &mut self,
+        registry: &ProjectRegistry,
+        candidate: &RecoveredIntegrationGateCandidate,
+    ) -> Result<(), ControllerError> {
+        if !self.task_is_multi_repo_integration_gate(&candidate.task_id)? {
+            return Err(ControllerError::InvalidPlan(format!(
+                "recovery candidate {} is no longer a multi-repository integration gate",
+                candidate.task_id
+            )));
+        }
+        let (task, attempt, plan_id, plan_revision, plan_digest, task_contract_digest) = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&candidate.task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "recovered integration gate task disappeared from active runtime".to_owned(),
+                )
+            })?;
+            let attempt = active.attempts.get(&candidate.attempt_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "recovered integration gate attempt disappeared from active runtime".to_owned(),
+                )
+            })?;
+            (
+                task.task.clone(),
+                attempt.clone(),
+                active.plan_id.clone(),
+                active.revision,
+                active.plan_digest.clone(),
+                task.task_contract_digest.clone(),
+            )
+        };
+        let binding = &candidate.binding;
+        if candidate.task_id != binding.task_id
+            || candidate.attempt_id != binding.attempt_id
+            || plan_id != binding.plan_id
+            || plan_revision != binding.plan_revision
+            || plan_digest != binding.plan_digest
+            || task_contract_digest != binding.task_contract_digest
+            || attempt.task_id != candidate.task_id
+            || attempt.task_contract_digest != task_contract_digest
+            || attempt.state != AttemptState::Verifying
+            || self
+                .active_ref()?
+                .tasks
+                .get(&candidate.task_id)
+                .is_none_or(|task| task.state != TaskState::Verifying)
+            || self.state.current_execution_epoch()? != binding.execution_epoch
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "recovered integration gate {} lost historical Verifying authority",
+                candidate.task_id
+            )));
+        }
+
+        let command_results = self.recover_required_command_verification(binding, &task)?;
+        if command_results.is_empty() {
+            return Err(ControllerError::InvalidPlan(
+                "recovered integration gate has no required deterministic command verification"
+                    .to_owned(),
+            ));
+        }
+        let current_view_digest = self.integration_view_set_digest(registry, &candidate.task_id)?;
+        let expected_diff_digest =
+            sha256_prefixed(format!("integration_read_only\0{current_view_digest}").as_bytes());
+        if attempt.baseline_digest != current_view_digest
+            || attempt.pre_snapshot_digest != current_view_digest
+            || attempt.pre_diff_digest != expected_diff_digest
+        {
+            return Err(ControllerError::NotReady(format!(
+                "recovered integration gate {} view authority drifted from the historical attempt",
+                candidate.task_id
+            )));
+        }
+        let verification = self.build_integration_gate_verification(
+            &candidate.task_id,
+            &candidate.attempt_id,
+            binding.execution_epoch,
+            &current_view_digest,
+            command_results,
+        )?;
+        let artifacts = ArtifactStore::open(&binding.artifact_store_root)?;
+        let (verification_artifact_digest, verification_evidence_id) =
+            self.persist_verification_result(&artifacts, &verification, "verification_recorded")?;
+        if !verification.passed {
+            let failure_code = verification
+                .failure_code
+                .clone()
+                .unwrap_or_else(|| "command_verification_failed".to_owned());
+            let failed = verification
+                .command_results
+                .iter()
+                .find(|result| !result.passed);
+            let failure = self.build_failure_record(FailureRecordInput {
+                task_id: candidate.task_id.clone(),
+                attempt_id: candidate.attempt_id.clone(),
+                action_id: failed.map(|result| result.action_id.clone()),
+                result_digest: Some(verification_artifact_digest),
+                exit_code: failed.and_then(|result| result.exit_code),
+                category: "verification_failure".to_owned(),
+                diagnostic: format!("integration command verification failed: {failure_code}"),
+                failure_code,
+                failed_action_facts: failed.map_or_else(BTreeMap::new, |result| {
+                    BTreeMap::from([
+                        ("step_id".to_owned(), result.step_id.clone()),
+                        ("action_id".to_owned(), result.action_id.clone()),
+                    ])
+                }),
+                evidence_refs: vec![verification_evidence_id],
+            })?;
+            let _ = self.route_failure_record(failure)?;
+            return Ok(());
+        }
+
+        self.record_verified_output_bindings(&verification, &verification_artifact_digest)?;
+        let _ = self.publish_integration_checkpoint(
+            registry,
+            &verification,
+            &verification_artifact_digest,
+        )?;
+        self.apply_verified_success(&verification)
     }
 
     /// Re-admits MODEL after a completed `BUILD_HEAVY` phase through the governor's automatic-reload
@@ -8988,6 +10613,10 @@ impl Controller {
             .as_bytes(),
         );
         let active = self.active_ref()?;
+        let repository_id = active
+            .single_task_repository(&lease.task_id)?
+            .repository_id
+            .clone();
         let action_id = format!("action.{}", &action_seed[7..27]);
         let now_ms = unix_millis()?;
         let timeout_i64 = i64::try_from(command.timeout_ms).unwrap_or(i64::MAX);
@@ -9004,7 +10633,7 @@ impl Controller {
             tool_version: permission_decision.tool_version.clone(),
             tool_digest: permission_decision.tool_digest.clone(),
             executable_digest: pinned.sha256.clone(),
-            repository_id: active.repository_id.clone(),
+            repository_id,
             // AuthorizedAction has no SecretRef field yet. This safe metadata-only digest binds the
             // exact handle into the existing payload digest until the frozen action contract grows
             // a dedicated secret-ref binding field.
@@ -10778,12 +12407,43 @@ impl Controller {
             task,
             &current_snapshot_digest,
         )?;
-        let mut dependency_records =
-            self.resolve_dependency_binding_digests(task_id, task, &current_snapshot_digest)?;
+        let mut dependency_records = self.resolve_dependency_binding_digests(
+            Some(registry),
+            task_id,
+            task,
+            &current_snapshot_digest,
+        )?;
         evidence_records.sort();
         dependency_records.sort();
         Ok(digest_json(&json!({
             "evidence_satisfactions": evidence_records,
+            "dependency_bindings": dependency_records,
+        }))?)
+    }
+
+    fn resolve_integration_readiness_evidence_digest(
+        &self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+        task: &Value,
+        integration_view_set_digest: &str,
+    ) -> Result<String, ControllerError> {
+        if !execution_evidence_requirements(task)?.is_empty() {
+            return Err(ControllerError::NotReady(
+                "multi-repository integration gates do not accept singular pre-execution repository evidence"
+                    .to_owned(),
+            ));
+        }
+        let mut dependency_records = self.resolve_dependency_binding_digests(
+            Some(registry),
+            task_id,
+            task,
+            integration_view_set_digest,
+        )?;
+        dependency_records.sort();
+        Ok(digest_json(&json!({
+            "integration_view_set_digest": integration_view_set_digest,
+            "evidence_satisfactions": [],
             "dependency_bindings": dependency_records,
         }))?)
     }
@@ -10869,16 +12529,20 @@ impl Controller {
                         "retained evidence {evidence_id} no longer matches its durable digest"
                     )));
                 }
+                let repository_id = active
+                    .single_task_repository(task_id)?
+                    .repository_id
+                    .clone();
                 self.validate_task_exact_context_evidence(
                     registry,
                     task_id,
-                    &active.repository_id,
+                    &repository_id,
                     &item,
                 )?;
                 self.validate_task_requirement_bound_evidence(
                     registry,
                     task_id,
-                    &active.repository_id,
+                    &repository_id,
                     &item,
                     &probe,
                 )?;
@@ -10890,11 +12554,14 @@ impl Controller {
 
     fn resolve_dependency_binding_digests(
         &self,
+        registry: Option<&ProjectRegistry>,
         downstream_task_id: &str,
         task: &Value,
         current_snapshot_digest: &str,
     ) -> Result<Vec<String>, ControllerError> {
         let active = self.active_ref()?;
+        let cross_repo_contracts = cross_repo_contracts_for_plan(&active.plan_document)?;
+        let downstream_repository_ids = active.task_repository_ids(downstream_task_id)?;
         let mut dependency_records = Vec::new();
         for binding in required_array(task, "/dependency_bindings")? {
             let upstream_task_id = required_str(binding, "/upstream_task_id")?;
@@ -10906,6 +12573,35 @@ impl Controller {
                     "dependency task {upstream_task_id} is not succeeded"
                 )));
             }
+            let upstream_repository_ids = active.task_repository_ids(upstream_task_id)?;
+            let crosses_repository_boundary = upstream_repository_ids != downstream_repository_ids;
+            if crosses_repository_boundary {
+                let contract_id = format!("binding:{downstream_task_id}:{upstream_task_id}");
+                let contract = cross_repo_contracts.get(&contract_id).ok_or_else(|| {
+                    ControllerError::NotReady(format!(
+                        "cross-repository dependency {contract_id} lacks a typed contract"
+                    ))
+                })?;
+                if contract.producer_task_contract_digest != upstream.task_contract_digest
+                    || contract.consumer_task_contract_digest
+                        != active
+                            .tasks
+                            .get(downstream_task_id)
+                            .ok_or_else(|| {
+                                ControllerError::NotReady(format!(
+                                    "dependency consumer {downstream_task_id} disappeared"
+                                ))
+                            })?
+                            .task_contract_digest
+                    || contract.producer_repository_ids != upstream_repository_ids
+                    || contract.consumer_repository_ids != downstream_repository_ids
+                {
+                    return Err(ControllerError::NotReady(format!(
+                        "cross-repository dependency contract {contract_id} is stale or misbound"
+                    )));
+                }
+                dependency_records.push(contract.contract_digest.clone());
+            }
             for artifact_id in required_array(binding, "/required_artifact_ids")? {
                 let artifact_id = artifact_id.as_str().ok_or_else(|| {
                     ControllerError::InvalidPlan(
@@ -10913,12 +12609,15 @@ impl Controller {
                     )
                 })?;
                 dependency_records.push(self.validated_output_binding_digest(
-                    "controller.artifact_binding",
-                    upstream_task_id,
-                    &upstream.task_contract_digest,
-                    artifact_id,
-                    downstream_task_id,
-                    current_snapshot_digest,
+                    &OutputBindingValidationRequest {
+                        namespace: "controller.artifact_binding",
+                        upstream_task_id,
+                        upstream_task_contract_digest: &upstream.task_contract_digest,
+                        binding_id: artifact_id,
+                        downstream_task_id,
+                        current_snapshot_digest,
+                        requires_composed_view: !crosses_repository_boundary,
+                    },
                 )?);
             }
             for criterion_id in required_array(binding, "/required_acceptance_criterion_ids")? {
@@ -10928,13 +12627,27 @@ impl Controller {
                     )
                 })?;
                 dependency_records.push(self.validated_output_binding_digest(
-                    "controller.acceptance_binding",
-                    upstream_task_id,
-                    &upstream.task_contract_digest,
-                    criterion_id,
-                    downstream_task_id,
-                    current_snapshot_digest,
+                    &OutputBindingValidationRequest {
+                        namespace: "controller.acceptance_binding",
+                        upstream_task_id,
+                        upstream_task_contract_digest: &upstream.task_contract_digest,
+                        binding_id: criterion_id,
+                        downstream_task_id,
+                        current_snapshot_digest,
+                        requires_composed_view: !crosses_repository_boundary,
+                    },
                 )?);
+            }
+            if self.task_is_multi_repo_integration_gate(upstream_task_id)? {
+                let registry = registry.ok_or_else(|| {
+                    ControllerError::NotReady(
+                        "integration checkpoint validation requires repository authority"
+                            .to_owned(),
+                    )
+                })?;
+                dependency_records.push(
+                    self.validated_integration_checkpoint_digest(registry, upstream_task_id)?,
+                );
             }
         }
         Ok(dependency_records)
@@ -10996,13 +12709,17 @@ impl Controller {
     #[allow(clippy::too_many_lines)]
     fn validated_output_binding_digest(
         &self,
-        namespace: &str,
-        upstream_task_id: &str,
-        upstream_task_contract_digest: &str,
-        binding_id: &str,
-        downstream_task_id: &str,
-        current_snapshot_digest: &str,
+        request: &OutputBindingValidationRequest<'_>,
     ) -> Result<String, ControllerError> {
+        let OutputBindingValidationRequest {
+            namespace,
+            upstream_task_id,
+            upstream_task_contract_digest,
+            binding_id,
+            downstream_task_id,
+            current_snapshot_digest,
+            requires_composed_view,
+        } = *request;
         let active = self.active_ref()?;
         let expected_kind = match namespace {
             "controller.artifact_binding" => "artifact",
@@ -11111,26 +12828,37 @@ impl Controller {
                         "carried dependency task {upstream_task_id} disappeared"
                     ))
                 })?;
-                let change_set = upstream.change_set.as_ref().ok_or_else(|| {
-                    ControllerError::NotReady(format!(
-                        "carried dependency task {upstream_task_id} lost immutable ChangeSet"
-                    ))
-                })?;
+                let upstream_mutates =
+                    Self::task_has_repository_mutation_authority(&upstream.task)?;
+                let Some(change_set) = upstream.change_set.as_ref() else {
+                    if upstream_mutates {
+                        return Err(ControllerError::NotReady(format!(
+                            "carried dependency task {upstream_task_id} lost immutable ChangeSet"
+                        )));
+                    }
+                    return Ok(digest_json(&serde_json::to_value(record)?)?);
+                };
                 let change_set_digest = change_set.digest()?;
                 let carried = upstream.change_set_carry.as_ref().ok_or_else(|| {
                     ControllerError::NotReady(format!(
                         "carried dependency task {upstream_task_id} lost explicit ChangeSet carry provenance"
                     ))
                 })?;
-                let downstream = active.tasks.get(downstream_task_id).ok_or_else(|| {
-                    ControllerError::NotReady(format!(
-                        "downstream task {downstream_task_id} disappeared"
-                    ))
-                })?;
-                let composed = downstream.worktree_composition.iter().any(|binding| {
-                    binding.task_id == upstream_task_id
-                        && binding.change_set_digest == change_set_digest
-                });
+                let composed = !requires_composed_view
+                    || active
+                        .tasks
+                        .get(downstream_task_id)
+                        .ok_or_else(|| {
+                            ControllerError::NotReady(format!(
+                                "downstream task {downstream_task_id} disappeared"
+                            ))
+                        })?
+                        .worktree_composition
+                        .iter()
+                        .any(|binding| {
+                            binding.task_id == upstream_task_id
+                                && binding.change_set_digest == change_set_digest
+                        });
                 if carried.from_revision != verification_revision
                     || carried.to_revision != active.revision
                     || carried.source_change_set_digest != change_set_digest
@@ -11150,30 +12878,35 @@ impl Controller {
             let upstream = active.tasks.get(upstream_task_id).ok_or_else(|| {
                 ControllerError::NotReady(format!("dependency task {upstream_task_id} disappeared"))
             })?;
-            let upstream_change_set_digest = upstream
-                .change_set
-                .as_ref()
-                .ok_or_else(|| {
-                    ControllerError::NotReady(format!(
-                        "dependency task {upstream_task_id} lacks immutable ChangeSet"
-                    ))
-                })?
-                .digest()?;
-            let downstream = active.tasks.get(downstream_task_id).ok_or_else(|| {
-                ControllerError::NotReady(format!(
-                    "downstream task {downstream_task_id} disappeared"
-                ))
-            })?;
-            let composed = downstream.worktree_composition.iter().any(|binding| {
-                binding.task_id == upstream_task_id
-                    && binding.change_set_digest == upstream_change_set_digest
-            });
-            if record.change_set_digest.as_deref() != Some(upstream_change_set_digest.as_str())
-                || verification.post_snapshot_digest != record.repository_snapshot_digest
-                || !composed
-            {
+            let upstream_mutates = Self::task_has_repository_mutation_authority(&upstream.task)?;
+            if let Some(change_set) = upstream.change_set.as_ref() {
+                let upstream_change_set_digest = change_set.digest()?;
+                let composed = !requires_composed_view
+                    || active
+                        .tasks
+                        .get(downstream_task_id)
+                        .ok_or_else(|| {
+                            ControllerError::NotReady(format!(
+                                "downstream task {downstream_task_id} disappeared"
+                            ))
+                        })?
+                        .worktree_composition
+                        .iter()
+                        .any(|binding| {
+                            binding.task_id == upstream_task_id
+                                && binding.change_set_digest == upstream_change_set_digest
+                        });
+                if record.change_set_digest.as_deref() != Some(upstream_change_set_digest.as_str())
+                    || verification.post_snapshot_digest != record.repository_snapshot_digest
+                    || !composed
+                {
+                    return Err(ControllerError::NotReady(format!(
+                        "verified dependency output binding {binding_id} is not present in the current governed execution view"
+                    )));
+                }
+            } else if upstream_mutates {
                 return Err(ControllerError::NotReady(format!(
-                    "verified dependency output binding {binding_id} is not present in the current composed execution view"
+                    "same-repository dependency task {upstream_task_id} lacks immutable ChangeSet"
                 )));
             }
         } else if verification.post_snapshot_digest != current_snapshot_digest
@@ -11350,6 +13083,83 @@ impl Controller {
         Ok(())
     }
 
+    fn validate_integration_gate_lease(
+        &mut self,
+        lease: &IntegrationGateLeaseV1,
+        registry: &ProjectRegistry,
+        tool_manifest: &ToolManifest,
+    ) -> Result<(), ControllerError> {
+        self.require_execution_not_paused()?;
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
+        if self.cancellation_blocks_task(&lease.task_id)? {
+            return Err(ControllerError::NotReady(
+                "integration gate is durably cancelled".to_owned(),
+            ));
+        }
+        self.require_current_baseline(registry)?;
+        if !self.task_is_multi_repo_integration_gate(&lease.task_id)? {
+            return Err(ControllerError::NotReady(
+                "integration gate lease task classification changed".to_owned(),
+            ));
+        }
+        let current_view_digest = self.integration_view_set_digest(registry, &lease.task_id)?;
+        let current_permission_decision =
+            self.permission_decision_for_task(&lease.task_id, tool_manifest)?;
+        current_permission_decision.validate()?;
+        if !current_permission_decision
+            .effective
+            .contains(PermissionClass::ProcessExec)
+            || current_permission_decision
+                .effective
+                .contains(PermissionClass::RepositoryWrite)
+        {
+            return Err(ControllerError::NotReady(
+                "integration gate permission authority is no longer read/process-only".to_owned(),
+            ));
+        }
+        let active = self.active_ref()?;
+        if active.validity != PlanValidity::Current
+            || active.plan_id != lease.plan_id
+            || active.revision != lease.plan_revision
+            || active.plan_digest != lease.plan_digest
+        {
+            return Err(ControllerError::NotReady(
+                "integration gate lease no longer binds the active plan".to_owned(),
+            ));
+        }
+        let task = active.tasks.get(&lease.task_id).ok_or_else(|| {
+            ControllerError::NotReady("integration gate task disappeared".to_owned())
+        })?;
+        if task.state != TaskState::Planned
+            || task.task_contract_digest != lease.task_contract_digest
+            || current_view_digest != lease.integration_view_set_digest
+            || self.state.current_execution_epoch()? != lease.execution_epoch
+            || integration_gate_lease_digest(lease) != lease.lease_digest
+        {
+            return Err(ControllerError::NotReady(
+                "integration gate lease binding is stale".to_owned(),
+            ));
+        }
+        let current_evidence_binding = self.resolve_integration_readiness_evidence_digest(
+            registry,
+            &lease.task_id,
+            &task.task,
+            &current_view_digest,
+        )?;
+        let (generation, action_sequence, checkpoint_hash) = self.current_checkpoint_binding()?;
+        if generation != lease.checkpoint_generation
+            || action_sequence != lease.checkpoint_action_sequence
+            || checkpoint_hash != lease.checkpoint_hash
+            || current_permission_decision != lease.permission_decision
+            || current_evidence_binding != lease.evidence_binding_digest
+        {
+            return Err(ControllerError::NotReady(
+                "integration gate checkpoint/evidence/permission binding is stale".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn require_current_baseline(
         &mut self,
         registry: &ProjectRegistry,
@@ -11359,21 +13169,27 @@ impl Controller {
                 "active plan validity is not current".to_owned(),
             ));
         }
-        let (repository_id, expected) = {
-            let active = self.active_ref()?;
-            (active.repository_id.clone(), active.baseline.clone())
-        };
-        let current = registry.snapshot(&repository_id)?;
-        if current != expected {
+        let expected = self
+            .active_ref()?
+            .repositories
+            .iter()
+            .map(|(repository_id, repository)| (repository_id.clone(), repository.baseline.clone()))
+            .collect::<Vec<_>>();
+        for (repository_id, expected_snapshot) in expected {
+            let current = registry.snapshot(&repository_id)?;
+            if current == expected_snapshot {
+                continue;
+            }
             if let Some(active) = self.active.as_mut() {
                 active.validity = PlanValidity::StaleEvidence;
             }
             let epoch = self.state.advance_execution_epoch()?;
             let (repository_snapshot_digest, baseline_diff_digest, plan_validity) = {
                 let active = self.active_ref()?;
+                let repository = active.repository(&repository_id)?;
                 (
-                    snapshot_digest(&active.baseline)?,
-                    active.baseline_diff_digest.clone(),
+                    snapshot_digest(&repository.baseline)?,
+                    repository.baseline_diff_digest.clone(),
                     active.validity,
                 )
             };
@@ -11508,6 +13324,7 @@ impl Controller {
             .tasks
             .get(&lease.task_id)
             .ok_or_else(|| ControllerError::ProposalRejected("task disappeared".to_owned()))?;
+        let repository = active.single_task_repository(&lease.task_id)?;
         let allowed_evidence = context
             .items
             .iter()
@@ -11524,7 +13341,7 @@ impl Controller {
             ));
         }
         let action = proposal.action;
-        if action.repository_id != active.repository_id
+        if action.repository_id != repository.repository_id
             || action.expected_occurrences != 1
             || action.old_literal.is_empty()
             || action.old_literal == action.new_literal
@@ -11547,9 +13364,9 @@ impl Controller {
             ));
         }
         let target_path = PathBuf::from(&action.path);
-        if active.baseline.untracked.paths.contains(&target_path)
+        if repository.baseline.untracked.paths.contains(&target_path)
             || baseline_target_added_line_contains_literal(
-                &active.baseline_diff_content,
+                &repository.baseline_diff_content,
                 &action.path,
                 &action.old_literal,
             )
@@ -11633,14 +13450,7 @@ impl Controller {
             .tasks
             .get(&lease.task_id)
             .ok_or_else(|| ControllerError::ProposalRejected("task disappeared".to_owned()))?;
-        if !required_array(&task.task, "/scope/repositories")?
-            .iter()
-            .any(|value| value.as_str() == Some(active.repository_id.as_str()))
-        {
-            return Err(ControllerError::ProposalRejected(
-                "active repository is outside exact task repository scope".to_owned(),
-            ));
-        }
+        let repository = active.single_task_repository(&lease.task_id)?;
         let execution_root = self.task_execution_root(&lease.task_id)?;
         match &proposal.action {
             RepositoryActionV1::CreateFile {
@@ -11648,7 +13458,7 @@ impl Controller {
                 path,
                 content,
             } => {
-                if repository_id != &active.repository_id
+                if repository_id != &repository.repository_id
                     || !valid_repo_relative_path(path)
                     || repository_path_is_internal(path)
                     || !scope_contains_path(&task.task, "/scope/allow_create", path)?
@@ -11683,7 +13493,7 @@ impl Controller {
                 expected_source_digest,
                 content,
             } => {
-                if repository_id != &active.repository_id
+                if repository_id != &repository.repository_id
                     || !is_sha256_digest(expected_source_digest)
                     || !valid_repo_relative_path(path)
                     || repository_path_is_internal(path)
@@ -11733,7 +13543,7 @@ impl Controller {
                         "update_file target must remain a regular non-symlink file".to_owned(),
                     ));
                 }
-                if active
+                if repository
                     .baseline
                     .untracked
                     .paths
@@ -11982,7 +13792,10 @@ impl Controller {
             tool_version: decision.tool_version.clone(),
             tool_digest: decision.tool_digest.clone(),
             executable_digest: python.sha256.clone(),
-            repository_id: active.repository_id.clone(),
+            repository_id: active
+                .single_task_repository(&lease.task_id)?
+                .repository_id
+                .clone(),
             destination_digest: Some(validated.proposal.expected_source_digest.clone()),
             permission_class: PermissionClass::RepositoryWrite,
             execution_epoch: lease.execution_epoch,
@@ -12084,7 +13897,10 @@ impl Controller {
             tool_version: decision.tool_version.clone(),
             tool_digest: decision.tool_digest.clone(),
             executable_digest: python.sha256.clone(),
-            repository_id: active.repository_id.clone(),
+            repository_id: active
+                .single_task_repository(&original_intent.task_id)?
+                .repository_id
+                .clone(),
             destination_digest: Some(validated.proposal.expected_source_digest.clone()),
             permission_class: PermissionClass::RepositoryWrite,
             execution_epoch: self.state.current_execution_epoch()?,
@@ -12224,16 +14040,19 @@ impl Controller {
             let task = active.tasks.get(&action.task_id).ok_or_else(|| {
                 ControllerError::InvalidPlan("action intent task disappeared".to_owned())
             })?;
+            let repository_root = active
+                .single_task_repository(&action.task_id)?
+                .repository_root
+                .clone();
             (
                 active.plan_digest.clone(),
                 task.task_contract_digest.clone(),
                 task.worktree_lease
                     .as_ref()
                     .map(|lease| lease.lease_id.clone()),
-                task.worktree_lease.as_ref().map_or_else(
-                    || active.repository_root.clone(),
-                    |lease| lease.worktree_path.clone(),
-                ),
+                task.worktree_lease
+                    .as_ref()
+                    .map_or(repository_root, |lease| lease.worktree_path.clone()),
             )
         };
         let intent = PersistedActionIntent {
@@ -12289,16 +14108,19 @@ impl Controller {
             let task = active.tasks.get(&action.task_id).ok_or_else(|| {
                 ControllerError::InvalidPlan("repository action intent task disappeared".to_owned())
             })?;
+            let repository_root = active
+                .single_task_repository(&action.task_id)?
+                .repository_root
+                .clone();
             (
                 active.plan_digest.clone(),
                 task.task_contract_digest.clone(),
                 task.worktree_lease
                     .as_ref()
                     .map(|lease| lease.lease_id.clone()),
-                task.worktree_lease.as_ref().map_or_else(
-                    || active.repository_root.clone(),
-                    |lease| lease.worktree_path.clone(),
-                ),
+                task.worktree_lease
+                    .as_ref()
+                    .map_or(repository_root, |lease| lease.worktree_path.clone()),
             )
         };
         let mutation = match &validated.preimage {
@@ -12367,17 +14189,18 @@ impl Controller {
             .worktree_lease
             .as_ref()
             .map(|lease| lease.lease_id.as_str());
+        let repository = active.single_task_repository(&intent.task_id)?;
         let expected_execution_root = task
             .worktree_lease
             .as_ref()
-            .map_or(active.repository_root.as_path(), |lease| {
+            .map_or(repository.repository_root.as_path(), |lease| {
                 lease.worktree_path.as_path()
             });
         if intent.schema_version != ACTION_INTENT_SCHEMA_VERSION
             || intent.plan_id != active.plan_id
             || intent.plan_revision != active.revision
             || intent.plan_digest != active.plan_digest
-            || intent.repository_id != active.repository_id
+            || intent.repository_id != repository.repository_id
             || intent.policy_digest != active.policy_digest
             || intent.task_contract_digest != task.task_contract_digest
             || intent.worktree_lease_id.as_deref() != expected_worktree_lease_id
@@ -12492,6 +14315,7 @@ impl Controller {
         }
         let (task_contract_digest, baseline_digest) = {
             let active = self.active_ref()?;
+            let repository = active.single_task_repository(intent.task_id())?;
             if active.plan_id != intent.plan_id()
                 || active.revision != intent.plan_revision()
                 || active.plan_digest
@@ -12499,7 +14323,7 @@ impl Controller {
                         .get("plan_digest")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
-                || active.repository_id != intent.repository_id()
+                || repository.repository_id != intent.repository_id()
             {
                 return Err(ControllerError::NotReady(
                     "recovery action intent no longer matches the active plan/repository"
@@ -12552,7 +14376,8 @@ impl Controller {
             let task = active.tasks.get(intent.task_id()).ok_or_else(|| {
                 ControllerError::InvalidPlan("recovery verification task missing".to_owned())
             })?;
-            self.recover_required_command_verification(&intent, &task.task)?
+            let command_binding = VerificationCommandRecoveryBinding::from(&intent);
+            self.recover_required_command_verification(&command_binding, &task.task)?
         };
         let active = self.active_ref()?;
         let binding = VerificationLeaseBinding {
@@ -12698,7 +14523,7 @@ impl Controller {
         }
         if legacy_primary_recovery {
             self.apply_verified_success(&verification)?;
-            self.refresh_baseline_after_verified_success(registry)?;
+            self.refresh_baseline_after_verified_success(registry, intent.task_id())?;
             self.append_controller_event(
                 "legacy_v2_primary_recovery_verified",
                 intent.task_id(),
@@ -12841,9 +14666,12 @@ impl Controller {
             ));
         }
         let pre_diff = self.task_execution_diff(registry, &lease.task_id)?;
-        if !self.active_uses_controller_worktrees()?
-            && pre_diff.digest != self.active_ref()?.baseline_diff_digest
-        {
+        let baseline_diff_digest = self
+            .active_ref()?
+            .single_task_repository(&lease.task_id)?
+            .baseline_diff_digest
+            .clone();
+        if !self.active_uses_controller_worktrees()? && pre_diff.digest != baseline_diff_digest {
             return Err(ControllerError::NotReady(
                 "repository diff changed before attempt start".to_owned(),
             ));
@@ -12921,6 +14749,104 @@ impl Controller {
             )],
         )?;
         self.checkpoint_now()?;
+        Ok(attempt_id)
+    }
+
+    fn start_integration_gate_attempt(
+        &mut self,
+        lease: &IntegrationGateLeaseV1,
+    ) -> Result<String, ControllerError> {
+        let attempt_number = {
+            let active = self.active_mut()?;
+            let task = active.tasks.get_mut(&lease.task_id).ok_or_else(|| {
+                ControllerError::NotReady("integration gate task disappeared".to_owned())
+            })?;
+            if task.state != TaskState::Planned {
+                return Err(ControllerError::NotReady(
+                    "integration gate task is no longer Planned".to_owned(),
+                ));
+            }
+            task.attempts_started = task.attempts_started.saturating_add(1);
+            task.state = TaskState::Running;
+            task.attempts_started
+        };
+        let seed = sha256_prefixed(
+            format!(
+                "integration_gate\0{}\0{}\0{}\0{}",
+                lease.plan_digest,
+                lease.task_contract_digest,
+                lease.execution_epoch,
+                attempt_number
+            )
+            .as_bytes(),
+        );
+        let attempt_id = format!("attempt.{}", &seed[7..27]);
+        let attempt = AttemptRuntime {
+            task_id: lease.task_id.clone(),
+            attempt_id: attempt_id.clone(),
+            state: AttemptState::Executing,
+            task_contract_digest: lease.task_contract_digest.clone(),
+            repair_origin: None,
+            baseline_digest: lease.integration_view_set_digest.clone(),
+            pre_snapshot_digest: lease.integration_view_set_digest.clone(),
+            pre_diff_digest: sha256_prefixed(
+                format!(
+                    "integration_read_only\0{}",
+                    lease.integration_view_set_digest
+                )
+                .as_bytes(),
+            ),
+            pre_changed_fingerprints: BTreeMap::new(),
+        };
+        self.active_mut()?
+            .attempts
+            .insert(attempt_id.clone(), attempt);
+        let task_json = serde_json::to_string(
+            self.active_ref()?
+                .tasks
+                .get(&lease.task_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?,
+        )?;
+        let attempt_json = serde_json::to_string(
+            self.active_ref()?
+                .attempts
+                .get(&attempt_id)
+                .ok_or_else(|| ControllerError::InvalidPlan("attempt disappeared".to_owned()))?,
+        )?;
+        self.persist_runtime_records_with_events(
+            &[
+                (
+                    "controller.task".to_owned(),
+                    lease.task_id.clone(),
+                    task_json,
+                ),
+                (
+                    "controller.attempt".to_owned(),
+                    attempt_id.clone(),
+                    attempt_json,
+                ),
+            ],
+            &[(
+                "integration_attempt_started".to_owned(),
+                attempt_id.clone(),
+                json!({
+                    "task_id": lease.task_id,
+                    "attempt_number": attempt_number,
+                    "integration_view_set_digest": lease.integration_view_set_digest,
+                }),
+            )],
+        )?;
+        self.checkpoint_now()?;
+        self.transition_attempt(
+            &attempt_id,
+            AttemptState::Verifying,
+            "integration_attempt_verifying",
+        )?;
+        self.transition_task(
+            &lease.task_id,
+            TaskState::Verifying,
+            "integration_task_verifying",
+        )?;
         Ok(attempt_id)
     }
 
@@ -13313,17 +15239,117 @@ impl Controller {
         Ok(())
     }
 
+    fn persist_verification_result(
+        &mut self,
+        artifacts: &ArtifactStore,
+        verification: &VerificationResultV1,
+        event_kind: &str,
+    ) -> Result<(String, String), ControllerError> {
+        let verification_bytes = serde_json::to_vec(verification)?;
+        let expected_artifact_digest = sha256_prefixed(&verification_bytes)
+            .strip_prefix("sha256:")
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "verification artifact digest lost SHA-256 prefix".to_owned(),
+                )
+            })?
+            .to_owned();
+        let verification_key = revision_scoped_key(
+            &verification.plan_id,
+            verification.plan_revision,
+            &verification.verification_id,
+        );
+        let evidence_id = format!(
+            "evidence.verification.{}",
+            digest_fragment(&expected_artifact_digest, 16)
+        );
+        if let Some(existing_raw) = self
+            .state
+            .get_state("controller.verification", &verification_key)?
+        {
+            let existing: VerificationResultV1 = serde_json::from_str(&existing_raw)?;
+            if existing != *verification {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "verification {} conflicts with durable verification authority",
+                    verification.verification_id
+                )));
+            }
+            let metadata = self
+                .state
+                .artifact_metadata(&expected_artifact_digest)?
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!(
+                        "verification {} lost durable artifact metadata",
+                        verification.verification_id
+                    ))
+                })?;
+            let expected_size = u64::try_from(verification_bytes.len()).map_err(|_| {
+                ControllerError::InvalidPlan(
+                    "verification artifact size does not fit u64".to_owned(),
+                )
+            })?;
+            if metadata.size_bytes != expected_size {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "verification {} artifact metadata size drifted",
+                    verification.verification_id
+                )));
+            }
+            let mut stored = Vec::new();
+            artifacts
+                .open_artifact(&self.state, &expected_artifact_digest)?
+                .read_to_end(&mut stored)?;
+            if stored != verification_bytes {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "verification {} artifact bytes drifted",
+                    verification.verification_id
+                )));
+            }
+            self.state
+                .add_artifact_reference(&evidence_id, &expected_artifact_digest)?;
+            return Ok((expected_artifact_digest, evidence_id));
+        }
+        let artifact = artifacts.put(&mut self.state, &verification_bytes)?;
+        if artifact.digest != expected_artifact_digest {
+            return Err(ControllerError::InvalidPlan(
+                "verification artifact store returned an unexpected digest".to_owned(),
+            ));
+        }
+        self.state
+            .add_artifact_reference(&evidence_id, &artifact.digest)?;
+        self.state.put_state(
+            "controller.verification",
+            &verification_key,
+            &serde_json::to_string(verification)?,
+        )?;
+        self.append_controller_event(
+            event_kind,
+            &verification.verification_id,
+            &json!({
+                "passed": verification.passed,
+                "artifact_digest": artifact.digest,
+                "plan_id": verification.plan_id,
+                "plan_revision": verification.plan_revision,
+                "plan_digest": verification.plan_digest,
+                "task_id": verification.task_id,
+                "task_contract_digest": verification.task_contract_digest,
+                "attempt_id": verification.attempt_id,
+            }),
+        )?;
+        self.checkpoint_now()?;
+        Ok((artifact.digest, evidence_id))
+    }
+
     fn persist_task_carry_fingerprint(
         &mut self,
         verification: &VerificationResultV1,
         verification_artifact_digest: &str,
         task_contract_digest: &str,
     ) -> Result<(), ControllerError> {
-        let execution_root = self.task_execution_root(&verification.task_id)?;
         let active = self.active_ref()?;
         let task = active.tasks.get(&verification.task_id).ok_or_else(|| {
             ControllerError::InvalidPlan("carry fingerprint task disappeared".to_owned())
         })?;
+        let mutates_repository = Self::task_has_repository_mutation_authority(&task.task)?;
         let mut fingerprint_paths = BTreeSet::new();
         for pointer in ["/scope/files", "/scope/allow_create"] {
             for path in required_array(&task.task, pointer)? {
@@ -13336,11 +15362,14 @@ impl Controller {
             }
         }
         let mut source_fingerprints = BTreeMap::new();
-        for path in fingerprint_paths {
-            source_fingerprints.insert(
-                path.clone(),
-                path_fingerprint(&execution_root, Path::new(&path))?,
-            );
+        if !fingerprint_paths.is_empty() {
+            let execution_root = self.task_execution_root(&verification.task_id)?;
+            for path in fingerprint_paths {
+                source_fingerprints.insert(
+                    path.clone(),
+                    path_fingerprint(&execution_root, Path::new(&path))?,
+                );
+            }
         }
         let implementation_inputs_digest = digest_json(
             task.task
@@ -13351,22 +15380,17 @@ impl Controller {
             digest_json(task.task.get("dependency_bindings").ok_or_else(|| {
                 ControllerError::InvalidPlan("task bindings missing".to_owned())
             })?)?;
-        let instruction_fingerprint_digest = digest_json(
-            active
-                .plan_document
-                .pointer("/repositories/0/instructions")
-                .ok_or_else(|| {
-                    ControllerError::InvalidPlan("repository instructions missing".to_owned())
-                })?,
-        )?;
+        let instruction_fingerprint_digest =
+            task_instruction_fingerprint_digest(&active.plan_document, &task.task)?;
         let (_, acceptance_contract_digest) = compiled_acceptance_contract(&task.task)?;
-        let execution_provenance = if matches!(
-            active
-                .plan_document
-                .pointer("/depth/mode")
-                .and_then(Value::as_str),
-            Some("D3" | "D4")
-        ) {
+        let execution_provenance = if mutates_repository
+            && matches!(
+                active
+                    .plan_document
+                    .pointer("/depth/mode")
+                    .and_then(Value::as_str),
+                Some("D3" | "D4")
+            ) {
             Some(
                 task_carry_execution_provenance(active, &verification.task_id)?.ok_or_else(
                     || {
@@ -13396,6 +15420,19 @@ impl Controller {
             verification_artifact_digest: verification_artifact_digest.to_owned(),
         };
         let key = active_scoped_key(active, &verification.task_id);
+        if let Some(existing_raw) = self
+            .state
+            .get_state("controller.task_carry_fingerprint", &key)?
+        {
+            let existing: TaskCarryFingerprintV1 = serde_json::from_str(&existing_raw)?;
+            if existing != record {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "task {} carry fingerprint conflicts with durable authority",
+                    verification.task_id
+                )));
+            }
+            return Ok(());
+        }
         self.state.put_state(
             "controller.task_carry_fingerprint",
             &key,
@@ -13438,14 +15475,22 @@ impl Controller {
             carried_from_plan_revision: None,
             carried_from_plan_digest: None,
         };
-        self.state.put_state(
-            namespace,
-            &active_scoped_key(
-                active,
-                &output_binding_key(&verification.task_id, binding_id),
-            ),
-            &serde_json::to_string(&record)?,
-        )?;
+        let key = active_scoped_key(
+            active,
+            &output_binding_key(&verification.task_id, binding_id),
+        );
+        if let Some(existing_raw) = self.state.get_state(namespace, &key)? {
+            let existing: VerifiedOutputBindingV1 = serde_json::from_str(&existing_raw)?;
+            if existing != record {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "verified output binding {}/{} conflicts with durable authority",
+                    verification.task_id, binding_id
+                )));
+            }
+            return Ok(());
+        }
+        self.state
+            .put_state(namespace, &key, &serde_json::to_string(&record)?)?;
         self.append_controller_event(
             "verified_output_bound",
             &verification.task_id,
@@ -13563,13 +15608,40 @@ impl Controller {
         Ok(())
     }
 
+    fn task_requires_worktree_change_set(&self, task_id: &str) -> Result<bool, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::InvalidPlan("ChangeSet task disappeared".to_owned()))?;
+        if Self::task_has_repository_mutation_authority(&task.task)? {
+            return Ok(true);
+        }
+        if task.worktree_lease.is_some()
+            || task.worktree_state.is_some()
+            || task.worktree_baseline.is_some()
+            || !task.worktree_composition.is_empty()
+            || task.worktree_conflict.is_some()
+            || task.change_set.is_some()
+            || task.change_set_artifact_digest.is_some()
+            || task.change_set_carry.is_some()
+        {
+            return Err(ControllerError::InvalidPlan(
+                "non-mutating task acquired repository mutation state".to_owned(),
+            ));
+        }
+        Ok(false)
+    }
+
     fn persist_worktree_change_set_if_required(
         &mut self,
         registry: &ProjectRegistry,
         task_id: &str,
         artifacts: &ArtifactStore,
     ) -> Result<(), ControllerError> {
-        if !self.active_uses_controller_worktrees()? {
+        if !self.active_uses_controller_worktrees()?
+            || !self.task_requires_worktree_change_set(task_id)?
+        {
             return Ok(());
         }
         let (lease, baseline, existing, existing_digest, record_key, reference_id) = {
@@ -13655,13 +15727,113 @@ impl Controller {
         Ok(())
     }
 
+    fn release_integration_view_for_supersession(
+        &mut self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+        repository_id: &str,
+        expected_root: &Path,
+    ) -> Result<(), ControllerError> {
+        let view = self
+            .active_ref()?
+            .tasks
+            .get(task_id)
+            .and_then(|task| task.integration_views.get(repository_id))
+            .cloned()
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan("integration view disappeared".to_owned())
+            })?;
+        self.validate_controller_worktree_lease_binding_for_repository(
+            task_id,
+            repository_id,
+            expected_root,
+            &view.lease,
+        )?;
+        match view.state {
+            WorktreeLifecycle::Released => {
+                if view.lease.worktree_path.exists() {
+                    return Err(ControllerError::NotReady(format!(
+                        "released integration view {task_id}/{repository_id} unexpectedly still exists"
+                    )));
+                }
+                return Ok(());
+            }
+            WorktreeLifecycle::Conflict => {
+                return Err(ControllerError::NotReady(format!(
+                    "conflicted integration view {task_id}/{repository_id} must remain durable for recovery/replan"
+                )));
+            }
+            WorktreeLifecycle::Prepared if !view.lease.worktree_path.exists() => {
+                self.active_mut()?
+                    .tasks
+                    .get_mut(task_id)
+                    .and_then(|task| task.integration_views.get_mut(repository_id))
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan("integration view disappeared".to_owned())
+                    })?
+                    .state = WorktreeLifecycle::Released;
+                self.persist_worktree_task_state(
+                    task_id,
+                    "integration_view_released_for_supersession",
+                    &json!({"repository_id": repository_id, "lease_id": view.lease.lease_id}),
+                )?;
+                return Ok(());
+            }
+            WorktreeLifecycle::Prepared | WorktreeLifecycle::Materialized => {}
+        }
+        registry.validate_worktree_lease(&view.lease)?;
+        let baseline = match view.state {
+            WorktreeLifecycle::Prepared => registry.capture_worktree_baseline(&view.lease)?,
+            WorktreeLifecycle::Materialized => {
+                let baseline = view.baseline.clone().ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!(
+                        "materialized integration view {task_id}/{repository_id} lacks baseline"
+                    ))
+                })?;
+                let (expected_composition, _) =
+                    self.ordered_upstream_change_sets_for_repository(task_id, repository_id)?;
+                if view.composition != expected_composition || view.conflict.is_some() {
+                    return Err(ControllerError::NotReady(format!(
+                        "integration view {task_id}/{repository_id} has stale composition authority"
+                    )));
+                }
+                baseline
+            }
+            WorktreeLifecycle::Conflict | WorktreeLifecycle::Released => unreachable!(),
+        };
+        let cleanup_change_set =
+            registry.capture_change_set_from_baseline(&view.lease, &baseline)?;
+        if !cleanup_change_set.diff_content.is_empty()
+            || !cleanup_change_set.changed_paths.is_empty()
+            || !cleanup_change_set.untracked_paths.is_empty()
+            || !cleanup_change_set.unmerged_paths.is_empty()
+        {
+            return Err(ControllerError::NotReady(format!(
+                "read-only integration view {task_id}/{repository_id} contains repository mutations"
+            )));
+        }
+        registry.release_worktree(&view.lease, &cleanup_change_set)?;
+        self.active_mut()?
+            .tasks
+            .get_mut(task_id)
+            .and_then(|task| task.integration_views.get_mut(repository_id))
+            .ok_or_else(|| ControllerError::InvalidPlan("integration view disappeared".to_owned()))?
+            .state = WorktreeLifecycle::Released;
+        self.persist_worktree_task_state(
+            task_id,
+            "integration_view_released_for_supersession",
+            &json!({"repository_id": repository_id, "lease_id": view.lease.lease_id}),
+        )?;
+        Ok(())
+    }
+
     fn finalize_verified_repository_success(
         &mut self,
         registry: &ProjectRegistry,
         task_id: &str,
     ) -> Result<(), ControllerError> {
         if !self.active_uses_controller_worktrees()? {
-            return self.refresh_baseline_after_verified_success(registry);
+            return self.refresh_baseline_after_verified_success(registry, task_id);
         }
         let (lease, change_set) = {
             let active = self.active_ref()?;
@@ -13707,6 +15879,7 @@ impl Controller {
         }
         let task_ids = self.active_ref()?.tasks.keys().cloned().collect::<Vec<_>>();
         for task_id in task_ids {
+            self.release_integration_views_for_supersession(registry, &task_id)?;
             let (lease, lifecycle, baseline, existing_change_set) = {
                 let task = self.active_ref()?.tasks.get(&task_id).ok_or_else(|| {
                     ControllerError::InvalidPlan("worktree task disappeared".to_owned())
@@ -13795,26 +15968,102 @@ impl Controller {
         Ok(())
     }
 
+    fn release_integration_views_for_supersession(
+        &mut self,
+        registry: &ProjectRegistry,
+        task_id: &str,
+    ) -> Result<(), ControllerError> {
+        let repository_ids = self
+            .active_ref()?
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| ControllerError::InvalidPlan("worktree task disappeared".to_owned()))?
+            .integration_views
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        if repository_ids.is_empty() {
+            return Ok(());
+        }
+        if !self.task_is_multi_repo_integration_gate(task_id)? {
+            return Err(ControllerError::InvalidPlan(format!(
+                "task {task_id} has integration views without integration-gate authority"
+            )));
+        }
+        let expected_root = self.integration_worktree_root(task_id)?;
+        for repository_id in repository_ids {
+            self.release_integration_view_for_supersession(
+                registry,
+                task_id,
+                &repository_id,
+                &expected_root,
+            )?;
+        }
+        Ok(())
+    }
+
     fn refresh_baseline_after_verified_success(
         &mut self,
         registry: &ProjectRegistry,
+        task_id: &str,
     ) -> Result<(), ControllerError> {
-        let repository_id = self.active_ref()?.repository_id.clone();
+        let repository_id = self
+            .active_ref()?
+            .single_task_repository(task_id)?
+            .repository_id
+            .clone();
         let refreshed = registry.snapshot(&repository_id)?;
         let refreshed_diff = ExactRetriever::new(registry).current_diff(&repository_id)?;
         {
             let active = self.active_mut()?;
-            active.baseline = refreshed;
-            active.baseline_diff_digest = refreshed_diff.digest;
-            active.baseline_diff_content = refreshed_diff.content;
-            active.validity = PlanValidity::Current;
+            let repository = active.repositories.get_mut(&repository_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "active repository {repository_id} disappeared during baseline refresh"
+                ))
+            })?;
+            repository.baseline = refreshed;
+            repository.baseline_diff_digest = refreshed_diff.digest;
+            repository.baseline_diff_content = refreshed_diff.content;
         }
+        let expected_repositories = self
+            .active_ref()?
+            .repositories
+            .iter()
+            .map(|(repository_id, repository)| {
+                (
+                    repository_id.clone(),
+                    repository.baseline.clone(),
+                    repository.baseline_diff_digest.clone(),
+                    repository.baseline_diff_content.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut stale_repository_id = None;
+        for (candidate_id, expected_snapshot, expected_diff_digest, expected_diff_content) in
+            expected_repositories
+        {
+            let current_snapshot = registry.snapshot(&candidate_id)?;
+            let current_diff = ExactRetriever::new(registry).current_diff(&candidate_id)?;
+            if current_snapshot != expected_snapshot
+                || current_diff.digest != expected_diff_digest
+                || current_diff.content != expected_diff_content
+            {
+                stale_repository_id = Some(candidate_id);
+                break;
+            }
+        }
+        self.active_mut()?.validity = if stale_repository_id.is_some() {
+            PlanValidity::StaleEvidence
+        } else {
+            PlanValidity::Current
+        };
         let epoch = self.state.advance_execution_epoch()?;
         let (repository_snapshot_digest, baseline_diff_digest, plan_validity) = {
             let active = self.active_ref()?;
+            let repository = active.repository(&repository_id)?;
             (
-                snapshot_digest(&active.baseline)?,
-                active.baseline_diff_digest.clone(),
+                snapshot_digest(&repository.baseline)?,
+                repository.baseline_diff_digest.clone(),
                 active.validity,
             )
         };
@@ -13828,6 +16077,28 @@ impl Controller {
                 "plan_validity": plan_validity,
             }),
         )?;
+        if let Some(stale_repository_id) = stale_repository_id {
+            let (repository_snapshot_digest, baseline_diff_digest, plan_validity) = {
+                let active = self.active_ref()?;
+                let repository = active.repository(&stale_repository_id)?;
+                (
+                    snapshot_digest(&repository.baseline)?,
+                    repository.baseline_diff_digest.clone(),
+                    active.validity,
+                )
+            };
+            self.append_controller_event(
+                "plan_stale_evidence",
+                &stale_repository_id,
+                &json!({
+                    "execution_epoch": epoch,
+                    "repository_snapshot_digest": repository_snapshot_digest,
+                    "baseline_diff_digest": baseline_diff_digest,
+                    "plan_validity": plan_validity,
+                    "detected_while_refreshing_repository": repository_id,
+                }),
+            )?;
+        }
         self.checkpoint_now()?;
         Ok(())
     }
@@ -14014,7 +16285,40 @@ impl Controller {
         let goal_autonomy_budget = active.goal_autonomy_budget.clone();
         let goal_autonomy_budget_digest =
             digest_json(&serde_json::to_value(&goal_autonomy_budget)?)?;
-        let repository_snapshot_digest = snapshot_digest(&active.baseline)?;
+        let repository_baselines = checkpoint_repository_baselines(active)?;
+        let cross_repo_contract_digests = cross_repo_contracts_for_plan(&active.plan_document)?
+            .into_iter()
+            .map(|(contract_id, contract)| (contract_id, contract.contract_digest))
+            .collect::<BTreeMap<_, _>>();
+        let mut integration_checkpoint_digests = BTreeMap::new();
+        for record in self.state.state_records(INTEGRATION_CHECKPOINT_NAMESPACE)? {
+            if !key_belongs_to_revision(&record.key, &active.plan_id, active.revision) {
+                continue;
+            }
+            let checkpoint: IntegrationCheckpointV1 = serde_json::from_str(&record.value_json)?;
+            checkpoint.validate()?;
+            if checkpoint.plan_id != active.plan_id
+                || checkpoint.plan_revision != active.revision
+                || checkpoint.plan_digest != active.plan_digest
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "active integration checkpoint record is misbound to another plan revision"
+                        .to_owned(),
+                ));
+            }
+            if integration_checkpoint_digests
+                .insert(
+                    checkpoint.gate_task_id.clone(),
+                    checkpoint.checkpoint_digest.clone(),
+                )
+                .is_some()
+            {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "duplicate integration checkpoint for gate {}",
+                    checkpoint.gate_task_id
+                )));
+            }
+        }
         Ok(CheckpointManifest {
             schema_version: CHECKPOINT_MANIFEST_SCHEMA_VERSION,
             plan_document: active.plan_document.clone(),
@@ -14025,12 +16329,15 @@ impl Controller {
             compiler_plan_digest: active.compiler_plan_digest.clone(),
             compilation_evidence_digest: active.compilation_evidence_digest.clone(),
             policy_digest: active.policy_digest.clone(),
-            repository_id: active.repository_id.clone(),
-            repository_root: active.repository_root.clone(),
-            repository_snapshot: active.baseline.clone(),
-            repository_snapshot_digest,
-            baseline_diff_digest: active.baseline_diff_digest.clone(),
-            baseline_diff_content: active.baseline_diff_content.clone(),
+            repository_id: None,
+            repository_root: None,
+            repository_snapshot: None,
+            repository_snapshot_digest: None,
+            baseline_diff_digest: None,
+            baseline_diff_content: None,
+            repository_baselines,
+            cross_repo_contract_digests,
+            integration_checkpoint_digests,
             plan_validity: active.validity,
             task_records,
             attempt_records,
@@ -14067,11 +16374,7 @@ impl Controller {
                     "validity": active.validity,
                 }),
                 serde_json::to_string(&active.plan_document)?,
-                serde_json::to_string(&PersistedRepositoryBaseline {
-                    snapshot: active.baseline.clone(),
-                    diff_digest: active.baseline_diff_digest.clone(),
-                    diff_content: active.baseline_diff_content.clone(),
-                })?,
+                serde_json::to_string(&persisted_repository_baseline_set(&active.repositories))?,
             )
         };
         self.state.put_state(
@@ -14446,11 +16749,7 @@ impl Controller {
                     "compilation_evidence_digest": active.compilation_evidence_digest,
                     "validity": active.validity,
                 }))?,
-                serde_json::to_string(&PersistedRepositoryBaseline {
-                    snapshot: active.baseline.clone(),
-                    diff_digest: active.baseline_diff_digest.clone(),
-                    diff_content: active.baseline_diff_content.clone(),
-                })?,
+                serde_json::to_string(&persisted_repository_baseline_set(&active.repositories))?,
             )
         };
         self.persist_runtime_records_with_events(
@@ -14493,11 +16792,7 @@ impl Controller {
         records.push((
             "controller.repository_baseline".to_owned(),
             "active".to_owned(),
-            serde_json::to_string(&PersistedRepositoryBaseline {
-                snapshot: active.baseline.clone(),
-                diff_digest: active.baseline_diff_digest.clone(),
-                diff_content: active.baseline_diff_content.clone(),
-            })?,
+            serde_json::to_string(&persisted_repository_baseline_set(&active.repositories))?,
         ));
         for (task_id, runtime) in &active.tasks {
             records.push((
@@ -14618,14 +16913,27 @@ fn task_carry_execution_provenance(
     let Some(change_set) = task.change_set.as_ref() else {
         return Ok(None);
     };
+    let target_repository_id = active
+        .single_task_repository(task_id)?
+        .repository_id
+        .clone();
     let mut composed_change_sets = Vec::new();
     for upstream_task_id in dependency_closure_order(&active.tasks, task_id)? {
-        let Some(upstream_change_set) = active
-            .tasks
-            .get(&upstream_task_id)
-            .and_then(|runtime| runtime.change_set.as_ref())
-        else {
-            return Ok(None);
+        let upstream = active.tasks.get(&upstream_task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "carry execution provenance dependency {upstream_task_id} disappeared"
+            ))
+        })?;
+        let upstream_repository_ids = active.task_repository_ids(&upstream_task_id)?;
+        if upstream_repository_ids.len() != 1 || upstream_repository_ids[0] != target_repository_id
+        {
+            continue;
+        }
+        let Some(upstream_change_set) = upstream.change_set.as_ref() else {
+            if Controller::task_has_repository_mutation_authority(&upstream.task)? {
+                return Ok(None);
+            }
+            continue;
         };
         composed_change_sets.push(ComposedChangeSetBindingV1 {
             task_id: upstream_task_id,
@@ -15543,6 +17851,12 @@ impl RecoveryManager {
             &manifest,
             trusted_checkpoint.action_sequence,
         )?;
+        validate_post_checkpoint_integration_checkpoint_correlation(
+            &state,
+            &manifest,
+            trusted_checkpoint.action_sequence,
+            supersession.as_ref(),
+        )?;
         let recovered_goal_autonomy_budget = replay_post_checkpoint_goal_autonomy_budget(
             &state,
             &manifest,
@@ -15658,8 +17972,23 @@ impl RecoveryManager {
         )?;
         let conservatively_metered_external_actions =
             recover_unknown_external_transport_budget(&mut controller, &unknown_action_ids)?;
-        let (interrupted_attempt_ids, pending_recovery_action_ids, verification_actions) =
-            normalize_recovered_runtime(&mut controller, &unknown_action_ids)?;
+        let integration_recovery = classify_recovered_integration_gates(
+            &mut controller,
+            &unknown_action_ids,
+            execution_epoch_before,
+        )?;
+        for candidate in &integration_recovery.resumable {
+            controller.resume_recovered_integration_gate(registry, candidate)?;
+        }
+        let (mut interrupted_attempt_ids, pending_recovery_action_ids, verification_actions) =
+            normalize_recovered_runtime(
+                &mut controller,
+                &unknown_action_ids,
+                &integration_recovery.preserved_attempt_ids,
+            )?;
+        interrupted_attempt_ids.extend(integration_recovery.interrupted_attempt_ids);
+        interrupted_attempt_ids.sort();
+        interrupted_attempt_ids.dedup();
         require_checkpoint_bound_recovery_intents(
             &controller.state,
             &manifest,
@@ -15785,20 +18114,89 @@ fn validate_checkpoint_manifest(
 ) -> Result<(), ControllerError> {
     if !matches!(
         manifest.schema_version,
-        LEGACY_CHECKPOINT_MANIFEST_SCHEMA_VERSION | CHECKPOINT_MANIFEST_SCHEMA_VERSION
+        LEGACY_CHECKPOINT_MANIFEST_SCHEMA_VERSION
+            | AUTONOMY_SECURITY_CHECKPOINT_MANIFEST_SCHEMA_VERSION
+            | CHECKPOINT_MANIFEST_SCHEMA_VERSION
     ) || manifest.action_journal_sequence != checkpoint.action_sequence
         || manifest.compiler_plan_digest != manifest.plan_digest
         || digest_json(&manifest.plan_document)? != manifest.plan_digest
-        || snapshot_digest(&manifest.repository_snapshot)? != manifest.repository_snapshot_digest
-        || sha256_prefixed(manifest.baseline_diff_content.as_bytes())
-            != manifest.baseline_diff_digest
-        || manifest.repository_snapshot.repository_id != manifest.repository_id
-        || manifest.repository_snapshot.root != manifest.repository_root
     {
         return Err(ControllerError::InvalidPlan(
             "checkpoint manifest integrity/binding mismatch".to_owned(),
         ));
     }
+    validate_checkpoint_repository_baselines(manifest)?;
+    validate_checkpoint_v3_bindings(manifest)?;
+    validate_checkpoint_task_records(manifest)?;
+    validate_checkpoint_security_and_goal_budget(manifest)?;
+    Ok(())
+}
+
+fn validate_checkpoint_repository_baselines(
+    manifest: &CheckpointManifest,
+) -> Result<(), ControllerError> {
+    let repository_baselines = normalized_checkpoint_repository_baselines(manifest)?;
+    let plan_repositories = required_array(&manifest.plan_document, "/repositories")?;
+    if repository_baselines.len() != plan_repositories.len() {
+        return Err(ControllerError::InvalidPlan(
+            "checkpoint repository set does not match canonical plan".to_owned(),
+        ));
+    }
+    for plan_repository in plan_repositories {
+        let repository_id = required_str(plan_repository, "/repository_id")?;
+        let baseline = repository_baselines.get(repository_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "checkpoint is missing repository baseline {repository_id}"
+            ))
+        })?;
+        let canonical_plan_root =
+            PathBuf::from(required_str(plan_repository, "/root")?).canonicalize()?;
+        if snapshot_digest(&baseline.repository_snapshot)? != baseline.repository_snapshot_digest
+            || sha256_prefixed(baseline.baseline_diff_content.as_bytes())
+                != baseline.baseline_diff_digest
+            || baseline.repository_snapshot.repository_id != repository_id
+            || baseline.repository_snapshot.root != baseline.repository_root
+            || baseline.repository_root.canonicalize()? != canonical_plan_root
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "checkpoint repository baseline {repository_id} is misbound"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_v3_bindings(manifest: &CheckpointManifest) -> Result<(), ControllerError> {
+    if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+        let expected_contracts = cross_repo_contracts_for_plan(&manifest.plan_document)?
+            .into_iter()
+            .map(|(contract_id, contract)| (contract_id, contract.contract_digest))
+            .collect::<BTreeMap<_, _>>();
+        if manifest.cross_repo_contract_digests != expected_contracts {
+            return Err(ControllerError::InvalidPlan(
+                "checkpoint v3 cross-repository contract map diverges from canonical Plan IR"
+                    .to_owned(),
+            ));
+        }
+        let plan_task_ids = required_array(&manifest.plan_document, "/tasks")?
+            .iter()
+            .map(|task| required_str(task, "/task_id").map(str::to_owned))
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if manifest
+            .integration_checkpoint_digests
+            .iter()
+            .any(|(task_id, digest)| !plan_task_ids.contains(task_id) || !is_sha256_digest(digest))
+        {
+            return Err(ControllerError::InvalidPlan(
+                "checkpoint v3 integration-checkpoint map contains an unknown gate or malformed digest"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_task_records(manifest: &CheckpointManifest) -> Result<(), ControllerError> {
     let plan_tasks = required_array(&manifest.plan_document, "/tasks")?;
     if manifest.task_records.len() != plan_tasks.len() {
         return Err(ControllerError::InvalidPlan(
@@ -15816,7 +18214,7 @@ fn validate_checkpoint_manifest(
                 "checkpoint task contract {task_id} is misbound"
             )));
         }
-        if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+        if checkpoint_has_autonomy_security(manifest.schema_version) {
             let budget = runtime.autonomy_budget.as_ref().ok_or_else(|| {
                 ControllerError::InvalidPlan(format!(
                     "checkpoint v2 task {task_id} is missing autonomy budget"
@@ -15844,7 +18242,13 @@ fn validate_checkpoint_manifest(
             }
         }
     }
-    if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+    Ok(())
+}
+
+fn validate_checkpoint_security_and_goal_budget(
+    manifest: &CheckpointManifest,
+) -> Result<(), ControllerError> {
+    if checkpoint_has_autonomy_security(manifest.schema_version) {
         let goal_budget = manifest.goal_autonomy_budget.as_ref().ok_or_else(|| {
             ControllerError::InvalidPlan("checkpoint v2 is missing goal autonomy budget".to_owned())
         })?;
@@ -15885,6 +18289,211 @@ fn validate_checkpoint_manifest(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DurableIntegrationCheckpointExpectation<'a> {
+    plan_document: &'a Value,
+    plan_id: &'a str,
+    plan_revision: u32,
+    plan_digest: &'a str,
+    repository_baselines: Option<&'a BTreeMap<String, CheckpointRepositoryBaselineV1>>,
+    gate_task_id: &'a str,
+    expected_checkpoint_digest: &'a str,
+}
+
+fn validate_durable_integration_checkpoint(
+    state: &StateStore,
+    expected: &DurableIntegrationCheckpointExpectation<'_>,
+) -> Result<IntegrationCheckpointV1, ControllerError> {
+    let gate_task = required_array(expected.plan_document, "/tasks")?
+        .iter()
+        .find(|task| optional_str(task, "/task_id") == Some(expected.gate_task_id))
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "integration checkpoint gate {} is absent from Plan IR",
+                expected.gate_task_id
+            ))
+        })?;
+    if !plan_task_is_multi_repo_integration_gate(expected.plan_document, gate_task)? {
+        return Err(ControllerError::InvalidPlan(format!(
+            "integration checkpoint gate {} is not a multi-repository D4 read/process gate",
+            expected.gate_task_id
+        )));
+    }
+    let key = revision_scoped_key(
+        expected.plan_id,
+        expected.plan_revision,
+        expected.gate_task_id,
+    );
+    let raw = state
+        .get_state(INTEGRATION_CHECKPOINT_NAMESPACE, &key)?
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "checkpoint v3 is missing durable integration checkpoint {}",
+                expected.gate_task_id
+            ))
+        })?;
+    let checkpoint: IntegrationCheckpointV1 = serde_json::from_str(&raw)?;
+    checkpoint.validate()?;
+    if checkpoint.plan_id != expected.plan_id
+        || checkpoint.plan_revision != expected.plan_revision
+        || checkpoint.plan_digest != expected.plan_digest
+        || checkpoint.gate_task_id != expected.gate_task_id
+        || checkpoint.gate_task_contract_digest != digest_json(gate_task)?
+        || checkpoint.checkpoint_digest != expected.expected_checkpoint_digest
+    {
+        return Err(ControllerError::InvalidPlan(format!(
+            "durable integration checkpoint {} is stale or misbound",
+            expected.gate_task_id
+        )));
+    }
+    validate_durable_integration_checkpoint_views(&checkpoint, gate_task, expected)?;
+    validate_durable_integration_checkpoint_verification(state, &checkpoint, expected)?;
+    validate_integration_checkpoint_cas(state, &checkpoint)?;
+    Ok(checkpoint)
+}
+
+fn validate_durable_integration_checkpoint_views(
+    checkpoint: &IntegrationCheckpointV1,
+    gate_task: &Value,
+    expected: &DurableIntegrationCheckpointExpectation<'_>,
+) -> Result<(), ControllerError> {
+    let expected_repository_ids = required_array(gate_task, "/scope/repositories")?
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "integration gate repository id must be a string".to_owned(),
+                )
+            })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if checkpoint
+        .repository_views
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        != expected_repository_ids
+    {
+        return Err(ControllerError::InvalidPlan(format!(
+            "durable integration checkpoint {} repository set is misbound",
+            expected.gate_task_id
+        )));
+    }
+    for (repository_id, view) in &checkpoint.repository_views {
+        if let Some(repository_baselines) = expected.repository_baselines {
+            let baseline = repository_baselines.get(repository_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "integration checkpoint {} references unknown repository {repository_id}",
+                    expected.gate_task_id
+                ))
+            })?;
+            if view.primary_snapshot_digest != baseline.repository_snapshot_digest
+                || baseline.repository_snapshot.head.as_deref() != Some(view.base_head.as_str())
+            {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "integration checkpoint {}/{repository_id} primary baseline binding is stale",
+                    expected.gate_task_id
+                )));
+            }
+        }
+        if !is_sha256_digest(&view.primary_snapshot_digest)
+            || !is_sha256_digest(&view.snapshot_digest)
+            || !is_sha256_digest(&view.baseline_digest)
+            || view
+                .composed_change_set_digests
+                .iter()
+                .any(|digest| !is_sha256_digest(digest))
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "integration checkpoint {}/{repository_id} baseline/view binding is malformed",
+                expected.gate_task_id
+            )));
+        }
+    }
+    let mut expected_contract_digests = cross_repo_contracts_for_plan(expected.plan_document)?
+        .into_values()
+        .filter(|contract| contract.consumer_task_id == expected.gate_task_id)
+        .map(|contract| contract.contract_digest)
+        .collect::<Vec<_>>();
+    expected_contract_digests.sort();
+    expected_contract_digests.dedup();
+    if checkpoint.cross_repo_contract_digests != expected_contract_digests {
+        return Err(ControllerError::InvalidPlan(format!(
+            "integration checkpoint {} cross-repository contract set is stale",
+            expected.gate_task_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_durable_integration_checkpoint_verification(
+    state: &StateStore,
+    checkpoint: &IntegrationCheckpointV1,
+    expected: &DurableIntegrationCheckpointExpectation<'_>,
+) -> Result<(), ControllerError> {
+    let verification_raw = state
+        .get_state(
+            "controller.verification",
+            &revision_scoped_key(
+                expected.plan_id,
+                expected.plan_revision,
+                &checkpoint.verification_id,
+            ),
+        )?
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "integration checkpoint {} lost verification {}",
+                expected.gate_task_id, checkpoint.verification_id
+            ))
+        })?;
+    let verification: VerificationResultV1 = serde_json::from_str(&verification_raw)?;
+    if !verification.passed
+        || verification.plan_id != expected.plan_id
+        || verification.plan_revision != expected.plan_revision
+        || verification.plan_digest != expected.plan_digest
+        || verification.task_id != expected.gate_task_id
+        || verification.task_contract_digest != checkpoint.gate_task_contract_digest
+        || verification.verification_id != checkpoint.verification_id
+        || verification.post_snapshot_digest != checkpoint.integration_view_set_digest
+        || digest_json(&serde_json::to_value(&verification)?)? != checkpoint.verification_digest
+        || state
+            .artifact_metadata(&checkpoint.verification_artifact_digest)?
+            .is_none()
+    {
+        return Err(ControllerError::InvalidPlan(format!(
+            "integration checkpoint {} verification authority is stale or incomplete",
+            expected.gate_task_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_integration_checkpoint_cas(
+    state: &StateStore,
+    checkpoint: &IntegrationCheckpointV1,
+) -> Result<(), ControllerError> {
+    let checkpoint_artifact_digest = checkpoint
+        .checkpoint_digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "integration checkpoint canonical digest is not SHA-256-prefixed".to_owned(),
+            )
+        })?;
+    let store = checkpoint_artifact_store(state.path())?;
+    let mut artifact = store.open_artifact(state, checkpoint_artifact_digest)?;
+    let mut bytes = Vec::new();
+    artifact.read_to_end(&mut bytes)?;
+    let stored: Value = serde_json::from_slice(&bytes)?;
+    if canonicalize(&stored) != canonicalize(&checkpoint.canonical_value()) {
+        return Err(ControllerError::InvalidPlan(format!(
+            "integration checkpoint {} canonical CAS object differs from durable row",
+            checkpoint.gate_task_id
+        )));
+    }
+    Ok(())
+}
+
 fn validate_checkpoint_immutable_bindings(
     state: &StateStore,
     manifest: &CheckpointManifest,
@@ -15920,6 +18529,23 @@ fn validate_checkpoint_immutable_bindings(
             )));
         }
     }
+    if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+        let repository_baselines = normalized_checkpoint_repository_baselines(manifest)?;
+        for (gate_task_id, checkpoint_digest) in &manifest.integration_checkpoint_digests {
+            let _ = validate_durable_integration_checkpoint(
+                state,
+                &DurableIntegrationCheckpointExpectation {
+                    plan_document: &manifest.plan_document,
+                    plan_id: &manifest.plan_id,
+                    plan_revision: manifest.plan_revision,
+                    plan_digest: &manifest.plan_digest,
+                    repository_baselines: Some(&repository_baselines),
+                    gate_task_id,
+                    expected_checkpoint_digest: checkpoint_digest,
+                },
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -15929,6 +18555,163 @@ struct ValidatedSupersession {
     revision: u32,
     plan_digest: String,
     compilation_evidence_digest: String,
+}
+
+fn validate_post_checkpoint_integration_checkpoint_correlation(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+    supersession: Option<&ValidatedSupersession>,
+) -> Result<(), ControllerError> {
+    if manifest.schema_version != CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let replayed = replay_integration_checkpoint_publications(
+        state,
+        manifest,
+        checkpoint_sequence,
+        supersession,
+    )?;
+    let current = current_integration_checkpoint_digests(state, manifest)?;
+    if replayed != current {
+        return Err(ControllerError::InvalidPlan(
+            "current integration checkpoint state does not equal trusted checkpoint plus ordered publication replay"
+                .to_owned(),
+        ));
+    }
+    let manifest_repository_baselines = normalized_checkpoint_repository_baselines(manifest)?;
+    for (gate_task_id, checkpoint_digest) in &current {
+        let sealed_by_manifest = manifest
+            .integration_checkpoint_digests
+            .contains_key(gate_task_id);
+        let _ = validate_durable_integration_checkpoint(
+            state,
+            &DurableIntegrationCheckpointExpectation {
+                plan_document: &manifest.plan_document,
+                plan_id: &manifest.plan_id,
+                plan_revision: manifest.plan_revision,
+                plan_digest: &manifest.plan_digest,
+                repository_baselines: sealed_by_manifest.then_some(&manifest_repository_baselines),
+                gate_task_id,
+                expected_checkpoint_digest: checkpoint_digest,
+            },
+        )?;
+    }
+    validate_superseding_integration_checkpoint_absence(state, supersession)?;
+    Ok(())
+}
+
+fn replay_integration_checkpoint_publications(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+    supersession: Option<&ValidatedSupersession>,
+) -> Result<BTreeMap<String, String>, ControllerError> {
+    let mut replayed = manifest.integration_checkpoint_digests.clone();
+    for event in state.journal_after(checkpoint_sequence)? {
+        if event.entity_type != "controller"
+            || event.event_kind != "integration_checkpoint_published"
+        {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        let plan_id = required_str(&payload, "/plan_id")?;
+        let plan_revision = required_u32(&payload, "/plan_revision")?;
+        let gate_task_id = required_str(&payload, "/gate_task_id")?;
+        let checkpoint_digest = required_str(&payload, "/checkpoint_digest")?;
+        let artifact_digest = required_str(&payload, "/artifact_digest")?;
+        if !is_sha256_digest(checkpoint_digest)
+            || checkpoint_digest.strip_prefix("sha256:") != Some(artifact_digest)
+        {
+            return Err(ControllerError::InvalidPlan(
+                "integration checkpoint publication event has a malformed CAS binding".to_owned(),
+            ));
+        }
+        if plan_id == manifest.plan_id && plan_revision == manifest.plan_revision {
+            let expected_key = revision_scoped_key(plan_id, plan_revision, gate_task_id);
+            if event.entity_id != expected_key {
+                return Err(ControllerError::InvalidPlan(
+                    "integration checkpoint publication event targets a stale state key".to_owned(),
+                ));
+            }
+            if replayed.contains_key(gate_task_id) {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "integration checkpoint {gate_task_id} was republished after its trusted checkpoint binding"
+                )));
+            }
+            replayed.insert(gate_task_id.to_owned(), checkpoint_digest.to_owned());
+            continue;
+        }
+        if supersession
+            .is_some_and(|next| plan_id == next.plan_id && plan_revision == next.revision)
+        {
+            return Err(ControllerError::InvalidPlan(
+                "superseding revision published integration authority without a trusted activation checkpoint"
+                    .to_owned(),
+            ));
+        }
+        if plan_id == manifest.plan_id && plan_revision > manifest.plan_revision {
+            return Err(ControllerError::InvalidPlan(
+                "post-checkpoint integration publication targets an untrusted plan revision"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(replayed)
+}
+
+fn current_integration_checkpoint_digests(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+) -> Result<BTreeMap<String, String>, ControllerError> {
+    let mut current = BTreeMap::new();
+    for record in state.state_records(INTEGRATION_CHECKPOINT_NAMESPACE)? {
+        if !key_belongs_to_revision(&record.key, &manifest.plan_id, manifest.plan_revision) {
+            continue;
+        }
+        let checkpoint: IntegrationCheckpointV1 = serde_json::from_str(&record.value_json)?;
+        checkpoint.validate()?;
+        let expected_key = revision_scoped_key(
+            &manifest.plan_id,
+            manifest.plan_revision,
+            &checkpoint.gate_task_id,
+        );
+        if record.key != expected_key
+            || checkpoint.plan_id != manifest.plan_id
+            || checkpoint.plan_revision != manifest.plan_revision
+            || checkpoint.plan_digest != manifest.plan_digest
+            || current
+                .insert(
+                    checkpoint.gate_task_id.clone(),
+                    checkpoint.checkpoint_digest.clone(),
+                )
+                .is_some()
+        {
+            return Err(ControllerError::InvalidPlan(
+                "durable integration checkpoint namespace contains duplicate or misbound state"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(current)
+}
+
+fn validate_superseding_integration_checkpoint_absence(
+    state: &StateStore,
+    supersession: Option<&ValidatedSupersession>,
+) -> Result<(), ControllerError> {
+    if let Some(next) = supersession
+        && state
+            .state_records(INTEGRATION_CHECKPOINT_NAMESPACE)?
+            .into_iter()
+            .any(|record| key_belongs_to_revision(&record.key, &next.plan_id, next.revision))
+    {
+        return Err(ControllerError::InvalidPlan(
+            "superseding revision has integration checkpoint state before its trusted reanchor checkpoint"
+            .to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -16152,14 +18935,53 @@ fn validate_post_checkpoint_supersession(
     let baseline_raw = state
         .get_state("controller.repository_baseline", "active")?
         .ok_or_else(|| ControllerError::InvalidPlan("active N+1 baseline missing".to_owned()))?;
-    let baseline: PersistedRepositoryBaseline = serde_json::from_str(&baseline_raw)?;
-    if snapshot_digest(&baseline.snapshot)?
-        != required_str(&payload, "/repository_snapshot_digest")?
-        || baseline.diff_digest != required_str(&payload, "/baseline_diff_digest")?
-    {
-        return Err(ControllerError::InvalidPlan(
-            "N+1 baseline differs from activation event binding".to_owned(),
-        ));
+    let baseline_set = decode_persisted_repository_baseline_set(&baseline_raw, &active_document)?;
+    let repository_snapshot_digests = baseline_set
+        .repositories
+        .iter()
+        .map(|(repository_id, baseline)| {
+            Ok((repository_id.clone(), snapshot_digest(&baseline.snapshot)?))
+        })
+        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+    let baseline_diff_digests = baseline_set
+        .repositories
+        .iter()
+        .map(|(repository_id, baseline)| (repository_id.clone(), baseline.diff_digest.clone()))
+        .collect::<BTreeMap<_, _>>();
+    match (
+        payload.get("repository_snapshot_digests"),
+        payload.get("baseline_diff_digests"),
+    ) {
+        (Some(event_snapshots), Some(event_diffs)) => {
+            if event_snapshots != &serde_json::to_value(&repository_snapshot_digests)?
+                || event_diffs != &serde_json::to_value(&baseline_diff_digests)?
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "N+1 baseline set differs from activation event binding".to_owned(),
+                ));
+            }
+        }
+        (None, None) if baseline_set.repositories.len() == 1 => {
+            let baseline = baseline_set.repositories.values().next().ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "legacy N+1 baseline unexpectedly disappeared".to_owned(),
+                )
+            })?;
+            if snapshot_digest(&baseline.snapshot)?
+                != required_str(&payload, "/repository_snapshot_digest")?
+                || baseline.diff_digest != required_str(&payload, "/baseline_diff_digest")?
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "legacy N+1 baseline differs from activation event binding".to_owned(),
+                ));
+            }
+        }
+        _ => {
+            return Err(ControllerError::InvalidPlan(
+                "N+1 activation event has incomplete or noncanonical repository baseline bindings"
+                    .to_owned(),
+            ));
+        }
     }
     let previous_lifecycle_raw = state
         .get_state(
@@ -16196,7 +19018,7 @@ fn replay_post_checkpoint_goal_autonomy_budget(
     manifest: &CheckpointManifest,
     checkpoint_sequence: i64,
 ) -> Result<AutonomyBudgetV1, ControllerError> {
-    let mut budget = if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+    let mut budget = if checkpoint_has_autonomy_security(manifest.schema_version) {
         let budget = manifest.goal_autonomy_budget.clone().ok_or_else(|| {
             ControllerError::InvalidPlan("checkpoint v2 is missing goal autonomy budget".to_owned())
         })?;
@@ -16718,52 +19540,135 @@ fn validate_post_checkpoint_baseline_correlation(
         .ok_or_else(|| {
             ControllerError::InvalidPlan("durable repository baseline is missing".to_owned())
         })?;
-    let current_baseline: PersistedRepositoryBaseline = serde_json::from_str(&raw_baseline)?;
-    if sha256_prefixed(current_baseline.diff_content.as_bytes()) != current_baseline.diff_digest {
+    let raw_document = state
+        .get_state("controller.plan_document", "active")?
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan("durable canonical plan document is missing".to_owned())
+        })?;
+    let current_document: Value = serde_json::from_str(&raw_document)?;
+    let current_baselines =
+        decode_persisted_repository_baseline_set(&raw_baseline, &current_document)?.repositories;
+    let checkpoint_baselines = normalized_checkpoint_repository_baselines(manifest)?;
+    if current_baselines.keys().ne(checkpoint_baselines.keys()) {
         return Err(ControllerError::InvalidPlan(
-            "durable repository baseline diff content does not match its digest".to_owned(),
+            "current repository baseline set differs from checkpoint repository identity set"
+                .to_owned(),
         ));
     }
-    let current_snapshot_digest = snapshot_digest(&current_baseline.snapshot)?;
-    let baseline_changed = current_snapshot_digest != manifest.repository_snapshot_digest
-        || current_baseline.diff_digest != manifest.baseline_diff_digest
-        || current_baseline.diff_content != manifest.baseline_diff_content;
-    let validity_changed = current_validity != manifest.plan_validity;
-    if baseline_changed || validity_changed {
-        let exact_transition = events
-            .iter()
-            .rev()
-            .find(|event| {
-                event.entity_type == "controller"
-                    && event.entity_id == manifest.repository_id
-                    && matches!(
-                        event.event_kind.as_str(),
-                        "verified_baseline_advanced"
-                            | "plan_stale_evidence"
-                            | "plan_failure_invalidated"
-                    )
-            })
-            .is_some_and(|event| {
-                let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
-                    return false;
-                };
-                payload
-                    .get("repository_snapshot_digest")
-                    .and_then(Value::as_str)
-                    == Some(current_snapshot_digest.as_str())
-                    && payload.get("baseline_diff_digest").and_then(Value::as_str)
-                        == Some(current_baseline.diff_digest.as_str())
-                    && payload.get("plan_validity")
-                        == serde_json::to_value(current_validity).ok().as_ref()
-            });
-        if !exact_transition {
-            return Err(ControllerError::InvalidPlan(
-                "current repository baseline/plan validity differs from checkpoint without an exact post-checkpoint transition event"
-                    .to_owned(),
-            ));
+    let mut changed_repositories = BTreeSet::new();
+    for (repository_id, current) in &current_baselines {
+        let checkpoint = checkpoint_baselines.get(repository_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "checkpoint lost repository baseline {repository_id}"
+            ))
+        })?;
+        if snapshot_digest(&current.snapshot)? != checkpoint.repository_snapshot_digest
+            || current.diff_digest != checkpoint.baseline_diff_digest
+            || current.diff_content != checkpoint.baseline_diff_content
+        {
+            changed_repositories.insert(repository_id.clone());
         }
     }
+    let validity_changed = current_validity != manifest.plan_validity;
+    if !changed_repositories.is_empty() || validity_changed {
+        validate_baseline_transition_evidence(
+            &current_baselines,
+            current_validity,
+            &changed_repositories,
+            validity_changed,
+            events,
+        )?;
+    }
     Ok(())
+}
+
+fn validate_baseline_transition_evidence(
+    current_baselines: &BTreeMap<String, PersistedRepositoryBaseline>,
+    current_validity: PlanValidity,
+    changed_repositories: &BTreeSet<String>,
+    validity_changed: bool,
+    events: &[JournalEvent],
+) -> Result<(), ControllerError> {
+    let current_snapshot_digests = current_baselines
+        .iter()
+        .map(|(repository_id, baseline)| {
+            Ok((repository_id.clone(), snapshot_digest(&baseline.snapshot)?))
+        })
+        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+    let current_diff_digests = current_baselines
+        .iter()
+        .map(|(repository_id, baseline)| (repository_id.clone(), baseline.diff_digest.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let supersession_transition = events.iter().rev().any(|event| {
+        if event.entity_type != "controller" || event.event_kind != "plan_revision_activated" {
+            return false;
+        }
+        let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+            return false;
+        };
+        payload.get("repository_snapshot_digests")
+            == serde_json::to_value(&current_snapshot_digests)
+                .ok()
+                .as_ref()
+            && payload.get("baseline_diff_digests")
+                == serde_json::to_value(&current_diff_digests).ok().as_ref()
+            && payload.get("plan_validity") == serde_json::to_value(current_validity).ok().as_ref()
+    });
+    let repository_transitions = changed_repositories.iter().all(|repository_id| {
+        let Some(current) = current_baselines.get(repository_id) else {
+            return false;
+        };
+        let Ok(current_snapshot_digest) = snapshot_digest(&current.snapshot) else {
+            return false;
+        };
+        events.iter().rev().any(|event| {
+            if event.entity_type != "controller"
+                || event.entity_id != *repository_id
+                || !matches!(
+                    event.event_kind.as_str(),
+                    "verified_baseline_advanced"
+                        | "plan_stale_evidence"
+                        | "plan_failure_invalidated"
+                )
+            {
+                return false;
+            }
+            let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+                return false;
+            };
+            payload
+                .get("repository_snapshot_digest")
+                .and_then(Value::as_str)
+                == Some(current_snapshot_digest.as_str())
+                && payload.get("baseline_diff_digest").and_then(Value::as_str)
+                    == Some(current.diff_digest.as_str())
+                && payload.get("plan_validity")
+                    == serde_json::to_value(current_validity).ok().as_ref()
+        })
+    });
+    let validity_transition = !validity_changed
+        || events.iter().rev().any(|event| {
+            if event.entity_type != "controller"
+                || !matches!(
+                    event.event_kind.as_str(),
+                    "plan_stale_evidence"
+                        | "plan_failure_invalidated"
+                        | "verified_baseline_advanced"
+                )
+            {
+                return false;
+            }
+            serde_json::from_str::<Value>(&event.payload_json).is_ok_and(|payload| {
+                payload.get("plan_validity") == serde_json::to_value(current_validity).ok().as_ref()
+            })
+        });
+    if supersession_transition || repository_transitions && validity_transition {
+        return Ok(());
+    }
+    Err(ControllerError::InvalidPlan(
+        "current repository baseline set/plan validity differs from checkpoint without exact post-checkpoint transition evidence"
+            .to_owned(),
+    ))
 }
 
 fn recovery_execution_epoch_floor(
@@ -16873,25 +19778,30 @@ fn reconstruct_active_plan(
         .ok_or_else(|| {
             ControllerError::InvalidPlan("durable repository baseline is missing".to_owned())
         })?;
-    let baseline: PersistedRepositoryBaseline = serde_json::from_str(&raw_baseline)?;
-    if sha256_prefixed(baseline.diff_content.as_bytes()) != baseline.diff_digest {
-        return Err(ControllerError::InvalidPlan(
-            "durable repository baseline diff content does not match its digest".to_owned(),
-        ));
-    }
-    let repository_id = required_str(&plan_document, "/repositories/0/repository_id")?.to_owned();
-    let registered = registry.repository(&repository_id).ok_or_else(|| {
-        ControllerError::InvalidPlan(format!(
-            "recovery repository {repository_id} is not registered"
-        ))
-    })?;
-    let repository_root = registered.root.canonicalize()?;
-    if baseline.snapshot.repository_id != repository_id
-        || baseline.snapshot.root.canonicalize()? != repository_root
-    {
-        return Err(ControllerError::InvalidPlan(
-            "durable repository baseline is bound to another repository".to_owned(),
-        ));
+    let baseline_set = decode_persisted_repository_baseline_set(&raw_baseline, &plan_document)?;
+    let mut repositories = BTreeMap::new();
+    for (repository_id, baseline) in baseline_set.repositories {
+        let registered = registry.repository(&repository_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "recovery repository {repository_id} is not registered"
+            ))
+        })?;
+        let repository_root = registered.root.canonicalize()?;
+        if baseline.snapshot.root.canonicalize()? != repository_root {
+            return Err(ControllerError::InvalidPlan(format!(
+                "durable repository baseline {repository_id} is bound to another repository"
+            )));
+        }
+        repositories.insert(
+            repository_id.clone(),
+            ActiveRepositoryState {
+                repository_id,
+                repository_root,
+                baseline: baseline.snapshot,
+                baseline_diff_digest: baseline.diff_digest,
+                baseline_diff_content: baseline.diff_content,
+            },
+        );
     }
     let plan_tasks = required_array(&plan_document, "/tasks")?;
     let plan_task_map = plan_tasks
@@ -16971,11 +19881,7 @@ fn reconstruct_active_plan(
         plan_digest: active_plan_digest.to_owned(),
         compilation_evidence_digest,
         policy_digest,
-        repository_id,
-        repository_root,
-        baseline: baseline.snapshot,
-        baseline_diff_digest: baseline.diff_digest,
-        baseline_diff_content: baseline.diff_content,
+        repositories,
         validity,
         goal_autonomy_budget,
         tasks,
@@ -17034,6 +19940,7 @@ fn reconcile_recovered_worktrees(
         .cloned()
         .collect::<Vec<_>>();
     for task_id in task_ids {
+        reconcile_recovered_integration_views(controller, registry, &task_id)?;
         let (lease, lifecycle, change_set, task_state, task_contract_digest) = {
             let task = controller
                 .active_ref()?
@@ -17203,6 +20110,108 @@ fn reconcile_recovered_worktrees(
         }
     }
     Ok(leases)
+}
+
+fn reconcile_recovered_integration_views(
+    controller: &mut Controller,
+    registry: &ProjectRegistry,
+    task_id: &str,
+) -> Result<(), ControllerError> {
+    let views = controller
+        .active_ref()?
+        .tasks
+        .get(task_id)
+        .ok_or_else(|| ControllerError::InvalidPlan("recovery task disappeared".to_owned()))?
+        .integration_views
+        .clone();
+    if views.is_empty() {
+        return Ok(());
+    }
+    if !controller.task_is_multi_repo_integration_gate(task_id)? {
+        return Err(ControllerError::InvalidPlan(format!(
+            "recovery task {task_id} has integration views without integration-gate authority"
+        )));
+    }
+    let expected_root = controller.integration_worktree_root(task_id)?;
+    let expected_repositories = controller
+        .active_ref()?
+        .task_repository_ids(task_id)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for (repository_id, view) in views {
+        if !expected_repositories.contains(&repository_id) {
+            return Err(ControllerError::InvalidPlan(format!(
+                "recovery integration view {task_id}/{repository_id} is outside task scope"
+            )));
+        }
+        controller.validate_controller_worktree_lease_binding_for_repository(
+            task_id,
+            &repository_id,
+            &expected_root,
+            &view.lease,
+        )?;
+        match view.state {
+            WorktreeLifecycle::Prepared => {
+                if view.baseline.is_some()
+                    || !view.composition.is_empty()
+                    || view.conflict.is_some()
+                {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "prepared recovery integration view {task_id}/{repository_id} contains materialized evidence"
+                    )));
+                }
+                if view.lease.worktree_path.exists() {
+                    registry.validate_worktree_lease(&view.lease)?;
+                }
+            }
+            WorktreeLifecycle::Materialized => {
+                if !view.lease.worktree_path.exists() {
+                    return Err(ControllerError::NotReady(format!(
+                        "materialized recovery integration view {task_id}/{repository_id} is missing"
+                    )));
+                }
+                registry.validate_worktree_lease(&view.lease)?;
+                let baseline = view.baseline.as_ref().ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!(
+                        "materialized recovery integration view {task_id}/{repository_id} lacks baseline"
+                    ))
+                })?;
+                let (expected_composition, _) = controller
+                    .ordered_upstream_change_sets_for_repository(task_id, &repository_id)?;
+                if view.composition != expected_composition || view.conflict.is_some() {
+                    return Err(ControllerError::NotReady(format!(
+                        "recovery integration view {task_id}/{repository_id} composition binding is stale"
+                    )));
+                }
+                let current = registry.capture_change_set_from_baseline(&view.lease, baseline)?;
+                if !current.diff_content.is_empty()
+                    || !current.changed_paths.is_empty()
+                    || !current.untracked_paths.is_empty()
+                    || !current.unmerged_paths.is_empty()
+                {
+                    return Err(ControllerError::NotReady(format!(
+                        "recovery integration view {task_id}/{repository_id} contains repository mutations"
+                    )));
+                }
+            }
+            WorktreeLifecycle::Conflict => {
+                if !view.lease.worktree_path.exists() || view.conflict.is_none() {
+                    return Err(ControllerError::NotReady(format!(
+                        "conflicted recovery integration view {task_id}/{repository_id} lost physical/durable conflict evidence"
+                    )));
+                }
+                registry.validate_worktree_lease(&view.lease)?;
+            }
+            WorktreeLifecycle::Released => {
+                if view.lease.worktree_path.exists() {
+                    return Err(ControllerError::NotReady(format!(
+                        "released recovery integration view {task_id}/{repository_id} unexpectedly still exists"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -17566,17 +20575,361 @@ fn recover_unknown_external_transport_budget(
 
 type RecoveryRuntimeNormalization = (Vec<String>, Vec<String>, Vec<String>);
 
+#[derive(Debug, Clone)]
+struct RecoveredIntegrationGateCandidate {
+    task_id: String,
+    attempt_id: String,
+    binding: VerificationCommandRecoveryBinding,
+}
+
+#[derive(Debug, Default)]
+struct RecoveredIntegrationGateClassification {
+    preserved_attempt_ids: BTreeSet<String>,
+    interrupted_attempt_ids: Vec<String>,
+    resumable: Vec<RecoveredIntegrationGateCandidate>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn classify_recovered_integration_gates(
+    controller: &mut Controller,
+    unknown_action_ids: &[String],
+    execution_epoch: i64,
+) -> Result<RecoveredIntegrationGateClassification, ControllerError> {
+    let unknown = unknown_action_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let command_intents = controller
+        .state
+        .state_records(VERIFICATION_COMMAND_INTENT_NAMESPACE)?
+        .into_iter()
+        .map(|record| {
+            let intent: PersistedVerificationCommandIntentV1 =
+                serde_json::from_str(&record.value_json)?;
+            Ok((record.key, intent))
+        })
+        .collect::<Result<Vec<_>, ControllerError>>()?;
+    let actions = controller
+        .state
+        .action_records()?
+        .into_iter()
+        .map(|record| (record.action_id.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let attempt_ids = controller
+        .active_ref()?
+        .attempts
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut classification = RecoveredIntegrationGateClassification::default();
+
+    for attempt_id in attempt_ids {
+        let (attempt_state, task_id) = {
+            let active = controller.active_ref()?;
+            let attempt = active.attempts.get(&attempt_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "integration recovery attempt disappeared from active runtime".to_owned(),
+                )
+            })?;
+            (attempt.state, attempt.task_id.clone())
+        };
+        if !matches!(
+            attempt_state,
+            AttemptState::Executing | AttemptState::Verifying
+        ) || !controller.task_is_multi_repo_integration_gate(&task_id)?
+        {
+            continue;
+        }
+
+        classification
+            .preserved_attempt_ids
+            .insert(attempt_id.clone());
+        let (
+            task_state,
+            task_value,
+            task_contract_digest,
+            repository_ids,
+            plan_id,
+            plan_revision,
+            plan_digest,
+            policy_digest,
+        ) = {
+            let active = controller.active_ref()?;
+            let task = active.tasks.get(&task_id).ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "integration recovery task disappeared from active runtime".to_owned(),
+                )
+            })?;
+            (
+                task.state,
+                task.task.clone(),
+                task.task_contract_digest.clone(),
+                active.task_repository_ids(&task_id)?,
+                active.plan_id.clone(),
+                active.revision,
+                active.plan_digest.clone(),
+                active.policy_digest.clone(),
+            )
+        };
+        if !matches!(task_state, TaskState::Running | TaskState::Verifying) {
+            return Err(ControllerError::InvalidPlan(format!(
+                "integration recovery attempt {attempt_id} is active while task {task_id} is {task_state:?}"
+            )));
+        }
+        let required_steps = required_command_verification_steps(&task_value)?;
+        if required_steps.is_empty() {
+            return Err(ControllerError::InvalidPlan(format!(
+                "integration recovery task {task_id} has no required command verification"
+            )));
+        }
+        let required_by_id = required_steps
+            .iter()
+            .map(|step| (step.step_id.as_str(), step))
+            .collect::<BTreeMap<_, _>>();
+        for step in &required_steps {
+            if !repository_ids
+                .iter()
+                .any(|repository_id| repository_id == &step.repository_id)
+            {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "integration recovery command step {} targets repository {} outside task scope",
+                    step.step_id, step.repository_id
+                )));
+            }
+        }
+        let mut intents_by_step = BTreeMap::<String, PersistedVerificationCommandIntentV1>::new();
+        for (record_key, intent) in command_intents
+            .iter()
+            .filter(|(_, intent)| intent.attempt_id == attempt_id)
+        {
+            let Some(step) = required_by_id.get(intent.step_id.as_str()) else {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "integration recovery attempt {attempt_id} has an unexpected verification command step {}",
+                    intent.step_id
+                )));
+            };
+            let expected_resource_lease_id = verification_build_lease_id(
+                &plan_id,
+                plan_revision,
+                &task_id,
+                &attempt_id,
+                &step.step_id,
+                execution_epoch,
+            );
+            let expected_action_id = heavy_build_action_id(&expected_resource_lease_id);
+            if record_key != &intent.action_id
+                || intent.schema_version != VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION
+                || intent.plan_id != plan_id
+                || intent.plan_revision != plan_revision
+                || intent.plan_digest != plan_digest
+                || intent.task_id != task_id
+                || intent.task_contract_digest != task_contract_digest
+                || intent.attempt_id != attempt_id
+                || intent.step_digest != step.step_digest
+                || intent.resource_lease_id != expected_resource_lease_id
+                || intent.action_id != expected_action_id
+                || intent.execution_epoch != execution_epoch
+                || !is_sha256_digest(&intent.payload_digest)
+                || !is_sha256_digest(&intent.policy_digest)
+                || intent.policy_digest != policy_digest
+            {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "integration recovery command intent {} drifted from immutable Plan/action authority",
+                    intent.action_id
+                )));
+            }
+            if intents_by_step
+                .insert(intent.step_id.clone(), intent.clone())
+                .is_some()
+            {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "integration recovery attempt {attempt_id} has duplicate verification command authority for step {}",
+                    intent.step_id
+                )));
+            }
+        }
+
+        if intents_by_step.is_empty() {
+            let active = controller.active_mut()?;
+            active
+                .attempts
+                .get_mut(&attempt_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "integration recovery attempt disappeared while classifying".to_owned(),
+                    )
+                })?
+                .state = AttemptState::Interrupted;
+            active
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "integration recovery task disappeared while classifying".to_owned(),
+                    )
+                })?
+                .state = TaskState::Planned;
+            classification.interrupted_attempt_ids.push(attempt_id);
+            continue;
+        }
+
+        let mut all_committed = intents_by_step.len() == required_steps.len();
+        let mut any_unknown = false;
+        let mut artifact_store_root = None::<PathBuf>;
+        for step in &required_steps {
+            let Some(intent) = intents_by_step.get(&step.step_id) else {
+                all_committed = false;
+                continue;
+            };
+            if let Some(root) = artifact_store_root.as_ref() {
+                if root != &intent.artifact_store_root {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "integration recovery attempt {attempt_id} has conflicting artifact-store authority"
+                    )));
+                }
+            } else {
+                artifact_store_root = Some(intent.artifact_store_root.clone());
+            }
+            let Some(action) = actions.get(&intent.action_id) else {
+                // Verification-command intent is persisted before ActionJournal prepare. A crash in
+                // that exact window has no physical side effect to reconcile and must never replay
+                // the historical deterministic action identity after restart.
+                all_committed = false;
+                continue;
+            };
+            if action.payload_digest != intent.payload_digest
+                || action.policy_digest != intent.policy_digest
+                || action.execution_epoch != intent.execution_epoch
+            {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "integration recovery command action {} drifted from its durable intent",
+                    intent.action_id
+                )));
+            }
+            match action.state.as_str() {
+                "committed" => {}
+                "unknown" => {
+                    if !unknown.contains(&intent.action_id) {
+                        return Err(ControllerError::InvalidPlan(format!(
+                            "integration recovery command action {} is Unknown without recovery fencing",
+                            intent.action_id
+                        )));
+                    }
+                    any_unknown = true;
+                    all_committed = false;
+                }
+                "prepared" | "authorized" | "failed" => {
+                    all_committed = false;
+                }
+                "dispatched" | "observed" => {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "integration recovery command action {} escaped pre-epoch Unknown reconciliation",
+                        intent.action_id
+                    )));
+                }
+                other => {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "integration recovery command action {} has unsupported lifecycle state {other}",
+                        intent.action_id
+                    )));
+                }
+            }
+        }
+
+        if any_unknown {
+            let active = controller.active_mut()?;
+            active
+                .attempts
+                .get_mut(&attempt_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "integration recovery attempt disappeared while fencing Unknown".to_owned(),
+                    )
+                })?
+                .state = AttemptState::Interrupted;
+            active
+                .tasks
+                .get_mut(&task_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "integration recovery task disappeared while fencing Unknown".to_owned(),
+                    )
+                })?
+                .state = TaskState::ReconcilingUnknown;
+            classification.interrupted_attempt_ids.push(attempt_id);
+            continue;
+        }
+
+        if all_committed {
+            if attempt_state != AttemptState::Verifying || task_state != TaskState::Verifying {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "integration recovery attempt {attempt_id} has committed command results without Verifying runtime authority"
+                )));
+            }
+            let artifact_store_root = artifact_store_root.ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "integration recovery attempt {attempt_id} lost artifact-store authority"
+                ))
+            })?;
+            classification
+                .resumable
+                .push(RecoveredIntegrationGateCandidate {
+                    task_id: task_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    binding: VerificationCommandRecoveryBinding {
+                        plan_id,
+                        plan_revision,
+                        plan_digest,
+                        task_id,
+                        task_contract_digest,
+                        attempt_id,
+                        execution_epoch,
+                        artifact_store_root,
+                    },
+                });
+            continue;
+        }
+
+        let active = controller.active_mut()?;
+        active
+            .attempts
+            .get_mut(&attempt_id)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "integration recovery attempt disappeared while interrupting".to_owned(),
+                )
+            })?
+            .state = AttemptState::Interrupted;
+        active
+            .tasks
+            .get_mut(&task_id)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "integration recovery task disappeared while interrupting".to_owned(),
+                )
+            })?
+            .state = TaskState::Planned;
+        classification.interrupted_attempt_ids.push(attempt_id);
+    }
+
+    Ok(classification)
+}
+
 fn normalize_recovered_runtime(
     controller: &mut Controller,
     unknown_action_ids: &[String],
+    preserved_attempt_ids: &BTreeSet<String>,
 ) -> Result<RecoveryRuntimeNormalization, ControllerError> {
     let unknown = unknown_action_ids.iter().cloned().collect::<BTreeSet<_>>();
-    let primary_root = controller.active_ref()?.repository_root.clone();
     let intents = controller
         .state
         .state_records("controller.action_intent")?
         .into_iter()
         .map(|record| {
+            let value: Value = serde_json::from_str(&record.value_json)?;
+            let repository_id = required_str(&value, "/repository_id")?;
+            let primary_root = controller
+                .active_ref()?
+                .repository(repository_id)?
+                .repository_root
+                .clone();
             let intent = decode_persisted_action_intent(&record.value_json, &primary_root)?;
             Ok((record.key, intent))
         })
@@ -17597,6 +20950,9 @@ fn normalize_recovered_runtime(
         .cloned()
         .collect::<Vec<_>>();
     for attempt_id in attempt_ids {
+        if preserved_attempt_ids.contains(&attempt_id) {
+            continue;
+        }
         let (attempt_state, task_id) = {
             let active = controller.active_ref()?;
             let attempt = active.attempts.get(&attempt_id).ok_or_else(|| {
@@ -17779,6 +21135,33 @@ struct PersistedVerificationCommandIntentV1 {
     policy_digest: String,
     execution_epoch: i64,
     artifact_store_root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerificationCommandRecoveryBinding {
+    plan_id: String,
+    plan_revision: u32,
+    plan_digest: String,
+    task_id: String,
+    task_contract_digest: String,
+    attempt_id: String,
+    execution_epoch: i64,
+    artifact_store_root: PathBuf,
+}
+
+impl From<&DecodedPersistedActionIntent> for VerificationCommandRecoveryBinding {
+    fn from(intent: &DecodedPersistedActionIntent) -> Self {
+        Self {
+            plan_id: intent.plan_id().to_owned(),
+            plan_revision: intent.plan_revision(),
+            plan_digest: intent.plan_digest().to_owned(),
+            task_id: intent.task_id().to_owned(),
+            task_contract_digest: intent.task_contract_digest().to_owned(),
+            attempt_id: intent.attempt_id().to_owned(),
+            execution_epoch: intent.execution_epoch(),
+            artifact_store_root: intent.artifact_store_root().to_path_buf(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -18201,12 +21584,14 @@ impl DeterministicVerifier {
         } else {
             active_task_execution_lease(active, &lease.task_id)?
         };
-        let execution_root = execution_lease.map_or(active.repository_root.as_path(), |worktree| {
-            worktree.worktree_path.as_path()
-        });
+        let repository = active.single_task_repository(&lease.task_id)?;
+        let execution_root = execution_lease
+            .map_or(repository.repository_root.as_path(), |worktree| {
+                worktree.worktree_path.as_path()
+            });
         let post_snapshot = match execution_lease {
             Some(worktree) => registry.worktree_snapshot(worktree)?,
-            None => registry.snapshot(&active.repository_id)?,
+            None => registry.snapshot(&repository.repository_id)?,
         };
         let post_snapshot_digest = snapshot_digest(&post_snapshot)?;
         let file = match execution_lease {
@@ -18214,7 +21599,7 @@ impl DeterministicVerifier {
                 registry.read_worktree_path(worktree, Path::new(&validated.proposal.path), None)?
             }
             None => ExactRetriever::new(registry).read_path(
-                &active.repository_id,
+                &repository.repository_id,
                 Path::new(&validated.proposal.path),
                 None,
             )?,
@@ -18224,7 +21609,7 @@ impl DeterministicVerifier {
         )?);
         let diff = match execution_lease {
             Some(worktree) => registry.worktree_diff(worktree)?,
-            None => ExactRetriever::new(registry).current_diff(&active.repository_id)?,
+            None => ExactRetriever::new(registry).current_diff(&repository.repository_id)?,
         };
         let action_record = state.action_record(action_id)?;
         let action_committed = action_record
@@ -18232,7 +21617,7 @@ impl DeterministicVerifier {
             .is_some_and(|record| record.state == "committed" && record.result_digest.is_some());
         let expected_path = PathBuf::from(&validated.proposal.path);
         let repository_failure = repository_verification_failure(
-            active,
+            repository,
             attempt,
             lease,
             &post_snapshot,
@@ -18353,12 +21738,14 @@ impl DeterministicVerifier {
         } else {
             active_task_execution_lease(active, &lease.task_id)?
         };
-        let execution_root = execution_lease.map_or(active.repository_root.as_path(), |worktree| {
-            worktree.worktree_path.as_path()
-        });
+        let repository = active.single_task_repository(&lease.task_id)?;
+        let execution_root = execution_lease
+            .map_or(repository.repository_root.as_path(), |worktree| {
+                worktree.worktree_path.as_path()
+            });
         let post_snapshot = match execution_lease {
             Some(worktree) => registry.worktree_snapshot(worktree)?,
-            None => registry.snapshot(&active.repository_id)?,
+            None => registry.snapshot(&repository.repository_id)?,
         };
         let post_snapshot_digest = snapshot_digest(&post_snapshot)?;
         let file = match execution_lease {
@@ -18366,7 +21753,7 @@ impl DeterministicVerifier {
                 registry.read_worktree_path(worktree, Path::new(validated.action.path()), None)?
             }
             None => ExactRetriever::new(registry).read_path(
-                &active.repository_id,
+                &repository.repository_id,
                 Path::new(validated.action.path()),
                 None,
             )?,
@@ -18377,7 +21764,7 @@ impl DeterministicVerifier {
             target_metadata.is_file() && !target_metadata.file_type().is_symlink();
         let diff = match execution_lease {
             Some(worktree) => registry.worktree_diff(worktree)?,
-            None => ExactRetriever::new(registry).current_diff(&active.repository_id)?,
+            None => ExactRetriever::new(registry).current_diff(&repository.repository_id)?,
         };
         let action_record = state.action_record(action_id)?;
         let action_committed = action_record
@@ -18385,7 +21772,7 @@ impl DeterministicVerifier {
             .is_some_and(|record| record.state == "committed" && record.result_digest.is_some());
         let expected_path = PathBuf::from(validated.action.path());
         let repository_failure = repository_verification_failure(
-            active,
+            repository,
             attempt,
             lease,
             &post_snapshot,
@@ -18478,7 +21865,7 @@ fn protected_preexisting_changes_unchanged(
 }
 
 fn repository_verification_failure(
-    active: &ActivePlan,
+    repository: &ActiveRepositoryState,
     attempt: &AttemptRuntime,
     lease: &VerificationLeaseBinding,
     post_snapshot: &RepositorySnapshot,
@@ -18498,9 +21885,9 @@ fn repository_verification_failure(
     if attempt.pre_snapshot_digest != lease.baseline_digest
         || attempt.baseline_digest != lease.baseline_digest
         || (!controller_worktree
-            && (attempt.pre_diff_digest != active.baseline_diff_digest
-                || sha256_prefixed(active.baseline_diff_content.as_bytes())
-                    != active.baseline_diff_digest))
+            && (attempt.pre_diff_digest != repository.baseline_diff_digest
+                || sha256_prefixed(repository.baseline_diff_content.as_bytes())
+                    != repository.baseline_diff_digest))
     {
         return Some("pre_attempt_baseline_binding_invalid".to_owned());
     }
@@ -19065,6 +22452,28 @@ fn ready_lease_digest(lease: &ReadyLease) -> String {
     )
 }
 
+fn integration_gate_lease_digest(lease: &IntegrationGateLeaseV1) -> String {
+    sha256_prefixed(
+        format!(
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            lease.plan_id,
+            lease.plan_revision,
+            lease.plan_digest,
+            lease.task_id,
+            lease.task_contract_digest,
+            lease.integration_view_set_digest,
+            lease.evidence_binding_digest,
+            lease.checkpoint_generation,
+            lease.checkpoint_action_sequence,
+            lease.checkpoint_hash,
+            lease.permission_decision.digest(),
+            lease.resource_digest,
+            lease.execution_epoch,
+        )
+        .as_bytes(),
+    )
+}
+
 fn capability_set_from_json_array(values: &[Value]) -> Result<CapabilitySet, ControllerError> {
     let mut capabilities = Vec::with_capacity(values.len());
     for value in values {
@@ -19535,6 +22944,7 @@ fn fresh_task_runtime(task: &Value) -> Result<TaskRuntime, ControllerError> {
         worktree_baseline: None,
         worktree_composition: Vec::new(),
         worktree_conflict: None,
+        integration_views: BTreeMap::new(),
         task_contract_digest: digest_json(task)?,
         task: task.clone(),
     })
@@ -19625,6 +23035,61 @@ fn task_dependency_contract_digest(task: &Value) -> Result<String, ControllerErr
     )?)?)
 }
 
+fn task_instruction_fingerprint_digest(
+    plan: &Value,
+    task: &Value,
+) -> Result<String, ControllerError> {
+    let mut scoped_repository_ids = BTreeSet::new();
+    for repository_id in required_array(task, "/scope/repositories")? {
+        let repository_id = repository_id.as_str().ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "task repository scope contains a non-string id".to_owned(),
+            )
+        })?;
+        if !scoped_repository_ids.insert(repository_id.to_owned()) {
+            return Err(ControllerError::InvalidPlan(format!(
+                "task repository scope contains duplicate {repository_id}"
+            )));
+        }
+    }
+    if scoped_repository_ids.is_empty() {
+        return Err(ControllerError::InvalidPlan(
+            "task repository scope is empty".to_owned(),
+        ));
+    }
+
+    let repositories = required_array(plan, "/repositories")?;
+    let mut scoped_instructions = BTreeMap::new();
+    for repository_id in scoped_repository_ids {
+        let mut matching = None;
+        for repository in repositories {
+            let candidate_id = required_str(repository, "/repository_id")?;
+            if candidate_id == repository_id && matching.replace(repository).is_some() {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "plan contains duplicate repository {repository_id}"
+                )));
+            }
+        }
+        let repository = matching.ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "task instruction scope references unknown repository {repository_id}"
+            ))
+        })?;
+        let instructions = repository.get("instructions").cloned().ok_or_else(|| {
+            ControllerError::InvalidPlan(format!("repository {repository_id} instructions missing"))
+        })?;
+        scoped_instructions.insert(repository_id, instructions);
+    }
+    if scoped_instructions.len() == 1 {
+        let instructions = scoped_instructions.values().next().ok_or_else(|| {
+            ControllerError::InvalidPlan("task instruction scope disappeared".to_owned())
+        })?;
+        return Ok(digest_json(instructions)?);
+    }
+    Ok(digest_json(&serde_json::to_value(scoped_instructions)?)?)
+}
+
+#[cfg(test)]
 fn plan_instruction_fingerprint_digest(plan: &Value) -> Result<String, ControllerError> {
     Ok(digest_json(
         plan.pointer("/repositories/0/instructions")
@@ -19843,7 +23308,7 @@ fn build_superseding_runtime(
     next_plan_digest: &str,
     next_compilation_evidence: &Value,
     diff: &PlanRevisionDiff,
-    current_snapshot_digest: &str,
+    current_snapshot_digests: &BTreeMap<String, String>,
 ) -> Result<SupersedingRuntimeBuild, ControllerError> {
     let next_revision = diff.to_revision;
     let next_task_values = required_array(next_plan, "/tasks")?;
@@ -19858,7 +23323,6 @@ fn build_superseding_runtime(
         .collect::<BTreeSet<_>>();
     let mut tasks = BTreeMap::new();
     let mut carry_records = Vec::new();
-    let instruction_digest = plan_instruction_fingerprint_digest(next_plan)?;
     let mut local_carry_candidates = BTreeMap::new();
     let previous_uses_worktrees = previous
         .plan_document
@@ -19892,6 +23356,7 @@ fn build_superseding_runtime(
             runtime.resource_deferrals_used = previous_runtime.resource_deferrals_used;
             runtime.resource_retry_exhausted = previous_runtime.resource_retry_exhausted;
             runtime.resource_deferred_from = previous_runtime.resource_deferred_from;
+            let mutates_repository = Controller::task_has_repository_mutation_authority(task)?;
             runtime.state = if previous_runtime.retry_exhausted {
                 TaskState::RepairPending
             } else if previous_runtime.resource_retry_exhausted {
@@ -19914,16 +23379,28 @@ fn build_superseding_runtime(
                 let old_key = revision_scoped_key(&previous.plan_id, previous.revision, task_id);
                 if let Some(raw) = state.get_state("controller.task_carry_fingerprint", &old_key)? {
                     let proof: TaskCarryFingerprintV1 = serde_json::from_str(&raw)?;
-                    let source_fresh = if previous_uses_worktrees {
+                    let instruction_digest = task_instruction_fingerprint_digest(next_plan, task)?;
+                    let source_fresh = if previous_uses_worktrees && mutates_repository {
                         proof.execution_provenance.is_some()
                             && task_carry_execution_provenance(previous, task_id)?
                                 == proof.execution_provenance
                     } else {
+                        let repository_ids = previous.task_repository_ids(task_id)?;
                         proof.execution_provenance.is_none()
-                            && proof.source_fingerprints.iter().all(|(path, fingerprint)| {
-                                path_fingerprint(&previous.repository_root, Path::new(path))
-                                    .is_ok_and(|current| current == *fingerprint)
-                            })
+                            && if proof.source_fingerprints.is_empty() {
+                                true
+                            } else if repository_ids.len() == 1 {
+                                let repository_root = previous
+                                    .repository(&repository_ids[0])?
+                                    .repository_root
+                                    .clone();
+                                proof.source_fingerprints.iter().all(|(path, fingerprint)| {
+                                    path_fingerprint(&repository_root, Path::new(path))
+                                        .is_ok_and(|current| current == *fingerprint)
+                                })
+                            } else {
+                                false
+                            }
                     };
                     let proof_matches = proof.schema_version
                         == TASK_CARRY_FINGERPRINT_SCHEMA_VERSION
@@ -19963,7 +23440,7 @@ fn build_superseding_runtime(
                     } else {
                         false
                     };
-                    let worktree_carry_ok = if previous_uses_worktrees {
+                    let worktree_carry_ok = if previous_uses_worktrees && mutates_repository {
                         validate_durable_change_set_binding(
                             state,
                             &old_key,
@@ -19971,6 +23448,16 @@ fn build_superseding_runtime(
                             previous_runtime,
                         )
                         .is_ok()
+                    } else if !mutates_repository {
+                        proof.execution_provenance.is_none()
+                            && previous_runtime.worktree_lease.is_none()
+                            && previous_runtime.worktree_state.is_none()
+                            && previous_runtime.worktree_baseline.is_none()
+                            && previous_runtime.worktree_composition.is_empty()
+                            && previous_runtime.worktree_conflict.is_none()
+                            && previous_runtime.change_set.is_none()
+                            && previous_runtime.change_set_artifact_digest.is_none()
+                            && previous_runtime.change_set_carry.is_none()
                     } else {
                         true
                     };
@@ -20001,6 +23488,7 @@ fn build_superseding_runtime(
             if !validate_prior_dependency_outputs_for_carry(
                 state,
                 previous,
+                next_plan,
                 task,
                 &next_task_map,
                 &carried_task_ids,
@@ -20018,7 +23506,8 @@ fn build_superseding_runtime(
                     "carry candidate {task_id} disappeared from previous runtime"
                 ))
             })?;
-            if previous_uses_worktrees {
+            let mutates_repository = Controller::task_has_repository_mutation_authority(task)?;
+            if previous_uses_worktrees && mutates_repository {
                 let change_set = previous_runtime.change_set.clone().ok_or_else(|| {
                     ControllerError::InvalidPlan(format!(
                         "D3/D4 carry candidate {task_id} lost immutable ChangeSet provenance"
@@ -20052,6 +23541,19 @@ fn build_superseding_runtime(
                     revision_scoped_key(&previous.plan_id, next_revision, task_id),
                     serde_json::to_string(&change_set)?,
                 ));
+            } else if !mutates_repository
+                && (previous_runtime.worktree_lease.is_some()
+                    || previous_runtime.worktree_state.is_some()
+                    || previous_runtime.worktree_baseline.is_some()
+                    || !previous_runtime.worktree_composition.is_empty()
+                    || previous_runtime.worktree_conflict.is_some()
+                    || previous_runtime.change_set.is_some()
+                    || previous_runtime.change_set_artifact_digest.is_some()
+                    || previous_runtime.change_set_carry.is_some())
+            {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "non-mutating carry candidate {task_id} contains repository mutation provenance"
+                )));
             }
             let mut next_proof = proof.clone();
             next_proof.plan_revision = next_revision;
@@ -20061,6 +23563,21 @@ fn build_superseding_runtime(
                 revision_scoped_key(&previous.plan_id, next_revision, task_id),
                 serde_json::to_string(&next_proof)?,
             ));
+            let repository_ids = previous.task_repository_ids(task_id)?;
+            let current_snapshot_digest = if repository_ids.len() == 1 {
+                Some(
+                    current_snapshot_digests
+                        .get(&repository_ids[0])
+                        .ok_or_else(|| {
+                            ControllerError::InvalidPlan(format!(
+                                "superseding repository snapshot digest is missing for {}",
+                                repository_ids[0]
+                            ))
+                        })?,
+                )
+            } else {
+                None
+            };
             carry_verified_output_records(
                 state,
                 previous,
@@ -20087,10 +23604,14 @@ fn build_superseding_runtime(
 fn validate_prior_dependency_outputs_for_carry(
     state: &StateStore,
     previous: &ActivePlan,
+    next_plan: &Value,
     task: &Value,
     next_task_map: &BTreeMap<String, &Value>,
     carried_task_ids: &BTreeSet<String>,
 ) -> Result<bool, ControllerError> {
+    let downstream_task_id = required_str(task, "/task_id")?;
+    let previous_cross_repo_contracts = cross_repo_contracts_for_plan(&previous.plan_document)?;
+    let next_cross_repo_contracts = cross_repo_contracts_for_plan(next_plan)?;
     for binding in required_array(task, "/dependency_bindings")? {
         if binding.get("freshness").and_then(Value::as_str)
             != Some("carry_forward_if_inputs_unchanged")
@@ -20104,6 +23625,16 @@ fn validate_prior_dependency_outputs_for_carry(
         let Some(new_upstream) = next_task_map.get(upstream_id) else {
             return Ok(false);
         };
+        let contract_id = format!("binding:{downstream_task_id}:{upstream_id}");
+        match (
+            previous_cross_repo_contracts.get(&contract_id),
+            next_cross_repo_contracts.get(&contract_id),
+        ) {
+            (Some(previous_contract), Some(next_contract))
+                if previous_contract.contract_digest == next_contract.contract_digest => {}
+            (None, None) => {}
+            _ => return Ok(false),
+        }
         if !carried_task_ids.contains(upstream_id)
             || old_upstream.state != TaskState::Succeeded
             || old_upstream.task_contract_digest != digest_json(new_upstream)?
@@ -20153,6 +23684,12 @@ fn compilation_inputs_are_fresh_for_carry(
     task: &Value,
     next_compilation_evidence: &Value,
 ) -> Result<bool, ControllerError> {
+    let task_id = required_str(task, "/task_id")?;
+    let repository_ids = previous.task_repository_ids(task_id)?;
+    if repository_ids.len() != 1 {
+        return Ok(false);
+    }
+    let repository = previous.repository(&repository_ids[0])?;
     let previous_evidence_raw = state
         .get_state(
             "controller.compilation_evidence",
@@ -20211,10 +23748,10 @@ fn compilation_inputs_are_fresh_for_carry(
                     "compilation evidence handle lacks source_uri".to_owned(),
                 )
             })?;
-        let repo_prefix = format!("repo://{}/", previous.repository_id);
+        let repo_prefix = format!("repo://{}/", repository.repository_id);
         if let Some(relative) = source_uri.strip_prefix(&repo_prefix) {
             let current = ExactRetriever::new(registry).read_path(
-                &previous.repository_id,
+                &repository.repository_id,
                 Path::new(relative),
                 Some(expected_source_digest),
             );
@@ -20234,7 +23771,7 @@ fn carry_verified_output_records(
     previous: &ActivePlan,
     next_revision: u32,
     next_plan_digest: &str,
-    current_snapshot_digest: &str,
+    current_snapshot_digest: Option<&String>,
     task: &Value,
     proof: &TaskCarryFingerprintV1,
     records: &mut Vec<(String, String, String)>,
@@ -20281,7 +23818,9 @@ fn carry_verified_output_records(
             binding.carried_from_plan_digest = Some(previous.plan_digest.clone());
             binding.plan_revision = next_revision;
             next_plan_digest.clone_into(&mut binding.plan_digest);
-            current_snapshot_digest.clone_into(&mut binding.repository_snapshot_digest);
+            if let Some(current_snapshot_digest) = current_snapshot_digest {
+                current_snapshot_digest.clone_into(&mut binding.repository_snapshot_digest);
+            }
             records.push((
                 namespace.to_owned(),
                 revision_scoped_key(
@@ -21329,7 +24868,7 @@ fn bootstrap_legacy_autonomy_budgets(
     active: &mut ActivePlan,
     manifest: &CheckpointManifest,
 ) -> Result<(), ControllerError> {
-    if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+    if checkpoint_has_autonomy_security(manifest.schema_version) {
         for (task_id, runtime) in &active.tasks {
             let budget = runtime.autonomy_budget.as_ref().ok_or_else(|| {
                 ControllerError::InvalidPlan(format!(
@@ -21385,20 +24924,121 @@ fn unix_millis() -> Result<i64, ControllerError> {
 }
 
 #[cfg(test)]
+pub(crate) fn valid_plan_ir_fixture() -> Value {
+    serde_json::from_str(include_str!(
+        "../../sovereign-plan/tests/fixtures/valid_trivial_plan.json"
+    ))
+    .unwrap_or_else(|error| panic!("valid Plan IR fixture: {error}"))
+}
+
+#[cfg(test)]
+pub(crate) fn valid_resource_policy_fixture() -> Value {
+    json!({
+        "max_wall_seconds": 60,
+        "max_model_calls": 10,
+        "max_model_call_seconds": 10,
+        "max_tool_actions": 10,
+        "max_single_tool_action_seconds": 10,
+        "max_peak_rss_mb": 4096,
+        "max_output_bytes": 1_000_000,
+        "max_retained_raw_bytes": 1_000_000,
+        "max_disk_write_mb": 1,
+        "max_network_bytes": 1_000_000,
+        "max_subprocesses": 10,
+        "max_child_cpu_seconds": 60,
+        "heavy_leases": ["MODEL", "BUILD_HEAVY"]
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn valid_task_fixture(
+    task_id: &str,
+    repository_ids: &[&str],
+    mutates_repository: bool,
+) -> Value {
+    let mut task = valid_plan_ir_fixture()["tasks"][0].clone();
+    let artifact_id = format!("artifact.{task_id}");
+    let criterion_id = format!("AC.{task_id}");
+    let verification_step_id = format!("verify.{task_id}");
+    task["task_id"] = json!(task_id);
+    task["title"] = json!(format!("{task_id} fixture"));
+    task["objective"] = json!(format!("Exercise {task_id} fixture behavior."));
+    task["rationale"] = json!("Focused controller regression fixture.");
+    task["dependencies"] = json!([]);
+    task["dependency_bindings"] = json!([]);
+    task["scope"] = json!({
+        "repositories": repository_ids,
+        "files": if mutates_repository { vec!["tracked.txt"] } else { Vec::<&str>::new() },
+        "symbols": [],
+        "allow_create": [],
+        "allow_delete": [],
+        "scope_resolution": "exact"
+    });
+    task["evidence_requirements"] = json!([]);
+    task["permissions"] = if mutates_repository {
+        json!(["read", "repo_write", "process_exec"])
+    } else {
+        json!(["read", "process_exec"])
+    };
+    task["action_policy"]["write_roots"] = if mutates_repository {
+        json!([{"repository_id": repository_ids[0], "path": "."}])
+    } else {
+        json!([])
+    };
+    task["implementation_contract"] = json!({
+        "preconditions": [],
+        "assumptions": [],
+        "inputs": [],
+        "outputs": ["fixture output"],
+        "invariants": [],
+        "non_goals": []
+    });
+    task["expected_artifacts"] = json!([{
+        "artifact_id": artifact_id,
+        "kind": "evidence",
+        "locator": format!("fixture:{task_id}"),
+        "required": true
+    }]);
+    task["acceptance_criteria"] = json!([{
+        "criterion_id": criterion_id,
+        "description": format!("{task_id} fixture acceptance"),
+        "kind": "diff",
+        "verification_step_ids": [verification_step_id.clone()],
+        "evidence_type": "diff_result",
+        "evidence_freshness": "carry_forward_if_inputs_unchanged",
+        "required": true
+    }]);
+    task["verification"] = json!({
+        "steps": [{
+            "step_id": verification_step_id,
+            "criterion_ids": [criterion_id],
+            "kind": "diff",
+            "evidence_type": "diff_result",
+            "evaluator": "builtin.diff.scoped_change.v1"
+        }],
+        "required_evidence_types": ["diff_result"],
+        "fresh_reviewer_role": Value::Null
+    });
+    task["resource_budget"] = valid_resource_policy_fixture();
+    task
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
-        ACTION_INTENT_SCHEMA_VERSION, APPROVAL_REQUEST_NAMESPACE, ActivePlan, ApprovalDecisionV1,
-        ApprovalRequestStatusV1, BrowserResourceResidencyStateV1, BrowserResourceResidencyV1,
-        CancellationScopeKindV1, CancellationScopeV1, CancellationTree,
-        CommandVerificationResultV1, Controller, ControllerError, DecodedPersistedActionIntent,
-        ExactRequirementProbe, FailureClassification, FailureClassificationKind,
-        LEGACY_ACTION_INTENT_SCHEMA_VERSION, PersistedActionIntent,
+        ACTION_INTENT_SCHEMA_VERSION, APPROVAL_REQUEST_NAMESPACE, ActivePlan,
+        ActiveRepositoryState, ApprovalDecisionV1, ApprovalRequestStatusV1,
+        BrowserResourceResidencyStateV1, BrowserResourceResidencyV1, CancellationScopeKindV1,
+        CancellationScopeV1, CancellationTree, CommandVerificationResultV1, Controller,
+        ControllerError, DecodedPersistedActionIntent, ExactRequirementProbe,
+        FailureClassification, FailureClassificationKind, LEGACY_ACTION_INTENT_SCHEMA_VERSION,
+        OutputBindingValidationRequest, PersistedActionIntent,
         PersistedVerificationCommandIntentV1, PlanValidity, ReadyLease, RecoveryIntegrityGate,
         RecoveryProcessLease, ResourceResidencyStateV1, ResourceResidencyV1,
-        TaskCarryExecutionProvenanceV1, TaskCarryFingerprintV1, TaskRuntime, TaskState,
-        VERIFICATION_COMMAND_INTENT_NAMESPACE, VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION,
-        VerificationResultV1, VerifiedOutputBindingV1, WorktreeLifecycle,
-        acceptance_permits_cross_revision_carry, aggregate_command_verification,
+        SupersedingRuntimeBuild, TaskCarryExecutionProvenanceV1, TaskCarryFingerprintV1,
+        TaskRuntime, TaskState, VERIFICATION_COMMAND_INTENT_NAMESPACE,
+        VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION, VerificationResultV1, VerifiedOutputBindingV1,
+        WorktreeLifecycle, acceptance_permits_cross_revision_carry, aggregate_command_verification,
         build_superseding_runtime, cleanup_recovered_browser_profile,
         command_verification_failure_code, compilation_inputs_are_fresh_for_carry,
         compiled_acceptance_contract, dependency_bindings_permit_cross_revision_carry, digest_json,
@@ -21409,7 +25049,8 @@ mod tests {
         normalized_failure_signature, output_binding_key, plan_instruction_fingerprint_digest,
         process_lease_is_terminal, ready_lease_digest, rebase_goal_autonomy_budget, repair_allowed,
         required_command_verification_steps, revision_record_key, revision_scoped_key,
-        scope_lineage_id, sha256_prefixed, validate_post_checkpoint_action_authority_correlation,
+        scope_lineage_id, sha256_prefixed, valid_plan_ir_fixture, valid_resource_policy_fixture,
+        valid_task_fixture, validate_post_checkpoint_action_authority_correlation,
         verification_build_lease_id,
     };
     use serde_json::{Value, json};
@@ -21469,21 +25110,7 @@ mod tests {
     }
 
     fn test_goal_resource_policy() -> Value {
-        json!({
-            "max_wall_seconds": 60,
-            "max_model_calls": 10,
-            "max_model_call_seconds": 10,
-            "max_tool_actions": 10,
-            "max_single_tool_action_seconds": 10,
-            "max_peak_rss_mb": 4096,
-            "max_output_bytes": 1_000_000,
-            "max_retained_raw_bytes": 1_000_000,
-            "max_disk_write_mb": 1,
-            "max_network_bytes": 1_000_000,
-            "max_subprocesses": 10,
-            "max_child_cpu_seconds": 60,
-            "heavy_leases": ["MODEL", "BUILD_HEAVY"]
-        })
+        valid_resource_policy_fixture()
     }
 
     #[test]
@@ -21723,8 +25350,8 @@ mod tests {
             .unwrap_or_else(|error| panic!("canonical repository root: {error}"));
         let plan_digest = format!("sha256:{}", "a".repeat(64));
         let mut active = active_fixture(&repository_root, 3, &plan_digest);
-        active.plan_document["depth"] = json!({"mode": "D3"});
-        let task = json!({"task_id": "task.A"});
+        let task = valid_task_fixture("task.A", &["repo.app"], true);
+        install_valid_plan_document(&mut active, &repository_root, 3, "D3", vec![task.clone()]);
         let runtime =
             fresh_task_runtime(&task).unwrap_or_else(|error| panic!("fresh task runtime: {error}"));
         let task_contract_digest = runtime.task_contract_digest.clone();
@@ -21881,16 +25508,7 @@ mod tests {
 
     #[test]
     fn carry_forward_rejects_compilation_input_source_drift() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_nanos());
-        let base = std::env::temp_dir().join(format!(
-            "sovereign-controller-carry-input-drift-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&base).unwrap_or_else(|error| panic!("temp dir: {error}"));
-        let mut state = StateStore::open(base.join("state.sqlite3"))
-            .unwrap_or_else(|error| panic!("state: {error}"));
+        let (base, mut state) = temp_state("carry-input-drift");
         let previous_compilation = json!({
             "exact_evidence": [{
                 "evidence_id": "ev.input",
@@ -21922,6 +25540,20 @@ mod tests {
             "protected_changes_present": false
         }))
         .unwrap_or_else(|error| panic!("baseline: {error}"));
+        let task = json!({
+            "task_id": "task.input-drift",
+            "scope": {
+                "repositories": ["repo.app"],
+                "files": [],
+                "allow_create": [],
+                "allow_delete": []
+            },
+            "implementation_contract": {
+                "inputs": ["ev.input sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+            }
+        });
+        let task_runtime = fresh_task_runtime(&task)
+            .unwrap_or_else(|error| panic!("input drift task runtime: {error}"));
         let previous = ActivePlan {
             plan_document: json!({}),
             compiler_plan_digest:
@@ -21935,22 +25567,23 @@ mod tests {
                 "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
             policy_digest:
                 "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
-            repository_id: "repo.app".to_owned(),
-            repository_root: PathBuf::from("/nonexistent-fixture"),
-            baseline,
-            baseline_diff_digest:
-                "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
-            baseline_diff_content: String::new(),
+            repositories: BTreeMap::from([(
+                "repo.app".to_owned(),
+                ActiveRepositoryState {
+                    repository_id: "repo.app".to_owned(),
+                    repository_root: PathBuf::from("/nonexistent-fixture"),
+                    baseline,
+                    baseline_diff_digest:
+                        "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                            .to_owned(),
+                    baseline_diff_content: String::new(),
+                },
+            )]),
             validity: PlanValidity::Current,
             goal_autonomy_budget: test_goal_autonomy_budget(),
-            tasks: BTreeMap::new(),
+            tasks: BTreeMap::from([("task.input-drift".to_owned(), task_runtime)]),
             attempts: BTreeMap::new(),
         };
-        let task = json!({
-            "implementation_contract": {
-                "inputs": ["ev.input sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
-            }
-        });
         let next_compilation = json!({
             "exact_evidence": [{
                 "evidence_id": "ev.input",
@@ -21987,23 +25620,15 @@ mod tests {
         let (base, state) = temp_state(label);
         let plan_digest = format!("sha256:{}", "a".repeat(64));
         let mut active = active_fixture(&base, 1, &plan_digest);
-        active.plan_document = json!({
-            "policy": {
-                "resources": test_goal_resource_policy(),
-                "approval": {
-                    "exact_action_binding": true,
-                    "reapprove_on_payload_change": true,
-                    "max_ttl_seconds": 30,
-                    "required_permissions": ["external_side_effect"]
-                }
-            }
-        });
-        let task = json!({
-            "task_id": "task.reconciliation",
-            "action_policy": {
-                "approval_required_permissions": []
-            }
-        });
+        let mut task = valid_task_fixture("task.reconciliation", &["repo.app"], false);
+        task["permissions"] = json!(["read", "external_side_effect"]);
+        task["action_policy"]["approval_required_permissions"] = json!([]);
+        install_valid_plan_document(&mut active, &base, 1, "D2", vec![task.clone()]);
+        active.plan_document["policy"]["capability_ceiling"] =
+            json!(["read", "process_exec", "external_side_effect"]);
+        active.plan_document["policy"]["approval"]["max_ttl_seconds"] = json!(30);
+        active.plan_document["policy"]["approval"]["required_permissions"] =
+            json!(["external_side_effect"]);
         let runtime = fresh_task_runtime(&task)
             .unwrap_or_else(|error| panic!("reconciliation task runtime: {error}"));
         let task_contract_digest = runtime.task_contract_digest.clone();
@@ -22436,18 +26061,15 @@ mod tests {
     fn physically_resident_model_is_proven_absent_before_build_heavy_admission() {
         let (base, state) = temp_state("resident-model-build-heavy-handoff");
         let plan_digest = format!("sha256:{}", "a".repeat(64));
-        let task = json!({
-            "task_id": "task.A",
-            "resource_budget": {
-                "max_peak_rss_mb": 4096,
-                "max_subprocesses": 2,
-                "heavy_leases": ["MODEL", "BUILD_HEAVY"]
-            }
-        });
+        let mut task = valid_task_fixture("task.A", &["repo.app"], false);
+        task["resource_budget"]["max_peak_rss_mb"] = json!(4096);
+        task["resource_budget"]["max_subprocesses"] = json!(2);
+        task["resource_budget"]["heavy_leases"] = json!(["MODEL", "BUILD_HEAVY"]);
         let runtime =
             fresh_task_runtime(&task).unwrap_or_else(|error| panic!("fresh task runtime: {error}"));
         let task_contract_digest = runtime.task_contract_digest.clone();
         let mut active = active_fixture(&base, 1, &plan_digest);
+        install_valid_plan_document(&mut active, &base, 1, "D2", vec![task.clone()]);
         active.tasks.insert("task.A".to_owned(), runtime);
 
         let mut controller = Controller::new(state);
@@ -22685,13 +26307,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
-    fn empty_snapshot(root: &std::path::Path) -> RepositorySnapshot {
+    fn empty_snapshot_for(repository_id: &str, root: &std::path::Path) -> RepositorySnapshot {
         let empty_change = json!({
             "digest": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
             "paths": []
         });
         serde_json::from_value(json!({
-            "repository_id": "repo.app",
+            "repository_id": repository_id,
             "root": root,
             "head": Value::Null,
             "branch": Value::Null,
@@ -22704,9 +26326,28 @@ mod tests {
         .unwrap_or_else(|error| panic!("snapshot: {error}"))
     }
 
+    fn empty_snapshot(root: &std::path::Path) -> RepositorySnapshot {
+        empty_snapshot_for("repo.app", root)
+    }
+
     fn active_fixture(root: &std::path::Path, revision: u32, plan_digest: &str) -> ActivePlan {
+        let repository = ActiveRepositoryState {
+            repository_id: "repo.app".to_owned(),
+            repository_root: root.to_path_buf(),
+            baseline: empty_snapshot(root),
+            baseline_diff_digest:
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            baseline_diff_content: String::new(),
+        };
         ActivePlan {
-            plan_document: json!({"policy": {"resources": test_goal_resource_policy()}}),
+            plan_document: json!({
+                "policy": {"resources": test_goal_resource_policy()},
+                "repositories": [{
+                    "repository_id": "repo.app",
+                    "root": root,
+                    "instructions": []
+                }]
+            }),
             compiler_plan_digest: plan_digest.to_owned(),
             plan_id: "plan.fixture".to_owned(),
             goal_id: "goal.fixture".to_owned(),
@@ -22716,17 +26357,43 @@ mod tests {
                 "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee".to_owned(),
             policy_digest:
                 "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_owned(),
-            repository_id: "repo.app".to_owned(),
-            repository_root: root.to_path_buf(),
-            baseline: empty_snapshot(root),
-            baseline_diff_digest:
-                "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
-            baseline_diff_content: String::new(),
+            repositories: BTreeMap::from([("repo.app".to_owned(), repository)]),
             validity: PlanValidity::Current,
             goal_autonomy_budget: test_goal_autonomy_budget(),
             tasks: BTreeMap::new(),
             attempts: BTreeMap::new(),
         }
+    }
+
+    fn install_valid_plan_document(
+        active: &mut ActivePlan,
+        root: &Path,
+        revision: u32,
+        depth_mode: &str,
+        tasks: Vec<Value>,
+    ) {
+        let mut plan = valid_plan_ir_fixture();
+        plan["plan_id"] = json!("plan.fixture");
+        plan["revision"] = json!(revision);
+        plan["supersedes_revision"] = if revision == 1 {
+            Value::Null
+        } else {
+            json!(revision - 1)
+        };
+        plan["compiled_at"] = json!("2026-09-19T05:00:00Z");
+        plan["goal"]["goal_id"] = json!("goal.fixture");
+        plan["depth"] = json!({
+            "mode": depth_mode,
+            "reason": "Focused sovereign-controller test fixture.",
+            "features": {"repository_count": 1, "cross_repo": false}
+        });
+        plan["policy"]["resources"] = test_goal_resource_policy();
+        plan["repositories"][0]["repository_id"] = json!("repo.app");
+        plan["repositories"][0]["root"] = json!(root);
+        plan["repositories"][0]["instructions"] = json!([]);
+        plan["tasks"] = Value::Array(tasks);
+        plan["edges"] = json!([]);
+        active.plan_document = plan;
     }
 
     #[test]
@@ -23081,8 +26748,9 @@ mod tests {
             Some(receipt_artifact.digest.as_str())
         );
 
+        let recovery_binding = super::VerificationCommandRecoveryBinding::from(&intent);
         let recovered = controller
-            .recover_required_command_verification(&intent, &task)
+            .recover_required_command_verification(&recovery_binding, &task)
             .unwrap_or_else(|error| panic!("recover committed command receipt: {error}"));
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].action_id, action_id);
@@ -23108,7 +26776,7 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("persist drifted command intent: {error}"));
         let error = controller
-            .recover_required_command_verification(&intent, &task)
+            .recover_required_command_verification(&recovery_binding, &task)
             .err()
             .unwrap_or_else(|| panic!("step-digest drift must fail closed"));
         assert!(
@@ -23126,7 +26794,10 @@ mod tests {
         let (base, state) = temp_state("command-intent-post-checkpoint-correlation");
         let mut controller = Controller::new(state);
         let plan_digest = sha256_prefixed(b"plan.command-intent-correlation");
-        controller.active = Some(active_fixture(&base, 1, &plan_digest));
+        let mut active = active_fixture(&base, 1, &plan_digest);
+        let task = valid_task_fixture("task.fixture", &["repo.app"], false);
+        install_valid_plan_document(&mut active, &base, 1, "D2", vec![task]);
+        controller.active = Some(active);
         let manifest = controller
             .checkpoint_manifest()
             .unwrap_or_else(|error| panic!("checkpoint manifest: {error}"));
@@ -23330,25 +27001,27 @@ mod tests {
             .unwrap_or_else(|error| panic!("verification artifact: {error}"));
         let plan_one_digest = format!("sha256:{}", "1".repeat(64));
         let plan_two_digest = format!("sha256:{}", "2".repeat(64));
-        let upstream_task = json!({"task_id":"A"});
+        let mut upstream_task = valid_task_fixture("task.A", &["repo.app"], false);
+        upstream_task["expected_artifacts"][0]["artifact_id"] = json!("artifact.A");
+        upstream_task["acceptance_criteria"][0]["criterion_id"] = json!("AC.A");
+        upstream_task["verification"]["steps"][0]["criterion_ids"] = json!(["AC.A"]);
         let upstream_digest =
             digest_json(&upstream_task).unwrap_or_else(|error| panic!("upstream digest: {error}"));
-        let downstream_task = json!({
-            "task_id": "B",
-            "dependency_bindings": [{
-                "upstream_task_id": "A",
-                "required_artifact_ids": ["artifact.A"],
-                "required_acceptance_criterion_ids": ["AC.A"],
-                "freshness": "carry_forward_if_inputs_unchanged"
-            }]
-        });
+        let mut downstream_task = valid_task_fixture("task.B", &["repo.app"], false);
+        downstream_task["dependencies"] = json!(["task.A"]);
+        downstream_task["dependency_bindings"] = json!([{
+            "upstream_task_id": "task.A",
+            "required_artifact_ids": ["artifact.A"],
+            "required_acceptance_criterion_ids": ["AC.A"],
+            "freshness": "carry_forward_if_inputs_unchanged"
+        }]);
         let verification = VerificationResultV1 {
             schema_version: super::VERIFICATION_RESULT_SCHEMA_VERSION,
             verification_id: "verification.A".to_owned(),
             plan_id: "plan.fixture".to_owned(),
             plan_revision: 1,
             plan_digest: plan_one_digest.clone(),
-            task_id: "A".to_owned(),
+            task_id: "task.A".to_owned(),
             task_contract_digest: upstream_digest.clone(),
             attempt_id: "attempt.A.1".to_owned(),
             execution_epoch: 1,
@@ -23376,7 +27049,7 @@ mod tests {
             plan_id: "plan.fixture".to_owned(),
             plan_revision: 2,
             plan_digest: plan_two_digest.clone(),
-            task_id: "A".to_owned(),
+            task_id: "task.A".to_owned(),
             task_contract_digest: upstream_digest.clone(),
             implementation_inputs_digest: format!("sha256:{}", "5".repeat(64)),
             dependency_contract_digest: format!("sha256:{}", "6".repeat(64)),
@@ -23390,7 +27063,7 @@ mod tests {
         state
             .put_state(
                 "controller.task_carry_fingerprint",
-                &revision_scoped_key("plan.fixture", 2, "A"),
+                &revision_scoped_key("plan.fixture", 2, "task.A"),
                 &serde_json::to_string(&carry)
                     .unwrap_or_else(|error| panic!("carry json: {error}")),
             )
@@ -23404,7 +27077,7 @@ mod tests {
                 plan_id: "plan.fixture".to_owned(),
                 plan_revision: 2,
                 plan_digest: plan_two_digest.clone(),
-                task_id: "A".to_owned(),
+                task_id: "task.A".to_owned(),
                 task_contract_digest: upstream_digest.clone(),
                 attempt_id: "attempt.A.1".to_owned(),
                 binding_kind: kind.to_owned(),
@@ -23419,16 +27092,26 @@ mod tests {
             state
                 .put_state(
                     namespace,
-                    &revision_scoped_key("plan.fixture", 2, &output_binding_key("A", binding_id)),
+                    &revision_scoped_key(
+                        "plan.fixture",
+                        2,
+                        &output_binding_key("task.A", binding_id),
+                    ),
                     &serde_json::to_string(&binding)
                         .unwrap_or_else(|error| panic!("binding json: {error}")),
                 )
                 .unwrap_or_else(|error| panic!("persist binding: {error}"));
         }
         let mut active = active_fixture(&base, 2, &plan_two_digest);
-        active.plan_document["depth"] = json!({"mode": "D2"});
+        install_valid_plan_document(
+            &mut active,
+            &base,
+            2,
+            "D2",
+            vec![upstream_task.clone(), downstream_task.clone()],
+        );
         active.tasks.insert(
-            "A".to_owned(),
+            "task.A".to_owned(),
             TaskRuntime {
                 state: TaskState::Succeeded,
                 attempts_started: 1,
@@ -23450,6 +27133,7 @@ mod tests {
                 worktree_baseline: None,
                 worktree_composition: Vec::new(),
                 worktree_conflict: None,
+                integration_views: BTreeMap::new(),
                 task_contract_digest: upstream_digest,
                 task: upstream_task,
             },
@@ -23457,7 +27141,7 @@ mod tests {
         let downstream_digest = digest_json(&downstream_task)
             .unwrap_or_else(|error| panic!("downstream digest: {error}"));
         active.tasks.insert(
-            "B".to_owned(),
+            "task.B".to_owned(),
             TaskRuntime {
                 state: TaskState::Planned,
                 attempts_started: 0,
@@ -23479,14 +27163,19 @@ mod tests {
                 worktree_baseline: None,
                 worktree_composition: Vec::new(),
                 worktree_conflict: None,
+                integration_views: BTreeMap::new(),
                 task_contract_digest: downstream_digest,
                 task: downstream_task.clone(),
             },
         );
         let mut controller = Controller::new(state);
         controller.active = Some(active);
-        let resolved =
-            controller.resolve_dependency_binding_digests("B", &downstream_task, "snapshot.N+1");
+        let resolved = controller.resolve_dependency_binding_digests(
+            None,
+            "task.B",
+            &downstream_task,
+            "snapshot.N+1",
+        );
         assert!(
             resolved.is_ok(),
             "carried N output must be consumable in N+1: {resolved:?}"
@@ -23529,40 +27218,38 @@ mod tests {
             .register("repo.app", &repository_root)
             .unwrap_or_else(|error| panic!("register repository: {error}"));
 
-        let task_a = json!({
-            "task_id": "A",
-            "dependencies": [],
-            "dependency_bindings": [],
-            "implementation_contract": {"inputs": []},
-            "acceptance_criteria": [{
-                "criterion_id": "AC.A",
-                "evidence_freshness": "carry_forward_if_inputs_unchanged",
-                "required": true
-            }],
-            "expected_artifacts": [{"artifact_id": "artifact.A", "required": true}]
-        });
-        let task_b = json!({
-            "task_id": "B",
-            "dependencies": ["A"],
-            "dependency_bindings": [{
-                "upstream_task_id": "A",
-                "required_artifact_ids": ["artifact.A"],
-                "required_acceptance_criterion_ids": ["AC.A"],
-                "freshness": "carry_forward_if_inputs_unchanged"
-            }],
-            "implementation_contract": {"inputs": []},
-            "acceptance_criteria": [],
-            "expected_artifacts": []
-        });
+        let mut task_a = valid_task_fixture("task.A", &["repo.app"], true);
+        task_a["expected_artifacts"][0]["artifact_id"] = json!("artifact.A");
+        task_a["acceptance_criteria"][0]["criterion_id"] = json!("AC.A");
+        task_a["verification"]["steps"][0]["criterion_ids"] = json!(["AC.A"]);
+        let mut task_b = valid_task_fixture("task.B", &["repo.app"], true);
+        task_b["dependencies"] = json!(["task.A"]);
+        task_b["dependency_bindings"] = json!([{
+            "upstream_task_id": "task.A",
+            "required_artifact_ids": ["artifact.A"],
+            "required_acceptance_criterion_ids": ["AC.A"],
+            "freshness": "carry_forward_if_inputs_unchanged"
+        }]);
         let digest_a = digest_json(&task_a).unwrap_or_else(|error| panic!("digest A: {error}"));
         let plan_one_digest = format!("sha256:{}", "1".repeat(64));
         let plan_two_digest = format!("sha256:{}", "2".repeat(64));
-        let next_plan = json!({
-            "policy": {"resources": test_goal_resource_policy()},
-            "depth": {"mode": "D3"},
-            "repositories": [{"instructions": []}],
-            "tasks": [task_a.clone(), task_b.clone()]
+        let mut next_plan = valid_plan_ir_fixture();
+        next_plan["plan_id"] = json!("plan.fixture");
+        next_plan["revision"] = json!(2);
+        next_plan["supersedes_revision"] = json!(1);
+        next_plan["compiled_at"] = json!("2026-09-19T05:00:00Z");
+        next_plan["goal"]["goal_id"] = json!("goal.fixture");
+        next_plan["depth"] = json!({
+            "mode": "D3",
+            "reason": "D3 carried ChangeSet composition fixture.",
+            "features": {"repository_count": 1, "cross_repo": false}
         });
+        next_plan["policy"]["resources"] = test_goal_resource_policy();
+        next_plan["repositories"][0]["repository_id"] = json!("repo.app");
+        next_plan["repositories"][0]["root"] = json!(repository_root);
+        next_plan["repositories"][0]["instructions"] = json!([]);
+        next_plan["tasks"] = json!([task_a.clone(), task_b.clone()]);
+        next_plan["edges"] = json!([]);
         let instruction_digest = plan_instruction_fingerprint_digest(&next_plan)
             .unwrap_or_else(|error| panic!("instruction digest: {error}"));
 
@@ -23572,7 +27259,7 @@ mod tests {
                 &base.join("historical-worktrees"),
                 "plan.fixture",
                 1,
-                "A",
+                "task.A",
                 &digest_a,
             )
             .unwrap_or_else(|error| panic!("prepare historical lease: {error}"));
@@ -23606,7 +27293,7 @@ mod tests {
         state
             .put_state(
                 "controller.change_set",
-                &revision_scoped_key("plan.fixture", 1, "A"),
+                &revision_scoped_key("plan.fixture", 1, "task.A"),
                 &serde_json::to_string(&change_set)
                     .unwrap_or_else(|error| panic!("durable ChangeSet json: {error}")),
             )
@@ -23620,7 +27307,7 @@ mod tests {
             plan_id: "plan.fixture".to_owned(),
             plan_revision: 1,
             plan_digest: plan_one_digest.clone(),
-            task_id: "A".to_owned(),
+            task_id: "task.A".to_owned(),
             task_contract_digest: digest_a.clone(),
             attempt_id: "attempt.A.1".to_owned(),
             execution_epoch: 1,
@@ -23664,7 +27351,7 @@ mod tests {
             plan_id: "plan.fixture".to_owned(),
             plan_revision: 1,
             plan_digest: plan_one_digest.clone(),
-            task_id: "A".to_owned(),
+            task_id: "task.A".to_owned(),
             task_contract_digest: digest_a.clone(),
             implementation_inputs_digest: digest_json(&json!([]))
                 .unwrap_or_else(|error| panic!("inputs digest: {error}")),
@@ -23683,7 +27370,7 @@ mod tests {
         state
             .put_state(
                 "controller.task_carry_fingerprint",
-                &revision_scoped_key("plan.fixture", 1, "A"),
+                &revision_scoped_key("plan.fixture", 1, "task.A"),
                 &serde_json::to_string(&proof)
                     .unwrap_or_else(|error| panic!("carry proof json: {error}")),
             )
@@ -23697,7 +27384,7 @@ mod tests {
                 plan_id: "plan.fixture".to_owned(),
                 plan_revision: 1,
                 plan_digest: plan_one_digest.clone(),
-                task_id: "A".to_owned(),
+                task_id: "task.A".to_owned(),
                 task_contract_digest: digest_a.clone(),
                 attempt_id: "attempt.A.1".to_owned(),
                 binding_kind: kind.to_owned(),
@@ -23712,7 +27399,11 @@ mod tests {
             state
                 .put_state(
                     namespace,
-                    &revision_scoped_key("plan.fixture", 1, &output_binding_key("A", binding_id)),
+                    &revision_scoped_key(
+                        "plan.fixture",
+                        1,
+                        &output_binding_key("task.A", binding_id),
+                    ),
                     &serde_json::to_string(&binding)
                         .unwrap_or_else(|error| panic!("binding json: {error}")),
                 )
@@ -23720,12 +27411,13 @@ mod tests {
         }
 
         let mut previous = active_fixture(&repository_root, 1, &plan_one_digest);
-        previous.plan_document = json!({
-            "policy": {"resources": test_goal_resource_policy()},
-            "depth": {"mode": "D3"},
-            "repositories": [{"instructions": []}],
-            "tasks": [task_a.clone()]
-        });
+        install_valid_plan_document(
+            &mut previous,
+            &repository_root,
+            1,
+            "D3",
+            vec![task_a.clone()],
+        );
         let mut runtime_a =
             fresh_task_runtime(&task_a).unwrap_or_else(|error| panic!("fresh A runtime: {error}"));
         runtime_a.state = TaskState::Succeeded;
@@ -23733,7 +27425,7 @@ mod tests {
         runtime_a.worktree_state = Some(WorktreeLifecycle::Released);
         runtime_a.change_set = Some(change_set.clone());
         runtime_a.change_set_artifact_digest = Some(change_set_artifact.digest.clone());
-        previous.tasks.insert("A".to_owned(), runtime_a);
+        previous.tasks.insert("task.A".to_owned(), runtime_a);
 
         let diff = PlanRevisionDiff {
             plan_id: "plan.fixture".to_owned(),
@@ -23743,10 +27435,10 @@ mod tests {
             to_plan_digest: plan_two_digest.clone(),
             scope: ReplanScope::Task,
             invalidated_contract_ids: vec!["ASSUME.unrelated".to_owned()],
-            affected_task_ids: vec!["B".to_owned()],
-            unchanged_task_ids: vec!["A".to_owned()],
+            affected_task_ids: vec!["task.B".to_owned()],
+            unchanged_task_ids: vec!["task.A".to_owned()],
             changed_task_ids: Vec::new(),
-            added_task_ids: vec!["B".to_owned()],
+            added_task_ids: vec!["task.B".to_owned()],
             removed_task_ids: Vec::new(),
         };
         let unrelated_artifact = artifact_store
@@ -23754,12 +27446,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("unrelated artifact: {error}"));
         let correct_change_set_artifact_digest = previous
             .tasks
-            .get("A")
+            .get("task.A")
             .and_then(|runtime| runtime.change_set_artifact_digest.clone())
             .unwrap_or_else(|| panic!("previous A ChangeSet artifact missing"));
         previous
             .tasks
-            .get_mut("A")
+            .get_mut("task.A")
             .unwrap_or_else(|| panic!("tampered previous A missing"))
             .change_set_artifact_digest = Some(unrelated_artifact.digest);
         let tampered_build = build_superseding_runtime(
@@ -23770,17 +27462,17 @@ mod tests {
             &plan_two_digest,
             &json!({"exact_evidence": []}),
             &diff,
-            "primary.snapshot.N+1",
+            &BTreeMap::from([("repo.app".to_owned(), "primary.snapshot.N+1".to_owned())]),
         )
         .unwrap_or_else(|error| panic!("build tampered superseding D3 runtime: {error}"));
         assert_eq!(
-            tampered_build.tasks["A"].state,
+            tampered_build.tasks["task.A"].state,
             TaskState::Planned,
             "unrelated artifact metadata must not authorize ChangeSet carry"
         );
         previous
             .tasks
-            .get_mut("A")
+            .get_mut("task.A")
             .unwrap_or_else(|| panic!("restore previous A missing"))
             .change_set_artifact_digest = Some(correct_change_set_artifact_digest);
 
@@ -23792,10 +27484,10 @@ mod tests {
             &plan_two_digest,
             &json!({"exact_evidence": []}),
             &diff,
-            "primary.snapshot.N+1",
+            &BTreeMap::from([("repo.app".to_owned(), "primary.snapshot.N+1".to_owned())]),
         )
         .unwrap_or_else(|error| panic!("build superseding D3 runtime: {error}"));
-        let carried_a = &build.tasks["A"];
+        let carried_a = &build.tasks["task.A"];
         assert_eq!(carried_a.state, TaskState::Succeeded);
         assert!(carried_a.worktree_lease.is_none());
         assert!(carried_a.worktree_state.is_none());
@@ -23816,21 +27508,29 @@ mod tests {
         let mut active = active_fixture(&repository_root, 2, &plan_two_digest);
         active.plan_document = next_plan;
         active.tasks = build.tasks;
-        active.baseline = registry
+        active
+            .repositories
+            .get_mut("repo.app")
+            .unwrap_or_else(|| panic!("repo.app active repository missing"))
+            .baseline = registry
             .snapshot("repo.app")
             .unwrap_or_else(|error| panic!("primary snapshot: {error}"));
         let primary_diff = ExactRetriever::new(&registry)
             .current_diff("repo.app")
             .unwrap_or_else(|error| panic!("primary diff: {error}"));
-        active.baseline_diff_digest = primary_diff.digest;
-        active.baseline_diff_content = primary_diff.content;
+        let active_repository = active
+            .repositories
+            .get_mut("repo.app")
+            .unwrap_or_else(|| panic!("repo.app active repository missing"));
+        active_repository.baseline_diff_digest = primary_diff.digest;
+        active_repository.baseline_diff_content = primary_diff.content;
         let mut controller = Controller::new(state);
         controller.active = Some(active);
         controller
-            .ensure_task_worktree(&registry, "B")
+            .ensure_task_worktree(&registry, "task.B")
             .unwrap_or_else(|error| panic!("compose carried A into fresh B lease: {error}"));
         let lease_b = controller
-            .task_worktree_lease("B")
+            .task_worktree_lease("task.B")
             .cloned()
             .unwrap_or_else(|| panic!("fresh N+1 downstream lease missing"));
         assert_eq!(lease_b.plan_revision, 2);
@@ -23841,7 +27541,8 @@ mod tests {
             "from-N\n"
         );
         let readiness_binding = controller.resolve_dependency_binding_digests(
-            "B",
+            None,
+            "task.B",
             &task_b,
             "deliberately-not-equal-to-primary-or-historical-snapshot",
         );
@@ -23858,6 +27559,252 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    fn persist_non_mutating_carry_verification(
+        state: &mut StateStore,
+        base: &Path,
+        task_digest: &str,
+        plan_digest: &str,
+        acceptance_contract_digest: &str,
+    ) -> (VerificationResultV1, String) {
+        state
+            .put_state(
+                "controller.compilation_evidence",
+                &revision_record_key("plan.fixture", 1),
+                &json!({"exact_evidence": []}).to_string(),
+            )
+            .unwrap_or_else(|error| panic!("persist compilation evidence: {error}"));
+        let artifacts = ArtifactStore::open(base.join("non-mutating-carry-cas"))
+            .unwrap_or_else(|error| panic!("artifact store: {error}"));
+        let artifact = artifacts
+            .put(state, b"non-mutating verification")
+            .unwrap_or_else(|error| panic!("verification artifact: {error}"));
+        let verification = VerificationResultV1 {
+            schema_version: super::VERIFICATION_RESULT_SCHEMA_VERSION,
+            verification_id: "verification.E".to_owned(),
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            plan_digest: plan_digest.to_owned(),
+            task_id: "task.E".to_owned(),
+            task_contract_digest: task_digest.to_owned(),
+            attempt_id: "attempt.E.1".to_owned(),
+            execution_epoch: 1,
+            evaluator: "builtin.diff.scoped_change.v1".to_owned(),
+            acceptance_contract_digest: acceptance_contract_digest.to_owned(),
+            diff_digest: sha256_prefixed(b"evidence-only"),
+            post_snapshot_digest: "snapshot.N".to_owned(),
+            expected_target_mode: 0,
+            observed_target_mode: 0,
+            evidence_ids: vec!["ev.E".to_owned()],
+            command_results: Vec::new(),
+            passed: true,
+            failure_code: None,
+        };
+        state
+            .put_state(
+                "controller.verification",
+                &revision_scoped_key("plan.fixture", 1, &verification.verification_id),
+                &serde_json::to_string(&verification)
+                    .unwrap_or_else(|error| panic!("verification json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist verification: {error}"));
+        (verification, artifact.digest)
+    }
+
+    fn persist_non_mutating_carry_bindings(
+        state: &mut StateStore,
+        task: &Value,
+        instruction_digest: String,
+        verification: &VerificationResultV1,
+        verification_artifact_digest: &str,
+    ) {
+        let proof = TaskCarryFingerprintV1 {
+            schema_version: super::TASK_CARRY_FINGERPRINT_SCHEMA_VERSION,
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            plan_digest: verification.plan_digest.clone(),
+            task_id: "task.E".to_owned(),
+            task_contract_digest: verification.task_contract_digest.clone(),
+            implementation_inputs_digest: super::task_inputs_digest(task)
+                .unwrap_or_else(|error| panic!("inputs digest: {error}")),
+            dependency_contract_digest: super::task_dependency_contract_digest(task)
+                .unwrap_or_else(|error| panic!("dependency digest: {error}")),
+            instruction_fingerprint_digest: instruction_digest,
+            source_fingerprints: BTreeMap::new(),
+            execution_provenance: None,
+            acceptance_contract_digest: verification.acceptance_contract_digest.clone(),
+            verification_id: verification.verification_id.clone(),
+            verification_artifact_digest: verification_artifact_digest.to_owned(),
+        };
+        state
+            .put_state(
+                "controller.task_carry_fingerprint",
+                &revision_scoped_key("plan.fixture", 1, "task.E"),
+                &serde_json::to_string(&proof)
+                    .unwrap_or_else(|error| panic!("carry proof json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist carry proof: {error}"));
+
+        for (namespace, kind, binding_id) in [
+            ("controller.artifact_binding", "artifact", "artifact.task.E"),
+            ("controller.acceptance_binding", "acceptance", "AC.task.E"),
+        ] {
+            let binding = VerifiedOutputBindingV1 {
+                schema_version: super::VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION,
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 1,
+                plan_digest: verification.plan_digest.clone(),
+                task_id: "task.E".to_owned(),
+                task_contract_digest: verification.task_contract_digest.clone(),
+                attempt_id: verification.attempt_id.clone(),
+                binding_kind: kind.to_owned(),
+                binding_id: binding_id.to_owned(),
+                verification_id: verification.verification_id.clone(),
+                verification_artifact_digest: verification_artifact_digest.to_owned(),
+                repository_snapshot_digest: verification.post_snapshot_digest.clone(),
+                change_set_digest: None,
+                carried_from_plan_revision: None,
+                carried_from_plan_digest: None,
+            };
+            state
+                .put_state(
+                    namespace,
+                    &revision_scoped_key(
+                        "plan.fixture",
+                        1,
+                        &output_binding_key("task.E", binding_id),
+                    ),
+                    &serde_json::to_string(&binding)
+                        .unwrap_or_else(|error| panic!("binding json: {error}")),
+                )
+                .unwrap_or_else(|error| panic!("persist binding: {error}"));
+        }
+    }
+
+    fn assert_non_mutating_carry_build(
+        build: &SupersedingRuntimeBuild,
+        verification: &VerificationResultV1,
+    ) {
+        let carried = &build.tasks["task.E"];
+        assert_eq!(carried.state, TaskState::Succeeded);
+        assert!(carried.worktree_lease.is_none());
+        assert!(carried.worktree_state.is_none());
+        assert!(carried.worktree_baseline.is_none());
+        assert!(carried.worktree_composition.is_empty());
+        assert!(carried.worktree_conflict.is_none());
+        assert!(carried.change_set.is_none());
+        assert!(carried.change_set_artifact_digest.is_none());
+        assert!(carried.change_set_carry.is_none());
+        assert!(carried.integration_views.is_empty());
+        assert!(
+            !build
+                .carry_records
+                .iter()
+                .any(|(namespace, _, _)| namespace == "controller.change_set")
+        );
+        let carried_proof = build
+            .carry_records
+            .iter()
+            .find(|(namespace, key, _)| {
+                namespace == "controller.task_carry_fingerprint"
+                    && key == &revision_scoped_key("plan.fixture", 2, "task.E")
+            })
+            .map_or_else(
+                || panic!("carried task fingerprint missing"),
+                |(_, _, raw)| {
+                    serde_json::from_str::<TaskCarryFingerprintV1>(raw)
+                        .unwrap_or_else(|error| panic!("carried proof json: {error}"))
+                },
+            );
+        assert!(carried_proof.execution_provenance.is_none());
+        assert_eq!(carried_proof.verification_id, verification.verification_id);
+        assert!(build.carry_records.iter().any(|(namespace, key, _)| {
+            namespace == "controller.artifact_binding"
+                && key
+                    == &revision_scoped_key(
+                        "plan.fixture",
+                        2,
+                        &output_binding_key("task.E", "artifact.task.E"),
+                    )
+        }));
+        assert!(build.carry_records.iter().any(|(namespace, key, _)| {
+            namespace == "controller.acceptance_binding"
+                && key
+                    == &revision_scoped_key(
+                        "plan.fixture",
+                        2,
+                        &output_binding_key("task.E", "AC.task.E"),
+                    )
+        }));
+    }
+
+    #[test]
+    fn d3_non_mutating_task_carries_without_changeset_or_execution_provenance() {
+        let (base, mut state) = temp_state("d3-non-mutating-carry");
+        let task = valid_task_fixture("task.E", &["repo.app"], false);
+        let task_digest = digest_json(&task).unwrap_or_else(|error| panic!("task digest: {error}"));
+        let plan_one_digest = format!("sha256:{}", "1".repeat(64));
+        let plan_two_digest = format!("sha256:{}", "2".repeat(64));
+        let mut previous = active_fixture(&base, 1, &plan_one_digest);
+        install_valid_plan_document(&mut previous, &base, 1, "D3", vec![task.clone()]);
+        let mut previous_runtime = fresh_task_runtime(&task)
+            .unwrap_or_else(|error| panic!("non-mutating runtime: {error}"));
+        previous_runtime.state = TaskState::Succeeded;
+        previous.tasks.insert("task.E".to_owned(), previous_runtime);
+
+        let mut next_plan = previous.plan_document.clone();
+        next_plan["revision"] = json!(2);
+        next_plan["supersedes_revision"] = json!(1);
+        next_plan["compiled_at"] = json!("2026-09-19T06:30:00Z");
+        let instruction_digest = super::task_instruction_fingerprint_digest(&next_plan, &task)
+            .unwrap_or_else(|error| panic!("instruction digest: {error}"));
+        let (_, acceptance_contract_digest) = compiled_acceptance_contract(&task)
+            .unwrap_or_else(|error| panic!("acceptance contract: {error}"));
+
+        let (verification, verification_artifact_digest) = persist_non_mutating_carry_verification(
+            &mut state,
+            &base,
+            &task_digest,
+            &plan_one_digest,
+            &acceptance_contract_digest,
+        );
+        persist_non_mutating_carry_bindings(
+            &mut state,
+            &task,
+            instruction_digest,
+            &verification,
+            &verification_artifact_digest,
+        );
+
+        let diff = PlanRevisionDiff {
+            plan_id: "plan.fixture".to_owned(),
+            from_revision: 1,
+            to_revision: 2,
+            from_plan_digest: plan_one_digest,
+            to_plan_digest: plan_two_digest.clone(),
+            scope: ReplanScope::Task,
+            invalidated_contract_ids: vec!["ASSUME.unrelated".to_owned()],
+            affected_task_ids: vec!["task.X".to_owned()],
+            unchanged_task_ids: vec!["task.E".to_owned()],
+            changed_task_ids: Vec::new(),
+            added_task_ids: Vec::new(),
+            removed_task_ids: Vec::new(),
+        };
+        let build = build_superseding_runtime(
+            &state,
+            &ProjectRegistry::new(),
+            &previous,
+            &next_plan,
+            &plan_two_digest,
+            &json!({"exact_evidence": []}),
+            &diff,
+            &BTreeMap::from([("repo.app".to_owned(), "snapshot.N+1".to_owned())]),
+        )
+        .unwrap_or_else(|error| panic!("non-mutating superseding runtime: {error}"));
+
+        assert_non_mutating_carry_build(&build, &verification);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn dependent_carry_requires_upstream_to_actually_carry_into_n_plus_one() {
@@ -23870,35 +27817,32 @@ mod tests {
         let plan_one_digest = format!("sha256:{}", "1".repeat(64));
         let plan_two_digest = format!("sha256:{}", "2".repeat(64));
         let task = |task_id: &str, dependency: Option<&str>| {
-            json!({
-                "task_id": task_id,
-                "dependencies": dependency.into_iter().collect::<Vec<_>>(),
-                "dependency_bindings": dependency.into_iter().map(|upstream| json!({
-                    "upstream_task_id": upstream,
-                    "required_artifact_ids": [format!("artifact.{upstream}")],
-                    "required_acceptance_criterion_ids": [format!("AC.{upstream}")],
-                    "freshness": "carry_forward_if_inputs_unchanged"
-                })).collect::<Vec<_>>(),
-                "implementation_contract": {"inputs": []},
-                "acceptance_criteria": [{
-                    "criterion_id": format!("AC.{task_id}"),
-                    "evidence_freshness": "carry_forward_if_inputs_unchanged",
-                    "required": true
-                }],
-                "expected_artifacts": [{
-                    "artifact_id": format!("artifact.{task_id}"),
-                    "required": true
-                }]
-            })
+            let mut task = valid_task_fixture(task_id, &["repo.app"], true);
+            task["resource_budget"]["max_network_bytes"] = json!(0);
+            task["dependencies"] = json!(dependency.into_iter().collect::<Vec<_>>());
+            task["dependency_bindings"] = json!(
+                dependency
+                    .into_iter()
+                    .map(|upstream| json!({
+                        "upstream_task_id": upstream,
+                        "required_artifact_ids": [format!("artifact.{upstream}")],
+                        "required_acceptance_criterion_ids": [format!("AC.{upstream}")],
+                        "freshness": "carry_forward_if_inputs_unchanged"
+                    }))
+                    .collect::<Vec<_>>()
+            );
+            task
         };
-        let task_a = task("A", None);
-        let task_b = task("B", Some("A"));
+        let task_a = task("task.A", None);
+        let task_b = task("task.B", Some("task.A"));
         let digest_a = digest_json(&task_a).unwrap_or_else(|error| panic!("digest A: {error}"));
         let digest_b = digest_json(&task_b).unwrap_or_else(|error| panic!("digest B: {error}"));
-        let next_plan = json!({
-            "repositories": [{"instructions": []}],
-            "tasks": [task_a.clone(), task_b.clone()]
-        });
+        let mut next_plan = valid_plan_ir_fixture();
+        next_plan["revision"] = json!(2);
+        next_plan["supersedes_revision"] = json!(1);
+        next_plan["compiled_at"] = json!("2026-09-19T05:00:00Z");
+        next_plan["tasks"] = json!([task_a.clone(), task_b.clone()]);
+        next_plan["edges"] = json!([]);
         let instruction_digest = plan_instruction_fingerprint_digest(&next_plan)
             .unwrap_or_else(|error| panic!("instruction digest: {error}"));
         state
@@ -23910,9 +27854,16 @@ mod tests {
             .unwrap_or_else(|error| panic!("persist compilation evidence: {error}"));
 
         let mut previous = active_fixture(&base, 1, &plan_one_digest);
+        let mut previous_plan = valid_plan_ir_fixture();
+        previous_plan["revision"] = json!(1);
+        previous_plan["supersedes_revision"] = Value::Null;
+        previous_plan["compiled_at"] = json!("2026-09-19T04:00:00Z");
+        previous_plan["tasks"] = json!([task_a.clone(), task_b.clone()]);
+        previous_plan["edges"] = json!([]);
+        previous.plan_document = previous_plan;
         for (task_id, task_value, task_digest, source_fingerprints) in [
             (
-                "A",
+                "task.A",
                 &task_a,
                 &digest_a,
                 BTreeMap::from([(
@@ -23920,7 +27871,7 @@ mod tests {
                     format!("sha256:{}", "9".repeat(64)),
                 )]),
             ),
-            ("B", &task_b, &digest_b, BTreeMap::new()),
+            ("task.B", &task_b, &digest_b, BTreeMap::new()),
         ] {
             let old_lease = WorktreeLease {
                 schema_version: 1,
@@ -23958,6 +27909,7 @@ mod tests {
                     worktree_baseline: None,
                     worktree_composition: Vec::new(),
                     worktree_conflict: None,
+                    integration_views: BTreeMap::new(),
                     task_contract_digest: task_digest.clone(),
                     task: task_value.clone(),
                 },
@@ -24071,7 +28023,7 @@ mod tests {
             scope: ReplanScope::Task,
             invalidated_contract_ids: vec!["ASSUME.unrelated".to_owned()],
             affected_task_ids: vec!["X".to_owned()],
-            unchanged_task_ids: vec!["A".to_owned(), "B".to_owned()],
+            unchanged_task_ids: vec!["task.A".to_owned(), "task.B".to_owned()],
             changed_task_ids: vec!["X".to_owned()],
             added_task_ids: Vec::new(),
             removed_task_ids: Vec::new(),
@@ -24084,11 +28036,11 @@ mod tests {
             &plan_two_digest,
             &json!({"exact_evidence": []}),
             &diff,
-            "snapshot.N+1",
+            &BTreeMap::from([("repo.app".to_owned(), "snapshot.N+1".to_owned())]),
         )
         .unwrap_or_else(|error| panic!("superseding runtime: {error}"));
-        assert_eq!(build.tasks["A"].state, TaskState::Planned);
-        assert_eq!(build.tasks["B"].state, TaskState::Planned);
+        assert_eq!(build.tasks["task.A"].state, TaskState::Planned);
+        assert_eq!(build.tasks["task.B"].state, TaskState::Planned);
         assert!(build.tasks.values().all(|task| {
             task.worktree_lease.is_none()
                 && task.worktree_state.is_none()
@@ -24287,6 +28239,2146 @@ mod tests {
         assert!(
             has_unresolved_process_lease(&state)
                 .unwrap_or_else(|error| panic!("unknown unresolved check: {error}"))
+        );
+        drop(state);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn init_committed_test_repository(base: &Path, name: &str) -> PathBuf {
+        let root = base.join(name);
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("create {name} repository: {error}"));
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap_or_else(|error| panic!("git {args:?} in {name}: {error}"));
+            assert!(
+                output.status.success(),
+                "git {args:?} in {name} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Sovereign Test"]);
+        git(&["config", "user.email", "test@sovereign.invalid"]);
+        std::fs::write(root.join("tracked.txt"), format!("{name}\n"))
+            .unwrap_or_else(|error| panic!("write {name} baseline: {error}"));
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "baseline"]);
+        root.canonicalize()
+            .unwrap_or_else(|error| panic!("canonicalize {name}: {error}"))
+    }
+
+    fn integration_gate_fixture(label: &str) -> (PathBuf, Controller, ProjectRegistry) {
+        let (base, state) = temp_state(label);
+        let repo_a = init_committed_test_repository(&base, "repo-a");
+        let repo_b = init_committed_test_repository(&base, "repo-b");
+        let mut registry = ProjectRegistry::new();
+        registry
+            .register("repo.a", &repo_a)
+            .unwrap_or_else(|error| panic!("register repo.a: {error}"));
+        registry
+            .register("repo.b", &repo_b)
+            .unwrap_or_else(|error| panic!("register repo.b: {error}"));
+
+        let mut task = valid_task_fixture("task.A7", &["repo.a", "repo.b"], false);
+        task["resource_budget"] = test_goal_resource_policy();
+        let mut plan_document = valid_plan_ir_fixture();
+        let mut repository_a = plan_document["repositories"][0].clone();
+        repository_a["repository_id"] = json!("repo.a");
+        repository_a["root"] = json!(repo_a);
+        repository_a["instructions"] = json!([]);
+        let mut repository_b = repository_a.clone();
+        repository_b["repository_id"] = json!("repo.b");
+        repository_b["root"] = json!(repo_b);
+        plan_document["plan_id"] = json!("plan.integration");
+        plan_document["revision"] = json!(1);
+        plan_document["supersedes_revision"] = Value::Null;
+        plan_document["compiled_at"] = json!("2026-09-19T05:00:00Z");
+        plan_document["goal"]["goal_id"] = json!("goal.integration");
+        plan_document["policy"]["resources"] = test_goal_resource_policy();
+        plan_document["depth"] = json!({
+            "mode": "D4",
+            "reason": "Multi-repository read/process integration gate fixture.",
+            "features": {"repository_count": 2, "cross_repo": true}
+        });
+        plan_document["repositories"] = json!([repository_a, repository_b]);
+        plan_document["tasks"] = json!([task.clone()]);
+        plan_document["edges"] = json!([]);
+        let plan_digest =
+            digest_json(&plan_document).unwrap_or_else(|error| panic!("plan digest: {error}"));
+        let repository_state = |repository_id: &str, root: &Path| {
+            let baseline = registry
+                .snapshot(repository_id)
+                .unwrap_or_else(|error| panic!("snapshot {repository_id}: {error}"));
+            let diff = ExactRetriever::new(&registry)
+                .current_diff(repository_id)
+                .unwrap_or_else(|error| panic!("diff {repository_id}: {error}"));
+            ActiveRepositoryState {
+                repository_id: repository_id.to_owned(),
+                repository_root: root.to_path_buf(),
+                baseline,
+                baseline_diff_digest: diff.digest,
+                baseline_diff_content: diff.content,
+            }
+        };
+        let runtime =
+            fresh_task_runtime(&task).unwrap_or_else(|error| panic!("A7 runtime: {error}"));
+        let active = ActivePlan {
+            plan_document,
+            compiler_plan_digest: plan_digest.clone(),
+            plan_id: "plan.integration".to_owned(),
+            goal_id: "goal.integration".to_owned(),
+            revision: 1,
+            plan_digest,
+            compilation_evidence_digest: format!("sha256:{}", "e".repeat(64)),
+            policy_digest: format!("sha256:{}", "f".repeat(64)),
+            repositories: BTreeMap::from([
+                ("repo.a".to_owned(), repository_state("repo.a", &repo_a)),
+                ("repo.b".to_owned(), repository_state("repo.b", &repo_b)),
+            ]),
+            validity: PlanValidity::Current,
+            goal_autonomy_budget: test_goal_autonomy_budget(),
+            tasks: BTreeMap::from([("task.A7".to_owned(), runtime)]),
+            attempts: BTreeMap::new(),
+        };
+        let mut controller = Controller::new(state);
+        controller.active = Some(active);
+        (base, controller, registry)
+    }
+
+    fn configure_integration_gate_command_contract(
+        controller: &mut Controller,
+        command_count: usize,
+    ) -> Vec<super::RequiredCommandVerificationStep> {
+        assert!(command_count > 0);
+        let mut task = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active integration plan: {error}"))
+            .tasks["task.A7"]
+            .task
+            .clone();
+        let criteria = (0..command_count)
+            .map(|index| {
+                json!({
+                    "criterion_id": format!("AC.command.{index}"),
+                    "description": format!("integration command {index} passes"),
+                    "kind": "command",
+                    "verification_step_ids": [format!("verify.command.{index}")],
+                    "evidence_type": "test_result",
+                    "evidence_freshness": "current_attempt",
+                    "required": true
+                })
+            })
+            .collect::<Vec<_>>();
+        let steps = (0..command_count)
+            .map(|index| {
+                json!({
+                    "step_id": format!("verify.command.{index}"),
+                    "criterion_ids": [format!("AC.command.{index}")],
+                    "kind": "command",
+                    "evidence_type": "test_result",
+                    "command_spec": {
+                        "tool_id": "tool.process",
+                        "mode": "exec",
+                        "program": "true",
+                        "args": [],
+                        "repository_id": if index % 2 == 0 { "repo.a" } else { "repo.b" },
+                        "working_dir_relative": ".",
+                        "literal_env": {},
+                        "secret_env": {},
+                        "stdin_artifact_id": null,
+                        "timeout_seconds": 5,
+                        "output_limit_bytes": 65536
+                    },
+                    "expected_exit_codes": [0]
+                })
+            })
+            .collect::<Vec<_>>();
+        task["acceptance_criteria"] = Value::Array(criteria);
+        task["verification"] = json!({
+            "steps": steps,
+            "required_evidence_types": ["test_result"],
+            "fresh_reviewer_role": null
+        });
+        let runtime =
+            fresh_task_runtime(&task).unwrap_or_else(|error| panic!("command A7 runtime: {error}"));
+        {
+            let active = controller
+                .active
+                .as_mut()
+                .unwrap_or_else(|| panic!("active integration plan missing"));
+            active.plan_document["tasks"] = json!([task.clone()]);
+            active.tasks.insert("task.A7".to_owned(), runtime);
+            let plan_digest = digest_json(&active.plan_document)
+                .unwrap_or_else(|error| panic!("command A7 plan digest: {error}"));
+            active.plan_digest.clone_from(&plan_digest);
+            active.compiler_plan_digest = plan_digest;
+        }
+        required_command_verification_steps(&task)
+            .unwrap_or_else(|error| panic!("required A7 commands: {error}"))
+    }
+
+    fn prepare_integration_gate_recovery_attempt(
+        controller: &mut Controller,
+        registry: &ProjectRegistry,
+    ) -> (String, i64, String) {
+        controller
+            .ensure_integration_views(registry, "task.A7")
+            .unwrap_or_else(|error| panic!("materialize A7 recovery views: {error}"));
+        let view_digest = controller
+            .integration_view_set_digest(registry, "task.A7")
+            .unwrap_or_else(|error| panic!("A7 recovery view digest: {error}"));
+        let execution_epoch = controller
+            .state
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("A7 recovery epoch: {error}"));
+        let attempt_id = "attempt.integration.recovery.1".to_owned();
+        let task_contract_digest = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active A7 plan: {error}"))
+            .tasks["task.A7"]
+            .task_contract_digest
+            .clone();
+        let attempt = super::AttemptRuntime {
+            task_id: "task.A7".to_owned(),
+            attempt_id: attempt_id.clone(),
+            state: super::AttemptState::Verifying,
+            task_contract_digest,
+            repair_origin: None,
+            baseline_digest: view_digest.clone(),
+            pre_snapshot_digest: view_digest.clone(),
+            pre_diff_digest: sha256_prefixed(
+                format!("integration_read_only\0{view_digest}").as_bytes(),
+            ),
+            pre_changed_fingerprints: BTreeMap::new(),
+        };
+        let active = controller
+            .active
+            .as_mut()
+            .unwrap_or_else(|| panic!("active A7 plan missing"));
+        let task = active
+            .tasks
+            .get_mut("task.A7")
+            .unwrap_or_else(|| panic!("A7 task runtime missing"));
+        task.state = TaskState::Verifying;
+        task.attempts_started = 1;
+        active.attempts.insert(attempt_id.clone(), attempt);
+        (attempt_id, execution_epoch, view_digest)
+    }
+
+    fn persist_integration_recovery_command_intent(
+        controller: &mut Controller,
+        base: &Path,
+        attempt_id: &str,
+        step: &super::RequiredCommandVerificationStep,
+    ) -> (PersistedVerificationCommandIntentV1, String) {
+        let (plan_id, plan_revision, plan_digest, task_contract_digest, policy_digest) = {
+            let active = controller
+                .active_ref()
+                .unwrap_or_else(|error| panic!("active A7 plan: {error}"));
+            (
+                active.plan_id.clone(),
+                active.revision,
+                active.plan_digest.clone(),
+                active.tasks["task.A7"].task_contract_digest.clone(),
+                active.policy_digest.clone(),
+            )
+        };
+        let execution_epoch = controller
+            .state
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("A7 recovery epoch: {error}"));
+        let resource_lease_id = verification_build_lease_id(
+            &plan_id,
+            plan_revision,
+            "task.A7",
+            attempt_id,
+            &step.step_id,
+            execution_epoch,
+        );
+        let action_id = heavy_build_action_id(&resource_lease_id);
+        let intent = PersistedVerificationCommandIntentV1 {
+            schema_version: VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION,
+            plan_id,
+            plan_revision,
+            plan_digest,
+            task_id: "task.A7".to_owned(),
+            task_contract_digest,
+            attempt_id: attempt_id.to_owned(),
+            step_id: step.step_id.clone(),
+            step_digest: step.step_digest.clone(),
+            resource_lease_id,
+            action_id: action_id.clone(),
+            payload_digest: sha256_prefixed(
+                format!("payload\0{attempt_id}\0{}", step.step_id).as_bytes(),
+            ),
+            policy_digest,
+            execution_epoch,
+            artifact_store_root: base.join("a7-command-cas"),
+        };
+        controller
+            .state
+            .put_state(
+                VERIFICATION_COMMAND_INTENT_NAMESPACE,
+                &action_id,
+                &serde_json::to_string(&intent)
+                    .unwrap_or_else(|error| panic!("A7 command intent json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist A7 command intent: {error}"));
+        (intent, action_id)
+    }
+
+    fn persist_integration_recovery_committed_receipt(
+        controller: &mut Controller,
+        intent: &PersistedVerificationCommandIntentV1,
+        action_id: &str,
+        exit_code: i32,
+    ) {
+        let artifacts = ArtifactStore::open(&intent.artifact_store_root)
+            .unwrap_or_else(|error| panic!("A7 command CAS: {error}"));
+        let receipt_bytes = serde_json::to_vec(&json!({
+            "schema": ACTION_RECEIPT_SCHEMA,
+            "schema_version": ACTION_RECEIPT_SCHEMA_VERSION,
+            "action_id": action_id,
+            "payload_digest": intent.payload_digest,
+            "policy_digest": intent.policy_digest,
+            "execution_epoch": intent.execution_epoch,
+            "exit_code": exit_code,
+            "elapsed_ms": 7,
+            "terminated_for_limit": null,
+            "process_group_reaped": true,
+            "stdout": {
+                "sha256": sha256_prefixed(b"a7-stdout"),
+                "retained_bytes": 0
+            },
+            "stderr": {
+                "sha256": sha256_prefixed(b"a7-stderr"),
+                "retained_bytes": 0
+            }
+        }))
+        .unwrap_or_else(|error| panic!("A7 receipt json: {error}"));
+        let receipt = artifacts
+            .put(&mut controller.state, &receipt_bytes)
+            .unwrap_or_else(|error| panic!("persist A7 receipt: {error}"));
+        controller
+            .state
+            .transition_action_with_event(ActionTransition {
+                action_id,
+                expected_state: "observed",
+                next_state: "committed",
+                expected_epoch: intent.execution_epoch,
+                event_id: &format!("event.{action_id}.committed"),
+                event_kind: "committed",
+                payload_json: "{}",
+                result_digest: Some(receipt.digest.as_str()),
+            })
+            .unwrap_or_else(|error| panic!("commit A7 recovery action: {error}"));
+        let process_lease = RecoveryProcessLease {
+            schema_version: super::RECOVERY_PROCESS_LEASE_SCHEMA_VERSION,
+            lease_id: format!("process.{action_id}"),
+            task_id: "task.A7".to_owned(),
+            attempt_id: heavy_build_attempt_id(&intent.resource_lease_id),
+            action_id: action_id.to_owned(),
+            process_group_id: None,
+            leader_identity: None,
+            state: "reaped".to_owned(),
+        };
+        controller
+            .state
+            .put_state(
+                "controller.process_lease",
+                action_id,
+                &serde_json::to_string(&process_lease)
+                    .unwrap_or_else(|error| panic!("A7 process lease json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist A7 process lease: {error}"));
+    }
+
+    fn seed_integration_recovery_command(
+        controller: &mut Controller,
+        base: &Path,
+        attempt_id: &str,
+        step: &super::RequiredCommandVerificationStep,
+        lifecycle: &str,
+        exit_code: i32,
+    ) -> String {
+        let (intent, action_id) =
+            persist_integration_recovery_command_intent(controller, base, attempt_id, step);
+        if lifecycle == "intent_only" {
+            return action_id;
+        }
+        let initial_state = match lifecycle {
+            "prepared" => "prepared",
+            "failed" => "failed",
+            _ => "authorized",
+        };
+        controller
+            .state
+            .insert_action_record(NewActionRecord {
+                action_id: &action_id,
+                state: initial_state,
+                payload_digest: &intent.payload_digest,
+                policy_digest: &intent.policy_digest,
+                execution_epoch: intent.execution_epoch,
+                event_id: &format!("event.{action_id}.{initial_state}"),
+                event_kind: initial_state,
+                payload_json: "{}",
+            })
+            .unwrap_or_else(|error| panic!("insert A7 recovery action: {error}"));
+        if matches!(lifecycle, "prepared" | "authorized" | "failed") {
+            return action_id;
+        }
+        controller
+            .state
+            .transition_action_with_event(ActionTransition {
+                action_id: &action_id,
+                expected_state: "authorized",
+                next_state: "dispatched",
+                expected_epoch: intent.execution_epoch,
+                event_id: &format!("event.{action_id}.dispatched"),
+                event_kind: "dispatched",
+                payload_json: "{}",
+                result_digest: None,
+            })
+            .unwrap_or_else(|error| panic!("dispatch A7 recovery action: {error}"));
+        if lifecycle == "dispatched" {
+            return action_id;
+        }
+        if lifecycle == "unknown" {
+            controller
+                .state
+                .recover_nonterminal_action_as_unknown(
+                    &action_id,
+                    &["dispatched"],
+                    &format!("event.{action_id}.unknown"),
+                    "{}",
+                )
+                .unwrap_or_else(|error| panic!("fence A7 action Unknown: {error}"));
+            return action_id;
+        }
+        controller
+            .state
+            .transition_action_with_event(ActionTransition {
+                action_id: &action_id,
+                expected_state: "dispatched",
+                next_state: "observed",
+                expected_epoch: intent.execution_epoch,
+                event_id: &format!("event.{action_id}.observed"),
+                event_kind: "observed",
+                payload_json: "{}",
+                result_digest: None,
+            })
+            .unwrap_or_else(|error| panic!("observe A7 recovery action: {error}"));
+        if lifecycle == "observed" {
+            return action_id;
+        }
+        persist_integration_recovery_committed_receipt(controller, &intent, &action_id, exit_code);
+        action_id
+    }
+
+    fn recovered_integration_verification(
+        controller: &Controller,
+        registry: &ProjectRegistry,
+        candidate: &super::RecoveredIntegrationGateCandidate,
+    ) -> VerificationResultV1 {
+        let task = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active A7 plan: {error}"))
+            .tasks["task.A7"]
+            .task
+            .clone();
+        let command_results = controller
+            .recover_required_command_verification(&candidate.binding, &task)
+            .unwrap_or_else(|error| panic!("recover A7 command results: {error}"));
+        let view_digest = controller
+            .integration_view_set_digest(registry, "task.A7")
+            .unwrap_or_else(|error| panic!("A7 current view digest: {error}"));
+        controller
+            .build_integration_gate_verification(
+                "task.A7",
+                &candidate.attempt_id,
+                candidate.binding.execution_epoch,
+                &view_digest,
+                command_results,
+            )
+            .unwrap_or_else(|error| panic!("build recovered A7 verification: {error}"))
+    }
+
+    fn journal_event_count(controller: &Controller, event_kind: &str) -> usize {
+        controller
+            .state
+            .journal()
+            .unwrap_or_else(|error| panic!("read controller journal: {error}"))
+            .iter()
+            .filter(|event| event.event_kind == event_kind)
+            .count()
+    }
+
+    #[test]
+    fn integration_gate_recovery_classifies_pre_dispatch_and_unknown_without_replay() {
+        for (label, lifecycle, expected_task_state) in [
+            ("a7-recovery-no-intent", "none", TaskState::Planned),
+            ("a7-recovery-intent-only", "intent_only", TaskState::Planned),
+            ("a7-recovery-prepared", "prepared", TaskState::Planned),
+            ("a7-recovery-authorized", "authorized", TaskState::Planned),
+            ("a7-recovery-failed", "failed", TaskState::Planned),
+            (
+                "a7-recovery-unknown",
+                "unknown",
+                TaskState::ReconcilingUnknown,
+            ),
+        ] {
+            let (base, mut controller, registry) = integration_gate_fixture(label);
+            let steps = configure_integration_gate_command_contract(&mut controller, 1);
+            let (attempt_id, execution_epoch, _) =
+                prepare_integration_gate_recovery_attempt(&mut controller, &registry);
+            let action_id = (lifecycle != "none").then(|| {
+                seed_integration_recovery_command(
+                    &mut controller,
+                    &base,
+                    &attempt_id,
+                    &steps[0],
+                    lifecycle,
+                    0,
+                )
+            });
+            let unknown = action_id
+                .as_ref()
+                .filter(|_| lifecycle == "unknown")
+                .cloned()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let classification = super::classify_recovered_integration_gates(
+                &mut controller,
+                &unknown,
+                execution_epoch,
+            )
+            .unwrap_or_else(|error| panic!("{label} classification: {error}"));
+            assert!(classification.preserved_attempt_ids.contains(&attempt_id));
+            assert!(classification.resumable.is_empty());
+            assert_eq!(
+                controller.task_state("task.A7"),
+                Some(expected_task_state),
+                "{label}"
+            );
+            assert_eq!(
+                controller
+                    .active_ref()
+                    .unwrap_or_else(|error| panic!("{label} active plan: {error}"))
+                    .attempts[&attempt_id]
+                    .state,
+                super::AttemptState::Interrupted,
+                "{label}"
+            );
+            assert_eq!(
+                controller
+                    .state
+                    .current_execution_epoch()
+                    .unwrap_or_else(|error| panic!("{label} epoch: {error}")),
+                execution_epoch,
+                "classification must not advance the historical epoch"
+            );
+            if let Some(action_id) = action_id {
+                let state = controller
+                    .state
+                    .action_record(&action_id)
+                    .unwrap_or_else(|error| panic!("{label} action record: {error}"))
+                    .map(|action| action.state);
+                let expected = match lifecycle {
+                    "intent_only" => None,
+                    "prepared" => Some("prepared".to_owned()),
+                    "authorized" => Some("authorized".to_owned()),
+                    "failed" => Some("failed".to_owned()),
+                    "unknown" => Some("unknown".to_owned()),
+                    other => panic!("unexpected lifecycle {other}"),
+                };
+                assert_eq!(state, expected, "{label} must not redispatch");
+            }
+            drop(controller);
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    #[test]
+    fn integration_gate_recovery_committed_receipt_finishes_historical_success_pre_epoch() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture("a7-recovery-committed-success");
+        let steps = configure_integration_gate_command_contract(&mut controller, 1);
+        let (attempt_id, execution_epoch, _) =
+            prepare_integration_gate_recovery_attempt(&mut controller, &registry);
+        let action_id = seed_integration_recovery_command(
+            &mut controller,
+            &base,
+            &attempt_id,
+            &steps[0],
+            "committed",
+            0,
+        );
+        let dispatched_before = controller
+            .state
+            .journal()
+            .unwrap_or_else(|error| panic!("journal before A7 recovery: {error}"))
+            .iter()
+            .filter(|event| {
+                event.entity_id == action_id && event.event_kind.as_str() == "dispatched"
+            })
+            .count();
+        let classification =
+            super::classify_recovered_integration_gates(&mut controller, &[], execution_epoch)
+                .unwrap_or_else(|error| panic!("classify committed A7: {error}"));
+        assert_eq!(classification.resumable.len(), 1);
+        controller
+            .resume_recovered_integration_gate(&registry, &classification.resumable[0])
+            .unwrap_or_else(|error| panic!("resume committed A7: {error}"));
+        assert_eq!(controller.task_state("task.A7"), Some(TaskState::Succeeded));
+        assert_eq!(
+            controller
+                .active_ref()
+                .unwrap_or_else(|error| panic!("active A7 plan: {error}"))
+                .attempts[&attempt_id]
+                .state,
+            super::AttemptState::Succeeded
+        );
+        assert_eq!(
+            controller
+                .state
+                .current_execution_epoch()
+                .unwrap_or_else(|error| panic!("epoch after A7 historical completion: {error}")),
+            execution_epoch
+        );
+        let checkpoint_key = revision_scoped_key("plan.integration", 1, "task.A7");
+        assert!(
+            controller
+                .state
+                .get_state(super::INTEGRATION_CHECKPOINT_NAMESPACE, &checkpoint_key)
+                .unwrap_or_else(|error| panic!("read A7 checkpoint: {error}"))
+                .is_some()
+        );
+        let dispatched_after = controller
+            .state
+            .journal()
+            .unwrap_or_else(|error| panic!("journal after A7 recovery: {error}"))
+            .iter()
+            .filter(|event| {
+                event.entity_id == action_id && event.event_kind.as_str() == "dispatched"
+            })
+            .count();
+        assert_eq!(dispatched_after, dispatched_before);
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn integration_gate_recovery_failed_receipt_routes_failure_without_checkpoint() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture("a7-recovery-committed-failure");
+        let steps = configure_integration_gate_command_contract(&mut controller, 1);
+        let (attempt_id, execution_epoch, _) =
+            prepare_integration_gate_recovery_attempt(&mut controller, &registry);
+        let _ = seed_integration_recovery_command(
+            &mut controller,
+            &base,
+            &attempt_id,
+            &steps[0],
+            "committed",
+            1,
+        );
+        let classification =
+            super::classify_recovered_integration_gates(&mut controller, &[], execution_epoch)
+                .unwrap_or_else(|error| panic!("classify failed A7 result: {error}"));
+        controller
+            .resume_recovered_integration_gate(&registry, &classification.resumable[0])
+            .unwrap_or_else(|error| panic!("route recovered A7 failure: {error}"));
+        assert_ne!(controller.task_state("task.A7"), Some(TaskState::Succeeded));
+        assert_eq!(
+            controller
+                .active_ref()
+                .unwrap_or_else(|error| panic!("active A7 plan: {error}"))
+                .attempts[&attempt_id]
+                .state,
+            super::AttemptState::Failed
+        );
+        let checkpoint_key = revision_scoped_key("plan.integration", 1, "task.A7");
+        assert!(
+            controller
+                .state
+                .get_state(super::INTEGRATION_CHECKPOINT_NAMESPACE, &checkpoint_key)
+                .unwrap_or_else(|error| panic!("read failed A7 checkpoint: {error}"))
+                .is_none()
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn integration_gate_recovery_partial_multistep_never_replays_committed_prefix() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture("a7-recovery-partial-multistep");
+        let steps = configure_integration_gate_command_contract(&mut controller, 2);
+        let (attempt_id, execution_epoch, _) =
+            prepare_integration_gate_recovery_attempt(&mut controller, &registry);
+        let committed_action = seed_integration_recovery_command(
+            &mut controller,
+            &base,
+            &attempt_id,
+            &steps[0],
+            "committed",
+            0,
+        );
+        let classification =
+            super::classify_recovered_integration_gates(&mut controller, &[], execution_epoch)
+                .unwrap_or_else(|error| panic!("classify partial A7: {error}"));
+        assert!(classification.resumable.is_empty());
+        assert_eq!(controller.task_state("task.A7"), Some(TaskState::Planned));
+        assert_eq!(
+            controller
+                .state
+                .action_record(&committed_action)
+                .unwrap_or_else(|error| panic!("read committed A7 prefix: {error}"))
+                .unwrap_or_else(|| panic!("committed A7 prefix disappeared"))
+                .state,
+            "committed"
+        );
+        assert!(
+            controller
+                .state
+                .get_state(
+                    VERIFICATION_COMMAND_INTENT_NAMESPACE,
+                    &heavy_build_action_id(&verification_build_lease_id(
+                        "plan.integration",
+                        1,
+                        "task.A7",
+                        &attempt_id,
+                        &steps[1].step_id,
+                        execution_epoch,
+                    )),
+                )
+                .unwrap_or_else(|error| panic!("read missing A7 suffix intent: {error}"))
+                .is_none()
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn integration_gate_recovery_maps_dispatched_and_observed_commands_to_unknown() {
+        for lifecycle in ["dispatched", "observed"] {
+            let label = format!("a7-recovery-{lifecycle}-unknown");
+            let (base, mut controller, registry) = integration_gate_fixture(&label);
+            let steps = configure_integration_gate_command_contract(&mut controller, 1);
+            let (attempt_id, execution_epoch, _) =
+                prepare_integration_gate_recovery_attempt(&mut controller, &registry);
+            let action_id = seed_integration_recovery_command(
+                &mut controller,
+                &base,
+                &attempt_id,
+                &steps[0],
+                lifecycle,
+                0,
+            );
+            let manifest = controller
+                .checkpoint_manifest()
+                .unwrap_or_else(|error| panic!("{label} checkpoint manifest: {error}"));
+            let unknown = super::reconcile_recovery_actions(
+                &mut controller.state,
+                &registry,
+                &BTreeSet::new(),
+                &manifest,
+                &BTreeMap::new(),
+            )
+            .unwrap_or_else(|error| panic!("{label} action reconciliation: {error}"));
+            assert_eq!(unknown, vec![action_id.clone()]);
+            assert_eq!(
+                controller
+                    .state
+                    .action_record(&action_id)
+                    .unwrap_or_else(|error| panic!("{label} action record: {error}"))
+                    .unwrap_or_else(|| panic!("{label} action disappeared"))
+                    .state,
+                "unknown"
+            );
+            let classification = super::classify_recovered_integration_gates(
+                &mut controller,
+                &unknown,
+                execution_epoch,
+            )
+            .unwrap_or_else(|error| panic!("{label} classification: {error}"));
+            assert!(classification.resumable.is_empty());
+            assert_eq!(
+                controller.task_state("task.A7"),
+                Some(TaskState::ReconcilingUnknown)
+            );
+            assert_eq!(
+                controller
+                    .active_ref()
+                    .unwrap_or_else(|error| panic!("{label} active plan: {error}"))
+                    .attempts[&attempt_id]
+                    .state,
+                super::AttemptState::Interrupted
+            );
+            drop(controller);
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    #[test]
+    fn integration_gate_recovery_reuses_verification_outputs_and_checkpoint_without_duplicate_events()
+     {
+        let (base, mut controller, registry) = integration_gate_fixture("a7-recovery-exact-reuse");
+        let steps = configure_integration_gate_command_contract(&mut controller, 1);
+        let (attempt_id, execution_epoch, _) =
+            prepare_integration_gate_recovery_attempt(&mut controller, &registry);
+        let _ = seed_integration_recovery_command(
+            &mut controller,
+            &base,
+            &attempt_id,
+            &steps[0],
+            "committed",
+            0,
+        );
+        let classification =
+            super::classify_recovered_integration_gates(&mut controller, &[], execution_epoch)
+                .unwrap_or_else(|error| panic!("classify A7 exact reuse: {error}"));
+        let candidate = classification.resumable[0].clone();
+        let verification = recovered_integration_verification(&controller, &registry, &candidate);
+        let artifacts = ArtifactStore::open(&candidate.binding.artifact_store_root)
+            .unwrap_or_else(|error| panic!("A7 verification CAS: {error}"));
+        let (verification_artifact_digest, _) = controller
+            .persist_verification_result(&artifacts, &verification, "verification_recorded")
+            .unwrap_or_else(|error| panic!("persist A7 verification before crash: {error}"));
+        controller
+            .record_verified_output_bindings(&verification, &verification_artifact_digest)
+            .unwrap_or_else(|error| panic!("persist A7 outputs before crash: {error}"));
+        let checkpoint = controller
+            .publish_integration_checkpoint(&registry, &verification, &verification_artifact_digest)
+            .unwrap_or_else(|error| panic!("publish A7 checkpoint before crash: {error}"));
+        let verification_events_before = journal_event_count(&controller, "verification_recorded");
+        let output_events_before = journal_event_count(&controller, "verified_output_bound");
+        let checkpoint_events_before =
+            journal_event_count(&controller, "integration_checkpoint_published");
+
+        controller
+            .resume_recovered_integration_gate(&registry, &candidate)
+            .unwrap_or_else(|error| panic!("resume A7 after checkpoint crash: {error}"));
+        assert_eq!(controller.task_state("task.A7"), Some(TaskState::Succeeded));
+        assert_eq!(
+            journal_event_count(&controller, "verification_recorded"),
+            verification_events_before
+        );
+        assert_eq!(
+            journal_event_count(&controller, "verified_output_bound"),
+            output_events_before
+        );
+        assert_eq!(
+            journal_event_count(&controller, "integration_checkpoint_published"),
+            checkpoint_events_before
+        );
+        let checkpoint_key = revision_scoped_key("plan.integration", 1, "task.A7");
+        let durable: super::IntegrationCheckpointV1 = serde_json::from_str(
+            &controller
+                .state
+                .get_state(super::INTEGRATION_CHECKPOINT_NAMESPACE, &checkpoint_key)
+                .unwrap_or_else(|error| panic!("read reused A7 checkpoint: {error}"))
+                .unwrap_or_else(|| panic!("reused A7 checkpoint disappeared")),
+        )
+        .unwrap_or_else(|error| panic!("decode reused A7 checkpoint: {error}"));
+        assert_eq!(durable, checkpoint);
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn integration_gate_recovery_reuses_existing_output_and_fills_missing_binding() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture("a7-recovery-partial-output-reuse");
+        let steps = configure_integration_gate_command_contract(&mut controller, 1);
+        let (attempt_id, execution_epoch, _) =
+            prepare_integration_gate_recovery_attempt(&mut controller, &registry);
+        let _ = seed_integration_recovery_command(
+            &mut controller,
+            &base,
+            &attempt_id,
+            &steps[0],
+            "committed",
+            0,
+        );
+        let classification =
+            super::classify_recovered_integration_gates(&mut controller, &[], execution_epoch)
+                .unwrap_or_else(|error| panic!("classify A7 partial output: {error}"));
+        let candidate = classification.resumable[0].clone();
+        let verification = recovered_integration_verification(&controller, &registry, &candidate);
+        let artifacts = ArtifactStore::open(&candidate.binding.artifact_store_root)
+            .unwrap_or_else(|error| panic!("A7 verification CAS: {error}"));
+        let (verification_artifact_digest, _) = controller
+            .persist_verification_result(&artifacts, &verification, "verification_recorded")
+            .unwrap_or_else(|error| panic!("persist A7 verification: {error}"));
+        let task_contract_digest = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active A7 plan: {error}"))
+            .tasks["task.A7"]
+            .task_contract_digest
+            .clone();
+        controller
+            .persist_verified_output_binding(
+                "controller.artifact_binding",
+                "artifact",
+                "artifact.task.A7",
+                &task_contract_digest,
+                &verification,
+                &verification_artifact_digest,
+            )
+            .unwrap_or_else(|error| panic!("persist first A7 output binding: {error}"));
+        let output_events_before = journal_event_count(&controller, "verified_output_bound");
+        assert_eq!(output_events_before, 1);
+
+        controller
+            .resume_recovered_integration_gate(&registry, &candidate)
+            .unwrap_or_else(|error| panic!("resume A7 partial output crash: {error}"));
+        assert_eq!(controller.task_state("task.A7"), Some(TaskState::Succeeded));
+        assert_eq!(
+            journal_event_count(&controller, "verified_output_bound"),
+            output_events_before + 1,
+            "exact artifact binding must be reused while only the missing acceptance binding is added"
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn integration_gate_recovery_fails_closed_on_verification_conflict() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture("a7-recovery-verification-conflict");
+        let steps = configure_integration_gate_command_contract(&mut controller, 1);
+        let (attempt_id, execution_epoch, _) =
+            prepare_integration_gate_recovery_attempt(&mut controller, &registry);
+        let _ = seed_integration_recovery_command(
+            &mut controller,
+            &base,
+            &attempt_id,
+            &steps[0],
+            "committed",
+            0,
+        );
+        let classification =
+            super::classify_recovered_integration_gates(&mut controller, &[], execution_epoch)
+                .unwrap_or_else(|error| panic!("classify A7 verification conflict: {error}"));
+        let candidate = classification.resumable[0].clone();
+        let verification = recovered_integration_verification(&controller, &registry, &candidate);
+        let mut conflicting = verification.clone();
+        conflicting.evaluator = "builtin.conflicting.verifier.v1".to_owned();
+        controller
+            .state
+            .put_state(
+                "controller.verification",
+                &revision_scoped_key(
+                    &verification.plan_id,
+                    verification.plan_revision,
+                    &verification.verification_id,
+                ),
+                &serde_json::to_string(&conflicting)
+                    .unwrap_or_else(|error| panic!("conflicting verification json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist conflicting A7 verification: {error}"));
+        let Err(error) = controller.resume_recovered_integration_gate(&registry, &candidate) else {
+            panic!("expected durable verification conflict")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with durable verification authority"),
+            "unexpected verification conflict error: {error}"
+        );
+        assert_eq!(controller.task_state("task.A7"), Some(TaskState::Verifying));
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn integration_gate_recovery_fails_closed_on_output_binding_conflict() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture("a7-recovery-output-conflict");
+        let steps = configure_integration_gate_command_contract(&mut controller, 1);
+        let (attempt_id, execution_epoch, _) =
+            prepare_integration_gate_recovery_attempt(&mut controller, &registry);
+        let _ = seed_integration_recovery_command(
+            &mut controller,
+            &base,
+            &attempt_id,
+            &steps[0],
+            "committed",
+            0,
+        );
+        let classification =
+            super::classify_recovered_integration_gates(&mut controller, &[], execution_epoch)
+                .unwrap_or_else(|error| panic!("classify A7 output conflict: {error}"));
+        let candidate = classification.resumable[0].clone();
+        let verification = recovered_integration_verification(&controller, &registry, &candidate);
+        let artifacts = ArtifactStore::open(&candidate.binding.artifact_store_root)
+            .unwrap_or_else(|error| panic!("A7 verification CAS: {error}"));
+        let (verification_artifact_digest, _) = controller
+            .persist_verification_result(&artifacts, &verification, "verification_recorded")
+            .unwrap_or_else(|error| panic!("persist A7 verification: {error}"));
+        let task_contract_digest = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active A7 plan: {error}"))
+            .tasks["task.A7"]
+            .task_contract_digest
+            .clone();
+        controller
+            .persist_verified_output_binding(
+                "controller.artifact_binding",
+                "artifact",
+                "artifact.task.A7",
+                &task_contract_digest,
+                &verification,
+                &verification_artifact_digest,
+            )
+            .unwrap_or_else(|error| panic!("persist exact A7 artifact binding: {error}"));
+        let key = revision_scoped_key(
+            &verification.plan_id,
+            verification.plan_revision,
+            &output_binding_key("task.A7", "artifact.task.A7"),
+        );
+        let raw = controller
+            .state
+            .get_state("controller.artifact_binding", &key)
+            .unwrap_or_else(|error| panic!("read A7 artifact binding: {error}"))
+            .unwrap_or_else(|| panic!("A7 artifact binding missing"));
+        let mut conflicting: VerifiedOutputBindingV1 = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("decode A7 artifact binding: {error}"));
+        conflicting.repository_snapshot_digest = sha256_prefixed(b"conflicting-view");
+        controller
+            .state
+            .put_state(
+                "controller.artifact_binding",
+                &key,
+                &serde_json::to_string(&conflicting)
+                    .unwrap_or_else(|error| panic!("conflicting output json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist conflicting A7 output: {error}"));
+        let Err(error) = controller.resume_recovered_integration_gate(&registry, &candidate) else {
+            panic!("expected durable output-binding conflict")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with durable authority"),
+            "unexpected output conflict error: {error}"
+        );
+        assert_eq!(controller.task_state("task.A7"), Some(TaskState::Verifying));
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn integration_gate_recovery_fails_closed_on_checkpoint_conflict() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture("a7-recovery-checkpoint-conflict");
+        let steps = configure_integration_gate_command_contract(&mut controller, 1);
+        let (attempt_id, execution_epoch, _) =
+            prepare_integration_gate_recovery_attempt(&mut controller, &registry);
+        let _ = seed_integration_recovery_command(
+            &mut controller,
+            &base,
+            &attempt_id,
+            &steps[0],
+            "committed",
+            0,
+        );
+        let classification =
+            super::classify_recovered_integration_gates(&mut controller, &[], execution_epoch)
+                .unwrap_or_else(|error| panic!("classify A7 checkpoint conflict: {error}"));
+        let candidate = classification.resumable[0].clone();
+        let verification = recovered_integration_verification(&controller, &registry, &candidate);
+        let artifacts = ArtifactStore::open(&candidate.binding.artifact_store_root)
+            .unwrap_or_else(|error| panic!("A7 verification CAS: {error}"));
+        let (verification_artifact_digest, _) = controller
+            .persist_verification_result(&artifacts, &verification, "verification_recorded")
+            .unwrap_or_else(|error| panic!("persist A7 verification: {error}"));
+        controller
+            .record_verified_output_bindings(&verification, &verification_artifact_digest)
+            .unwrap_or_else(|error| panic!("persist A7 outputs: {error}"));
+        let mut conflicting = controller
+            .build_integration_checkpoint(&registry, &verification, &verification_artifact_digest)
+            .unwrap_or_else(|error| panic!("build expected A7 checkpoint: {error}"));
+        conflicting.integration_view_set_digest = sha256_prefixed(b"conflicting-view");
+        conflicting.checkpoint_digest = conflicting
+            .canonical_digest()
+            .unwrap_or_else(|error| panic!("rebind conflicting A7 checkpoint digest: {error}"));
+        let key = revision_scoped_key(&verification.plan_id, verification.plan_revision, "task.A7");
+        controller
+            .state
+            .put_state(
+                super::INTEGRATION_CHECKPOINT_NAMESPACE,
+                &key,
+                &serde_json::to_string(&conflicting)
+                    .unwrap_or_else(|error| panic!("conflicting checkpoint json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist conflicting A7 checkpoint: {error}"));
+        let Err(error) = controller.resume_recovered_integration_gate(&registry, &candidate) else {
+            panic!("expected durable integration-checkpoint conflict")
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with durable authority"),
+            "unexpected checkpoint conflict error: {error}"
+        );
+        assert_eq!(controller.task_state("task.A7"), Some(TaskState::Verifying));
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn integration_gate_fixture_with_contract(
+        label: &str,
+    ) -> (PathBuf, Controller, ProjectRegistry) {
+        let (base, mut controller, registry) = integration_gate_fixture(label);
+        let mut producer = valid_task_fixture("task.P", &["repo.b"], false);
+        producer["resource_budget"] = test_goal_resource_policy();
+        let mut gate = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active integration plan: {error}"))
+            .tasks["task.A7"]
+            .task
+            .clone();
+        gate["dependencies"] = json!(["task.P"]);
+        gate["dependency_bindings"] = json!([{
+            "upstream_task_id": "task.P",
+            "required_artifact_ids": ["artifact.task.P"],
+            "required_acceptance_criterion_ids": ["AC.task.P"],
+            "freshness": "same_plan_revision"
+        }]);
+        let mut producer_runtime = fresh_task_runtime(&producer)
+            .unwrap_or_else(|error| panic!("producer runtime: {error}"));
+        producer_runtime.state = TaskState::Succeeded;
+        let gate_runtime =
+            fresh_task_runtime(&gate).unwrap_or_else(|error| panic!("gate runtime: {error}"));
+        let active = controller
+            .active
+            .as_mut()
+            .unwrap_or_else(|| panic!("active integration fixture missing"));
+        active.plan_document["tasks"] = json!([producer.clone(), gate.clone()]);
+        active.plan_document["edges"] = json!([{
+            "edge_id": "edge.integration.001",
+            "from": "task.P",
+            "to": "task.A7",
+            "kind": "produces_for",
+            "contract": "task.A7 consumes the required output contract of task.P."
+        }]);
+        active.tasks = BTreeMap::from([
+            ("task.P".to_owned(), producer_runtime),
+            ("task.A7".to_owned(), gate_runtime),
+        ]);
+        let plan_digest = digest_json(&active.plan_document)
+            .unwrap_or_else(|error| panic!("contract fixture plan digest: {error}"));
+        active.plan_digest.clone_from(&plan_digest);
+        active.compiler_plan_digest = plan_digest;
+        (base, controller, registry)
+    }
+
+    fn integration_verification_fixture(
+        controller: &mut Controller,
+        registry: &ProjectRegistry,
+        base: &Path,
+    ) -> (VerificationResultV1, String) {
+        controller
+            .ensure_integration_views(registry, "task.A7")
+            .unwrap_or_else(|error| panic!("materialize integration views: {error}"));
+        let integration_view_set_digest = controller
+            .integration_view_set_digest(registry, "task.A7")
+            .unwrap_or_else(|error| panic!("integration view digest: {error}"));
+        let (plan_id, plan_revision, plan_digest, task_contract_digest) = {
+            let active = controller
+                .active_ref()
+                .unwrap_or_else(|error| panic!("active integration plan: {error}"));
+            (
+                active.plan_id.clone(),
+                active.revision,
+                active.plan_digest.clone(),
+                active.tasks["task.A7"].task_contract_digest.clone(),
+            )
+        };
+        let verification = VerificationResultV1 {
+            schema_version: super::VERIFICATION_RESULT_SCHEMA_VERSION,
+            verification_id: "verification.integration.A7".to_owned(),
+            plan_id,
+            plan_revision,
+            plan_digest,
+            task_id: "task.A7".to_owned(),
+            task_contract_digest,
+            attempt_id: "attempt.integration.A7.1".to_owned(),
+            execution_epoch: controller
+                .state
+                .current_execution_epoch()
+                .unwrap_or_else(|error| panic!("execution epoch: {error}")),
+            evaluator: "builtin.command.exit_codes.v1".to_owned(),
+            acceptance_contract_digest: format!("sha256:{}", "a".repeat(64)),
+            diff_digest: sha256_prefixed(b"integration-read-only"),
+            post_snapshot_digest: integration_view_set_digest,
+            expected_target_mode: 0,
+            observed_target_mode: 0,
+            evidence_ids: Vec::new(),
+            command_results: Vec::new(),
+            passed: true,
+            failure_code: None,
+        };
+        let artifacts = ArtifactStore::open(base.join("integration-verification-cas"))
+            .unwrap_or_else(|error| panic!("verification artifact store: {error}"));
+        let (artifact_digest, _) = controller
+            .persist_verification_result(&artifacts, &verification, "verification_recorded")
+            .unwrap_or_else(|error| panic!("persist integration verification: {error}"));
+        (verification, artifact_digest)
+    }
+
+    fn persist_integration_checkpoint_row_and_cas(
+        controller: &mut Controller,
+        registry: &ProjectRegistry,
+        verification: &VerificationResultV1,
+        verification_artifact_digest: &str,
+    ) -> super::IntegrationCheckpointV1 {
+        let checkpoint = controller
+            .build_integration_checkpoint(registry, verification, verification_artifact_digest)
+            .unwrap_or_else(|error| panic!("build integration checkpoint: {error}"));
+        let bytes = serde_json::to_vec(&super::canonicalize(&checkpoint.canonical_value()))
+            .unwrap_or_else(|error| panic!("canonical integration checkpoint bytes: {error}"));
+        let store = super::checkpoint_artifact_store(controller.state.path())
+            .unwrap_or_else(|error| panic!("checkpoint artifact store: {error}"));
+        let artifact = store
+            .put(&mut controller.state, &bytes)
+            .unwrap_or_else(|error| panic!("persist checkpoint CAS: {error}"));
+        assert_eq!(
+            format!("sha256:{}", artifact.digest),
+            checkpoint.checkpoint_digest
+        );
+        controller
+            .state
+            .put_state(
+                super::INTEGRATION_CHECKPOINT_NAMESPACE,
+                &revision_scoped_key(
+                    &checkpoint.plan_id,
+                    checkpoint.plan_revision,
+                    &checkpoint.gate_task_id,
+                ),
+                &serde_json::to_string(&checkpoint)
+                    .unwrap_or_else(|error| panic!("integration checkpoint row json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist integration checkpoint row: {error}"));
+        checkpoint
+    }
+
+    fn checkpoint_record_for(
+        manifest: &super::CheckpointManifest,
+    ) -> sovereign_state::CheckpointIntegrityRecord {
+        sovereign_state::CheckpointIntegrityRecord {
+            generation: 1,
+            previous_hash: None,
+            checkpoint_hash: format!("sha256:{}", "c".repeat(64)),
+            payload_digest: format!("sha256:{}", "d".repeat(64)),
+            action_sequence: manifest.action_journal_sequence,
+            created_at_ms: 0,
+        }
+    }
+
+    fn validate_v3_manifest_and_integration_state(
+        state: &StateStore,
+        manifest: &super::CheckpointManifest,
+    ) -> Result<(), ControllerError> {
+        super::validate_checkpoint_manifest(manifest, &checkpoint_record_for(manifest))?;
+        super::validate_checkpoint_immutable_bindings(state, manifest)?;
+        super::validate_post_checkpoint_integration_checkpoint_correlation(
+            state,
+            manifest,
+            manifest.action_journal_sequence,
+            None,
+        )
+    }
+
+    fn singleton_checkpoint_manifest(label: &str) -> (PathBuf, super::CheckpointManifest) {
+        let (base, state) = temp_state(label);
+        let root = base
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonical singleton root: {error}"));
+        let task = valid_task_fixture("task.A", &["repo.app"], true);
+        let mut active = active_fixture(&root, 1, "sha256:placeholder");
+        install_valid_plan_document(&mut active, &root, 1, "D1", vec![task.clone()]);
+        active
+            .repositories
+            .get_mut("repo.app")
+            .unwrap_or_else(|| panic!("singleton repository state missing"))
+            .baseline_diff_digest = sha256_prefixed(b"");
+        active.tasks.insert(
+            "task.A".to_owned(),
+            fresh_task_runtime(&task)
+                .unwrap_or_else(|error| panic!("singleton task runtime: {error}")),
+        );
+        let plan_digest = digest_json(&active.plan_document)
+            .unwrap_or_else(|error| panic!("singleton plan digest: {error}"));
+        active.plan_digest.clone_from(&plan_digest);
+        active.compiler_plan_digest = plan_digest;
+        let mut controller = Controller::new(state);
+        controller.active = Some(active);
+        let manifest = controller
+            .checkpoint_manifest()
+            .unwrap_or_else(|error| panic!("singleton checkpoint manifest: {error}"));
+        (base, manifest)
+    }
+
+    fn legacy_checkpoint_manifest(
+        mut manifest: super::CheckpointManifest,
+        schema_version: u32,
+    ) -> super::CheckpointManifest {
+        let (repository_id, baseline) = manifest.repository_baselines.iter().next().map_or_else(
+            || panic!("singleton v3 manifest repository baseline missing"),
+            |(repository_id, baseline)| (repository_id.clone(), baseline.clone()),
+        );
+        manifest.schema_version = schema_version;
+        manifest.repository_id = Some(repository_id);
+        manifest.repository_root = Some(baseline.repository_root);
+        manifest.repository_snapshot = Some(baseline.repository_snapshot);
+        manifest.repository_snapshot_digest = Some(baseline.repository_snapshot_digest);
+        manifest.baseline_diff_digest = Some(baseline.baseline_diff_digest);
+        manifest.baseline_diff_content = Some(baseline.baseline_diff_content);
+        manifest.repository_baselines.clear();
+        manifest.cross_repo_contract_digests.clear();
+        manifest.integration_checkpoint_digests.clear();
+        if schema_version == super::LEGACY_CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+            manifest.security_audit_head = None;
+            manifest.autonomy_budget_digests.clear();
+            manifest.goal_autonomy_budget = None;
+            manifest.goal_autonomy_budget_digest = None;
+        }
+        manifest
+    }
+
+    #[test]
+    fn a7_read_process_gate_materializes_repository_views_without_mutation_worktree() {
+        let (base, mut controller, registry) = integration_gate_fixture("a7-integration-views");
+        assert!(
+            controller
+                .task_is_multi_repo_integration_gate("task.A7")
+                .unwrap_or_else(|error| panic!("classify A7 integration gate: {error}"))
+        );
+        assert!(
+            !Controller::task_has_repository_mutation_authority(
+                &controller
+                    .active_ref()
+                    .unwrap_or_else(|error| panic!("active A7 plan: {error}"))
+                    .tasks["task.A7"]
+                    .task
+            )
+            .unwrap_or_else(|error| panic!("A7 mutation authority: {error}"))
+        );
+
+        controller
+            .ensure_integration_views(&registry, "task.A7")
+            .unwrap_or_else(|error| panic!("A7 read/process integration views: {error}"));
+        let runtime = &controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active A7 plan: {error}"))
+            .tasks["task.A7"];
+        assert!(runtime.worktree_lease.is_none());
+        assert!(runtime.worktree_state.is_none());
+        assert_eq!(runtime.integration_views.len(), 2);
+        assert!(runtime.integration_views.values().all(|view| {
+            view.state == WorktreeLifecycle::Materialized
+                && view.conflict.is_none()
+                && view.lease.worktree_path.exists()
+        }));
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn integration_views_fail_closed_on_recovery_when_a_materialized_view_disappears() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture("integration-view-recovery");
+        controller
+            .ensure_integration_views(&registry, "task.A7")
+            .unwrap_or_else(|error| panic!("materialize A7 integration views: {error}"));
+        let missing_view = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active A7 plan: {error}"))
+            .tasks["task.A7"]
+            .integration_views["repo.b"]
+            .lease
+            .worktree_path
+            .clone();
+        std::fs::remove_dir_all(&missing_view)
+            .unwrap_or_else(|error| panic!("remove recovered integration view: {error}"));
+
+        let result = super::reconcile_recovered_worktrees(&mut controller, &registry);
+        assert!(
+            result.is_err(),
+            "recovery must fail closed when a materialized integration view disappears"
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn integration_views_are_released_before_supersession() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture("integration-view-supersede");
+        controller
+            .ensure_integration_views(&registry, "task.A7")
+            .unwrap_or_else(|error| panic!("materialize A7 integration views: {error}"));
+        let view_paths = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active A7 plan: {error}"))
+            .tasks["task.A7"]
+            .integration_views
+            .values()
+            .map(|view| view.lease.worktree_path.clone())
+            .collect::<Vec<_>>();
+
+        controller
+            .close_active_worktrees_for_supersession(&registry)
+            .unwrap_or_else(|error| panic!("close A7 integration views for supersession: {error}"));
+        let runtime = &controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active A7 plan: {error}"))
+            .tasks["task.A7"];
+        assert!(
+            runtime
+                .integration_views
+                .values()
+                .all(|view| view.state == WorktreeLifecycle::Released)
+        );
+        assert!(view_paths.iter().all(|path| !path.exists()));
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn checkpoint_v3_manifest_binds_exact_cross_repo_and_integration_maps() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture_with_contract("checkpoint-v3-exact-maps");
+        let (verification, verification_artifact_digest) =
+            integration_verification_fixture(&mut controller, &registry, &base);
+        let checkpoint = controller
+            .publish_integration_checkpoint(&registry, &verification, &verification_artifact_digest)
+            .unwrap_or_else(|error| panic!("publish integration checkpoint: {error}"));
+        let manifest = controller
+            .checkpoint_manifest()
+            .unwrap_or_else(|error| panic!("checkpoint v3 manifest: {error}"));
+        let expected_contracts = super::cross_repo_contracts_for_plan(&manifest.plan_document)
+            .unwrap_or_else(|error| panic!("derive expected cross-repo contracts: {error}"))
+            .into_iter()
+            .map(|(contract_id, contract)| (contract_id, contract.contract_digest))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(expected_contracts.len(), 1);
+        assert_eq!(manifest.cross_repo_contract_digests, expected_contracts);
+        assert_eq!(
+            manifest.integration_checkpoint_digests,
+            BTreeMap::from([("task.A7".to_owned(), checkpoint.checkpoint_digest.clone())])
+        );
+        validate_v3_manifest_and_integration_state(controller.state(), &manifest)
+            .unwrap_or_else(|error| panic!("validate exact checkpoint v3 bindings: {error}"));
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn checkpoint_v3_rejects_missing_extra_and_tampered_semantic_maps() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture_with_contract("checkpoint-v3-map-tamper");
+        let (verification, verification_artifact_digest) =
+            integration_verification_fixture(&mut controller, &registry, &base);
+        let checkpoint = controller
+            .publish_integration_checkpoint(&registry, &verification, &verification_artifact_digest)
+            .unwrap_or_else(|error| panic!("publish integration checkpoint: {error}"));
+        let manifest = controller
+            .checkpoint_manifest()
+            .unwrap_or_else(|error| panic!("checkpoint v3 manifest: {error}"));
+        let contract_id = manifest
+            .cross_repo_contract_digests
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| panic!("cross-repo contract missing"));
+
+        let mut missing_contract = manifest.clone();
+        missing_contract
+            .cross_repo_contract_digests
+            .remove(&contract_id);
+        assert!(
+            super::validate_checkpoint_manifest(
+                &missing_contract,
+                &checkpoint_record_for(&missing_contract)
+            )
+            .is_err()
+        );
+
+        let mut extra_contract = manifest.clone();
+        extra_contract.cross_repo_contract_digests.insert(
+            "binding:task.A7:task.extra".to_owned(),
+            format!("sha256:{}", "1".repeat(64)),
+        );
+        assert!(
+            super::validate_checkpoint_manifest(
+                &extra_contract,
+                &checkpoint_record_for(&extra_contract)
+            )
+            .is_err()
+        );
+
+        let mut tampered_contract = manifest.clone();
+        tampered_contract
+            .cross_repo_contract_digests
+            .insert(contract_id, format!("sha256:{}", "2".repeat(64)));
+        assert!(
+            super::validate_checkpoint_manifest(
+                &tampered_contract,
+                &checkpoint_record_for(&tampered_contract)
+            )
+            .is_err()
+        );
+
+        let mut missing_integration = manifest.clone();
+        missing_integration
+            .integration_checkpoint_digests
+            .remove("task.A7");
+        assert!(
+            validate_v3_manifest_and_integration_state(controller.state(), &missing_integration)
+                .is_err()
+        );
+
+        let mut extra_integration = manifest.clone();
+        extra_integration.integration_checkpoint_digests.insert(
+            "task.unknown".to_owned(),
+            format!("sha256:{}", "3".repeat(64)),
+        );
+        assert!(
+            validate_v3_manifest_and_integration_state(controller.state(), &extra_integration)
+                .is_err()
+        );
+
+        let mut tampered_integration = manifest;
+        tampered_integration
+            .integration_checkpoint_digests
+            .insert("task.A7".to_owned(), format!("sha256:{}", "4".repeat(64)));
+        assert_ne!(
+            tampered_integration.integration_checkpoint_digests["task.A7"],
+            checkpoint.checkpoint_digest
+        );
+        assert!(
+            validate_v3_manifest_and_integration_state(controller.state(), &tampered_integration)
+                .is_err()
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn validate_durable_integration_checkpoint_fixture(
+        controller: &Controller,
+        manifest: &super::CheckpointManifest,
+        checkpoint: &super::IntegrationCheckpointV1,
+    ) -> Result<super::IntegrationCheckpointV1, ControllerError> {
+        super::validate_durable_integration_checkpoint(
+            controller.state(),
+            &super::DurableIntegrationCheckpointExpectation {
+                plan_document: &manifest.plan_document,
+                plan_id: &manifest.plan_id,
+                plan_revision: manifest.plan_revision,
+                plan_digest: &manifest.plan_digest,
+                repository_baselines: Some(&manifest.repository_baselines),
+                gate_task_id: "task.A7",
+                expected_checkpoint_digest: &checkpoint.checkpoint_digest,
+            },
+        )
+    }
+
+    #[test]
+    fn durable_integration_checkpoint_rejects_row_verification_and_cas_tamper() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture_with_contract("integration-checkpoint-row-tamper");
+        let (verification, verification_artifact_digest) =
+            integration_verification_fixture(&mut controller, &registry, &base);
+        let checkpoint = persist_integration_checkpoint_row_and_cas(
+            &mut controller,
+            &registry,
+            &verification,
+            &verification_artifact_digest,
+        );
+        let manifest = controller
+            .checkpoint_manifest()
+            .unwrap_or_else(|error| panic!("row-tamper checkpoint manifest: {error}"));
+        validate_durable_integration_checkpoint_fixture(&controller, &manifest, &checkpoint)
+            .unwrap_or_else(|error| panic!("valid durable integration checkpoint: {error}"));
+        let mut tampered_row = checkpoint.clone();
+        tampered_row.integration_view_set_digest = format!("sha256:{}", "5".repeat(64));
+        controller
+            .state
+            .put_state(
+                super::INTEGRATION_CHECKPOINT_NAMESPACE,
+                "task.A7",
+                &serde_json::to_string(&tampered_row)
+                    .unwrap_or_else(|error| panic!("tampered row json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist tampered checkpoint row: {error}"));
+        assert!(
+            validate_durable_integration_checkpoint_fixture(&controller, &manifest, &checkpoint)
+                .is_err()
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+
+        let (base, mut controller, registry) =
+            integration_gate_fixture_with_contract("integration-checkpoint-verification-tamper");
+        let (verification, verification_artifact_digest) =
+            integration_verification_fixture(&mut controller, &registry, &base);
+        let checkpoint = persist_integration_checkpoint_row_and_cas(
+            &mut controller,
+            &registry,
+            &verification,
+            &verification_artifact_digest,
+        );
+        let manifest = controller
+            .checkpoint_manifest()
+            .unwrap_or_else(|error| panic!("verification-tamper checkpoint manifest: {error}"));
+        let verification_key = revision_scoped_key(
+            &verification.plan_id,
+            verification.plan_revision,
+            &verification.verification_id,
+        );
+        let mut tampered_verification = verification.clone();
+        tampered_verification.passed = false;
+        controller
+            .state
+            .put_state(
+                "controller.verification",
+                &verification_key,
+                &serde_json::to_string(&tampered_verification)
+                    .unwrap_or_else(|error| panic!("tampered verification json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist tampered verification: {error}"));
+        assert!(
+            validate_durable_integration_checkpoint_fixture(&controller, &manifest, &checkpoint)
+                .is_err()
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+
+        let (base, mut controller, registry) =
+            integration_gate_fixture_with_contract("integration-checkpoint-cas-tamper");
+        let (verification, verification_artifact_digest) =
+            integration_verification_fixture(&mut controller, &registry, &base);
+        let checkpoint = persist_integration_checkpoint_row_and_cas(
+            &mut controller,
+            &registry,
+            &verification,
+            &verification_artifact_digest,
+        );
+        let manifest = controller
+            .checkpoint_manifest()
+            .unwrap_or_else(|error| panic!("CAS-tamper checkpoint manifest: {error}"));
+        let digest = checkpoint
+            .checkpoint_digest
+            .strip_prefix("sha256:")
+            .unwrap_or_else(|| panic!("checkpoint digest prefix"));
+        let store = super::checkpoint_artifact_store(controller.state.path())
+            .unwrap_or_else(|error| panic!("checkpoint CAS: {error}"));
+        let object = store.root().join("sha256").join(&digest[..2]).join(digest);
+        std::fs::write(&object, b"tampered integration checkpoint")
+            .unwrap_or_else(|error| panic!("tamper integration checkpoint CAS: {error}"));
+        assert!(
+            validate_durable_integration_checkpoint_fixture(&controller, &manifest, &checkpoint)
+                .is_err()
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn post_checkpoint_integration_publication_requires_exact_ordered_replay() {
+        let run = |label: &str, mode: &str| {
+            let (base, mut controller, registry) = integration_gate_fixture_with_contract(label);
+            let (verification, verification_artifact_digest) =
+                integration_verification_fixture(&mut controller, &registry, &base);
+            let trusted_manifest = controller
+                .checkpoint_manifest()
+                .unwrap_or_else(|error| panic!("trusted pre-publication manifest: {error}"));
+            assert!(trusted_manifest.integration_checkpoint_digests.is_empty());
+            let checkpoint = persist_integration_checkpoint_row_and_cas(
+                &mut controller,
+                &registry,
+                &verification,
+                &verification_artifact_digest,
+            );
+            let key = revision_scoped_key(
+                &checkpoint.plan_id,
+                checkpoint.plan_revision,
+                &checkpoint.gate_task_id,
+            );
+            if mode != "row-only" {
+                let claimed_digest = if mode == "bad-event-digest" {
+                    format!("sha256:{}", "9".repeat(64))
+                } else {
+                    checkpoint.checkpoint_digest.clone()
+                };
+                let artifact_digest = claimed_digest
+                    .strip_prefix("sha256:")
+                    .unwrap_or_else(|| panic!("claimed checkpoint digest prefix"));
+                controller
+                    .append_controller_event(
+                        "integration_checkpoint_published",
+                        &key,
+                        &json!({
+                            "plan_id": checkpoint.plan_id,
+                            "plan_revision": checkpoint.plan_revision,
+                            "gate_task_id": checkpoint.gate_task_id,
+                            "checkpoint_digest": claimed_digest,
+                            "artifact_digest": artifact_digest,
+                        }),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("append integration publication event: {error}")
+                    });
+            }
+            let result = super::validate_post_checkpoint_integration_checkpoint_correlation(
+                controller.state(),
+                &trusted_manifest,
+                trusted_manifest.action_journal_sequence,
+                None,
+            );
+            drop(controller);
+            let _ = std::fs::remove_dir_all(base);
+            result
+        };
+
+        run("integration-publication-exact-replay", "exact")
+            .unwrap_or_else(|error| panic!("exact post-checkpoint publication replay: {error}"));
+        assert!(run("integration-publication-row-only", "row-only").is_err());
+        assert!(run("integration-publication-bad-event", "bad-event-digest").is_err());
+    }
+
+    #[test]
+    fn checkpoint_v1_v2_require_empty_v3_maps_and_preserve_legacy_compatibility() {
+        for (schema_version, label) in [
+            (
+                super::LEGACY_CHECKPOINT_MANIFEST_SCHEMA_VERSION,
+                "checkpoint-v1-compat",
+            ),
+            (
+                super::AUTONOMY_SECURITY_CHECKPOINT_MANIFEST_SCHEMA_VERSION,
+                "checkpoint-v2-compat",
+            ),
+        ] {
+            let (base, v3) = singleton_checkpoint_manifest(label);
+            let legacy = legacy_checkpoint_manifest(v3, schema_version);
+            super::validate_checkpoint_manifest(&legacy, &checkpoint_record_for(&legacy))
+                .unwrap_or_else(|error| panic!("legacy checkpoint v{schema_version}: {error}"));
+
+            let mut cross_repo_claim = legacy.clone();
+            cross_repo_claim.cross_repo_contract_digests.insert(
+                "binding:legacy:forged".to_owned(),
+                format!("sha256:{}", "6".repeat(64)),
+            );
+            assert!(
+                super::validate_checkpoint_manifest(
+                    &cross_repo_claim,
+                    &checkpoint_record_for(&cross_repo_claim)
+                )
+                .is_err(),
+                "legacy checkpoint v{schema_version} must reject v3 cross-repo bindings"
+            );
+
+            let mut integration_claim = legacy;
+            integration_claim
+                .integration_checkpoint_digests
+                .insert("task.A".to_owned(), format!("sha256:{}", "7".repeat(64)));
+            assert!(
+                super::validate_checkpoint_manifest(
+                    &integration_claim,
+                    &checkpoint_record_for(&integration_claim)
+                )
+                .is_err(),
+                "legacy checkpoint v{schema_version} must reject v3 integration bindings"
+            );
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    #[test]
+    fn task_instruction_fingerprint_tracks_only_scoped_repositories() {
+        let plan = json!({
+            "repositories": [
+                {"repository_id": "repo.a", "instructions": ["A-v1"]},
+                {"repository_id": "repo.b", "instructions": ["B-v1"]}
+            ]
+        });
+        let task_a = json!({"scope": {"repositories": ["repo.a"]}});
+        let task_b = json!({"scope": {"repositories": ["repo.b"]}});
+        let task_gate = json!({"scope": {"repositories": ["repo.a", "repo.b"]}});
+        let a_before = super::task_instruction_fingerprint_digest(&plan, &task_a)
+            .unwrap_or_else(|error| panic!("repo.a instruction fingerprint: {error}"));
+        let b_before = super::task_instruction_fingerprint_digest(&plan, &task_b)
+            .unwrap_or_else(|error| panic!("repo.b instruction fingerprint: {error}"));
+        let gate_before = super::task_instruction_fingerprint_digest(&plan, &task_gate)
+            .unwrap_or_else(|error| panic!("gate instruction fingerprint: {error}"));
+
+        let mut changed = plan.clone();
+        changed["repositories"][1]["instructions"] = json!(["B-v2"]);
+        let a_after = super::task_instruction_fingerprint_digest(&changed, &task_a)
+            .unwrap_or_else(|error| panic!("changed repo.a instruction fingerprint: {error}"));
+        let b_after = super::task_instruction_fingerprint_digest(&changed, &task_b)
+            .unwrap_or_else(|error| panic!("changed repo.b instruction fingerprint: {error}"));
+        let gate_after = super::task_instruction_fingerprint_digest(&changed, &task_gate)
+            .unwrap_or_else(|error| panic!("changed gate instruction fingerprint: {error}"));
+
+        assert_eq!(a_before, a_after);
+        assert_ne!(b_before, b_after);
+        assert_ne!(gate_before, gate_after);
+    }
+
+    fn evidence_only_dependency_tasks() -> (Value, Value) {
+        let upstream = json!({
+            "task_id": "A",
+            "scope": {
+                "repositories": ["repo.app"],
+                "files": [],
+                "allow_create": [],
+                "allow_delete": []
+            },
+            "action_policy": {"write_roots": []},
+            "dependencies": [],
+            "dependency_bindings": []
+        });
+        let downstream = json!({
+            "task_id": "B",
+            "scope": {
+                "repositories": ["repo.app"],
+                "files": [],
+                "allow_create": [],
+                "allow_delete": []
+            },
+            "action_policy": {"write_roots": []},
+            "dependencies": ["A"],
+            "dependency_bindings": []
+        });
+        (upstream, downstream)
+    }
+
+    #[test]
+    fn same_repository_evidence_only_dependency_does_not_require_a_changeset() {
+        let (base, mut state) = temp_state("same-repo-evidence-only");
+        let artifacts = ArtifactStore::open(base.join("cas"))
+            .unwrap_or_else(|error| panic!("artifact store: {error}"));
+        let verification_artifact = artifacts
+            .put(&mut state, b"verification-evidence-only")
+            .unwrap_or_else(|error| panic!("verification artifact: {error}"));
+        let plan_digest = format!("sha256:{}", "a".repeat(64));
+        let (upstream_task, downstream_task) = evidence_only_dependency_tasks();
+        let upstream_digest =
+            digest_json(&upstream_task).unwrap_or_else(|error| panic!("upstream digest: {error}"));
+        let verification = VerificationResultV1 {
+            schema_version: super::VERIFICATION_RESULT_SCHEMA_VERSION,
+            verification_id: "verification.A".to_owned(),
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            plan_digest: plan_digest.clone(),
+            task_id: "A".to_owned(),
+            task_contract_digest: upstream_digest.clone(),
+            attempt_id: "attempt.A.1".to_owned(),
+            execution_epoch: 1,
+            evaluator: "builtin.command.aggregate.v1".to_owned(),
+            acceptance_contract_digest: format!("sha256:{}", "b".repeat(64)),
+            diff_digest: format!("sha256:{}", "c".repeat(64)),
+            post_snapshot_digest: "snapshot.current".to_owned(),
+            expected_target_mode: 0,
+            observed_target_mode: 0,
+            evidence_ids: vec!["ev.A".to_owned()],
+            command_results: Vec::new(),
+            passed: true,
+            failure_code: None,
+        };
+        state
+            .put_state(
+                "controller.verification",
+                &revision_scoped_key("plan.fixture", 1, &verification.verification_id),
+                &serde_json::to_string(&verification)
+                    .unwrap_or_else(|error| panic!("verification json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist verification: {error}"));
+        let binding = VerifiedOutputBindingV1 {
+            schema_version: super::VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION,
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            plan_digest: plan_digest.clone(),
+            task_id: "A".to_owned(),
+            task_contract_digest: upstream_digest.clone(),
+            attempt_id: verification.attempt_id.clone(),
+            binding_kind: "artifact".to_owned(),
+            binding_id: "artifact.A".to_owned(),
+            verification_id: verification.verification_id.clone(),
+            verification_artifact_digest: verification_artifact.digest,
+            repository_snapshot_digest: verification.post_snapshot_digest.clone(),
+            change_set_digest: None,
+            carried_from_plan_revision: None,
+            carried_from_plan_digest: None,
+        };
+        state
+            .put_state(
+                "controller.artifact_binding",
+                &revision_scoped_key("plan.fixture", 1, &output_binding_key("A", "artifact.A")),
+                &serde_json::to_string(&binding)
+                    .unwrap_or_else(|error| panic!("binding json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist binding: {error}"));
+
+        let mut active = active_fixture(&base, 1, &plan_digest);
+        active.plan_document["depth"] = json!({"mode": "D4"});
+        let mut upstream = fresh_task_runtime(&upstream_task)
+            .unwrap_or_else(|error| panic!("upstream runtime: {error}"));
+        upstream.state = TaskState::Succeeded;
+        active.tasks.insert("A".to_owned(), upstream);
+        active.tasks.insert(
+            "B".to_owned(),
+            fresh_task_runtime(&downstream_task)
+                .unwrap_or_else(|error| panic!("downstream runtime: {error}")),
+        );
+        let mut controller = Controller::new(state);
+        controller.active = Some(active);
+
+        let resolved =
+            controller.validated_output_binding_digest(&OutputBindingValidationRequest {
+                namespace: "controller.artifact_binding",
+                upstream_task_id: "A",
+                upstream_task_contract_digest: &upstream_digest,
+                binding_id: "artifact.A",
+                downstream_task_id: "B",
+                current_snapshot_digest: "snapshot.current",
+                requires_composed_view: true,
+            });
+        assert!(
+            resolved.is_ok(),
+            "evidence-only same-repository dependency must not require an immutable ChangeSet: {resolved:?}"
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn persist_v3_baseline_active_state(
+        state: &mut StateStore,
+        plan_document: &Value,
+        current_a: &RepositorySnapshot,
+        current_b: &RepositorySnapshot,
+        empty_diff_digest: &str,
+    ) {
+        let persisted = super::PersistedRepositoryBaselineSet {
+            schema_version: super::PERSISTED_REPOSITORY_BASELINE_SET_SCHEMA_VERSION,
+            repositories: BTreeMap::from([
+                (
+                    "repo.a".to_owned(),
+                    super::PersistedRepositoryBaseline {
+                        snapshot: current_a.clone(),
+                        diff_digest: empty_diff_digest.to_owned(),
+                        diff_content: String::new(),
+                    },
+                ),
+                (
+                    "repo.b".to_owned(),
+                    super::PersistedRepositoryBaseline {
+                        snapshot: current_b.clone(),
+                        diff_digest: empty_diff_digest.to_owned(),
+                        diff_content: String::new(),
+                    },
+                ),
+            ]),
+        };
+        state
+            .put_state(
+                "controller.plan",
+                "active",
+                &json!({"validity": "current"}).to_string(),
+            )
+            .unwrap_or_else(|error| panic!("persist active plan: {error}"));
+        state
+            .put_state(
+                "controller.plan_document",
+                "active",
+                &plan_document.to_string(),
+            )
+            .unwrap_or_else(|error| panic!("persist active document: {error}"));
+        state
+            .put_state(
+                "controller.repository_baseline",
+                "active",
+                &serde_json::to_string(&persisted)
+                    .unwrap_or_else(|error| panic!("baseline-set json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist baseline set: {error}"));
+    }
+
+    fn checkpoint_repository_baseline_fixture(
+        repository_root: &Path,
+        snapshot: RepositorySnapshot,
+        empty_diff_digest: &str,
+    ) -> super::CheckpointRepositoryBaselineV1 {
+        super::CheckpointRepositoryBaselineV1 {
+            repository_root: repository_root.to_path_buf(),
+            repository_snapshot_digest: super::snapshot_digest(&snapshot)
+                .unwrap_or_else(|error| panic!("checkpoint snapshot digest: {error}")),
+            repository_snapshot: snapshot,
+            baseline_diff_digest: empty_diff_digest.to_owned(),
+            baseline_diff_content: String::new(),
+        }
+    }
+
+    fn v3_baseline_supersession_manifest(
+        plan_document: &Value,
+        repo_a: &Path,
+        repo_b: &Path,
+        checkpoint_a: RepositorySnapshot,
+        checkpoint_b: RepositorySnapshot,
+        empty_diff_digest: &str,
+    ) -> super::CheckpointManifest {
+        super::CheckpointManifest {
+            schema_version: super::CHECKPOINT_MANIFEST_SCHEMA_VERSION,
+            plan_document: plan_document.clone(),
+            plan_id: "plan.fixture".to_owned(),
+            goal_id: "goal.fixture".to_owned(),
+            plan_revision: 1,
+            plan_digest: format!("sha256:{}", "1".repeat(64)),
+            compiler_plan_digest: format!("sha256:{}", "1".repeat(64)),
+            compilation_evidence_digest: format!("sha256:{}", "2".repeat(64)),
+            policy_digest: format!("sha256:{}", "3".repeat(64)),
+            repository_id: None,
+            repository_root: None,
+            repository_snapshot: None,
+            repository_snapshot_digest: None,
+            baseline_diff_digest: None,
+            baseline_diff_content: None,
+            repository_baselines: BTreeMap::from([
+                (
+                    "repo.a".to_owned(),
+                    checkpoint_repository_baseline_fixture(repo_a, checkpoint_a, empty_diff_digest),
+                ),
+                (
+                    "repo.b".to_owned(),
+                    checkpoint_repository_baseline_fixture(repo_b, checkpoint_b, empty_diff_digest),
+                ),
+            ]),
+            cross_repo_contract_digests: BTreeMap::new(),
+            integration_checkpoint_digests: BTreeMap::new(),
+            plan_validity: PlanValidity::Current,
+            task_records: BTreeMap::new(),
+            attempt_records: BTreeMap::new(),
+            evidence_binding_digests: BTreeMap::new(),
+            action_records: Vec::new(),
+            process_leases: Vec::new(),
+            security_audit_head: None,
+            autonomy_budget_digests: BTreeMap::new(),
+            goal_autonomy_budget: None,
+            goal_autonomy_budget_digest: None,
+            execution_control: super::ExecutionControlV1::default(),
+            action_journal_sequence: 0,
+            execution_epoch: 1,
+        }
+    }
+
+    fn v3_baseline_supersession_event(
+        current_a: &RepositorySnapshot,
+        current_b: &RepositorySnapshot,
+        empty_diff_digest: &str,
+    ) -> sovereign_state::JournalEvent {
+        let current_snapshot_digests = BTreeMap::from([
+            (
+                "repo.a".to_owned(),
+                super::snapshot_digest(current_a)
+                    .unwrap_or_else(|error| panic!("current repo.a digest: {error}")),
+            ),
+            (
+                "repo.b".to_owned(),
+                super::snapshot_digest(current_b)
+                    .unwrap_or_else(|error| panic!("current repo.b digest: {error}")),
+            ),
+        ]);
+        let payload = json!({
+            "repository_snapshot_digests": current_snapshot_digests,
+            "baseline_diff_digests": {
+                "repo.a": empty_diff_digest,
+                "repo.b": empty_diff_digest
+            },
+            "plan_validity": "current"
+        });
+        sovereign_state::JournalEvent {
+            sequence: 1,
+            event_id: "event.supersession".to_owned(),
+            entity_type: "controller".to_owned(),
+            entity_id: "plan.fixture".to_owned(),
+            event_kind: "plan_revision_activated".to_owned(),
+            payload_json: payload.to_string(),
+            occurred_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn v3_baseline_set_supersession_requires_exact_repository_set_correlation() {
+        let (base, mut state) = temp_state("v3-baseline-supersession");
+        let repo_a = base.join("repo-a");
+        let repo_b = base.join("repo-b");
+        std::fs::create_dir_all(&repo_a).unwrap_or_else(|error| panic!("create repo-a: {error}"));
+        std::fs::create_dir_all(&repo_b).unwrap_or_else(|error| panic!("create repo-b: {error}"));
+        let repo_a = repo_a
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonical repo-a: {error}"));
+        let repo_b = repo_b
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonical repo-b: {error}"));
+        let plan_document = json!({
+            "repositories": [
+                {"repository_id": "repo.a", "root": repo_a},
+                {"repository_id": "repo.b", "root": repo_b}
+            ]
+        });
+        let empty_diff_digest = sha256_prefixed(b"");
+        let current_a = empty_snapshot_for("repo.a", &repo_a);
+        let current_b = empty_snapshot_for("repo.b", &repo_b);
+        let mut checkpoint_a = current_a.clone();
+        let mut checkpoint_b = current_b.clone();
+        checkpoint_a.dirty_digest = format!("sha256:{}", "a".repeat(64));
+        checkpoint_b.dirty_digest = format!("sha256:{}", "b".repeat(64));
+
+        persist_v3_baseline_active_state(
+            &mut state,
+            &plan_document,
+            &current_a,
+            &current_b,
+            &empty_diff_digest,
+        );
+
+        let manifest = v3_baseline_supersession_manifest(
+            &plan_document,
+            &repo_a,
+            &repo_b,
+            checkpoint_a,
+            checkpoint_b,
+            &empty_diff_digest,
+        );
+        let event = v3_baseline_supersession_event(&current_a, &current_b, &empty_diff_digest);
+        super::validate_post_checkpoint_baseline_correlation(
+            &state,
+            &manifest,
+            std::slice::from_ref(&event),
+        )
+        .unwrap_or_else(|error| panic!("exact v3 baseline supersession correlation: {error}"));
+
+        let mut tampered_payload: Value = serde_json::from_str(&event.payload_json)
+            .unwrap_or_else(|error| panic!("decode supersession event: {error}"));
+        tampered_payload["repository_snapshot_digests"]["repo.b"] =
+            json!(format!("sha256:{}", "9".repeat(64)));
+        let tampered = sovereign_state::JournalEvent {
+            payload_json: tampered_payload.to_string(),
+            ..event
+        };
+        assert!(
+            super::validate_post_checkpoint_baseline_correlation(&state, &manifest, &[tampered])
+                .is_err(),
+            "v3 recovery must reject supersession evidence that loses one repository baseline binding"
         );
         drop(state);
         let _ = std::fs::remove_dir_all(base);

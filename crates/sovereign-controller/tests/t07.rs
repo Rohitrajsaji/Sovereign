@@ -7,11 +7,11 @@ use sovereign_context::{
     EvidenceKind, RepairPacket,
 };
 use sovereign_controller::{
-    CheckpointActionRecord, CheckpointManifest, Controller, ControllerError, ExecutionRuntime,
-    ExecutionSuccess, FailureClassification, FailureClassificationKind, LocalControl,
-    ModelProposalV1, PermissionContext, PlanValidity, ReadinessInputs, RecoveryManager,
-    ResourcePressureProbe, RoleId, RoleRegistry, SchedulerView, SecretProcessRuntime, TaskState,
-    VERIFICATION_RESULT_SCHEMA_VERSION, VerificationResultV1,
+    CheckpointActionRecord, CheckpointManifest, CheckpointRepositoryBaselineV1, Controller,
+    ControllerError, ExecutionRuntime, ExecutionSuccess, FailureClassification,
+    FailureClassificationKind, LocalControl, ModelProposalV1, PermissionContext, PlanValidity,
+    ReadinessInputs, RecoveryManager, ResourcePressureProbe, RoleId, RoleRegistry, SchedulerView,
+    SecretProcessRuntime, TaskState, VERIFICATION_RESULT_SCHEMA_VERSION, VerificationResultV1,
 };
 #[cfg(feature = "recovery-test-hooks")]
 use sovereign_controller::{
@@ -364,6 +364,26 @@ fn latest_checkpoint_manifest(state: &StateStore) -> CheckpointManifest {
         .unwrap_or_else(|error| panic!("read checkpoint manifest: {error}"));
     serde_json::from_slice(&bytes)
         .unwrap_or_else(|error| panic!("decode checkpoint manifest: {error}"))
+}
+
+fn singleton_checkpoint_repository(
+    manifest: &CheckpointManifest,
+) -> (String, CheckpointRepositoryBaselineV1) {
+    assert_eq!(
+        manifest.repository_baselines.len(),
+        1,
+        "single-repository fixture must carry exactly one canonical checkpoint baseline"
+    );
+    let (repository_id, baseline) = manifest
+        .repository_baselines
+        .iter()
+        .next()
+        .unwrap_or_else(|| panic!("single-repository checkpoint baseline missing"));
+    assert_eq!(
+        baseline.repository_snapshot.repository_id, *repository_id,
+        "checkpoint repository baseline is misbound"
+    );
+    (repository_id.clone(), baseline.clone())
 }
 
 fn replace_persisted_task_runtime(
@@ -812,8 +832,8 @@ fn compiled_command_verification_fixture(
                     "command_spec": {
                         "tool_id": "tool.patch",
                         "mode": "exec",
-                        "program": "mvn",
-                        "args": ["-o", "-f", "sovereign-command-verification-missing-pom.xml", "validate"],
+                        "program": "make",
+                        "args": ["-f", "/dev/null", "sovereign-nonexistent-target"],
                         "repository_id": "repo.app",
                         "working_dir_relative": ".",
                         "literal_env": {},
@@ -1310,25 +1330,24 @@ fn runtime_parts_for_paths(root: &Path, base: &Path) -> RuntimeParts {
     }
 }
 
-fn runtime_parts_with_maven(fixture: &CompiledFixture) -> RuntimeParts {
+fn runtime_parts_with_make(fixture: &CompiledFixture) -> RuntimeParts {
     let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python")
         .unwrap_or_else(|error| panic!("pin python: {error}"));
-    let maven = PinnedExecutable::from_path("/opt/homebrew/bin/mvn", "homebrew-maven")
-        .unwrap_or_else(|error| panic!("pin maven: {error}"));
+    let make = PinnedExecutable::from_path("/usr/bin/make", "macos-system-make")
+        .unwrap_or_else(|error| panic!("pin make: {error}"));
     let roots = [
         python
             .path
             .parent()
             .unwrap_or_else(|| panic!("python parent"))
             .to_path_buf(),
-        maven
-            .path
+        make.path
             .parent()
-            .unwrap_or_else(|| panic!("maven parent"))
+            .unwrap_or_else(|| panic!("make parent"))
             .to_path_buf(),
     ];
-    let command_policy = CommandPolicy::new([python, maven], roots)
-        .unwrap_or_else(|error| panic!("command policy with maven: {error}"));
+    let command_policy = CommandPolicy::new([python, make], roots)
+        .unwrap_or_else(|error| panic!("command policy with make: {error}"));
     let home = std::env::var_os("HOME").map_or_else(|| panic!("HOME"), PathBuf::from);
     RuntimeParts {
         command_policy,
@@ -4427,6 +4446,7 @@ fn seeded_reconciliation_recovery(
     let mut state = StateStore::open(&fixture.repo.state_path)
         .unwrap_or_else(|error| panic!("reopen reconciliation state: {error}"));
     let manifest = latest_checkpoint_manifest(&state);
+    let (repository_id, _) = singleton_checkpoint_repository(&manifest);
     let execution_epoch = state
         .current_execution_epoch()
         .unwrap_or_else(|error| panic!("reconciliation execution epoch: {error}"));
@@ -4460,7 +4480,7 @@ fn seeded_reconciliation_recovery(
         "payload_digest": payload_digest,
         "action_nonce": format!("nonce.{label}"),
         "policy_digest": manifest.policy_digest,
-        "repository_id": manifest.repository_id,
+        "repository_id": repository_id,
         "worktree_lease_id": Value::Null,
         "execution_root": fixture.repo.root,
         "path": "src/settings/SettingsForm.tsx",
@@ -5338,7 +5358,7 @@ fn committed_nonzero_process_result_is_execution_failure_not_unknown() {
 #[allow(clippy::too_many_lines)]
 fn governed_command_verification_treats_real_nonzero_exit_as_evidence_only() {
     for (label, expected_exit_codes, command_should_pass) in [
-        ("command-expected-nonzero", vec![0, 1], true),
+        ("command-expected-nonzero", vec![0, 2], true),
         ("command-unexpected-nonzero", vec![0], false),
     ] {
         let mut fixture = compiled_command_verification_fixture(label, &expected_exit_codes);
@@ -5355,7 +5375,7 @@ fn governed_command_verification_treats_real_nonzero_exit_as_evidence_only() {
             valid_execution_proposal(&fixture.form_digest),
             fixture.packet.metrics.final_serialized_input_tokens,
         )]);
-        let parts = runtime_parts_with_maven(&fixture);
+        let parts = runtime_parts_with_make(&fixture);
         let isolation = PassthroughIsolation {
             capabilities: MacSandboxExecBackend::detect()
                 .unwrap_or_else(|error| panic!("detect command isolation capabilities: {error}")),
@@ -5395,7 +5415,7 @@ fn governed_command_verification_treats_real_nonzero_exit_as_evidence_only() {
         assert_eq!(verification.command_results.len(), 1);
         let command = &verification.command_results[0];
         assert_eq!(command.expected_exit_codes, expected_exit_codes);
-        assert_eq!(command.exit_code, Some(1));
+        assert_eq!(command.exit_code, Some(2));
         assert!(command.process_group_reaped);
         assert_eq!(command.passed, command_should_pass);
         assert_eq!(
@@ -5936,6 +5956,7 @@ fn committed_v2_action_intent_recovers_as_primary_only_and_cannot_gain_worktree_
     let mut state = StateStore::open(&fixture.repo.state_path)
         .unwrap_or_else(|error| panic!("reopen state for v2 intent: {error}"));
     let manifest = latest_checkpoint_manifest(&state);
+    let (repository_id, repository_baseline) = singleton_checkpoint_repository(&manifest);
     let mut task_runtime = manifest
         .task_records
         .get(&task_id)
@@ -5989,9 +6010,9 @@ fn committed_v2_action_intent_recovers_as_primary_only_and_cannot_gain_worktree_
         "state": "verifying",
         "task_contract_digest": task_contract_digest,
         "repair_origin": null,
-        "baseline_digest": manifest.repository_snapshot_digest,
-        "pre_snapshot_digest": manifest.repository_snapshot_digest,
-        "pre_diff_digest": manifest.baseline_diff_digest,
+        "baseline_digest": repository_baseline.repository_snapshot_digest,
+        "pre_snapshot_digest": repository_baseline.repository_snapshot_digest,
+        "pre_diff_digest": repository_baseline.baseline_diff_digest,
         "pre_changed_fingerprints": {}
     });
     state
@@ -6062,7 +6083,7 @@ fn committed_v2_action_intent_recovers_as_primary_only_and_cannot_gain_worktree_
         "payload_digest": payload_digest,
         "action_nonce": "nonce.legacy-v2-primary",
         "policy_digest": manifest.policy_digest,
-        "repository_id": manifest.repository_id,
+        "repository_id": repository_id,
         "path": "src/settings/SettingsForm.tsx",
         "expected_source_digest": fixture.form_digest,
         "old_literal": "Save",

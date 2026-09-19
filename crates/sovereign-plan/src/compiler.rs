@@ -7,9 +7,10 @@
 //! existing [`PlanValidator`] to accept that candidate before returning it.
 
 use super::{
-    DepthDecision, ExecutionDepth, PlanAssumption, PlanAssumptionEvidence, PlanIr, PlanReplanInput,
-    PlanRevisionDiff, PlanValidator, ReplanScope, ValidationDiagnostic, canonicalize,
-    smallest_replan_scope_tasks,
+    CrossRepoContract, CrossRepoContractError, DepthDecision, ExecutionDepth, PlanAssumption,
+    PlanAssumptionEvidence, PlanIr, PlanReplanInput, PlanRevisionDiff, PlanValidator, ReplanScope,
+    ValidationDiagnostic, canonicalize, derive_cross_repo_contracts, smallest_replan_scope_tasks,
+    strings_at,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -337,6 +338,17 @@ impl PlanCompilationResult {
     #[must_use]
     pub fn compilation_evidence_digest(&self) -> &str {
         &self.compilation_evidence_digest
+    }
+
+    /// Returns deterministic cross-repository dependency contracts for this
+    /// compiler-validated Plan IR candidate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed structural error if the stored validated plan no
+    /// longer has coherent task dependency bindings or repository scopes.
+    pub fn cross_repo_contracts(&self) -> Result<Vec<CrossRepoContract>, CrossRepoContractError> {
+        derive_cross_repo_contracts(&self.plan)
     }
 
     /// Adds one exact Controller-selected `SecretRef` to one already-generated
@@ -1582,6 +1594,8 @@ struct M3PlanProposal {
 struct M3TaskProposal {
     local_id: String,
     repository_id: String,
+    #[serde(default)]
+    integration_repository_ids: Vec<String>,
     title: String,
     objective: String,
     rationale: String,
@@ -1771,6 +1785,13 @@ fn m3_proposal_schema(max_tasks: usize) -> Value {
                     "properties": {
                         "local_id": {"type": "string", "minLength": 3, "maxLength": 127},
                         "repository_id": {"type": "string", "minLength": 3, "maxLength": 127},
+                        "integration_repository_ids": {
+                            "type": "array",
+                            "minItems": 2,
+                            "maxItems": MAX_M3_ADDITIONAL_REPOSITORIES + 1,
+                            "uniqueItems": true,
+                            "items": {"type": "string", "minLength": 3, "maxLength": 127}
+                        },
                         "title": {"type": "string", "minLength": 1, "maxLength": 200},
                         "objective": {"type": "string", "minLength": 1, "maxLength": MAX_PROPOSAL_TEXT_BYTES},
                         "rationale": {"type": "string", "minLength": 1, "maxLength": MAX_PROPOSAL_TEXT_BYTES},
@@ -1854,8 +1875,13 @@ fn parse_and_bound_m3_proposal(
         .collect::<BTreeSet<_>>();
     let mut local_ids = BTreeSet::new();
     for task in &proposal.tasks {
+        let task_repository_scope = canonical_m3_task_repository_ids(task)?;
+        let integration_gate = !task.integration_repository_ids.is_empty();
         if !valid_plan_id(&task.local_id)
             || !repositories.contains(task.repository_id.as_str())
+            || task_repository_scope
+                .iter()
+                .any(|repository_id| !repositories.contains(repository_id.as_str()))
             || task.title.is_empty()
             || task.objective.is_empty()
             || task.rationale.is_empty()
@@ -1884,6 +1910,22 @@ fn parse_and_bound_m3_proposal(
             || !local_ids.insert(task.local_id.clone())
         {
             return Err("planning proposal exceeds deterministic M3 bounds".to_owned());
+        }
+        if integration_gate
+            && (extension.depth.mode != ExecutionDepth::D4
+                || task_repository_scope.len() < 2
+                || !task_repository_scope.contains(&task.repository_id)
+                || !task.files.is_empty()
+                || !task.create_files.is_empty()
+                || !task
+                    .acceptance
+                    .iter()
+                    .any(|acceptance| matches!(acceptance.kind, M3AcceptanceKind::Command)))
+        {
+            return Err(
+                "multi-repository integration scope requires a D4 read/process gate with at least two registered repositories and command acceptance"
+                    .to_owned(),
+            );
         }
         if task.evidence_needs.iter().any(|need| {
             need.query.is_empty()
@@ -1924,7 +1966,8 @@ fn parse_and_bound_m3_proposal(
                     if acceptance.manual_gate_id.is_some()
                         || acceptance.expected_exit_codes.is_empty()
                         || acceptance.command_spec.as_ref().is_none_or(|command| {
-                            command.repository_id != task.repository_id
+                            !task_repository_scope.contains(&command.repository_id)
+                                || integration_gate && command.tool_id == input.write_tool_id
                                 || !matches!(command.mode.as_str(), "exec" | "shell_explicit")
                                 || !valid_working_dir_relative(&command.working_dir_relative)
                                 || command.program.trim().is_empty()
@@ -1945,7 +1988,7 @@ fn parse_and_bound_m3_proposal(
                         })
                     {
                         return Err(
-                            "command acceptance requires one bounded typed command for the task repository"
+                            "command acceptance requires one bounded typed command within the task repository scope"
                                 .to_owned(),
                         );
                     }
@@ -1991,8 +2034,102 @@ fn parse_and_bound_m3_proposal(
             }
         }
     }
+    validate_integration_dependency_repository_coverage(input, &proposal)?;
     topological_m3_tasks(&proposal)?;
     Ok(proposal)
+}
+
+fn canonical_m3_task_repository_ids(task: &M3TaskProposal) -> Result<Vec<String>, String> {
+    if task.integration_repository_ids.is_empty() {
+        return Ok(vec![task.repository_id.clone()]);
+    }
+    if task.integration_repository_ids.len() > MAX_M3_ADDITIONAL_REPOSITORIES + 1 {
+        return Err(
+            "multi-repository integration scope exceeds the deterministic repository cap"
+                .to_owned(),
+        );
+    }
+    let repositories = task
+        .integration_repository_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if repositories.len() != task.integration_repository_ids.len()
+        || !repositories.contains(&task.repository_id)
+    {
+        return Err(
+            "multi-repository integration scope must contain unique repository ids including repository_id"
+                .to_owned(),
+        );
+    }
+    Ok(repositories.into_iter().collect())
+}
+
+fn validate_integration_dependency_repository_coverage(
+    input: &PlanCompilationInput,
+    proposal: &M3PlanProposal,
+) -> Result<(), String> {
+    let proposal_by_id = proposal
+        .tasks
+        .iter()
+        .map(|task| (task.local_id.as_str(), task))
+        .collect::<BTreeMap<_, _>>();
+    let prior_tasks = input
+        .m3
+        .as_ref()
+        .and_then(|extension| extension.replan.as_ref())
+        .map(|replan| plan_task_map(&replan.previous_plan))
+        .transpose()?
+        .unwrap_or_default();
+
+    for task in &proposal.tasks {
+        if task.integration_repository_ids.is_empty() {
+            continue;
+        }
+        let scope = canonical_m3_task_repository_ids(task)?;
+        let required = scope
+            .into_iter()
+            .filter(|repository_id| repository_id != &task.repository_id)
+            .collect::<BTreeSet<_>>();
+        let mut covered = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        let mut pending = task.dependencies.clone();
+        while let Some(dependency_id) = pending.pop() {
+            if !seen.insert(dependency_id.clone()) {
+                continue;
+            }
+            if let Some(upstream) = proposal_by_id.get(dependency_id.as_str()) {
+                covered.extend(canonical_m3_task_repository_ids(upstream)?);
+                pending.extend(upstream.dependencies.iter().cloned());
+                continue;
+            }
+            let upstream = prior_tasks.get(&dependency_id).ok_or_else(|| {
+                format!(
+                    "integration task {} dependency {dependency_id} does not resolve while checking repository coverage",
+                    task.local_id
+                )
+            })?;
+            covered.extend(
+                strings_at(upstream, &["scope", "repositories"])
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+            pending.extend(
+                strings_at(upstream, &["dependencies"])
+                    .into_iter()
+                    .map(str::to_owned),
+            );
+        }
+        if !required.is_subset(&covered) {
+            let missing = required.difference(&covered).cloned().collect::<Vec<_>>();
+            return Err(format!(
+                "integration task {} repository scope is not covered by its dependency closure: {}",
+                task.local_id,
+                missing.join(",")
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn topological_m3_tasks(proposal: &M3PlanProposal) -> Result<Vec<usize>, String> {
@@ -2398,6 +2535,8 @@ fn build_m3_task(
                 proposal.local_id, proposal.repository_id
             ))
         })?;
+    let repository_scope =
+        canonical_m3_task_repository_ids(proposal).map_err(PlanCompilationError::InvalidInput)?;
     let known_paths = known_repository_paths(&input.context_packet, &repository.repository_id);
     let known_files = proposal
         .files
@@ -2758,7 +2897,7 @@ fn build_m3_task(
         "dependencies": dependencies,
         "dependency_bindings": dependency_bindings,
         "scope": {
-            "repositories": [repository.repository_id],
+            "repositories": repository_scope,
             "files": known_files,
             "symbols": proposal.symbols,
             "allow_create": create_files,
@@ -3111,13 +3250,14 @@ fn validate_replan_input(
             "replan cannot change root goal or authoritative policy".to_owned(),
         ));
     }
-    let previous_repository_id = replan
-        .previous_plan
-        .pointer("/repositories/0/repository_id")
-        .and_then(Value::as_str);
-    if previous_repository_id != Some(input.repository.repository_id.as_str()) {
+    let previous_repositories = plan_repository_identity_roots(&replan.previous_plan)?;
+    let current_repositories = all_compilation_repositories(input)
+        .into_iter()
+        .map(|repository| (repository.repository_id.clone(), repository.root.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if previous_repositories != current_repositories {
         return Err(PlanCompilationError::InvalidInput(
-            "replan primary repository identity differs from previous revision".to_owned(),
+            "replan repository identity/root set differs from previous revision".to_owned(),
         ));
     }
 
@@ -3153,6 +3293,47 @@ fn validate_replan_input(
         ));
     }
     Ok(())
+}
+
+fn plan_repository_identity_roots(
+    plan: &Value,
+) -> Result<BTreeMap<String, String>, PlanCompilationError> {
+    let repositories = plan
+        .get("repositories")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            PlanCompilationError::InvalidInput(
+                "replan previous plan lacks repositories[]".to_owned(),
+            )
+        })?;
+    let mut identities = BTreeMap::new();
+    for repository in repositories {
+        let repository_id = repository
+            .get("repository_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                PlanCompilationError::InvalidInput(
+                    "replan previous repository lacks repository_id".to_owned(),
+                )
+            })?;
+        let root = repository
+            .get("root")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                PlanCompilationError::InvalidInput(
+                    "replan previous repository lacks root".to_owned(),
+                )
+            })?;
+        if identities
+            .insert(repository_id.to_owned(), root.to_owned())
+            .is_some()
+        {
+            return Err(PlanCompilationError::InvalidInput(format!(
+                "replan previous plan contains duplicate repository {repository_id}"
+            )));
+        }
+    }
+    Ok(identities)
 }
 
 fn resolve_stable_contract(plan: &Value, contract_id: &str) -> Option<(String, ReplanScope)> {
