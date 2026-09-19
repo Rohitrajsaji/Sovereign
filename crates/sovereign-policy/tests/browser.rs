@@ -4,10 +4,10 @@ use sovereign_policy::browser::{
     BrowserDownloadMode, BrowserDownloadPolicyV1, BrowserDownloadRetentionPolicyV1,
     BrowserDownloadRootAuthorityV1, BrowserIsolationRequest, BrowserLoopbackCapabilityV1,
     BrowserNavigationScheme, BrowserPolicyError, BrowserProfileAuthority, BrowserProfileMode,
-    BrowserProfilePolicy, MacBrowserSandboxExecBackend,
-    PERSISTENT_BROWSER_PROFILE_GRANT_SCHEMA_VERSION, PersistentBrowserProfileGrantV1,
-    TASK_LOOPBACK_GRANT_SCHEMA_VERSION, TaskLoopbackGrantV1, TaskLoopbackScope,
-    authorize_top_level_browser_url,
+    BrowserProfilePolicy, LoopbackServerIsolationRequestV1, MacBrowserSandboxExecBackend,
+    MacLoopbackServerSandboxExecBackend, PERSISTENT_BROWSER_PROFILE_GRANT_SCHEMA_VERSION,
+    PersistentBrowserProfileGrantV1, TASK_LOOPBACK_GRANT_SCHEMA_VERSION, TaskLoopbackGrantV1,
+    TaskLoopbackScope, authorize_top_level_browser_url,
 };
 use sovereign_policy::{NetworkDestination, NetworkPolicy};
 use std::collections::BTreeSet;
@@ -83,6 +83,85 @@ fn task_loopback_scope(grant: &TaskLoopbackGrantV1) -> TaskLoopbackScope<'_> {
         resource_lease_id: &grant.resource_lease_id,
         execution_epoch: grant.execution_epoch,
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn loopback_server_seatbelt_profile_is_exact_and_self_tested() {
+    let root = TestDir::new("loopback-server-seatbelt");
+    let repository_root = root.0.join("repo");
+    let data_root = root.0.join("data");
+    fs::create_dir(&repository_root).unwrap_or_else(|error| panic!("create repo root: {error}"));
+    fs::create_dir(&data_root).unwrap_or_else(|error| panic!("create data root: {error}"));
+    let repository_root = repository_root
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonical repo root: {error}"));
+    let data_root = data_root
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonical data root: {error}"));
+    let protected_root = repository_root.join(".controller-protected");
+    fs::create_dir(&protected_root)
+        .unwrap_or_else(|error| panic!("create protected root: {error}"));
+    let repository_file = repository_root.join("readable.txt");
+    let data_file = data_root.join("readable.txt");
+    let protected_file = protected_root.join("secret.txt");
+    fs::write(&repository_file, b"repo")
+        .unwrap_or_else(|error| panic!("repo read fixture: {error}"));
+    fs::write(&data_file, b"data").unwrap_or_else(|error| panic!("data read fixture: {error}"));
+    fs::write(&protected_file, b"secret")
+        .unwrap_or_else(|error| panic!("protected read fixture: {error}"));
+    let mut grant = task_loopback_grant();
+    grant.port = 43_219;
+    grant.expires_at_ms = i64::MAX;
+    let request = LoopbackServerIsolationRequestV1 {
+        task_loopback_grant: grant,
+        repository_root: repository_root.clone(),
+        data_root: data_root.clone(),
+        user_home_root: root.0.clone(),
+        extra_protected_read_roots: vec![protected_root.clone()],
+        now_ms: 100,
+    };
+    let profile = MacLoopbackServerSandboxExecBackend::build_profile(&request)
+        .unwrap_or_else(|error| panic!("build loopback server profile: {error}"));
+    assert!(profile.contains("(deny network*)"));
+    assert!(profile.contains("(allow network-bind (local ip \"localhost:43219\"))"));
+    assert!(profile.contains("(allow network-inbound (local ip \"localhost:43219\"))"));
+    let home_deny = format!("(deny file-read* (subpath \"{}\"))", root.0.display());
+    let repository_allow = format!(
+        "(allow file-read* (subpath \"{}\"))",
+        repository_root.display()
+    );
+    let data_allow = format!("(allow file-read* (subpath \"{}\"))", data_root.display());
+    let protected_deny = format!(
+        "(deny file-read* (subpath \"{}\"))",
+        protected_root.display()
+    );
+    assert!(profile.contains(&home_deny));
+    assert!(profile.contains(&repository_allow));
+    assert!(profile.contains(&data_allow));
+    assert!(profile.contains(&protected_deny));
+    assert!(profile.find(&home_deny) < profile.find(&repository_allow));
+    assert!(profile.find(&home_deny) < profile.find(&data_allow));
+    assert!(profile.find(&repository_allow) < profile.find(&protected_deny));
+    assert!(profile.contains("(deny file-write* (subpath \"/\"))"));
+    assert!(profile.contains(&format!(
+        "(allow file-write* (subpath \"{}\"))",
+        data_root.display()
+    )));
+    assert!(!profile.contains(&format!(
+        "(allow file-write* (subpath \"{}\"))",
+        repository_root.display()
+    )));
+
+    let backend = MacLoopbackServerSandboxExecBackend::detect()
+        .unwrap_or_else(|error| panic!("loopback server Seatbelt self-test: {error}"));
+    assert!(sandbox_read_status(backend.sandbox_exec_path(), &profile, &repository_file).success());
+    assert!(sandbox_read_status(backend.sandbox_exec_path(), &profile, &data_file).success());
+    assert!(!sandbox_read_status(backend.sandbox_exec_path(), &profile, &protected_file).success());
+
+    let mut broad_protected = request;
+    broad_protected.extra_protected_read_roots = vec![root.0.clone()];
+    assert!(broad_protected.validate().is_err());
 }
 
 #[test]
@@ -446,6 +525,10 @@ fn mac_browser_sandbox_allows_only_exact_controller_loopback_port_and_roots() {
     assert!(!profile.contains(&format!("localhost:{denied_port}")));
     assert!(!profile.contains("(allow network*)"));
     assert!(!profile.contains("remote ip \"localhost\")"));
+    assert!(profile.contains("(allow file-write* (literal \"/dev/null\"))"));
+    assert!(profile.contains("com.google.Chrome."));
+    assert!(profile.contains("(allow network-bind (prefix "));
+    assert!(!profile.contains("(allow network-bind)"));
 
     let isolated = backend
         .isolate(Path::new("/usr/bin/true"), &[], &request)
@@ -504,6 +587,22 @@ fn sandbox_connect_status(
         .stderr(Stdio::null())
         .status()
         .unwrap_or_else(|error| panic!("network probe: {error}"))
+}
+
+#[cfg(target_os = "macos")]
+fn sandbox_read_status(
+    sandbox_exec: &Path,
+    profile: &str,
+    path: &Path,
+) -> std::process::ExitStatus {
+    Command::new(sandbox_exec)
+        .args(["-p", profile, "/bin/cat"])
+        .arg(path)
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap_or_else(|error| panic!("read probe: {error}"))
 }
 
 #[cfg(target_os = "macos")]

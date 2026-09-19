@@ -17,10 +17,19 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
 pub const BROWSER_LOOPBACK_CAPABILITY_SCHEMA_VERSION: u32 = 1;
 pub const TASK_LOOPBACK_GRANT_SCHEMA_VERSION: u32 = 1;
 pub const PERSISTENT_BROWSER_PROFILE_GRANT_SCHEMA_VERSION: u32 = 1;
 pub const BROWSER_DOWNLOAD_POLICY_SCHEMA_VERSION: u32 = 1;
+
+fn digest_field(hasher: &mut Sha256, value: &str) {
+    let bytes = value.as_bytes();
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(bytes);
+}
 
 #[derive(Debug)]
 pub enum BrowserPolicyError {
@@ -569,6 +578,366 @@ pub struct BrowserIsolationRequest {
     pub now_ms: i64,
 }
 
+/// Exact local-only Seatbelt authority for one Controller-owned loopback application server.
+///
+/// This is intentionally separate from browser isolation and from the generic offline execution
+/// backend. The server may bind only the task's exact loopback port, may not initiate outbound
+/// network connections, and may write only beneath a Controller-owned application-data root.
+/// Protected user-home reads are denied, with exact read access reopened for the repository and
+/// application-data roots; explicitly protected subtrees remain unreadable. The repository is
+/// never writable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopbackServerIsolationRequestV1 {
+    pub task_loopback_grant: TaskLoopbackGrantV1,
+    pub repository_root: PathBuf,
+    pub data_root: PathBuf,
+    pub user_home_root: PathBuf,
+    pub extra_protected_read_roots: Vec<PathBuf>,
+    pub now_ms: i64,
+}
+
+impl LoopbackServerIsolationRequestV1 {
+    /// Validates the exact loopback grant and disjoint repository/data roots.
+    ///
+    /// # Errors
+    /// Returns a denial when the grant is stale/non-HTTP, roots are unsafe, or writable data is
+    /// placed inside the repository tree.
+    pub fn validate(&self) -> Result<(), BrowserPolicyError> {
+        self.task_loopback_grant.validate(self.now_ms)?;
+        if self.task_loopback_grant.scheme != "http" {
+            return Err(BrowserPolicyError::Denied(
+                "managed loopback server v1 requires exact http authority".to_owned(),
+            ));
+        }
+        validate_existing_directory(&self.repository_root)?;
+        validate_existing_directory(&self.data_root)?;
+        validate_existing_directory(&self.user_home_root)?;
+        let repository_root = self.repository_root.canonicalize()?;
+        let data_root = self.data_root.canonicalize()?;
+        let user_home_root = self.user_home_root.canonicalize()?;
+        if data_root.starts_with(&repository_root) || repository_root.starts_with(&data_root) {
+            return Err(BrowserPolicyError::Denied(
+                "managed loopback server repository and data roots must be disjoint".to_owned(),
+            ));
+        }
+        if !repository_root.starts_with(&user_home_root) || !data_root.starts_with(&user_home_root)
+        {
+            return Err(BrowserPolicyError::Denied(
+                "managed loopback server repository and data roots must remain beneath the declared protected user home"
+                    .to_owned(),
+            ));
+        }
+        for root in &self.extra_protected_read_roots {
+            let canonical = canonicalize_existing_or_parent_browser(root)?;
+            if repository_root.starts_with(&canonical) || data_root.starts_with(&canonical) {
+                return Err(BrowserPolicyError::Denied(
+                    "managed loopback protected-read roots cannot contain exact repository/data read authority"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Computes the immutable isolation-policy digest bound into Controller action authority.
+    ///
+    /// # Errors
+    /// Returns a policy error when roots/grant cannot be validated and canonicalized.
+    pub fn digest(&self) -> Result<String, BrowserPolicyError> {
+        self.validate()?;
+        let repository_root = self.repository_root.canonicalize()?;
+        let data_root = self.data_root.canonicalize()?;
+        let user_home_root = self.user_home_root.canonicalize()?;
+        let mut protected = self
+            .extra_protected_read_roots
+            .iter()
+            .map(|root| canonicalize_existing_or_parent_browser(root))
+            .collect::<Result<Vec<_>, _>>()?;
+        protected.sort();
+        let grant = &self.task_loopback_grant;
+        let mut hasher = Sha256::new();
+        digest_field(&mut hasher, "sovereign.loopback_server_isolation.v1");
+        digest_field(&mut hasher, &grant.plan_id);
+        hasher.update(grant.plan_revision.to_be_bytes());
+        digest_field(&mut hasher, &grant.task_id);
+        digest_field(&mut hasher, &grant.task_contract_digest);
+        digest_field(&mut hasher, &grant.resource_lease_id);
+        hasher.update(grant.execution_epoch.to_be_bytes());
+        digest_field(&mut hasher, &grant.scheme);
+        digest_field(&mut hasher, &grant.host);
+        hasher.update(grant.port.to_be_bytes());
+        hasher.update(grant.expires_at_ms.to_be_bytes());
+        digest_field(&mut hasher, &repository_root.display().to_string());
+        digest_field(&mut hasher, &data_root.display().to_string());
+        digest_field(&mut hasher, &user_home_root.display().to_string());
+        for root in protected {
+            digest_field(&mut hasher, &root.display().to_string());
+        }
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    }
+}
+
+/// Dedicated macOS Seatbelt backend for one exact Controller-owned loopback server.
+#[derive(Debug, Clone)]
+pub struct MacLoopbackServerSandboxExecBackend {
+    sandbox_exec: PathBuf,
+}
+
+impl MacLoopbackServerSandboxExecBackend {
+    /// Detects macOS Seatbelt and proves the exact-port bind / no-outbound / writable-data-root
+    /// boundary with a small runtime self-test.
+    ///
+    /// # Errors
+    /// Returns fail-closed when `sandbox-exec` is unavailable or the required boundary is not
+    /// enforced by the host.
+    pub fn detect() -> Result<Self, BrowserPolicyError> {
+        let sandbox_exec = PathBuf::from("/usr/bin/sandbox-exec");
+        if !sandbox_exec.is_file() {
+            return Err(BrowserPolicyError::IsolationUnavailable(
+                "macOS sandbox-exec is unavailable".to_owned(),
+            ));
+        }
+        let backend = Self { sandbox_exec };
+        backend.self_test()?;
+        Ok(backend)
+    }
+
+    #[must_use]
+    pub fn sandbox_exec_path(&self) -> &Path {
+        &self.sandbox_exec
+    }
+
+    /// Builds the exact server Seatbelt profile. Protected user-home reads are denied then reopened
+    /// only for the exact repository and Controller data roots; extra protected roots remain denied.
+    /// Writes are denied globally then reopened only for the exact Controller data root. Network is
+    /// denied globally then reopened only for binding/listening on the exact canonical loopback port;
+    /// no outbound exception exists.
+    ///
+    /// # Errors
+    /// Returns a denial for malformed/stale authority or unsafe roots.
+    pub fn build_profile(
+        request: &LoopbackServerIsolationRequestV1,
+    ) -> Result<String, BrowserPolicyError> {
+        request.validate()?;
+        let repository_root = request.repository_root.canonicalize()?;
+        let data_root = request.data_root.canonicalize()?;
+        let user_home_root = request.user_home_root.canonicalize()?;
+        let mut profile = String::from("(version 1)(allow default)(deny network*)");
+        write!(
+            &mut profile,
+            "(allow network-bind (local ip \"localhost:{}\"))",
+            request.task_loopback_grant.port
+        )
+        .map_err(|_| {
+            BrowserPolicyError::Denied("failed to build loopback server network profile".to_owned())
+        })?;
+        write!(
+            &mut profile,
+            "(allow network-inbound (local ip \"localhost:{}\"))",
+            request.task_loopback_grant.port
+        )
+        .map_err(|_| {
+            BrowserPolicyError::Denied("failed to build loopback server inbound profile".to_owned())
+        })?;
+        write!(
+            &mut profile,
+            "(deny file-read* (subpath {}))(allow file-read* (subpath {}))(allow file-read* (subpath {}))",
+            seatbelt_string(&user_home_root),
+            seatbelt_string(&repository_root),
+            seatbelt_string(&data_root)
+        )
+        .map_err(|_| {
+            BrowserPolicyError::Denied("failed to build loopback server read-jail profile".to_owned())
+        })?;
+        for root in &request.extra_protected_read_roots {
+            let root = canonicalize_existing_or_parent_browser(root)?;
+            write!(
+                &mut profile,
+                "(deny file-read* (subpath {}))",
+                seatbelt_string(&root)
+            )
+            .map_err(|_| {
+                BrowserPolicyError::Denied(
+                    "failed to build loopback server protected-read profile".to_owned(),
+                )
+            })?;
+        }
+        profile.push_str("(deny file-write* (subpath \"/\"))");
+        profile.push_str("(allow file-write* (literal \"/dev/null\"))");
+        write!(
+            &mut profile,
+            "(allow file-write* (subpath {}))",
+            seatbelt_string(&data_root)
+        )
+        .map_err(|_| {
+            BrowserPolicyError::Denied("failed to build loopback server data-root rule".to_owned())
+        })?;
+        profile.push_str("(deny process-exec (literal \"/usr/bin/security\"))");
+        profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd\"))");
+        profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd.xpc\"))");
+        profile.push_str("(deny mach-lookup (global-name \"com.apple.securityd.system\"))");
+        Ok(profile)
+    }
+
+    /// Wraps one exact already-authorized server executable/argv in the dedicated Seatbelt profile.
+    ///
+    /// # Errors
+    /// Returns fail-closed for invalid authority or a missing/non-absolute executable.
+    pub fn isolate(
+        &self,
+        executable: &Path,
+        args: &[String],
+        request: &LoopbackServerIsolationRequestV1,
+    ) -> Result<crate::IsolatedCommand, BrowserPolicyError> {
+        if !executable.is_absolute() || !executable.is_file() {
+            return Err(BrowserPolicyError::Denied(
+                "loopback server executable must be an existing absolute file".to_owned(),
+            ));
+        }
+        let profile = Self::build_profile(request)?;
+        let mut wrapped = vec!["-p".to_owned(), profile, executable.display().to_string()];
+        wrapped.extend(args.iter().cloned());
+        Ok(crate::IsolatedCommand {
+            executable: self.sandbox_exec.clone(),
+            args: wrapped,
+        })
+    }
+
+    fn self_test(&self) -> Result<(), BrowserPolicyError> {
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| BrowserPolicyError::IsolationUnavailable(error.to_string()))?
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(format!("sovereign-loopback-server-{nonce}"));
+        let repository_root = root.join("repo");
+        let data_root = root.join("data");
+        fs::create_dir_all(&repository_root)?;
+        fs::create_dir_all(&data_root)?;
+        let repository_root = repository_root.canonicalize()?;
+        let data_root = data_root.canonicalize()?;
+        let protected_root = repository_root.join(".protected");
+        fs::create_dir_all(&protected_root)?;
+        let protected_file = protected_root.join("secret.txt");
+        let repository_file = repository_root.join("readable.txt");
+        let data_file = data_root.join("readable.txt");
+        fs::write(&protected_file, b"secret")?;
+        fs::write(&repository_file, b"repository")?;
+        fs::write(&data_file, b"data")?;
+        let allowed_listener = TcpListener::bind("127.0.0.1:0")?;
+        let denied_listener = TcpListener::bind("127.0.0.1:0")?;
+        let allowed_port = allowed_listener.local_addr()?.port();
+        let denied_port = denied_listener.local_addr()?.port();
+        drop(allowed_listener);
+        drop(denied_listener);
+        let request = LoopbackServerIsolationRequestV1 {
+            task_loopback_grant: TaskLoopbackGrantV1 {
+                schema_version: TASK_LOOPBACK_GRANT_SCHEMA_VERSION,
+                plan_id: "plan.selftest".to_owned(),
+                plan_revision: 1,
+                task_id: "task.selftest".to_owned(),
+                task_contract_digest: format!("sha256:{}", "1".repeat(64)),
+                resource_lease_id: "resource.selftest".to_owned(),
+                execution_epoch: 1,
+                scheme: "http".to_owned(),
+                host: "127.0.0.1".to_owned(),
+                port: allowed_port,
+                expires_at_ms: i64::MAX,
+            },
+            repository_root: repository_root.clone(),
+            data_root: data_root.clone(),
+            user_home_root: root.canonicalize()?,
+            extra_protected_read_roots: vec![protected_root],
+            now_ms: 0,
+        };
+        let profile = Self::build_profile(&request)?;
+        let bind_probe = |port: u16| {
+            format!(
+                "import socket; s=socket.socket(); s.bind(('127.0.0.1',{port})); s.listen(1); s.close()"
+            )
+        };
+        let allowed_bind = self.python_probe(&profile, &bind_probe(allowed_port))?;
+        let denied_bind = self.python_probe(&profile, &bind_probe(denied_port))?;
+        let repository_read = self.file_read_probe(&profile, &repository_file)?;
+        let data_read = self.file_read_probe(&profile, &data_file)?;
+        let protected_read = self.file_read_probe(&profile, &protected_file)?;
+        let inside = data_root.join("inside");
+        let outside = repository_root.join("outside");
+        let write_inside =
+            self.shell_probe(&profile, &format!("printf ok > '{}'", inside.display()))?;
+        let write_outside =
+            self.shell_probe(&profile, &format!("printf no > '{}'", outside.display()))?;
+        let outbound_listener = TcpListener::bind("127.0.0.1:0")?;
+        let outbound_port = outbound_listener.local_addr()?.port();
+        let outbound = self.python_probe(
+            &profile,
+            &format!(
+                "import socket; s=socket.socket(); s.settimeout(0.2); s.connect(('127.0.0.1',{outbound_port}))"
+            ),
+        )?;
+        drop(outbound_listener);
+        let _ = fs::remove_dir_all(&root);
+        if !allowed_bind.success()
+            || denied_bind.success()
+            || !repository_read.success()
+            || !data_read.success()
+            || protected_read.success()
+            || !write_inside.success()
+            || write_outside.success()
+            || outbound.success()
+        {
+            return Err(BrowserPolicyError::IsolationUnavailable(
+                "loopback server Seatbelt self-test did not enforce exact bind/read/write/outbound authority"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn file_read_probe(
+        &self,
+        profile: &str,
+        path: &Path,
+    ) -> Result<std::process::ExitStatus, BrowserPolicyError> {
+        Ok(std::process::Command::new(&self.sandbox_exec)
+            .args(["-p", profile, "/bin/cat"])
+            .arg(path)
+            .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?)
+    }
+
+    fn python_probe(
+        &self,
+        profile: &str,
+        source: &str,
+    ) -> Result<std::process::ExitStatus, BrowserPolicyError> {
+        Ok(std::process::Command::new(&self.sandbox_exec)
+            .args(["-p", profile, "/usr/bin/python3", "-B", "-c", source])
+            .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?)
+    }
+
+    fn shell_probe(
+        &self,
+        profile: &str,
+        source: &str,
+    ) -> Result<std::process::ExitStatus, BrowserPolicyError> {
+        Ok(std::process::Command::new(&self.sandbox_exec)
+            .args(["-p", profile, "/bin/sh", "-c", source])
+            .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?)
+    }
+}
+
 impl BrowserIsolationRequest {
     /// Validates exact writable roots and current Controller loopback authority.
     ///
@@ -625,6 +994,8 @@ impl MacBrowserSandboxExecBackend {
     pub fn build_profile(request: &BrowserIsolationRequest) -> Result<String, BrowserPolicyError> {
         request.validate()?;
         let profile_root = request.profile_root.canonicalize()?;
+        #[cfg(target_os = "macos")]
+        let chrome_singleton_prefix = chrome_process_singleton_prefix(&profile_root)?;
         let mut profile = String::from("(version 1)(allow default)(deny network*)");
         write!(
             &mut profile,
@@ -634,7 +1005,30 @@ impl MacBrowserSandboxExecBackend {
         .map_err(|_| {
             BrowserPolicyError::Denied("failed to build browser network profile".to_owned())
         })?;
+        #[cfg(target_os = "macos")]
+        write!(
+            &mut profile,
+            "(allow network-bind (prefix {}))",
+            seatbelt_string(&chrome_singleton_prefix)
+        )
+        .map_err(|_| {
+            BrowserPolicyError::Denied("failed to build browser singleton profile".to_owned())
+        })?;
         profile.push_str("(deny file-write* (subpath \"/\"))");
+        #[cfg(target_os = "macos")]
+        {
+            profile.push_str("(allow file-write* (literal \"/dev/null\"))");
+            write!(
+                &mut profile,
+                "(allow file-write* (prefix {}))",
+                seatbelt_string(&chrome_singleton_prefix)
+            )
+            .map_err(|_| {
+                BrowserPolicyError::Denied(
+                    "failed to build browser singleton file profile".to_owned(),
+                )
+            })?;
+        }
         write!(
             &mut profile,
             "(allow file-write* (subpath {}))",
@@ -872,6 +1266,21 @@ fn validate_existing_directory(path: &Path) -> Result<(), BrowserPolicyError> {
     Ok(())
 }
 
+fn canonicalize_existing_or_parent_browser(path: &Path) -> Result<PathBuf, BrowserPolicyError> {
+    if path.exists() {
+        return Ok(path.canonicalize()?);
+    }
+    let Some(parent) = path.parent() else {
+        return Err(BrowserPolicyError::Denied(format!(
+            "protected browser root has no parent: {}",
+            path.display()
+        )));
+    };
+    Ok(parent.canonicalize()?.join(path.file_name().ok_or_else(|| {
+        BrowserPolicyError::Denied("protected browser root has no final component".to_owned())
+    })?))
+}
+
 fn seatbelt_string(path: &Path) -> String {
     let value = path
         .display()
@@ -879,6 +1288,29 @@ fn seatbelt_string(path: &Path) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
     format!("\"{value}\"")
+}
+
+#[cfg(target_os = "macos")]
+fn chrome_process_singleton_prefix(profile_root: &Path) -> Result<PathBuf, BrowserPolicyError> {
+    let temp_root = std::env::temp_dir().canonicalize().map_err(|error| {
+        BrowserPolicyError::IsolationUnavailable(format!(
+            "cannot resolve the macOS per-user temporary directory: {error}"
+        ))
+    })?;
+    let temp_metadata = fs::symlink_metadata(&temp_root)?;
+    let profile_metadata = fs::symlink_metadata(profile_root)?;
+    if !temp_metadata.is_dir()
+        || temp_metadata.uid() != profile_metadata.uid()
+        || temp_metadata.permissions().mode() & 0o077 != 0
+        || temp_root.file_name().and_then(|name| name.to_str()) != Some("T")
+        || !temp_root.starts_with("/private/var/folders")
+    {
+        return Err(BrowserPolicyError::IsolationUnavailable(
+            "macOS browser singleton root is not an owner-private canonical Darwin temporary directory"
+                .to_owned(),
+        ));
+    }
+    Ok(temp_root.join("com.google.Chrome."))
 }
 
 #[cfg(target_os = "macos")]

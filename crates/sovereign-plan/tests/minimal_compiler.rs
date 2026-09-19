@@ -10,7 +10,8 @@ use sovereign_model::{
 };
 use sovereign_plan::{
     PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationError, PlanCompilationInput,
-    PlanCompilationRepository, PlanCompiler, PlanValidator, ValidationEnvironment,
+    PlanCompilationRepository, PlanCompilationResult, PlanCompiler, PlanValidator,
+    ValidationEnvironment,
 };
 use sovereign_policy::{ModelCallBudget, SecretInjection, SecretProviderKind, SecretRef};
 use std::collections::VecDeque;
@@ -184,6 +185,47 @@ fn enable_external_intelligence(
     input.policy["resources"]["max_network_bytes"] = json!(max_network_bytes);
 }
 
+const LOOPBACK_BROWSER_PORT: u16 = 4_173;
+const LOOPBACK_BROWSER_MAX_NETWORK_BYTES: u64 = 4_096;
+
+fn browser_tool_pin() -> Value {
+    json!({
+        "id": "tool.browser",
+        "version": "1.0.0",
+        "digest": format!("sha256:{}", "b".repeat(64))
+    })
+}
+
+fn enable_loopback_browser(input: &mut PlanCompilationInput) {
+    input.policy["capability_ceiling"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("capability ceiling must be an array"))
+        .extend([
+            json!("browser_interactive"),
+            json!("network_read"),
+            json!("network_write"),
+        ]);
+    input.policy["network"] = json!({
+        "default": "task_scoped",
+        "allowed_hosts": ["127.0.0.1"],
+        "allowed_schemes": ["http"],
+        "allowed_ports": [LOOPBACK_BROWSER_PORT],
+        "allowed_methods": ["GET", "POST"],
+        "follow_redirects": true,
+        "max_redirects": 1,
+        "allow_private_ranges": false,
+        "dns_revalidation": true,
+        "connected_peer_validation": true,
+        "ambient_proxy": "deny",
+        "allow_task_loopback": true
+    });
+    input.policy["resources"]["max_network_bytes"] = json!(LOOPBACK_BROWSER_MAX_NETWORK_BYTES);
+    input.policy["resources"]["heavy_leases"]
+        .as_array_mut()
+        .unwrap_or_else(|| panic!("heavy leases must be an array"))
+        .push(json!("BROWSER"));
+}
+
 fn one_task_proposal() -> String {
     json!({
         "tasks": [{
@@ -238,6 +280,184 @@ fn unknown_path_proposal() -> String {
         }]
     })
     .to_string()
+}
+
+fn two_read_only_browser_tasks_proposal() -> String {
+    json!({
+        "tasks": [
+            {
+                "title": "Capture inventory baseline",
+                "objective": "Resolve the current inventory baseline before browser verification.",
+                "rationale": "The proposed browser fixture path is intentionally outside bounded source evidence.",
+                "files": ["src/browser/InventoryBaseline.ts"],
+                "symbols": ["InventoryBaseline"],
+                "evidence_queries": [],
+                "expected_change": "Exact baseline evidence for the loopback application."
+            },
+            {
+                "title": "Verify inventory flow in the browser",
+                "objective": "Verify the loopback inventory flow after the baseline task completes.",
+                "rationale": "Browser verification requires Controller-bound loopback authority only on this task.",
+                "files": ["src/browser/InventoryBrowserFlow.ts"],
+                "symbols": ["InventoryBrowserFlow"],
+                "evidence_queries": [],
+                "expected_change": "Browser verification evidence for the loopback inventory flow."
+            }
+        ]
+    })
+    .to_string()
+}
+
+fn compile_loopback_browser_source(
+    configure: impl FnOnce(&mut PlanCompilationInput),
+) -> PlanCompilationResult {
+    let backend = RecordingBackend::new(vec![response(two_read_only_browser_tasks_proposal())]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    enable_loopback_browser(&mut input);
+    configure(&mut input);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile loopback browser source: {error}"))
+}
+
+fn assert_loopback_browser_binding_rejected(
+    configure: impl FnOnce(&mut PlanCompilationInput),
+    message_fragment: &str,
+) {
+    let source = compile_loopback_browser_source(configure);
+    let validator = validator();
+    let target_task_id = source.plan().as_value()["tasks"][1]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("target task id"));
+    let Err(error) = source.bind_controller_loopback_browser(
+        &validator,
+        target_task_id,
+        &browser_tool_pin(),
+        LOOPBACK_BROWSER_PORT,
+        LOOPBACK_BROWSER_MAX_NETWORK_BYTES,
+    ) else {
+        panic!("loopback browser binding must fail closed");
+    };
+    assert!(matches!(
+        error,
+        PlanCompilationError::ControllerBindingRejected(message)
+            if message.contains(message_fragment)
+    ));
+}
+
+fn assert_loopback_browser_authority(
+    sibling: &Value,
+    target: &Value,
+    browser_tool_pin: &Value,
+    source_target_approvals: &Value,
+) {
+    let sibling_leases = sibling["resource_budget"]["heavy_leases"]
+        .as_array()
+        .unwrap_or_else(|| panic!("sibling heavy leases"));
+    let target_leases = target["resource_budget"]["heavy_leases"]
+        .as_array()
+        .unwrap_or_else(|| panic!("target heavy leases"));
+    let target_permissions = target["permissions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("target permissions"));
+    let target_tools = target["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("target tools"));
+
+    assert!(target_leases.contains(&json!("BROWSER")));
+    assert!(!target_leases.contains(&json!("MODEL")));
+    assert!(!sibling_leases.contains(&json!("BROWSER")));
+    assert!(sibling_leases.contains(&json!("MODEL")));
+    assert!(target_permissions.contains(&json!("browser_interactive")));
+    assert!(target_permissions.contains(&json!("network_read")));
+    assert!(target_permissions.contains(&json!("network_write")));
+    assert!(!target_permissions.contains(&json!("repo_write")));
+    assert_eq!(target_tools.last(), Some(browser_tool_pin));
+    assert_eq!(
+        target["action_policy"]["network"],
+        json!({
+            "default": "task_scoped",
+            "allowed_hosts": ["127.0.0.1"],
+            "allowed_schemes": ["http"],
+            "allowed_ports": [LOOPBACK_BROWSER_PORT],
+            "allowed_methods": ["GET", "POST"],
+            "follow_redirects": true,
+            "max_redirects": 1,
+            "allow_private_ranges": false,
+            "dns_revalidation": true,
+            "connected_peer_validation": true,
+            "ambient_proxy": "deny",
+            "allow_task_loopback": true
+        })
+    );
+    assert_eq!(
+        target["resource_budget"]["max_network_bytes"],
+        json!(LOOPBACK_BROWSER_MAX_NETWORK_BYTES)
+    );
+    assert_eq!(target["resource_budget"]["max_model_calls"], json!(0));
+    assert_eq!(
+        target["action_policy"]["approval_required_permissions"],
+        *source_target_approvals
+    );
+}
+
+fn assert_loopback_browser_fail_closed_lifecycle(target: &Value) {
+    let rules = target["next_state_rules"]
+        .as_array()
+        .unwrap_or_else(|| panic!("next state rules"));
+    let unknown_action_rules = rules
+        .iter()
+        .filter(|rule| rule["event"] == json!("unknown_action"))
+        .collect::<Vec<_>>();
+    assert_eq!(unknown_action_rules.len(), 1);
+    assert_eq!(unknown_action_rules[0]["transition"], json!("reconcile"));
+    assert_eq!(
+        unknown_action_rules[0]["guards"],
+        json!(["plan_revision_active"])
+    );
+    let execution_failure_rules = rules
+        .iter()
+        .filter(|rule| rule["event"] == json!("execution_failure"))
+        .collect::<Vec<_>>();
+    assert_eq!(execution_failure_rules.len(), 1);
+    assert_eq!(execution_failure_rules[0]["transition"], json!("block"));
+    assert_eq!(
+        target["failure_policy"]["on_execution_failure"],
+        json!("block")
+    );
+    assert_eq!(target["rollback"]["mode"], json!("compensating_action"));
+    assert_eq!(
+        target["rollback"]["verification_steps"][0]["evidence_type"],
+        json!("browser_compensation_receipt")
+    );
+    let compensation_artifact_id = target["rollback"]["verification_steps"][0]["artifact_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("browser compensation artifact id"));
+    let compensation_artifact = target["expected_artifacts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected artifacts"))
+        .iter()
+        .find(|artifact| artifact["artifact_id"] == json!(compensation_artifact_id))
+        .unwrap_or_else(|| panic!("linked browser compensation artifact"));
+    assert_eq!(compensation_artifact["kind"], json!("evidence"));
+    assert_eq!(compensation_artifact["required"], json!(false));
+    assert!(
+        compensation_artifact["locator"].as_str().is_some_and(
+            |locator| locator.starts_with("controller://rollback/browser-compensation/")
+        )
+    );
+    let rollback_procedure = target["rollback"]["procedure"]
+        .as_str()
+        .unwrap_or_else(|| panic!("rollback procedure"));
+    assert!(rollback_procedure.contains("No automatic compensation is authorized"));
+    assert!(
+        rollback_procedure.contains("First reconcile the exact original browser write outcome")
+    );
+    assert!(rollback_procedure.contains("fresh Controller-governed compensating action"));
+    assert!(rollback_procedure.contains("never replay an unknown write"));
 }
 
 fn response(content: impl Into<String>) -> ModelResponse {
@@ -564,6 +784,270 @@ fn controller_external_intelligence_binding_reruns_plan_validation() {
         ),
         Err(PlanCompilationError::ValidationRejected(_))
     ));
+}
+
+#[test]
+fn controller_loopback_browser_binding_is_validator_clean_and_narrows_authority() {
+    let source = compile_loopback_browser_source(|_| {});
+    let validator = validator();
+    let source_tasks = source.plan().as_value()["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("source tasks array"));
+    let target_task_id = source_tasks[1]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("target task id"))
+        .to_owned();
+    let source_plan_digest = source.plan_digest().to_owned();
+    let source_evidence_digest = source.compilation_evidence_digest().to_owned();
+    let source_global_approval = source.plan().as_value()["policy"]["approval"].clone();
+    let source_target_approvals =
+        source_tasks[1]["action_policy"]["approval_required_permissions"].clone();
+    let browser_tool_pin = browser_tool_pin();
+
+    assert_eq!(source_tasks[1]["permissions"], json!(["read"]));
+    assert_eq!(source_tasks[1]["rollback"]["mode"], json!("none"));
+    assert_eq!(
+        source_tasks[1]["action_policy"]["browser"]["allowed"],
+        json!(false)
+    );
+
+    let bound = source
+        .bind_controller_loopback_browser(
+            &validator,
+            &target_task_id,
+            &browser_tool_pin,
+            LOOPBACK_BROWSER_PORT,
+            LOOPBACK_BROWSER_MAX_NETWORK_BYTES,
+        )
+        .unwrap_or_else(|error| panic!("bind loopback browser: {error}"));
+    let bound_tasks = bound.plan().as_value()["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bound tasks array"));
+    let sibling = &bound_tasks[0];
+    let target = &bound_tasks[1];
+
+    assert!(validator.is_valid(bound.plan()));
+    assert_loopback_browser_authority(sibling, target, &browser_tool_pin, &source_target_approvals);
+    assert_eq!(
+        bound.plan().as_value()["policy"]["approval"],
+        source_global_approval
+    );
+    assert!(
+        bound.plan().as_value()["policy"]["approval"]["required_permissions"]
+            .as_array()
+            .is_some_and(|permissions| permissions.contains(&json!("network_write")))
+    );
+    assert_loopback_browser_fail_closed_lifecycle(target);
+
+    assert_ne!(bound.plan_digest(), source_plan_digest);
+    assert_ne!(bound.compilation_evidence_digest(), source_evidence_digest);
+    assert_eq!(
+        bound.compilation_evidence().plan_digest(),
+        bound.plan_digest()
+    );
+    let bindings = bound
+        .compilation_evidence()
+        .controller_browser_loopback_bindings();
+    assert_eq!(bindings.len(), 1);
+    assert_eq!(bindings[0].source_plan_digest(), source_plan_digest);
+    assert_eq!(bindings[0].target_task_id(), target_task_id);
+    assert!(bindings[0].binding_digest().starts_with("sha256:"));
+}
+
+#[test]
+fn controller_loopback_browser_binding_digest_covers_bound_resource_lifecycle() {
+    let validator = validator();
+    let default_source = compile_loopback_browser_source(|_| {});
+    let tightened_source = compile_loopback_browser_source(|input| {
+        input.policy["resources"]["max_wall_seconds"] = json!(3_599);
+    });
+    let default_target = default_source.plan().as_value()["tasks"][1]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("default target task id"))
+        .to_owned();
+    let tightened_target = tightened_source.plan().as_value()["tasks"][1]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tightened target task id"))
+        .to_owned();
+    assert_eq!(default_target, tightened_target);
+
+    let default_bound = default_source
+        .bind_controller_loopback_browser(
+            &validator,
+            &default_target,
+            &browser_tool_pin(),
+            LOOPBACK_BROWSER_PORT,
+            LOOPBACK_BROWSER_MAX_NETWORK_BYTES,
+        )
+        .unwrap_or_else(|error| panic!("bind default browser task: {error}"));
+    let tightened_bound = tightened_source
+        .bind_controller_loopback_browser(
+            &validator,
+            &tightened_target,
+            &browser_tool_pin(),
+            LOOPBACK_BROWSER_PORT,
+            LOOPBACK_BROWSER_MAX_NETWORK_BYTES,
+        )
+        .unwrap_or_else(|error| panic!("bind tightened browser task: {error}"));
+
+    assert_eq!(
+        default_bound.plan().as_value()["tasks"][1]["failure_policy"]["on_execution_failure"],
+        json!("block")
+    );
+    assert_eq!(
+        tightened_bound.plan().as_value()["tasks"][1]["failure_policy"]["on_execution_failure"],
+        json!("block")
+    );
+    assert_eq!(
+        default_bound.plan().as_value()["tasks"][1]["resource_budget"]["max_model_calls"],
+        json!(0)
+    );
+    assert_eq!(
+        tightened_bound.plan().as_value()["tasks"][1]["resource_budget"]["max_model_calls"],
+        json!(0)
+    );
+    assert_ne!(
+        default_bound
+            .compilation_evidence()
+            .controller_browser_loopback_bindings()[0]
+            .binding_digest(),
+        tightened_bound
+            .compilation_evidence()
+            .controller_browser_loopback_bindings()[0]
+            .binding_digest()
+    );
+}
+
+#[test]
+fn controller_loopback_browser_binding_rejects_non_exact_sha256_tool_pin() {
+    let source = compile_loopback_browser_source(|_| {});
+    let validator = validator();
+    let target_task_id = source.plan().as_value()["tasks"][1]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("target task id"));
+    let mut invalid_pin = browser_tool_pin();
+    invalid_pin["digest"] = json!(format!("sha256:{}", "g".repeat(64)));
+
+    assert!(matches!(
+        source.bind_controller_loopback_browser(
+            &validator,
+            target_task_id,
+            &invalid_pin,
+            LOOPBACK_BROWSER_PORT,
+            LOOPBACK_BROWSER_MAX_NETWORK_BYTES,
+        ),
+        Err(PlanCompilationError::ControllerBindingRejected(message))
+            if message.contains("exact sha256:<64-hex> digest")
+    ));
+}
+
+#[test]
+fn controller_loopback_browser_binding_rejects_duplicate_or_preexisting_browser_authority() {
+    let source = compile_loopback_browser_source(|_| {});
+    let validator = validator();
+    let target_task_id = source.plan().as_value()["tasks"][1]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("target task id"))
+        .to_owned();
+    let exact_pin = browser_tool_pin();
+    let bound = source
+        .bind_controller_loopback_browser(
+            &validator,
+            &target_task_id,
+            &exact_pin,
+            LOOPBACK_BROWSER_PORT,
+            LOOPBACK_BROWSER_MAX_NETWORK_BYTES,
+        )
+        .unwrap_or_else(|error| panic!("first loopback browser binding: {error}"));
+    assert!(matches!(
+        bound.bind_controller_loopback_browser(
+            &validator,
+            &target_task_id,
+            &exact_pin,
+            LOOPBACK_BROWSER_PORT,
+            LOOPBACK_BROWSER_MAX_NETWORK_BYTES,
+        ),
+        Err(PlanCompilationError::ControllerBindingRejected(message))
+            if message.contains("already contains a Controller authority binding")
+    ));
+
+    let preexisting_pin = browser_tool_pin();
+    let preexisting = compile_loopback_browser_source(|input| {
+        input.tools.push(preexisting_pin.clone());
+        input.read_tool_id = "tool.browser".to_owned();
+    });
+    let preexisting_target = preexisting.plan().as_value()["tasks"][1]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("preexisting target task id"));
+    assert!(matches!(
+        preexisting.bind_controller_loopback_browser(
+            &validator,
+            preexisting_target,
+            &preexisting_pin,
+            LOOPBACK_BROWSER_PORT,
+            LOOPBACK_BROWSER_MAX_NETWORK_BYTES,
+        ),
+        Err(PlanCompilationError::ControllerBindingRejected(message))
+            if message.contains("already contains the Controller-selected browser tool pin")
+    ));
+}
+
+#[test]
+fn controller_loopback_browser_binding_requires_exact_global_preauthorization() {
+    assert_loopback_browser_binding_rejected(
+        |input| {
+            input.policy["capability_ceiling"]
+                .as_array_mut()
+                .unwrap_or_else(|| panic!("capability ceiling"))
+                .retain(|capability| capability != &json!("browser_interactive"));
+        },
+        "capability ceiling does not include browser_interactive",
+    );
+    assert_loopback_browser_binding_rejected(
+        |input| input.policy["network"]["allow_task_loopback"] = json!(false),
+        "global network policy does not preauthorize exact",
+    );
+    assert_loopback_browser_binding_rejected(
+        |input| input.policy["network"]["allowed_methods"] = json!(["GET"]),
+        "global network policy does not preauthorize exact",
+    );
+    assert_loopback_browser_binding_rejected(
+        |input| input.policy["network"]["allowed_ports"] = json!([4_174]),
+        "global network policy does not preauthorize exact",
+    );
+    assert_loopback_browser_binding_rejected(
+        |input| input.policy["network"]["follow_redirects"] = json!(false),
+        "global network policy does not preauthorize exact",
+    );
+    assert_loopback_browser_binding_rejected(
+        |input| input.policy["network"]["max_redirects"] = json!(0),
+        "global network policy does not preauthorize exact",
+    );
+    assert_loopback_browser_binding_rejected(
+        |input| {
+            input.policy["resources"]["heavy_leases"]
+                .as_array_mut()
+                .unwrap_or_else(|| panic!("heavy leases"))
+                .retain(|lease| lease != &json!("BROWSER"));
+        },
+        "global resources do not preauthorize BROWSER",
+    );
+    assert_loopback_browser_binding_rejected(
+        |input| {
+            input.policy["resources"]["max_network_bytes"] =
+                json!(LOOPBACK_BROWSER_MAX_NETWORK_BYTES - 1);
+        },
+        "global resources do not preauthorize BROWSER",
+    );
+    assert_loopback_browser_binding_rejected(
+        |input| {
+            input.policy["approval"]["required_permissions"]
+                .as_array_mut()
+                .unwrap_or_else(|| panic!("required permissions"))
+                .retain(|permission| permission != &json!("network_write"));
+        },
+        "must retain network_write approval",
+    );
 }
 
 #[test]

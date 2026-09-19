@@ -75,7 +75,8 @@ mod roles;
 mod skills;
 
 pub use browser::{
-    AuthorizedBrowserAction, BrowserDestinationV1, BrowserTaskAuthorityV1, browser_destination,
+    AuthorizedBrowserAction, BrowserDestinationV1, BrowserReadyLeaseV1, BrowserTaskAuthorityV1,
+    ControllerBrowserSession, ControllerManagedLoopbackApp, browser_destination,
 };
 
 pub use local_control::{
@@ -516,6 +517,10 @@ struct PersistedActionReconciliationBindingV1 {
     plan_id: String,
     plan_revision: u32,
     task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_contract_digest: Option<String>,
     payload_digest: String,
     policy_digest: String,
     execution_epoch: i64,
@@ -910,6 +915,27 @@ pub struct ReadyLease {
     resource_lease: ResourceLeaseV1,
     release_resource_on_finish: bool,
     lease_digest: String,
+}
+
+#[derive(Debug, Clone)]
+struct AttemptStartBinding {
+    task_id: String,
+    plan_digest: String,
+    task_contract_digest: String,
+    execution_epoch: i64,
+    baseline_digest: String,
+}
+
+impl From<&ReadyLease> for AttemptStartBinding {
+    fn from(lease: &ReadyLease) -> Self {
+        Self {
+            task_id: lease.task_id.clone(),
+            plan_digest: lease.plan_digest.clone(),
+            task_contract_digest: lease.task_contract_digest.clone(),
+            execution_epoch: lease.execution_epoch,
+            baseline_digest: lease.baseline_digest.clone(),
+        }
+    }
 }
 
 /// Ephemeral Controller authority for a D4 multi-repository read/process-only integration gate.
@@ -2018,6 +2044,47 @@ struct RepairAttemptOriginV1 {
     prior_attempt_id: String,
     failure_record_digest: String,
     repair_packet_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepairProposalKind {
+    ReplaceLiteral,
+    RepositoryAction,
+}
+
+impl RepairProposalKind {
+    fn output_schema(self) -> &'static str {
+        match self {
+            Self::ReplaceLiteral => {
+                "Strict ModelProposalV1 JSON: schema_version=1, evidence_ids, and exactly one replace_literal action with repository_id, path, expected_source_digest, old_literal, new_literal, expected_occurrences=1. The Controller enforces the full JSON Schema out-of-band."
+            }
+            Self::RepositoryAction => {
+                "Strict RepositoryProposalV1 JSON: schema_version=1, evidence_ids, and exactly one create_file or update_file action. create_file requires repository_id, path, content; update_file requires repository_id, path, expected_source_digest, content. The Controller enforces the full JSON Schema out-of-band."
+            }
+        }
+    }
+
+    fn path_guidance(self) -> &'static str {
+        match self {
+            Self::ReplaceLiteral => {
+                "use that exact current digest for expected_source_digest and derive old/new literals only from the immutable task/goal contract."
+            }
+            Self::RepositoryAction => {
+                "for update_file use that exact current digest for expected_source_digest; for create_file the target must remain absent and explicitly allowed by the immutable task scope; derive complete content only from the immutable task/goal contract."
+            }
+        }
+    }
+
+    fn general_guidance(self) -> &'static str {
+        match self {
+            Self::ReplaceLiteral => {
+                "derive replacement fields only from current exact evidence and the immutable task/goal contract."
+            }
+            Self::RepositoryAction => {
+                "derive create/update fields only from current exact evidence and the immutable task/goal contract; never treat rejected proposal fields as authority."
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5301,12 +5368,25 @@ impl Controller {
         &mut self,
         action: &dyn JournalActionAuthority,
     ) -> Result<(), ControllerError> {
+        let task_contract_digest = self
+            .active_ref()?
+            .tasks
+            .get(action.task_id())
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "action reconciliation task disappeared from active runtime".to_owned(),
+                )
+            })?
+            .task_contract_digest
+            .clone();
         let binding = PersistedActionReconciliationBindingV1 {
             schema_version: ACTION_RECONCILIATION_SCHEMA_VERSION,
             action_id: action.action_id().to_owned(),
             plan_id: action.plan_id().to_owned(),
             plan_revision: action.plan_revision(),
             task_id: action.task_id().to_owned(),
+            attempt_id: Some(action.attempt_id().to_owned()),
+            task_contract_digest: Some(task_contract_digest),
             payload_digest: action.payload_digest(),
             policy_digest: action.policy_digest().to_owned(),
             execution_epoch: action.execution_epoch(),
@@ -5412,7 +5492,7 @@ impl Controller {
             ));
         }
         if self.any_unresolved_action()?
-            || has_unresolved_process_lease(&self.state)?
+            || self.has_blocking_process_lease_for_action(action)?
             || has_unresolved_rollback(&self.state, Some(action.action_id()))?
         {
             return Err(ControllerError::NotReady(
@@ -9651,7 +9731,39 @@ impl Controller {
             .goal_autonomy_budget
             .max_disk_write_bytes
             .saturating_sub(active.goal_autonomy_budget.used_disk_write_bytes);
-        let limit = task_remaining.min(goal_remaining) / commands_remaining;
+        let future_other_commands = active
+            .tasks
+            .iter()
+            .filter(|(candidate_id, task)| {
+                candidate_id.as_str() != task_id
+                    && !matches!(task.state, TaskState::FailedTerminal | TaskState::Succeeded)
+            })
+            .try_fold(0_u64, |total, (_, task)| {
+                let count = required_command_verification_steps(&task.task)?.len();
+                let count = u64::try_from(count).map_err(|_| {
+                    ControllerError::InvalidPlan(
+                        "future command verification step count does not fit resource arithmetic"
+                            .to_owned(),
+                    )
+                })?;
+                total.checked_add(count).ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "future command verification step count overflowed resource arithmetic"
+                            .to_owned(),
+                    )
+                })
+            })?;
+        let goal_command_slots = commands_remaining
+            .checked_add(future_other_commands)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "goal command verification step count overflowed resource arithmetic"
+                        .to_owned(),
+                )
+            })?;
+        let task_limit = task_remaining / commands_remaining;
+        let goal_limit = goal_remaining / goal_command_slots;
+        let limit = task_limit.min(goal_limit);
         if limit == 0 {
             return Err(ControllerError::Policy(PolicyError::ResourceDenied(
                 "command verification has no remaining governed disk-write budget".to_owned(),
@@ -10780,14 +10892,43 @@ impl Controller {
         result
     }
 
-    /// Executes one bounded targeted repair attempt against the same active task contract.
-    /// The repair packet is rebuilt from current diff/failure evidence and the existing bounded
-    /// context; no `PlanCompiler` call or plan/task-contract mutation occurs.
+    /// Requests one typed repository create/update proposal from the resident model and executes it
+    /// through the same canonical Controller authorization, journal, filesystem-guard,
+    /// verification, and completion path as [`Self::execute_repository_proposal`].
+    ///
+    /// # Errors
+    /// Returns fail-closed for stale readiness, model admission/cancellation failures, invalid model
+    /// output, proposal scope/evidence violations, authorization, filesystem ambiguity, unknown
+    /// outcome, or deterministic verification failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn execute_repository_with_model<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        mut lease: ReadyLease,
+        runtime: &ExecutionRuntime<'_, I>,
+        context: &ContextPacket,
+        model_budget: &mut ModelCallBudget,
+    ) -> Result<ExecutionSuccess, ControllerError> {
+        let result = self.execute_repository_with_model_inner(
+            &mut lease,
+            runtime,
+            context,
+            model_budget,
+            None,
+        );
+        let cleanup = self.unload_model_for_ready_lease(&mut lease, runtime.backend);
+        match (result, cleanup) {
+            (Ok(success), Ok(())) => Ok(success),
+            (_, Err(error)) | (Err(error), Ok(())) => Err(error),
+        }
+    }
+
+    /// Executes one bounded targeted replacement repair attempt against the same active task
+    /// contract. The repair packet is rebuilt from current diff/failure evidence and the existing
+    /// bounded context; no `PlanCompiler` call or plan/task-contract mutation occurs.
     ///
     /// # Errors
     /// Returns a fail-closed readiness/policy/error result when retry counters, failure evidence,
     /// resources, task contract, or current repository truth do not permit another attempt.
-    #[allow(clippy::too_many_lines)]
     pub fn repair_replace<I: sovereign_policy::ExecutionIsolationBackend>(
         &mut self,
         task_id: &str,
@@ -10797,6 +10938,79 @@ impl Controller {
         readiness: ReadinessInputs<'_>,
         model_budget: &mut ModelCallBudget,
     ) -> Result<(ExecutionSuccess, RepairPacket), ControllerError> {
+        let (repair_packet, mut lease, repair_origin) = self.prepare_repair_attempt(
+            task_id,
+            runtime,
+            base_context,
+            tool_schemas,
+            readiness,
+            RepairProposalKind::ReplaceLiteral,
+        )?;
+        let result = self.execute_replace_inner(
+            &mut lease,
+            runtime,
+            &repair_packet.context,
+            model_budget,
+            Some(&repair_origin),
+        );
+        let cleanup = self.unload_model_for_ready_lease(&mut lease, runtime.backend);
+        let success = match (result, cleanup) {
+            (Ok(success), Ok(())) => success,
+            (_, Err(error)) | (Err(error), Ok(())) => return Err(error),
+        };
+        self.verify_repair_success_bindings(task_id, &repair_packet, &success)?;
+        Ok((success, repair_packet))
+    }
+
+    /// Executes one bounded targeted repository create/update repair under the same immutable task
+    /// contract and failure policy as the failed model-backed repository attempt.
+    ///
+    /// # Errors
+    /// Returns fail-closed when the repair origin, retry/resource budgets, current evidence,
+    /// readiness authority, model proposal, repository preimage, or acceptance bindings are stale.
+    pub fn repair_repository_with_model<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        task_id: &str,
+        runtime: &ExecutionRuntime<'_, I>,
+        base_context: &ContextPacket,
+        tool_schemas: &[ToolSchemaV1],
+        readiness: ReadinessInputs<'_>,
+        model_budget: &mut ModelCallBudget,
+    ) -> Result<(ExecutionSuccess, RepairPacket), ControllerError> {
+        let (repair_packet, mut lease, repair_origin) = self.prepare_repair_attempt(
+            task_id,
+            runtime,
+            base_context,
+            tool_schemas,
+            readiness,
+            RepairProposalKind::RepositoryAction,
+        )?;
+        let result = self.execute_repository_with_model_inner(
+            &mut lease,
+            runtime,
+            &repair_packet.context,
+            model_budget,
+            Some(&repair_origin),
+        );
+        let cleanup = self.unload_model_for_ready_lease(&mut lease, runtime.backend);
+        let success = match (result, cleanup) {
+            (Ok(success), Ok(())) => success,
+            (_, Err(error)) | (Err(error), Ok(())) => return Err(error),
+        };
+        self.verify_repair_success_bindings(task_id, &repair_packet, &success)?;
+        Ok((success, repair_packet))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn prepare_repair_attempt<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        task_id: &str,
+        runtime: &ExecutionRuntime<'_, I>,
+        base_context: &ContextPacket,
+        tool_schemas: &[ToolSchemaV1],
+        readiness: ReadinessInputs<'_>,
+        proposal_kind: RepairProposalKind,
+    ) -> Result<(RepairPacket, ReadyLease, RepairAttemptOriginV1), ControllerError> {
         let (failure, failure_record_digest) = self
             .latest_failure_record_with_digest(task_id)?
             .ok_or_else(|| {
@@ -10963,14 +11177,18 @@ impl Controller {
                     .find(|item| item.locator.as_deref() == Some(locator.as_str()))
                     .map(|item| {
                         format!(
-                            "Repair only the still-valid task using current failure/diff evidence. Controller authority and acceptance are unchanged. The prior failed_action_facts are rejected-attempt diagnostics, not repair instructions. For failed path {path}, current exact evidence {} has source_digest {}; use that exact current digest for expected_source_digest and derive old/new literals only from the immutable task/goal contract.",
-                            item.evidence_id, item.source_digest
+                            "Repair only the still-valid task using current failure/diff evidence. Controller authority and acceptance are unchanged. The prior failed_action_facts are rejected-attempt diagnostics, not repair instructions. For failed path {path}, current exact evidence {} has source_digest {}; {}",
+                            item.evidence_id,
+                            item.source_digest,
+                            proposal_kind.path_guidance()
                         )
                     })
             })
             .unwrap_or_else(|| {
-                "Repair only the still-valid task using current failure/diff evidence. Controller authority and acceptance are unchanged. The prior failed_action_facts are rejected-attempt diagnostics, not repair instructions; derive repair action fields from current exact evidence and the immutable task/goal contract."
-                    .to_owned()
+                format!(
+                    "Repair only the still-valid task using current failure/diff evidence. Controller authority and acceptance are unchanged. The prior failed_action_facts are rejected-attempt diagnostics, not repair instructions. {}",
+                    proposal_kind.general_guidance()
+                )
             });
         let repair_packet = ContextPlanner::default()
             .build_repair(
@@ -10993,8 +11211,7 @@ impl Controller {
                     ),
                     authorized_tool_schemas,
                     candidates,
-                    output_schema: "Strict ModelProposalV1 JSON: schema_version=1, evidence_ids, and exactly one replace_literal action with repository_id, path, expected_source_digest, old_literal, new_literal, expected_occurrences=1. The Controller enforces the full JSON Schema out-of-band."
-                        .to_owned(),
+                    output_schema: proposal_kind.output_schema().to_owned(),
                 },
             )
             .map_err(|error| {
@@ -11043,26 +11260,23 @@ impl Controller {
         )?;
         self.checkpoint_now()?;
 
-        let mut lease =
+        let lease =
             self.derive_repair_lease(runtime.registry, task_id, readiness, runtime.tool_manifest)?;
         let repair_origin = RepairAttemptOriginV1 {
             schema_version: 1,
-            prior_attempt_id: failure.attempt_id.clone(),
+            prior_attempt_id: failure.attempt_id,
             failure_record_digest: repair_packet.failure_record_digest.clone(),
             repair_packet_digest,
         };
-        let result = self.execute_replace_inner(
-            &mut lease,
-            runtime,
-            &repair_packet.context,
-            model_budget,
-            Some(&repair_origin),
-        );
-        let cleanup = self.unload_model_for_ready_lease(&mut lease, runtime.backend);
-        let success = match (result, cleanup) {
-            (Ok(success), Ok(())) => success,
-            (_, Err(error)) | (Err(error), Ok(())) => return Err(error),
-        };
+        Ok((repair_packet, lease, repair_origin))
+    }
+
+    fn verify_repair_success_bindings(
+        &self,
+        task_id: &str,
+        repair_packet: &RepairPacket,
+        success: &ExecutionSuccess,
+    ) -> Result<(), ControllerError> {
         let active = self.active_ref()?;
         let task = active
             .tasks
@@ -11081,7 +11295,7 @@ impl Controller {
                 "repair mutated the active plan/task/acceptance contract".to_owned(),
             ));
         }
-        Ok((success, repair_packet))
+        Ok(())
     }
 
     /// Resumes a crash-interrupted, not-yet-mutated replacement from the exact durable
@@ -11634,6 +11848,112 @@ impl Controller {
                 }
             };
         self.execute_validated_replace(lease, runtime, &attempt_id, &validated)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn execute_repository_with_model_inner<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        lease: &mut ReadyLease,
+        runtime: &ExecutionRuntime<'_, I>,
+        context: &ContextPacket,
+        model_budget: &mut ModelCallBudget,
+        repair_origin: Option<&RepairAttemptOriginV1>,
+    ) -> Result<ExecutionSuccess, ControllerError> {
+        self.validate_ready_lease(lease, runtime.registry, runtime.tool_manifest)?;
+        let model_deadline_ms = self.task_model_deadline_ms(&lease.task_id)?;
+        self.ensure_model_resident(
+            lease,
+            runtime.backend,
+            context.budget.max_input_tokens,
+            model_deadline_ms,
+        )?;
+        match self.consume_task_model_call(&lease.task_id, model_budget, model_deadline_ms) {
+            Ok(()) => {}
+            Err(ControllerError::Policy(error @ PolicyError::ResourceDenied(_))) => {
+                let current = self.task_state(&lease.task_id).ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "task disappeared before model admission".to_owned(),
+                    )
+                })?;
+                self.record_pre_attempt_resource_deferral(&lease.task_id, current)?;
+                return Err(ControllerError::Policy(error));
+            }
+            Err(error) => return Err(error),
+        }
+        let attempt_id = self.start_attempt_with_origin(lease, runtime.registry, repair_origin)?;
+        let cancellation = self.attempt_cancellation_handle(&lease.task_id, &attempt_id)?;
+        if cancellation.is_cancelled() {
+            self.persist_observed_cancellation(&cancellation)?;
+            self.mark_cancelled_without_dispatch(&attempt_id, &lease.task_id)?;
+            self.unload_model_for_ready_lease(lease, runtime.backend)?;
+            return Err(ControllerError::NotReady(
+                "task cancelled before model dispatch".to_owned(),
+            ));
+        }
+        let proposal_result = Self::request_repository_model_proposal(
+            runtime.backend,
+            context,
+            &lease.task_id,
+            model_deadline_ms,
+            &cancellation,
+        );
+        self.unload_model_for_ready_lease(lease, runtime.backend)?;
+        if cancellation.is_cancelled() {
+            self.persist_observed_cancellation(&cancellation)?;
+            self.mark_cancelled_without_dispatch(&attempt_id, &lease.task_id)?;
+            return Err(ControllerError::NotReady(
+                "task cancelled during model dispatch".to_owned(),
+            ));
+        }
+        let proposal = match proposal_result {
+            Ok(value) => value,
+            Err(error) => {
+                let failure = self.build_failure_record(FailureRecordInput {
+                    task_id: lease.task_id.clone(),
+                    attempt_id: attempt_id.clone(),
+                    action_id: None,
+                    result_digest: None,
+                    exit_code: None,
+                    category: "model_proposal_failure".to_owned(),
+                    failure_code: controller_failure_code(&error).to_owned(),
+                    diagnostic: error.to_string(),
+                    failed_action_facts: BTreeMap::new(),
+                    evidence_refs: context
+                        .items
+                        .iter()
+                        .map(|item| item.evidence_id.clone())
+                        .collect(),
+                })?;
+                let _ = self.route_failure_record(failure)?;
+                return Err(error);
+            }
+        };
+        let failed_proposal = proposal.clone();
+        let validated =
+            match self.validate_repository_proposal(runtime.registry, context, lease, proposal) {
+                Ok(value) => value,
+                Err(error) => {
+                    let failure = self.build_failure_record(FailureRecordInput {
+                        task_id: lease.task_id.clone(),
+                        attempt_id: attempt_id.clone(),
+                        action_id: None,
+                        result_digest: None,
+                        exit_code: None,
+                        category: "proposal_validation_failure".to_owned(),
+                        failure_code: controller_failure_code(&error).to_owned(),
+                        diagnostic: error.to_string(),
+                        failed_action_facts: repository_proposal_action_facts(&failed_proposal),
+                        evidence_refs: context
+                            .items
+                            .iter()
+                            .map(|item| item.evidence_id.clone())
+                            .collect(),
+                    })?;
+                    let _ = self.route_failure_record(failure)?;
+                    return Err(error);
+                }
+            };
+        self.execute_validated_repository_action(lease, runtime, &attempt_id, &validated)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -13218,13 +13538,86 @@ impl Controller {
         model_deadline_ms: u64,
         cancellation: &CancellationHandle,
     ) -> Result<ModelProposalV1, ControllerError> {
+        let raw_json = Self::request_model_json_content(
+            backend,
+            context,
+            task_id,
+            model_deadline_ms,
+            cancellation,
+            "Return only ModelProposalV1. Propose one exact replace_literal action. Never emit task state, success, permissions, authorization, shell, or tool execution directives.",
+            ModelOutputContract::JsonSchema {
+                name: "ModelProposalV1".to_owned(),
+                schema: model_proposal_schema(),
+            },
+        )?;
+        let proposal: ModelProposalV1 = serde_json::from_str(&raw_json).map_err(|error| {
+            ControllerError::ProposalRejected(format!(
+                "strict ModelProposalV1 decode failed: {error}"
+            ))
+        })?;
+        if proposal.schema_version != MODEL_PROPOSAL_SCHEMA_VERSION {
+            return Err(ControllerError::ProposalRejected(
+                "unsupported ModelProposalV1 schema_version".to_owned(),
+            ));
+        }
+        validate_proposal_evidence_bounds(&proposal.evidence_ids, "ModelProposalV1")?;
+        Ok(proposal)
+    }
+
+    fn request_repository_model_proposal(
+        backend: &dyn ModelBackend,
+        context: &ContextPacket,
+        task_id: &str,
+        model_deadline_ms: u64,
+        cancellation: &CancellationHandle,
+    ) -> Result<RepositoryProposalV1, ControllerError> {
+        let raw_json = Self::request_model_json_content(
+            backend,
+            context,
+            task_id,
+            model_deadline_ms,
+            cancellation,
+            "Return only RepositoryProposalV1. Propose one exact create_file or update_file action permitted by the immutable task scope and current evidence. Never emit task state, success, permissions, authorization, shell, or tool execution directives.",
+            ModelOutputContract::JsonSchema {
+                name: "RepositoryProposalV1".to_owned(),
+                schema: repository_proposal_schema(),
+            },
+        )?;
+        let proposal: RepositoryProposalV1 = serde_json::from_str(&raw_json).map_err(|error| {
+            ControllerError::ProposalRejected(format!(
+                "strict RepositoryProposalV1 decode failed: {error}"
+            ))
+        })?;
+        if proposal.schema_version != REPOSITORY_PROPOSAL_SCHEMA_VERSION {
+            return Err(ControllerError::ProposalRejected(
+                "unsupported RepositoryProposalV1 schema_version".to_owned(),
+            ));
+        }
+        if serde_json::to_vec(&proposal)?.len() > MAX_REPOSITORY_PROPOSAL_BYTES {
+            return Err(ControllerError::ProposalRejected(
+                "RepositoryProposalV1 exceeds deterministic payload bounds".to_owned(),
+            ));
+        }
+        validate_proposal_evidence_bounds(&proposal.evidence_ids, "RepositoryProposalV1")?;
+        Ok(proposal)
+    }
+
+    fn request_model_json_content(
+        backend: &dyn ModelBackend,
+        context: &ContextPacket,
+        task_id: &str,
+        model_deadline_ms: u64,
+        cancellation: &CancellationHandle,
+        system_prompt: &str,
+        output_contract: ModelOutputContract,
+    ) -> Result<String, ControllerError> {
         let request = ModelRequest {
             schema_version: MODEL_SCHEMA_VERSION,
             request_id: format!("controller.{task_id}.proposal"),
             messages: vec![
                 ModelMessage {
                     role: ModelMessageRole::System,
-                    content: "Return only ModelProposalV1. Propose one exact replace_literal action. Never emit task state, success, permissions, authorization, shell, or tool execution directives.".to_owned(),
+                    content: system_prompt.to_owned(),
                     tool_call_id: None,
                 },
                 ModelMessage {
@@ -13234,10 +13627,7 @@ impl Controller {
                 },
             ],
             tools: Vec::new(),
-            output_contract: ModelOutputContract::JsonSchema {
-                name: "ModelProposalV1".to_owned(),
-                schema: model_proposal_schema(),
-            },
+            output_contract,
             input_token_ceiling: context.budget.max_input_tokens,
             max_output_tokens: M1_MODEL_OUTPUT_TOKENS,
             deadline_ms: model_deadline_ms,
@@ -13286,30 +13676,7 @@ impl Controller {
                 "proposal must finish normally without model tool calls".to_owned(),
             ));
         }
-        let proposal: ModelProposalV1 =
-            serde_json::from_str(&response.content).map_err(|error| {
-                ControllerError::ProposalRejected(format!(
-                    "strict ModelProposalV1 decode failed: {error}"
-                ))
-            })?;
-        if proposal.schema_version != MODEL_PROPOSAL_SCHEMA_VERSION {
-            return Err(ControllerError::ProposalRejected(
-                "unsupported ModelProposalV1 schema_version".to_owned(),
-            ));
-        }
-        let unique_evidence = proposal.evidence_ids.iter().collect::<BTreeSet<_>>();
-        if proposal.evidence_ids.is_empty()
-            || proposal.evidence_ids.len() > MAX_PROPOSAL_EVIDENCE_IDS
-            || unique_evidence.len() != proposal.evidence_ids.len()
-            || proposal.evidence_ids.iter().any(|evidence_id| {
-                evidence_id.is_empty() || evidence_id.len() > MAX_PROPOSAL_EVIDENCE_ID_BYTES
-            })
-        {
-            return Err(ControllerError::ProposalRejected(
-                "ModelProposalV1 evidence_ids violate deterministic bounds".to_owned(),
-            ));
-        }
-        Ok(proposal)
+        Ok(response.content)
     }
 
     fn validate_replace_proposal(
@@ -14657,18 +15024,27 @@ impl Controller {
         registry: &ProjectRegistry,
         repair_origin: Option<&RepairAttemptOriginV1>,
     ) -> Result<String, ControllerError> {
-        let repository_root = self.task_execution_root(&lease.task_id)?;
-        let pre_snapshot = self.task_execution_snapshot(registry, &lease.task_id)?;
+        self.start_attempt_from_binding(&AttemptStartBinding::from(lease), registry, repair_origin)
+    }
+
+    fn start_attempt_from_binding(
+        &mut self,
+        binding: &AttemptStartBinding,
+        registry: &ProjectRegistry,
+        repair_origin: Option<&RepairAttemptOriginV1>,
+    ) -> Result<String, ControllerError> {
+        let repository_root = self.task_execution_root(&binding.task_id)?;
+        let pre_snapshot = self.task_execution_snapshot(registry, &binding.task_id)?;
         let pre_snapshot_digest = snapshot_digest(&pre_snapshot)?;
-        if pre_snapshot_digest != lease.baseline_digest {
+        if pre_snapshot_digest != binding.baseline_digest {
             return Err(ControllerError::NotReady(
                 "repository changed before attempt start".to_owned(),
             ));
         }
-        let pre_diff = self.task_execution_diff(registry, &lease.task_id)?;
+        let pre_diff = self.task_execution_diff(registry, &binding.task_id)?;
         let baseline_diff_digest = self
             .active_ref()?
-            .single_task_repository(&lease.task_id)?
+            .single_task_repository(&binding.task_id)?
             .baseline_diff_digest
             .clone();
         if !self.active_uses_controller_worktrees()? && pre_diff.digest != baseline_diff_digest {
@@ -14681,9 +15057,14 @@ impl Controller {
             capture_protected_fingerprints(&repository_root, &pre_changed_paths)?;
         let attempt_number = {
             let active = self.active_mut()?;
-            let task = active.tasks.get_mut(&lease.task_id).ok_or_else(|| {
+            let task = active.tasks.get_mut(&binding.task_id).ok_or_else(|| {
                 ControllerError::NotReady("ready task disappeared before attempt".to_owned())
             })?;
+            if task.state != TaskState::Planned && repair_origin.is_none() {
+                return Err(ControllerError::NotReady(
+                    "task is no longer Planned before attempt start".to_owned(),
+                ));
+            }
             task.attempts_started = task.attempts_started.saturating_add(1);
             task.state = TaskState::Running;
             task.attempts_started
@@ -14691,21 +15072,21 @@ impl Controller {
         let seed = sha256_prefixed(
             format!(
                 "{}\0{}\0{}\0{}",
-                lease.plan_digest,
-                lease.task_contract_digest,
-                lease.execution_epoch,
+                binding.plan_digest,
+                binding.task_contract_digest,
+                binding.execution_epoch,
                 attempt_number
             )
             .as_bytes(),
         );
         let attempt_id = format!("attempt.{}", &seed[7..27]);
         let attempt = AttemptRuntime {
-            task_id: lease.task_id.clone(),
+            task_id: binding.task_id.clone(),
             attempt_id: attempt_id.clone(),
             state: AttemptState::Executing,
-            task_contract_digest: lease.task_contract_digest.clone(),
+            task_contract_digest: binding.task_contract_digest.clone(),
             repair_origin: repair_origin.cloned(),
-            baseline_digest: lease.baseline_digest.clone(),
+            baseline_digest: binding.baseline_digest.clone(),
             pre_snapshot_digest,
             pre_diff_digest: pre_diff.digest,
             pre_changed_fingerprints,
@@ -14716,7 +15097,7 @@ impl Controller {
         let task_json = serde_json::to_string(
             self.active_ref()?
                 .tasks
-                .get(&lease.task_id)
+                .get(&binding.task_id)
                 .ok_or_else(|| ControllerError::InvalidPlan("task disappeared".to_owned()))?,
         )?;
         let attempt_json = serde_json::to_string(
@@ -14729,7 +15110,7 @@ impl Controller {
             &[
                 (
                     "controller.task".to_owned(),
-                    lease.task_id.clone(),
+                    binding.task_id.clone(),
                     task_json,
                 ),
                 (
@@ -14742,7 +15123,7 @@ impl Controller {
                 "attempt_started".to_owned(),
                 attempt_id.clone(),
                 json!({
-                    "task_id": lease.task_id,
+                    "task_id": binding.task_id,
                     "attempt_number": attempt_number,
                     "repair_origin": repair_origin,
                 }),
@@ -17977,16 +18358,24 @@ impl RecoveryManager {
             &unknown_action_ids,
             execution_epoch_before,
         )?;
+        let browser_recovery = classify_recovered_browser_attempts(
+            &mut controller,
+            &unknown_action_ids,
+            execution_epoch_before,
+        )?;
         for candidate in &integration_recovery.resumable {
             controller.resume_recovered_integration_gate(registry, candidate)?;
         }
+        let mut preserved_attempt_ids = integration_recovery.preserved_attempt_ids.clone();
+        preserved_attempt_ids.extend(browser_recovery.preserved_attempt_ids.iter().cloned());
         let (mut interrupted_attempt_ids, pending_recovery_action_ids, verification_actions) =
             normalize_recovered_runtime(
                 &mut controller,
                 &unknown_action_ids,
-                &integration_recovery.preserved_attempt_ids,
+                &preserved_attempt_ids,
             )?;
         interrupted_attempt_ids.extend(integration_recovery.interrupted_attempt_ids);
+        interrupted_attempt_ids.extend(browser_recovery.interrupted_attempt_ids);
         interrupted_attempt_ids.sort();
         interrupted_attempt_ids.dedup();
         require_checkpoint_bound_recovery_intents(
@@ -20589,6 +20978,263 @@ struct RecoveredIntegrationGateClassification {
     resumable: Vec<RecoveredIntegrationGateCandidate>,
 }
 
+#[derive(Debug, Default)]
+struct RecoveredBrowserClassification {
+    preserved_attempt_ids: BTreeSet<String>,
+    interrupted_attempt_ids: Vec<String>,
+}
+
+#[derive(Debug)]
+struct RecoveredBrowserAttemptContext {
+    attempt_state: AttemptState,
+    task_state: TaskState,
+    task_id: String,
+    task_contract_digest: String,
+    plan_id: String,
+    plan_revision: u32,
+}
+
+#[derive(Debug, Default)]
+struct RecoveredBrowserActionClassification {
+    any_exact_unknown: bool,
+    any_exact_committed_consequential: bool,
+    ambiguous_legacy_consequential: bool,
+}
+
+fn recovered_browser_attempt_context(
+    controller: &Controller,
+    attempt_id: &str,
+) -> Result<Option<RecoveredBrowserAttemptContext>, ControllerError> {
+    let (attempt_state, task_id) = {
+        let active = controller.active_ref()?;
+        let attempt = active.attempts.get(attempt_id).ok_or_else(|| {
+            ControllerError::InvalidPlan("browser recovery attempt disappeared".to_owned())
+        })?;
+        (attempt.state, attempt.task_id.clone())
+    };
+    if !matches!(
+        attempt_state,
+        AttemptState::Executing | AttemptState::Verifying
+    ) {
+        return Ok(None);
+    }
+
+    let (task_state, task_contract_digest, is_browser_task, plan_id, plan_revision) = {
+        let active = controller.active_ref()?;
+        let task = active.tasks.get(&task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan("browser recovery task disappeared".to_owned())
+        })?;
+        (
+            task.state,
+            task.task_contract_digest.clone(),
+            task.task
+                .pointer("/action_policy/browser/allowed")
+                .and_then(Value::as_bool)
+                == Some(true),
+            active.plan_id.clone(),
+            active.revision,
+        )
+    };
+    if !is_browser_task {
+        return Ok(None);
+    }
+    if !matches!(task_state, TaskState::Running | TaskState::Verifying) {
+        return Err(ControllerError::InvalidPlan(format!(
+            "browser recovery attempt {attempt_id} is active while task {task_id} is {task_state:?}"
+        )));
+    }
+
+    Ok(Some(RecoveredBrowserAttemptContext {
+        attempt_state,
+        task_state,
+        task_id,
+        task_contract_digest,
+        plan_id,
+        plan_revision,
+    }))
+}
+
+fn classify_recovered_browser_actions(
+    attempt_id: &str,
+    context: &RecoveredBrowserAttemptContext,
+    execution_epoch: i64,
+    unknown: &BTreeSet<String>,
+    actions: &BTreeMap<String, sovereign_state::PersistedActionRecord>,
+    bindings: &[(String, PersistedActionReconciliationBindingV1)],
+) -> Result<RecoveredBrowserActionClassification, ControllerError> {
+    let mut classification = RecoveredBrowserActionClassification::default();
+    for (record_key, binding) in bindings.iter().filter(|(_, binding)| {
+        binding.plan_id == context.plan_id
+            && binding.plan_revision == context.plan_revision
+            && binding.task_id == context.task_id
+            && binding.execution_epoch == execution_epoch
+    }) {
+        if record_key != &binding.action_id
+            || binding.schema_version != ACTION_RECONCILIATION_SCHEMA_VERSION
+            || binding.payload_digest.trim().is_empty()
+            || binding.policy_digest.trim().is_empty()
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "browser recovery reconciliation binding {} is malformed",
+                binding.action_id
+            )));
+        }
+        let Some(action) = actions.get(&binding.action_id) else {
+            continue;
+        };
+        if action.payload_digest != binding.payload_digest
+            || action.policy_digest != binding.policy_digest
+            || action.execution_epoch != binding.execution_epoch
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "browser recovery action {} drifted from its reconciliation binding",
+                binding.action_id
+            )));
+        }
+        let exact_attempt = binding.attempt_id.as_deref() == Some(attempt_id)
+            && binding.task_contract_digest.as_deref()
+                == Some(context.task_contract_digest.as_str());
+        if !exact_attempt {
+            if binding.attempt_id.is_none()
+                && binding.policy.class == ReconciliationClass::ConsequentialExternal
+                && action.state == ActionState::Committed.as_str()
+            {
+                classification.ambiguous_legacy_consequential = true;
+            }
+            continue;
+        }
+        match action.state.as_str() {
+            "unknown" => {
+                if !unknown.contains(&binding.action_id) {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "browser recovery action {} is Unknown without recovery fencing",
+                        binding.action_id
+                    )));
+                }
+                classification.any_exact_unknown = true;
+            }
+            "committed" => {
+                if binding.policy.class == ReconciliationClass::ConsequentialExternal {
+                    classification.any_exact_committed_consequential = true;
+                }
+            }
+            "prepared" | "authorized" | "failed" => {}
+            "dispatched" | "observed" => {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "browser recovery action {} escaped pre-epoch Unknown reconciliation",
+                    binding.action_id
+                )));
+            }
+            other => {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "browser recovery action {} has unsupported lifecycle state {other}",
+                    binding.action_id
+                )));
+            }
+        }
+    }
+    Ok(classification)
+}
+
+fn classify_recovered_browser_attempts(
+    controller: &mut Controller,
+    unknown_action_ids: &[String],
+    execution_epoch: i64,
+) -> Result<RecoveredBrowserClassification, ControllerError> {
+    let unknown = unknown_action_ids.iter().cloned().collect::<BTreeSet<_>>();
+    let actions = controller
+        .state
+        .action_records()?
+        .into_iter()
+        .map(|record| (record.action_id.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let bindings = controller
+        .state
+        .state_records(ACTION_RECONCILIATION_NAMESPACE)?
+        .into_iter()
+        .map(|record| {
+            let binding: PersistedActionReconciliationBindingV1 =
+                serde_json::from_str(&record.value_json)?;
+            Ok((record.key, binding))
+        })
+        .collect::<Result<Vec<_>, ControllerError>>()?;
+    let attempt_ids = controller
+        .active_ref()?
+        .attempts
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut classification = RecoveredBrowserClassification::default();
+
+    for attempt_id in attempt_ids {
+        let Some(context) = recovered_browser_attempt_context(controller, &attempt_id)? else {
+            continue;
+        };
+        let action_classification = classify_recovered_browser_actions(
+            &attempt_id,
+            &context,
+            execution_epoch,
+            &unknown,
+            &actions,
+            &bindings,
+        )?;
+        if action_classification.any_exact_unknown
+            || action_classification.ambiguous_legacy_consequential
+        {
+            let active = controller.active_mut()?;
+            active
+                .attempts
+                .get_mut(&attempt_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "browser recovery attempt disappeared while fencing".to_owned(),
+                    )
+                })?
+                .state = AttemptState::Interrupted;
+            active
+                .tasks
+                .get_mut(&context.task_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "browser recovery task disappeared while fencing".to_owned(),
+                    )
+                })?
+                .state = TaskState::ReconcilingUnknown;
+            classification.interrupted_attempt_ids.push(attempt_id);
+            continue;
+        }
+
+        if context.attempt_state == AttemptState::Verifying
+            || context.task_state == TaskState::Verifying
+            || action_classification.any_exact_committed_consequential
+        {
+            let active = controller.active_mut()?;
+            active
+                .attempts
+                .get_mut(&attempt_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "browser recovery attempt disappeared while preserving verification"
+                            .to_owned(),
+                    )
+                })?
+                .state = AttemptState::Verifying;
+            active
+                .tasks
+                .get_mut(&context.task_id)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(
+                        "browser recovery task disappeared while preserving verification"
+                            .to_owned(),
+                    )
+                })?
+                .state = TaskState::Verifying;
+            classification.preserved_attempt_ids.insert(attempt_id);
+        }
+    }
+    Ok(classification)
+}
+
 #[allow(clippy::too_many_lines)]
 fn classify_recovered_integration_gates(
     controller: &mut Controller,
@@ -22055,6 +22701,79 @@ fn model_proposal_schema() -> Value {
     })
 }
 
+fn repository_proposal_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schema_version", "evidence_ids", "action"],
+        "properties": {
+            "schema_version": {"const": REPOSITORY_PROPOSAL_SCHEMA_VERSION},
+            "evidence_ids": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": MAX_PROPOSAL_EVIDENCE_IDS,
+                "uniqueItems": true,
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_PROPOSAL_EVIDENCE_ID_BYTES
+                }
+            },
+            "action": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["kind", "repository_id", "path", "content"],
+                        "properties": {
+                            "kind": {"const": "create_file"},
+                            "repository_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                            "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+                            "content": {"type": "string", "maxLength": MAX_REPOSITORY_PROPOSAL_BYTES}
+                        }
+                    },
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                            "kind", "repository_id", "path", "expected_source_digest", "content"
+                        ],
+                        "properties": {
+                            "kind": {"const": "update_file"},
+                            "repository_id": {"type": "string", "minLength": 1, "maxLength": 128},
+                            "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+                            "expected_source_digest": {
+                                "type": "string",
+                                "pattern": "^sha256:[0-9a-f]{64}$"
+                            },
+                            "content": {"type": "string", "maxLength": MAX_REPOSITORY_PROPOSAL_BYTES}
+                        }
+                    }
+                ]
+            }
+        }
+    })
+}
+
+fn validate_proposal_evidence_bounds(
+    evidence_ids: &[String],
+    contract_name: &str,
+) -> Result<(), ControllerError> {
+    let unique_evidence = evidence_ids.iter().collect::<BTreeSet<_>>();
+    if evidence_ids.is_empty()
+        || evidence_ids.len() > MAX_PROPOSAL_EVIDENCE_IDS
+        || unique_evidence.len() != evidence_ids.len()
+        || evidence_ids.iter().any(|evidence_id| {
+            evidence_id.is_empty() || evidence_id.len() > MAX_PROPOSAL_EVIDENCE_ID_BYTES
+        })
+    {
+        return Err(ControllerError::ProposalRejected(format!(
+            "{contract_name} evidence_ids violate deterministic bounds"
+        )));
+    }
+    Ok(())
+}
+
 fn repair_allowed(
     attempts_started: u32,
     max_attempts: u32,
@@ -22097,12 +22816,18 @@ fn controller_failure_code(error: &ControllerError) -> &'static str {
 }
 
 fn proposal_rejection_code(message: &str) -> &'static str {
-    if message.starts_with("strict ModelProposalV1 decode failed") {
+    if message.starts_with("strict ModelProposalV1 decode failed")
+        || message.starts_with("strict RepositoryProposalV1 decode failed")
+    {
         "proposal_decode"
     } else if message.contains("finish normally without model tool calls") {
         "proposal_finish_contract"
-    } else if message.contains("unsupported ModelProposalV1 schema_version") {
+    } else if message.contains("unsupported ModelProposalV1 schema_version")
+        || message.contains("unsupported RepositoryProposalV1 schema_version")
+    {
         "proposal_schema_version"
+    } else if message.contains("RepositoryProposalV1 exceeds deterministic payload bounds") {
+        "proposal_payload_bounds"
     } else if message.contains("evidence_ids violate deterministic bounds") {
         "proposal_evidence_bounds"
     } else if message.contains("evidence outside the current ContextPacket") {
@@ -22165,6 +22890,42 @@ fn proposal_action_facts(proposal: &ModelProposalV1) -> BTreeMap<String, String>
             proposal.action.expected_occurrences.to_string(),
         ),
     ])
+}
+
+fn repository_proposal_action_facts(proposal: &RepositoryProposalV1) -> BTreeMap<String, String> {
+    match &proposal.action {
+        RepositoryActionV1::CreateFile {
+            repository_id,
+            path,
+            content,
+        } => BTreeMap::from([
+            ("kind".to_owned(), "create_file".to_owned()),
+            ("repository_id".to_owned(), repository_id.clone()),
+            ("path".to_owned(), path.clone()),
+            (
+                "content_digest".to_owned(),
+                sha256_prefixed(content.as_bytes()),
+            ),
+        ]),
+        RepositoryActionV1::UpdateFile {
+            repository_id,
+            path,
+            expected_source_digest,
+            content,
+        } => BTreeMap::from([
+            ("kind".to_owned(), "update_file".to_owned()),
+            ("repository_id".to_owned(), repository_id.clone()),
+            ("path".to_owned(), path.clone()),
+            (
+                "expected_source_digest".to_owned(),
+                expected_source_digest.clone(),
+            ),
+            (
+                "content_digest".to_owned(),
+                sha256_prefixed(content.as_bytes()),
+            ),
+        ]),
+    }
 }
 
 fn failure_synopsis(
@@ -25077,8 +25838,9 @@ mod tests {
     use sovereign_state::{ActionTransition, NewActionRecord, SecurityAuditEventV1, StateStore};
     use sovereign_tools::{
         ACTION_RECEIPT_SCHEMA, ACTION_RECEIPT_SCHEMA_VERSION, APPROVAL_CLAIM_NAMESPACE,
-        ApprovalClaim, AuthorizedAction, PermissionClass, RawToolResult, ReconciliationMode,
-        ResourceLimitKind, ToolManifest,
+        ApprovalClaim, AuthorizedAction, JournalActionAuthority, JournalActionReservation,
+        PermissionClass, RawToolResult, ReconciliationMode, ResourceLimitKind, ToolError,
+        ToolManifest,
     };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
@@ -25111,6 +25873,140 @@ mod tests {
 
     fn test_goal_resource_policy() -> Value {
         valid_resource_policy_fixture()
+    }
+
+    #[derive(Clone)]
+    struct OutputChargeAuthority {
+        action: AuthorizedAction,
+        payload_digest: String,
+        output_bytes: u64,
+    }
+
+    impl OutputChargeAuthority {
+        fn from_action(action: AuthorizedAction) -> Self {
+            let payload_digest = action.payload_digest();
+            let output_bytes = action.command.output_limit_bytes;
+            Self {
+                action,
+                payload_digest,
+                output_bytes,
+            }
+        }
+    }
+
+    impl JournalActionAuthority for OutputChargeAuthority {
+        fn action_id(&self) -> &str {
+            &self.action.action_id
+        }
+
+        fn plan_id(&self) -> &str {
+            &self.action.plan_id
+        }
+
+        fn plan_revision(&self) -> u32 {
+            self.action.plan_revision
+        }
+
+        fn task_id(&self) -> &str {
+            &self.action.task_id
+        }
+
+        fn attempt_id(&self) -> &str {
+            &self.action.attempt_id
+        }
+
+        fn tool_id(&self) -> &str {
+            &self.action.tool_id
+        }
+
+        fn tool_version(&self) -> &str {
+            &self.action.tool_version
+        }
+
+        fn tool_digest(&self) -> &str {
+            &self.action.tool_digest
+        }
+
+        fn repository_id(&self) -> &str {
+            &self.action.repository_id
+        }
+
+        fn destination_digest(&self) -> Option<&str> {
+            self.action.destination_digest.as_deref()
+        }
+
+        fn permission_class(&self) -> PermissionClass {
+            self.action.permission_class
+        }
+
+        fn execution_epoch(&self) -> i64 {
+            self.action.execution_epoch
+        }
+
+        fn policy_digest(&self) -> &str {
+            &self.action.policy_digest
+        }
+
+        fn permission_decision_digest(&self) -> &str {
+            &self.action.permission_decision_digest
+        }
+
+        fn isolation_policy_digest(&self) -> &str {
+            &self.action.isolation_policy_digest
+        }
+
+        fn nonce(&self) -> &str {
+            &self.action.nonce
+        }
+
+        fn expires_at_ms(&self) -> i64 {
+            self.action.expires_at_ms
+        }
+
+        fn approval_required(&self) -> bool {
+            self.action.approval_required
+        }
+
+        fn reconciliation_mode(&self) -> ReconciliationMode {
+            self.action.reconciliation_mode
+        }
+
+        fn declared_risk(&self) -> CommandRisk {
+            self.action.command.declared_risk
+        }
+
+        fn approval_execution_identity_digest(&self) -> Option<&str> {
+            Some(&self.action.executable_digest)
+        }
+
+        fn payload_digest(&self) -> String {
+            self.payload_digest.clone()
+        }
+
+        fn validate(&self, now_ms: i64) -> Result<(), ToolError> {
+            self.action.validate(now_ms)
+        }
+
+        fn verify_permission_decision(
+            &self,
+            decision: &PermissionDecision,
+        ) -> Result<(), ToolError> {
+            self.action.verify_permission_decision(decision)
+        }
+
+        fn verify_approval_claim(
+            &self,
+            claim: &ApprovalClaim,
+            now_ms: i64,
+        ) -> Result<(), ToolError> {
+            self.action.verify_approval_claim(claim, now_ms)
+        }
+
+        fn reservation(&self) -> JournalActionReservation {
+            let mut reservation = self.action.reservation();
+            reservation.output_bytes = self.output_bytes;
+            reservation
+        }
     }
 
     #[test]
@@ -25709,6 +26605,464 @@ mod tests {
             reconciliation_mode: ReconciliationMode::ConsequentialExternal,
         };
         (base, controller, action, manifest, permission_decision)
+    }
+
+    fn output_charge_budgets(
+        controller: &Controller,
+        task_id: &str,
+    ) -> (AutonomyBudgetV1, AutonomyBudgetV1) {
+        let active = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active output-charge fixture: {error}"));
+        let task = active
+            .tasks
+            .get(task_id)
+            .unwrap_or_else(|| panic!("output-charge task {task_id} disappeared"));
+        (
+            task.autonomy_budget
+                .clone()
+                .unwrap_or_else(|| panic!("output-charge task budget missing")),
+            active.goal_autonomy_budget.clone(),
+        )
+    }
+
+    fn output_charge_row(controller: &Controller, action_id: &str) -> Option<String> {
+        let active = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active output-charge row fixture: {error}"));
+        controller
+            .state
+            .get_state(
+                super::AUTONOMY_ACTION_CHARGE_NAMESPACE,
+                &revision_scoped_key(&active.plan_id, active.revision, action_id),
+            )
+            .unwrap_or_else(|error| panic!("read durable output charge: {error}"))
+    }
+
+    fn output_charge_event_count(controller: &Controller) -> usize {
+        controller
+            .state
+            .journal()
+            .unwrap_or_else(|error| panic!("read output-charge journal: {error}"))
+            .iter()
+            .filter(|event| event.event_kind == "autonomy_action_charged")
+            .count()
+    }
+
+    #[test]
+    fn autonomy_output_charge_is_idempotent_and_rejects_payload_or_reservation_drift() {
+        let (base, mut controller, action, _, _) =
+            reconciliation_external_side_effect_fixture("output-charge-exactness");
+        let mut authority = OutputChargeAuthority::from_action(action);
+        authority.output_bytes = 4_096;
+        let before_events = output_charge_event_count(&controller);
+
+        controller
+            .charge_autonomy_action_once(&authority)
+            .unwrap_or_else(|error| panic!("first output charge: {error}"));
+        let first_budgets = output_charge_budgets(&controller, authority.task_id());
+        assert_eq!(first_budgets.0.used_output_bytes, 4_096);
+        assert_eq!(first_budgets.1.used_output_bytes, 4_096);
+        let first_row = output_charge_row(&controller, authority.action_id())
+            .unwrap_or_else(|| panic!("first durable output charge row missing"));
+        assert_eq!(output_charge_event_count(&controller), before_events + 1);
+
+        controller
+            .charge_autonomy_action_once(&authority)
+            .unwrap_or_else(|error| panic!("exact duplicate output charge: {error}"));
+        assert_eq!(
+            output_charge_budgets(&controller, authority.task_id()),
+            first_budgets
+        );
+        assert_eq!(
+            output_charge_row(&controller, authority.action_id()).as_deref(),
+            Some(first_row.as_str())
+        );
+        assert_eq!(output_charge_event_count(&controller), before_events + 1);
+
+        let mut payload_drift = authority.clone();
+        payload_drift.payload_digest = format!("sha256:{}", "9".repeat(64));
+        let payload_error = controller
+            .charge_autonomy_action_once(&payload_drift)
+            .err()
+            .unwrap_or_else(|| panic!("same action payload drift unexpectedly charged"));
+        assert!(payload_error.to_string().contains("charge drifted"));
+        assert_eq!(
+            output_charge_budgets(&controller, authority.task_id()),
+            first_budgets
+        );
+        assert_eq!(
+            output_charge_row(&controller, authority.action_id()).as_deref(),
+            Some(first_row.as_str())
+        );
+        assert_eq!(output_charge_event_count(&controller), before_events + 1);
+
+        let mut reservation_drift = authority.clone();
+        reservation_drift.output_bytes = authority.output_bytes + 1;
+        let reservation_error = controller
+            .charge_autonomy_action_once(&reservation_drift)
+            .err()
+            .unwrap_or_else(|| panic!("same action output-reservation drift unexpectedly charged"));
+        assert!(reservation_error.to_string().contains("charge drifted"));
+        assert_eq!(
+            output_charge_budgets(&controller, authority.task_id()),
+            first_budgets
+        );
+        assert_eq!(
+            output_charge_row(&controller, authority.action_id()).as_deref(),
+            Some(first_row.as_str())
+        );
+        assert_eq!(output_charge_event_count(&controller), before_events + 1);
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn autonomy_output_charge_task_or_goal_denial_is_atomic() {
+        for (label, narrow_task) in [("task", true), ("goal", false)] {
+            let fixture_label = format!("output-charge-{label}-denial");
+            let (base, mut controller, action, _, _) =
+                reconciliation_external_side_effect_fixture(&fixture_label);
+            let mut authority = OutputChargeAuthority::from_action(action);
+            authority.output_bytes = 4_096;
+            {
+                let active = controller
+                    .active
+                    .as_mut()
+                    .unwrap_or_else(|| panic!("{label} denial active plan missing"));
+                if narrow_task {
+                    active
+                        .tasks
+                        .get_mut(authority.task_id())
+                        .unwrap_or_else(|| panic!("{label} denial task missing"))
+                        .autonomy_budget
+                        .as_mut()
+                        .unwrap_or_else(|| panic!("{label} denial task budget missing"))
+                        .max_output_bytes = 4_095;
+                } else {
+                    active.goal_autonomy_budget.max_output_bytes = 4_095;
+                }
+            }
+            let before_budgets = output_charge_budgets(&controller, authority.task_id());
+            let before_row = output_charge_row(&controller, authority.action_id());
+            let before_events = output_charge_event_count(&controller);
+
+            let error = controller
+                .charge_autonomy_action_once(&authority)
+                .err()
+                .unwrap_or_else(|| panic!("{label}-narrower output budget unexpectedly charged"));
+            assert!(
+                error.to_string().contains("output_bytes"),
+                "unexpected {label} denial: {error}"
+            );
+            assert_eq!(
+                output_charge_budgets(&controller, authority.task_id()),
+                before_budgets,
+                "{label}-narrower failure partially mutated a budget"
+            );
+            assert_eq!(
+                output_charge_row(&controller, authority.action_id()),
+                before_row,
+                "{label}-narrower failure persisted a charge row"
+            );
+            assert_eq!(
+                output_charge_event_count(&controller),
+                before_events,
+                "{label}-narrower failure persisted a charge event"
+            );
+
+            drop(controller);
+            let _ = std::fs::remove_dir_all(base);
+        }
+    }
+
+    fn output_recovery_authority(controller: &Controller, base: &Path) -> OutputChargeAuthority {
+        let execution_epoch = controller
+            .state
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("output recovery execution epoch: {error}"));
+        let policy_digest = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("output recovery active plan: {error}"))
+            .policy_digest
+            .clone();
+        let action = AuthorizedAction {
+            action_id: "action.output.recovery".to_owned(),
+            plan_id: "plan.integration".to_owned(),
+            plan_revision: 1,
+            task_id: "task.A7".to_owned(),
+            attempt_id: "attempt.output.recovery".to_owned(),
+            tool_id: "tool.output.recovery".to_owned(),
+            tool_version: "1.0.0".to_owned(),
+            tool_digest: format!("sha256:{}", "1".repeat(64)),
+            executable_digest: format!("sha256:{}", "2".repeat(64)),
+            repository_id: "repo.a".to_owned(),
+            destination_digest: None,
+            permission_class: PermissionClass::Read,
+            execution_epoch,
+            policy_digest,
+            permission_decision_digest: format!("sha256:{}", "3".repeat(64)),
+            isolation_policy_digest: format!("sha256:{}", "4".repeat(64)),
+            nonce: "nonce.output.recovery".to_owned(),
+            expires_at_ms: i64::MAX,
+            command: CommandSpec {
+                executable: PathBuf::from("/usr/bin/true"),
+                args: Vec::new(),
+                working_directory: base.to_path_buf(),
+                environment: BTreeMap::new(),
+                mode: CommandMode::Direct,
+                declared_risk: CommandRisk::ReadOnly,
+                timeout_ms: 1_000,
+                output_limit_bytes: 4_096,
+                disk_write_limit_bytes: 0,
+                subprocess_limit: 0,
+            },
+            individually_authorized_environment: BTreeSet::new(),
+            approval_required: false,
+            reconciliation_mode: ReconciliationMode::IdempotentRead,
+        };
+        let mut authority = OutputChargeAuthority::from_action(action);
+        authority.output_bytes = 4_096;
+        authority
+    }
+
+    fn checkpoint_output_charge(
+        controller: &mut Controller,
+        authority: &OutputChargeAuthority,
+    ) -> PathBuf {
+        controller
+            .charge_autonomy_action_once(authority)
+            .unwrap_or_else(|error| panic!("durable output charge: {error}"));
+        assert_eq!(
+            output_charge_budgets(controller, "task.A7")
+                .0
+                .used_output_bytes,
+            4_096
+        );
+        assert_eq!(
+            output_charge_budgets(controller, "task.A7")
+                .1
+                .used_output_bytes,
+            4_096
+        );
+        let state_path = controller.state.path().to_path_buf();
+        controller
+            .persist_all_runtime()
+            .unwrap_or_else(|error| panic!("persist charged output runtime: {error}"));
+        controller
+            .checkpoint_now()
+            .unwrap_or_else(|error| panic!("checkpoint charged output: {error}"));
+        state_path
+    }
+
+    fn recover_output_charge(
+        state_path: &Path,
+        registry: &ProjectRegistry,
+        action_id: &str,
+    ) -> Controller {
+        let state = StateStore::open(state_path)
+            .unwrap_or_else(|error| panic!("reopen charged output state: {error}"));
+        let (recovered, _) = super::RecoveryManager::recover(state, registry)
+            .unwrap_or_else(|error| panic!("recover charged output: {error}"));
+        let recovered_budgets = output_charge_budgets(&recovered, "task.A7");
+        assert_eq!(recovered_budgets.0.used_output_bytes, 4_096);
+        assert_eq!(recovered_budgets.1.used_output_bytes, 4_096);
+        assert!(
+            output_charge_row(&recovered, action_id).is_some(),
+            "checkpoint recovery lost the exact durable output charge"
+        );
+        recovered
+    }
+
+    fn output_charge_superseding_runtime(
+        recovered: &Controller,
+        registry: &ProjectRegistry,
+    ) -> (
+        Value,
+        String,
+        Value,
+        SupersedingRuntimeBuild,
+        AutonomyBudgetV1,
+    ) {
+        let mut next_plan = recovered
+            .active_ref()
+            .unwrap_or_else(|error| panic!("recovered active output plan: {error}"))
+            .plan_document
+            .clone();
+        next_plan["revision"] = json!(2);
+        next_plan["supersedes_revision"] = json!(1);
+        next_plan["compiled_at"] = json!("2026-09-19T06:00:00Z");
+        let next_plan_digest = digest_json(&next_plan)
+            .unwrap_or_else(|error| panic!("next output plan digest: {error}"));
+        let previous_plan_digest = recovered
+            .active_ref()
+            .unwrap_or_else(|error| panic!("previous output plan: {error}"))
+            .plan_digest
+            .clone();
+        let diff = PlanRevisionDiff {
+            plan_id: "plan.integration".to_owned(),
+            from_revision: 1,
+            to_revision: 2,
+            from_plan_digest: previous_plan_digest,
+            to_plan_digest: next_plan_digest.clone(),
+            scope: ReplanScope::Task,
+            invalidated_contract_ids: Vec::new(),
+            affected_task_ids: Vec::new(),
+            unchanged_task_ids: vec!["task.A7".to_owned()],
+            changed_task_ids: Vec::new(),
+            added_task_ids: Vec::new(),
+            removed_task_ids: Vec::new(),
+        };
+        let current_snapshot_digests = recovered
+            .active_ref()
+            .unwrap_or_else(|error| panic!("output snapshots active plan: {error}"))
+            .repositories
+            .iter()
+            .map(|(repository_id, repository)| {
+                (
+                    repository_id.clone(),
+                    super::snapshot_digest(&repository.baseline)
+                        .unwrap_or_else(|error| panic!("snapshot digest {repository_id}: {error}")),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let next_compilation_evidence = json!({"exact_evidence": []});
+        let runtime_build = build_superseding_runtime(
+            &recovered.state,
+            registry,
+            recovered
+                .active_ref()
+                .unwrap_or_else(|error| panic!("output supersession active plan: {error}")),
+            &next_plan,
+            &next_plan_digest,
+            &next_compilation_evidence,
+            &diff,
+            &current_snapshot_digests,
+        )
+        .unwrap_or_else(|error| panic!("build output superseding runtime: {error}"));
+        assert_eq!(
+            runtime_build.tasks["task.A7"]
+                .autonomy_budget
+                .as_ref()
+                .map(|budget| budget.used_output_bytes),
+            Some(4_096),
+            "unchanged superseded task refilled its output budget"
+        );
+        let next_goal_budget = rebase_goal_autonomy_budget(
+            &next_plan,
+            &recovered
+                .active_ref()
+                .unwrap_or_else(|error| panic!("output goal rebase active plan: {error}"))
+                .goal_autonomy_budget,
+        )
+        .unwrap_or_else(|error| panic!("rebase output goal budget: {error}"));
+        assert_eq!(next_goal_budget.used_output_bytes, 4_096);
+        (
+            next_plan,
+            next_plan_digest,
+            next_compilation_evidence,
+            runtime_build,
+            next_goal_budget,
+        )
+    }
+
+    fn persist_output_charge_supersession(
+        recovered: &mut Controller,
+        next_plan: Value,
+        next_plan_digest: String,
+        next_compilation_evidence: &Value,
+        runtime_build: SupersedingRuntimeBuild,
+        next_goal_budget: AutonomyBudgetV1,
+    ) {
+        {
+            let active = recovered
+                .active
+                .as_mut()
+                .unwrap_or_else(|| panic!("output supersession active plan disappeared"));
+            active.plan_document = next_plan;
+            active.compiler_plan_digest = next_plan_digest.clone();
+            active.revision = 2;
+            active.plan_digest = next_plan_digest;
+            active.compilation_evidence_digest = digest_json(next_compilation_evidence)
+                .unwrap_or_else(|error| panic!("next output compilation evidence: {error}"));
+            active.policy_digest = digest_json(&active.plan_document["policy"])
+                .unwrap_or_else(|error| panic!("next output policy digest: {error}"));
+            active.validity = PlanValidity::Current;
+            active.goal_autonomy_budget = next_goal_budget;
+            active.tasks = runtime_build.tasks;
+            active.attempts.clear();
+        }
+        recovered
+            .persist_all_runtime()
+            .unwrap_or_else(|error| panic!("persist superseded output runtime: {error}"));
+        recovered
+            .checkpoint_now()
+            .unwrap_or_else(|error| panic!("checkpoint superseded output budget: {error}"));
+    }
+
+    fn assert_reopened_output_charge(
+        state_path: &Path,
+        registry: &ProjectRegistry,
+        action_id: &str,
+    ) {
+        let state = StateStore::open(state_path)
+            .unwrap_or_else(|error| panic!("reopen superseded output state: {error}"));
+        let (reopened, _) = super::RecoveryManager::recover(state, registry)
+            .unwrap_or_else(|error| panic!("recover superseded output state: {error}"));
+        let reopened_budgets = output_charge_budgets(&reopened, "task.A7");
+        assert_eq!(reopened_budgets.0.used_output_bytes, 4_096);
+        assert_eq!(reopened_budgets.1.used_output_bytes, 4_096);
+        assert_eq!(
+            reopened
+                .active_ref()
+                .unwrap_or_else(|error| panic!("reopened output active plan: {error}"))
+                .revision,
+            2
+        );
+        assert!(
+            reopened
+                .state
+                .get_state(
+                    super::AUTONOMY_ACTION_CHARGE_NAMESPACE,
+                    &revision_scoped_key("plan.integration", 1, action_id),
+                )
+                .unwrap_or_else(|error| panic!("read historical output charge: {error}"))
+                .is_some(),
+            "supersession/reopen removed historical exact output charge authority"
+        );
+        drop(reopened);
+    }
+
+    #[test]
+    fn autonomy_output_charge_survives_checkpoint_recovery_supersession_and_reopen() {
+        let (base, mut controller, registry) =
+            integration_gate_fixture("output-charge-recovery-replan");
+        let authority = output_recovery_authority(&controller, &base);
+        let action_id = authority.action_id().to_owned();
+        let state_path = checkpoint_output_charge(&mut controller, &authority);
+        drop(controller);
+
+        let mut recovered = recover_output_charge(&state_path, &registry, &action_id);
+        let (
+            next_plan,
+            next_plan_digest,
+            next_compilation_evidence,
+            runtime_build,
+            next_goal_budget,
+        ) = output_charge_superseding_runtime(&recovered, &registry);
+        persist_output_charge_supersession(
+            &mut recovered,
+            next_plan,
+            next_plan_digest,
+            &next_compilation_evidence,
+            runtime_build,
+            next_goal_budget,
+        );
+        drop(recovered);
+
+        assert_reopened_output_charge(&state_path, &registry, &action_id);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

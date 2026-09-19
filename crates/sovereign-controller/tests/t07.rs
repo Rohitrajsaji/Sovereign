@@ -30,25 +30,28 @@ use sovereign_plan::{
     PlanCompilationResult, PlanCompiler, PlanIr, PlanValidator, ValidationEnvironment,
 };
 use sovereign_policy::{
-    CapabilitySet, CommandMode, CommandPolicy, CommandRisk, CommandSpec, ControllerSecretLocator,
-    ExecutionIsolationBackend, FakeSecretProvider, IsolatedCommand, IsolationCapabilities,
-    IsolationRequest, MacSandboxExecBackend, ModelCallBudget, OsMemoryPressure, PinnedExecutable,
-    PolicyError, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ReconciliationPolicy,
-    ResourcePressureSnapshotV1, SecretBroker, SecretInjection, SecretProviderBackend,
-    SecretProviderKind, SecretRef, SecretValue, ThermalPressure,
+    CapabilityLayers, CapabilitySet, CommandMode, CommandPolicy, CommandRisk, CommandSpec,
+    ControllerSecretLocator, ExecutionIsolationBackend, FakeSecretProvider, IsolatedCommand,
+    IsolationCapabilities, IsolationRequest, MacSandboxExecBackend, ModelCallBudget,
+    OsMemoryPressure, PermissionDecision, PinnedExecutable, PolicyError,
+    RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ReconciliationPolicy, ResourcePressureSnapshotV1,
+    SecretBroker, SecretInjection, SecretProviderBackend, SecretProviderKind, SecretRef,
+    SecretValue, ThermalPressure,
 };
 use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence};
 use sovereign_state::{
     ActionTransition, NewActionRecord, NewCheckpointIntegrityRecord, NewJournalEvent,
     StateRecordUpdate, StateStore,
 };
+use sovereign_tools::browser::BrowserAdapterConfig;
 use sovereign_tools::{
-    EPHEMERAL_SECRET_FILE_ENV, PermissionClass, ToolManifest, ToolSchemaV1,
-    process_group_leader_identity,
+    ActionJournal, AuthorizedAction, EPHEMERAL_SECRET_FILE_ENV, PermissionClass, ProcessRunner,
+    ReconciliationMode, ToolError, ToolManifest, ToolSchemaV1, process_group_leader_identity,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -65,6 +68,9 @@ const SOURCE: &str =
 const OTHER_SOURCE: &str = "baseline other file\n";
 const WRITE_TOOL_DIGEST: &str =
     "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const BROWSER_TOOL_DIGEST: &str =
+    "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+const MANAGED_LOOPBACK_NETWORK_BYTES: u64 = 1024 * 1024;
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 #[cfg(feature = "recovery-test-hooks")]
 const PD_T05_V4_CRASH_STATE: &str = "SOVEREIGN_PD_T05_V4_CRASH_STATE";
@@ -536,6 +542,34 @@ fn global_policy() -> Value {
     .unwrap_or_else(|error| panic!("policy fixture: {error}"))
 }
 
+fn managed_loopback_policy(port: u16) -> Value {
+    let mut policy = global_policy();
+    policy["capability_ceiling"] = json!([
+        "read",
+        "process_exec",
+        "browser_interactive",
+        "network_read",
+        "network_write"
+    ]);
+    policy["network"] = json!({
+        "default": "task_scoped",
+        "allowed_hosts": ["127.0.0.1"],
+        "allowed_schemes": ["http"],
+        "allowed_ports": [port],
+        "allowed_methods": ["GET", "POST"],
+        "follow_redirects": true,
+        "max_redirects": 1,
+        "allow_private_ranges": false,
+        "dns_revalidation": true,
+        "connected_peer_validation": true,
+        "ambient_proxy": "deny",
+        "allow_task_loopback": true
+    });
+    policy["resources"]["heavy_leases"] = json!(["MODEL", "BUILD_HEAVY", "BROWSER"]);
+    policy["resources"]["max_network_bytes"] = json!(MANAGED_LOOPBACK_NETWORK_BYTES);
+    policy
+}
+
 fn capability(id: &str, digest: &str) -> Value {
     json!({"id": id, "version": "1.0.0", "digest": digest})
 }
@@ -862,6 +896,79 @@ fn compiled_command_verification_fixture(
     )
 }
 
+fn compiled_managed_loopback_fixture(label: &str, port: u16) -> CompiledFixture {
+    let planning = json!({
+        "tasks": [{
+            "local_id": "managed-loopback-browser",
+            "repository_id": "repo.app",
+            "title": "Verify managed loopback authority",
+            "objective": "Verify the local application through one governed loopback browser session.",
+            "rationale": "The focused Controller regression needs exact process and browser authority without repository mutation.",
+            "files": [],
+            "create_files": [],
+            "symbols": ["managed-loopback"],
+            "dependencies": [],
+            "evidence_needs": [],
+            "expected_change": "No repository mutation; local browser verification succeeds.",
+            "acceptance": [{
+                "kind": "command",
+                "description": "Run the bounded local verification command.",
+                "manual_gate_id": Value::Null,
+                "command_spec": {
+                    "tool_id": "tool.patch",
+                    "mode": "exec",
+                    "program": "python3",
+                    "args": ["-B", "-c", "pass"],
+                    "repository_id": "repo.app",
+                    "working_dir_relative": ".",
+                    "literal_env": {},
+                    "secret_env": {},
+                    "timeout_seconds": 15,
+                    "output_limit_bytes": 65536
+                },
+                "expected_exit_codes": [0]
+            }]
+        }]
+    });
+    let mut fixture = compiled_fixture_inner(
+        label,
+        false,
+        false,
+        None,
+        None,
+        false,
+        false,
+        Some(planning),
+        Some("Verify exact managed loopback application authority.".to_owned()),
+        None,
+        Some(managed_loopback_policy(port)),
+        Some(ExecutionDepth::D2),
+    );
+    let validator = PlanValidator::new(ValidationEnvironment::default())
+        .unwrap_or_else(|error| panic!("managed loopback validator: {error}"));
+    let compilation = fixture
+        .compilation
+        .take()
+        .unwrap_or_else(|| panic!("managed loopback compilation missing"));
+    let task_id = compilation.plan().as_value()["tasks"]
+        .as_array()
+        .and_then(|tasks| tasks.first())
+        .and_then(|task| task["task_id"].as_str())
+        .map_or_else(|| panic!("managed loopback task id missing"), str::to_owned);
+    fixture.compilation = Some(
+        compilation
+            .bind_controller_loopback_browser(
+                &validator,
+                &task_id,
+                &capability("tool.browser", BROWSER_TOOL_DIGEST),
+                port,
+                MANAGED_LOOPBACK_NETWORK_BYTES,
+            )
+            .unwrap_or_else(|error| panic!("bind managed loopback browser authority: {error:?}")),
+    );
+    fixture
+}
+
 #[cfg(feature = "recovery-test-hooks")]
 fn compiled_repository_create_fixture(label: &str) -> CompiledFixture {
     let planning = json!({
@@ -902,6 +1009,19 @@ fn compiled_repository_create_fixture(label: &str) -> CompiledFixture {
 
 #[cfg(feature = "recovery-test-hooks")]
 fn compiled_repository_update_fixture(label: &str) -> CompiledFixture {
+    compiled_repository_update_fixture_inner(label, None)
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+fn compiled_repository_update_repair_fixture(label: &str) -> CompiledFixture {
+    compiled_repository_update_fixture_inner(label, Some(2))
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+fn compiled_repository_update_fixture_inner(
+    label: &str,
+    task_model_call_cap: Option<u64>,
+) -> CompiledFixture {
     let planning = json!({
         "tasks": [{
             "local_id": "update-settings-file",
@@ -926,7 +1046,7 @@ fn compiled_repository_update_fixture(label: &str) -> CompiledFixture {
         label,
         false,
         false,
-        None,
+        task_model_call_cap,
         None,
         false,
         false,
@@ -1280,6 +1400,21 @@ fn write_tool_manifest() -> ToolManifest {
             PermissionClass::RepositoryWrite,
         ]),
         declared_risk_floor: CommandRisk::RepositoryMutation,
+        reconciliation_policy: ReconciliationPolicy::proof_required_local(),
+    }
+}
+
+fn browser_tool_manifest() -> ToolManifest {
+    ToolManifest {
+        tool_id: "tool.browser".to_owned(),
+        version: "1.0.0".to_owned(),
+        content_digest: BROWSER_TOOL_DIGEST.to_owned(),
+        permission_ceiling: BTreeSet::from([
+            PermissionClass::BrowserInteractive,
+            PermissionClass::NetworkRead,
+            PermissionClass::NetworkWrite,
+        ]),
+        declared_risk_floor: CommandRisk::ReadOnly,
         reconciliation_policy: ReconciliationPolicy::proof_required_local(),
     }
 }
@@ -1707,6 +1842,237 @@ fn strict_model_proposal_rejects_injected_state_success_and_permissions() {
         }
     });
     assert!(serde_json::from_value::<ModelProposalV1>(injected).is_err());
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn repository_model_stale_update_repairs_from_repair_pending_to_success() {
+    let mut fixture = compiled_repository_update_repair_fixture("repository-model-stale-repair");
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
+        .unwrap_or_else(|error| panic!("derive repository ready lease: {error}"));
+    let context = repository_context_packet(
+        &fixture.registry,
+        "Update the exact governed SettingsForm repository file.",
+    );
+    let exact_source = context
+        .items
+        .iter()
+        .find(|item| item.evidence_id == "file:repo.app:src/settings/SettingsForm.tsx")
+        .unwrap_or_else(|| panic!("repository update exact evidence missing"));
+    let updated_content = SOURCE.replacen("Save", "Apply", 1);
+    let stale = json!({
+        "schema_version": REPOSITORY_PROPOSAL_SCHEMA_VERSION,
+        "evidence_ids": [exact_source.evidence_id.clone()],
+        "action": {
+            "kind": "update_file",
+            "repository_id": "repo.app",
+            "path": "src/settings/SettingsForm.tsx",
+            "expected_source_digest": format!("sha256:{}", "a".repeat(64)),
+            "content": updated_content.clone()
+        }
+    });
+    let repaired = json!({
+        "schema_version": REPOSITORY_PROPOSAL_SCHEMA_VERSION,
+        "evidence_ids": [exact_source.evidence_id.clone()],
+        "action": {
+            "kind": "update_file",
+            "repository_id": "repo.app",
+            "path": "src/settings/SettingsForm.tsx",
+            "expected_source_digest": exact_source.source_digest.clone(),
+            "content": updated_content.clone()
+        }
+    });
+    let execution = backend(vec![
+        model_response(
+            stale.to_string(),
+            context.metrics.final_serialized_input_tokens,
+        ),
+        model_response(
+            repaired.to_string(),
+            context.metrics.final_serialized_input_tokens,
+        ),
+    ]);
+    let parts = runtime_parts(&fixture);
+    let isolation =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("seatbelt: {error}"));
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut budget = ModelCallBudget::new(2, 30_000);
+    let error = controller
+        .execute_repository_with_model(ready, &runtime, &context, &mut budget)
+        .err()
+        .unwrap_or_else(|| panic!("stale repository proposal unexpectedly succeeded"));
+    assert!(matches!(error, ControllerError::ProposalRejected(_)));
+    assert_eq!(
+        controller.task_state(&task_id),
+        Some(TaskState::RepairPending)
+    );
+    assert_eq!(controller.task_attempts_started(&task_id), Some(1));
+    assert_eq!(controller.task_model_calls_used(&task_id), Some(1));
+    assert_eq!(budget.remaining_calls(), 1);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+            .unwrap_or_else(|error| panic!("read unchanged repository source: {error}")),
+        SOURCE
+    );
+    let failure = controller
+        .latest_failure_record(&task_id)
+        .unwrap_or_else(|error| panic!("read stale repository failure: {error}"))
+        .unwrap_or_else(|| panic!("stale repository failure missing"));
+    assert_eq!(failure.category, "proposal_validation_failure");
+
+    let (success, repair_packet) = controller
+        .repair_repository_with_model(&task_id, &runtime, &context, &[], readiness(), &mut budget)
+        .unwrap_or_else(|error| panic!("repair stale repository proposal: {error}"));
+    assert!(success.verification.passed);
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Succeeded));
+    assert_eq!(controller.task_attempts_started(&task_id), Some(2));
+    assert_eq!(controller.task_model_calls_used(&task_id), Some(2));
+    assert_eq!(budget.remaining_calls(), 0);
+    assert_eq!(repair_packet.prior_attempt_id, failure.attempt_id);
+    assert_eq!(repair_packet.failure_signature, failure.signature);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+            .unwrap_or_else(|error| panic!("read repaired repository source: {error}")),
+        updated_content
+    );
+    let attempt_raw = controller
+        .state()
+        .get_state("controller.attempt", &success.attempt_id)
+        .unwrap_or_else(|error| panic!("read repository repair attempt: {error}"))
+        .unwrap_or_else(|| panic!("repository repair attempt missing"));
+    let attempt: Value = serde_json::from_str(&attempt_raw)
+        .unwrap_or_else(|error| panic!("decode repository repair attempt: {error}"));
+    assert_eq!(
+        attempt
+            .pointer("/repair_origin/prior_attempt_id")
+            .and_then(Value::as_str),
+        Some(failure.attempt_id.as_str())
+    );
+    assert_eq!(
+        attempt
+            .pointer("/repair_origin/failure_record_digest")
+            .and_then(Value::as_str),
+        Some(repair_packet.failure_record_digest.as_str())
+    );
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn repository_model_malformed_schema_repairs_from_repair_pending_to_success() {
+    let mut fixture = compiled_repository_update_repair_fixture("repository-model-schema-repair");
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
+        .unwrap_or_else(|error| panic!("derive repository ready lease: {error}"));
+    let context = repository_context_packet(
+        &fixture.registry,
+        "Update the exact governed SettingsForm repository file.",
+    );
+    let exact_source = context
+        .items
+        .iter()
+        .find(|item| item.evidence_id == "file:repo.app:src/settings/SettingsForm.tsx")
+        .unwrap_or_else(|| panic!("repository update exact evidence missing"));
+    let updated_content = SOURCE.replacen("Save", "Apply", 1);
+    let malformed = json!({
+        "schema_version": REPOSITORY_PROPOSAL_SCHEMA_VERSION,
+        "evidence_ids": [exact_source.evidence_id.clone()],
+        "task_state": "succeeded",
+        "action": {
+            "kind": "update_file",
+            "repository_id": "repo.app",
+            "path": "src/settings/SettingsForm.tsx",
+            "expected_source_digest": exact_source.source_digest.clone(),
+            "content": updated_content.clone()
+        }
+    });
+    let repaired = json!({
+        "schema_version": REPOSITORY_PROPOSAL_SCHEMA_VERSION,
+        "evidence_ids": [exact_source.evidence_id.clone()],
+        "action": {
+            "kind": "update_file",
+            "repository_id": "repo.app",
+            "path": "src/settings/SettingsForm.tsx",
+            "expected_source_digest": exact_source.source_digest.clone(),
+            "content": updated_content.clone()
+        }
+    });
+    let execution = backend(vec![
+        model_response(
+            malformed.to_string(),
+            context.metrics.final_serialized_input_tokens,
+        ),
+        model_response(
+            repaired.to_string(),
+            context.metrics.final_serialized_input_tokens,
+        ),
+    ]);
+    let parts = runtime_parts(&fixture);
+    let isolation =
+        MacSandboxExecBackend::detect().unwrap_or_else(|error| panic!("seatbelt: {error}"));
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut budget = ModelCallBudget::new(2, 30_000);
+    assert!(
+        controller
+            .execute_repository_with_model(ready, &runtime, &context, &mut budget)
+            .is_err()
+    );
+    assert_eq!(
+        controller.task_state(&task_id),
+        Some(TaskState::RepairPending)
+    );
+    let failure = controller
+        .latest_failure_record(&task_id)
+        .unwrap_or_else(|error| panic!("read malformed repository failure: {error}"))
+        .unwrap_or_else(|| panic!("malformed repository failure missing"));
+    assert_eq!(failure.category, "model_proposal_failure");
+
+    let (success, repair_packet) = controller
+        .repair_repository_with_model(&task_id, &runtime, &context, &[], readiness(), &mut budget)
+        .unwrap_or_else(|error| panic!("repair malformed repository proposal: {error}"));
+    assert!(success.verification.passed);
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Succeeded));
+    assert_eq!(controller.task_attempts_started(&task_id), Some(2));
+    assert_eq!(controller.task_model_calls_used(&task_id), Some(2));
+    assert_eq!(budget.remaining_calls(), 0);
+    assert_eq!(repair_packet.prior_attempt_id, failure.attempt_id);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.root.join("src/settings/SettingsForm.tsx"))
+            .unwrap_or_else(|error| panic!("read schema-repaired source: {error}")),
+        updated_content
+    );
 }
 
 #[test]
@@ -6987,5 +7353,457 @@ fn committed_v4_repository_update_recovers_through_recovery_manager_to_success()
             .mode()
             & 0o7777,
         expected_source_mode
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn managed_loopback_start_rejects_scope_escape_symlink_and_stale_baseline_before_dispatch() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .unwrap_or_else(|error| panic!("reserve managed loopback port: {error}"));
+    let port = listener
+        .local_addr()
+        .unwrap_or_else(|error| panic!("read managed loopback port: {error}"))
+        .port();
+    drop(listener);
+
+    let mut fixture = compiled_managed_loopback_fixture("managed-loopback-authority", port);
+    let state = StateStore::open(&fixture.repo.state_path)
+        .unwrap_or_else(|error| panic!("open managed loopback state: {error}"));
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
+    let mut browser_pressure = green_pressure_snapshot(1_000);
+    browser_pressure.host_free_disk_mib = Some(32_768);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(browser_pressure)));
+    let activation = controller
+        .activate(
+            fixture
+                .compilation
+                .take()
+                .unwrap_or_else(|| panic!("managed loopback compilation already activated")),
+            &fixture.registry,
+        )
+        .unwrap_or_else(|error| panic!("activate managed loopback plan: {error}"));
+    let task_id = activation
+        .task_ids
+        .first()
+        .cloned()
+        .unwrap_or_else(|| panic!("managed loopback activation task missing"));
+    let browser_manifest = browser_tool_manifest();
+    let browser_config = BrowserAdapterConfig {
+        request_timeout_ms: 5_000,
+        ..BrowserAdapterConfig::default()
+    };
+    let ready = controller
+        .derive_browser_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &browser_manifest,
+            browser_config.clone(),
+        )
+        .unwrap_or_else(|error| panic!("derive managed loopback browser lease: {error}"));
+    let browser_backend = backend(Vec::new());
+    let chrome = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+    assert!(
+        chrome.is_file(),
+        "managed loopback regression requires local Google Chrome"
+    );
+    let session = controller
+        .acquire_browser_session_from_ready_lease(
+            ready,
+            &fixture.registry,
+            &browser_manifest,
+            &browser_backend,
+            chrome,
+            browser_config,
+        )
+        .unwrap_or_else(|error| panic!("acquire managed loopback browser session: {error}"));
+    let parts = runtime_parts(&fixture);
+    let action_ids_before = controller
+        .state()
+        .action_records()
+        .unwrap_or_else(|error| panic!("read pre-test action records: {error}"))
+        .into_iter()
+        .map(|record| record.action_id)
+        .collect::<BTreeSet<_>>();
+    let process_leases_before = controller
+        .state()
+        .state_records("controller.process_lease")
+        .unwrap_or_else(|error| panic!("read pre-test process leases: {error}"))
+        .len();
+
+    let sibling_root = fixture.repo.base.join("sibling-runtime-repo");
+    fs::create_dir(&sibling_root)
+        .unwrap_or_else(|error| panic!("create mismatched runtime repository: {error}"));
+    let mut mismatched_isolation = parts.isolation_request.clone();
+    mismatched_isolation.repository_root = sibling_root;
+    let mismatch_backend = MacSandboxExecBackend::detect()
+        .unwrap_or_else(|error| panic!("detect mismatch Seatbelt: {error}"));
+    let mismatch_runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &browser_backend,
+        command_policy: &parts.command_policy,
+        isolation_backend: &mismatch_backend,
+        isolation_request: &mismatched_isolation,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mismatch = controller
+        .start_managed_loopback_app(
+            &session,
+            &mismatch_runtime,
+            1,
+            Path::new("src/other.txt"),
+            "managed.sqlite3",
+        )
+        .err()
+        .unwrap_or_else(|| panic!("mismatched runtime repository unexpectedly dispatched"));
+    assert!(
+        mismatch
+            .to_string()
+            .contains("runtime repository authority does not match")
+    );
+    assert_eq!(
+        controller
+            .state()
+            .action_records()
+            .unwrap_or_else(|error| panic!("read mismatch action records: {error}"))
+            .into_iter()
+            .map(|record| record.action_id)
+            .collect::<BTreeSet<_>>(),
+        action_ids_before
+    );
+    assert_eq!(
+        controller
+            .state()
+            .state_records("controller.process_lease")
+            .unwrap_or_else(|error| panic!("read mismatch process leases: {error}"))
+            .len(),
+        process_leases_before
+    );
+
+    let outside_server = fixture.repo.base.join("outside-server.py");
+    fs::write(&outside_server, "print('outside')\n")
+        .unwrap_or_else(|error| panic!("write outside managed server: {error}"));
+    let server_path = fixture.repo.root.join("src/other.txt");
+    fs::remove_file(&server_path).unwrap_or_else(|error| panic!("remove server target: {error}"));
+    std::os::unix::fs::symlink(&outside_server, &server_path)
+        .unwrap_or_else(|error| panic!("symlink escaping managed server: {error}"));
+    let normal_isolation = parts.isolation_request.clone();
+    let normal_backend = MacSandboxExecBackend::detect()
+        .unwrap_or_else(|error| panic!("detect normal Seatbelt: {error}"));
+    let normal_runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &browser_backend,
+        command_policy: &parts.command_policy,
+        isolation_backend: &normal_backend,
+        isolation_request: &normal_isolation,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let symlink_escape = controller
+        .start_managed_loopback_app(
+            &session,
+            &normal_runtime,
+            2,
+            Path::new("src/other.txt"),
+            "managed.sqlite3",
+        )
+        .err()
+        .unwrap_or_else(|| panic!("escaping server symlink unexpectedly dispatched"));
+    assert!(
+        symlink_escape
+            .to_string()
+            .contains("server path escaped the canonical repository")
+    );
+    assert_eq!(
+        controller
+            .state()
+            .action_records()
+            .unwrap_or_else(|error| panic!("read symlink action records: {error}"))
+            .into_iter()
+            .map(|record| record.action_id)
+            .collect::<BTreeSet<_>>(),
+        action_ids_before
+    );
+    assert_eq!(
+        controller
+            .state()
+            .state_records("controller.process_lease")
+            .unwrap_or_else(|error| panic!("read symlink process leases: {error}"))
+            .len(),
+        process_leases_before
+    );
+
+    fs::remove_file(&server_path).unwrap_or_else(|error| panic!("remove server symlink: {error}"));
+    fs::write(&server_path, OTHER_SOURCE)
+        .unwrap_or_else(|error| panic!("restore server fixture: {error}"));
+    fs::write(
+        fixture.repo.root.join("src/settings/SettingsForm.tsx"),
+        SOURCE.replace("Save", "Drifted"),
+    )
+    .unwrap_or_else(|error| panic!("write managed loopback baseline drift: {error}"));
+    let baseline_error = controller
+        .start_managed_loopback_app(
+            &session,
+            &normal_runtime,
+            3,
+            Path::new("src/other.txt"),
+            "managed.sqlite3",
+        )
+        .err()
+        .unwrap_or_else(|| panic!("stale managed loopback baseline unexpectedly dispatched"));
+    assert!(
+        baseline_error
+            .to_string()
+            .contains("repository baseline drifted"),
+        "unexpected stale managed-loopback error: {baseline_error}"
+    );
+    let new_actions = controller
+        .state()
+        .action_records()
+        .unwrap_or_else(|error| panic!("read stale-baseline action records: {error}"))
+        .into_iter()
+        .filter(|record| !action_ids_before.contains(&record.action_id))
+        .collect::<Vec<_>>();
+    assert_eq!(new_actions.len(), 1);
+    assert_eq!(new_actions[0].state, "authorized");
+    assert_eq!(
+        controller
+            .state()
+            .state_records("controller.process_lease")
+            .unwrap_or_else(|error| panic!("read stale-baseline process leases: {error}"))
+            .len(),
+        process_leases_before
+    );
+    controller
+        .shutdown_browser_session(session)
+        .unwrap_or_else(|error| panic!("shutdown managed loopback browser session: {error}"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn managed_limit_cleanup_reaps_existing_lease_without_durable_stopped_acceptance() {
+    let repo = TestRepo::create("managed-limit-durable-stop");
+    let mut state = StateStore::open(&repo.state_path)
+        .unwrap_or_else(|error| panic!("open managed-limit state: {error}"));
+    let artifacts = ArtifactStore::open(repo.base.join("managed-limit-cas"))
+        .unwrap_or_else(|error| panic!("open managed-limit artifacts: {error}"));
+    let data_root = repo.base.join("managed-limit-data");
+    fs::create_dir_all(&data_root)
+        .unwrap_or_else(|error| panic!("create managed-limit data root: {error}"));
+
+    let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python")
+        .unwrap_or_else(|error| panic!("pin managed-limit python: {error}"));
+    let executable = python.path.clone();
+    let executable_digest = python.sha256.clone();
+    let toolchain_root = executable
+        .parent()
+        .unwrap_or_else(|| panic!("managed-limit python parent missing"))
+        .to_path_buf();
+    let command_policy = CommandPolicy::new([python], [toolchain_root])
+        .unwrap_or_else(|error| panic!("managed-limit command policy: {error}"));
+    let manifest = write_tool_manifest();
+    let policy_digest = format!("sha256:{:064x}", 71);
+    let isolation_policy_digest = format!("sha256:{:064x}", 72);
+    let execution_epoch = state
+        .current_execution_epoch()
+        .unwrap_or_else(|error| panic!("managed-limit execution epoch: {error}"));
+    let expires_at_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|error| panic!("managed-limit clock: {error}"))
+        .as_millis();
+    let expires_at_ms = i64::try_from(expires_at_ms)
+        .unwrap_or(i64::MAX)
+        .saturating_add(60_000);
+    let mut action = AuthorizedAction {
+        action_id: "managed-loopback-start.limit-durable-stop".to_owned(),
+        plan_id: "plan.managed-limit".to_owned(),
+        plan_revision: 1,
+        task_id: "task.managed-limit".to_owned(),
+        attempt_id: "attempt.managed-limit".to_owned(),
+        tool_id: manifest.tool_id.clone(),
+        tool_version: manifest.version.clone(),
+        tool_digest: manifest.content_digest.clone(),
+        executable_digest,
+        repository_id: "repo.managed-limit".to_owned(),
+        destination_digest: Some(format!("sha256:{:064x}", 73)),
+        permission_class: PermissionClass::ProcessExec,
+        execution_epoch,
+        policy_digest: policy_digest.clone(),
+        permission_decision_digest: String::new(),
+        isolation_policy_digest: isolation_policy_digest.clone(),
+        nonce: "nonce.managed-limit".to_owned(),
+        expires_at_ms,
+        command: CommandSpec {
+            executable: executable.clone(),
+            args: vec!["-c".to_owned(), "import time; time.sleep(30)".to_owned()],
+            working_directory: repo.root.clone(),
+            environment: BTreeMap::new(),
+            mode: CommandMode::Direct,
+            declared_risk: CommandRisk::RepositoryMutation,
+            timeout_ms: 5_000,
+            output_limit_bytes: 64 * 1024,
+            disk_write_limit_bytes: 64 * 1024,
+            subprocess_limit: 0,
+        },
+        individually_authorized_environment: BTreeSet::new(),
+        approval_required: false,
+        reconciliation_mode: ReconciliationMode::UnsafeSideEffect,
+    };
+    let layers = CapabilityLayers {
+        global: CapabilitySet::all(),
+        project: CapabilitySet::all(),
+        task: CapabilitySet::all(),
+        role: CapabilitySet::all(),
+        tool: CapabilitySet::all(),
+        user: CapabilitySet::all(),
+    };
+    let permission_decision = PermissionDecision::new(
+        action.plan_id.clone(),
+        action.plan_revision,
+        action.task_id.clone(),
+        format!("sha256:{:064x}", 74),
+        policy_digest,
+        action.tool_id.clone(),
+        action.tool_version.clone(),
+        action.tool_digest.clone(),
+        layers,
+    )
+    .unwrap_or_else(|error| panic!("managed-limit permission decision: {error}"));
+    action.permission_decision_digest = permission_decision.digest();
+    let isolated = IsolatedCommand {
+        executable,
+        args: action.command.args.clone(),
+    };
+    let isolation = MacSandboxExecBackend::detect()
+        .unwrap_or_else(|error| panic!("detect managed-limit isolation: {error}"));
+    let runner = ProcessRunner::new(&command_policy, &isolation);
+
+    let mut process = {
+        let mut journal = ActionJournal::new(&mut state);
+        journal
+            .authorize(&action, &manifest, &permission_decision)
+            .unwrap_or_else(|error| panic!("authorize managed-limit action: {error}"));
+        runner
+            .start_managed_preisolated_with_write_root_until(
+                &mut journal,
+                &action,
+                &isolated,
+                &isolation_policy_digest,
+                &data_root,
+                Instant::now() + Duration::from_millis(750),
+            )
+            .unwrap_or_else(|error| panic!("start managed-limit process: {error}"))
+    };
+    let process_group_id = process.process_group_id();
+    let leader_identity = process.leader_identity().to_owned();
+    let start_result_digest = {
+        let mut journal = ActionJournal::new(&mut state);
+        runner
+            .commit_managed_started(&mut journal, &action, &artifacts, &mut process)
+            .unwrap_or_else(|error| panic!("commit managed-limit start: {error}"))
+    };
+
+    let app_id = "managed-loopback.limit-durable-stop";
+    let binding = json!({
+        "schema_version": 1,
+        "app_id": app_id,
+        "generation": 1,
+        "plan_id": action.plan_id,
+        "plan_revision": action.plan_revision,
+        "task_id": action.task_id,
+        "task_contract_digest": format!("sha256:{:064x}", 75),
+        "attempt_id": action.attempt_id,
+        "execution_epoch": execution_epoch,
+        "browser_resource_lease_id": "browser:managed-limit",
+        "loopback_grant_digest": format!("sha256:{:064x}", 76),
+        "port": 49_997,
+        "repository_root": repo.root,
+        "data_root": data_root,
+        "database_path": repo.base.join("managed-limit-data/managed.sqlite3"),
+        "start_action_id": action.action_id,
+        "start_result_digest": start_result_digest,
+        "process_group_id": process_group_id,
+        "leader_identity": leader_identity,
+        "state": "ready"
+    });
+    let binding_json = binding.to_string();
+    state
+        .put_state_records_with_events(
+            &[StateRecordUpdate {
+                namespace: "controller.managed_loopback_app",
+                key: &action.action_id,
+                value_json: &binding_json,
+            }],
+            &[NewJournalEvent {
+                event_id: "event.managed-limit.ready",
+                entity_type: "managed_loopback_app",
+                entity_id: app_id,
+                event_kind: "managed_loopback_ready",
+                payload_json: "{}",
+            }],
+        )
+        .unwrap_or_else(|error| panic!("persist managed-limit ready binding: {error}"));
+
+    thread::sleep(Duration::from_millis(1_000));
+    let stop_error = {
+        let mut journal = ActionJournal::new(&mut state);
+        runner
+            .stop_managed(&mut journal, &mut process)
+            .err()
+            .unwrap_or_else(|| panic!("limited managed generation reported a clean manual stop"))
+    };
+    assert!(
+        matches!(&stop_error, ToolError::ResourceLimit(message) if message.contains("timeout"))
+    );
+
+    let lease_raw = state
+        .get_state("controller.process_lease", &action.action_id)
+        .unwrap_or_else(|error| panic!("read managed-limit process lease: {error}"))
+        .unwrap_or_else(|| panic!("managed-limit process lease missing"));
+    let lease: Value = serde_json::from_str(&lease_raw)
+        .unwrap_or_else(|error| panic!("decode managed-limit process lease: {error}"));
+    assert_eq!(lease["state"], json!("reaped"));
+    assert_eq!(lease["process_group_id"], json!(process_group_id));
+    assert_eq!(lease["leader_identity"], json!(leader_identity));
+    let durable_binding_raw = state
+        .get_state("controller.managed_loopback_app", &action.action_id)
+        .unwrap_or_else(|error| panic!("read managed-limit app binding: {error}"))
+        .unwrap_or_else(|| panic!("managed-limit app binding missing"));
+    let durable_binding: Value = serde_json::from_str(&durable_binding_raw)
+        .unwrap_or_else(|error| panic!("decode managed-limit app binding: {error}"));
+    assert_eq!(durable_binding["state"], json!("ready"));
+    let journal = state
+        .journal()
+        .unwrap_or_else(|error| panic!("read managed-limit journal: {error}"));
+    assert_eq!(
+        journal
+            .iter()
+            .filter(
+                |event| event.entity_id == app_id && event.event_kind == "managed_loopback_ready"
+            )
+            .count(),
+        1
+    );
+    assert_eq!(
+        journal
+            .iter()
+            .filter(|event| {
+                event.entity_id == app_id && event.event_kind == "managed_loopback_stopped"
+            })
+            .count(),
+        0
+    );
+    assert_eq!(
+        state
+            .action_record(&action.action_id)
+            .unwrap_or_else(|error| panic!("read managed-limit start action: {error}"))
+            .unwrap_or_else(|| panic!("managed-limit start action missing"))
+            .state,
+        "committed"
     );
 }

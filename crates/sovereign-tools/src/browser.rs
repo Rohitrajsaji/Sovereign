@@ -31,6 +31,7 @@ const MAX_SYNOPSIS_BYTES_HARD: usize = 256 * 1024;
 const MAX_DOM_BYTES_HARD: usize = 512 * 1024;
 const MAX_DOWNLOAD_BYTES_HARD: u64 = 128 * 1024 * 1024;
 const MAX_REQUEST_TIMEOUT_MS: u64 = 60_000;
+const CDP_INITIALIZATION_TIMEOUT_MS: u64 = 15_000;
 const MAX_SELECTOR_BYTES: usize = 4 * 1024;
 const MAX_CONTENT_TYPE_BYTES: usize = 512;
 const MAX_FORM_STRUCTURE_BYTES: usize = 64 * 1024;
@@ -1581,8 +1582,25 @@ impl BrowserAdapter {
         lease: &BrowserLease,
         action: &BrowserAction,
     ) -> Result<BrowserActionReceipt, BrowserError> {
+        let deadline = Instant::now() + Duration::from_millis(self.config.request_timeout_ms);
+        self.execute_until(lease, action, deadline)
+    }
+
+    /// Executes one observation action under an absolute caller-owned deadline shared by every CDP
+    /// phase, including single-tab enforcement.
+    ///
+    /// # Errors
+    /// Returns the same validation, protocol, resource, and transport errors as [`Self::execute`],
+    /// and fails once `deadline` is exhausted without creating a replacement inner timeout.
+    pub fn execute_until(
+        &mut self,
+        lease: &BrowserLease,
+        action: &BrowserAction,
+        deadline: Instant,
+    ) -> Result<BrowserActionReceipt, BrowserError> {
         self.verify_lease(lease)?;
         action.validate_shape()?;
+        ensure_deadline(deadline, "browser observation action")?;
         if !self.paused_document_requests.is_empty() || !self.document_requests.is_empty() {
             return Err(BrowserError::InvalidRequest(
                 "top-level document authorization remains unresolved".to_owned(),
@@ -1596,8 +1614,8 @@ impl BrowserAdapter {
                 ));
             }
             BrowserAction::CaptureSynopsis { .. } => {
-                let (request_id, synopsis) = self.capture_synopsis()?;
-                self.enforce_single_page_target(request_id, action.kind_name())?;
+                let (request_id, synopsis) = self.capture_synopsis_until(deadline)?;
+                self.enforce_single_page_target_until(request_id, action.kind_name(), deadline)?;
                 (request_id, None, Some(synopsis), None)
             }
             BrowserAction::CaptureScreenshot { .. }
@@ -1606,13 +1624,22 @@ impl BrowserAdapter {
                 (0, None, None, None)
             }
             BrowserAction::CaptureScreenshot { .. } => {
-                let (synopsis_request_id, synopsis) = self.capture_synopsis()?;
-                self.enforce_single_page_target(synopsis_request_id, action.kind_name())?;
+                let (synopsis_request_id, synopsis) = self.capture_synopsis_until(deadline)?;
+                self.enforce_single_page_target_until(
+                    synopsis_request_id,
+                    action.kind_name(),
+                    deadline,
+                )?;
                 if synopsis.requires_visual_capture_suppression() {
                     (synopsis_request_id, None, Some(synopsis), None)
                 } else {
-                    let (screenshot_request_id, screenshot) = self.capture_screenshot()?;
-                    self.enforce_single_page_target(screenshot_request_id, action.kind_name())?;
+                    let (screenshot_request_id, screenshot) =
+                        self.capture_screenshot_until(deadline)?;
+                    self.enforce_single_page_target_until(
+                        screenshot_request_id,
+                        action.kind_name(),
+                        deadline,
+                    )?;
                     (
                         screenshot_request_id,
                         None,
@@ -1660,9 +1687,25 @@ impl BrowserAdapter {
         selector: &str,
         payload_digest: &str,
     ) -> Result<BrowserFormInspectionReceipt, BrowserError> {
+        let deadline = Instant::now() + Duration::from_millis(self.config.request_timeout_ms);
+        self.inspect_form_until(lease, selector, payload_digest, deadline)
+    }
+
+    /// Performs form inspection under one absolute caller-owned deadline.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::inspect_form`] and fails once `deadline` is exhausted.
+    pub fn inspect_form_until(
+        &mut self,
+        lease: &BrowserLease,
+        selector: &str,
+        payload_digest: &str,
+        deadline: Instant,
+    ) -> Result<BrowserFormInspectionReceipt, BrowserError> {
         self.verify_lease(lease)?;
         validate_selector(selector)?;
         validate_sha256_digest(payload_digest, "form payload digest")?;
+        ensure_deadline(deadline, "form inspection")?;
         if self.pending_action.is_some() || !self.paused_document_requests.is_empty() {
             return Err(BrowserError::InvalidRequest(
                 "form inspection requires no dispatched action or unresolved document authorization"
@@ -1673,7 +1716,7 @@ impl BrowserAdapter {
             BrowserError::Protocol(format!("selector serialization failed: {error}"))
         })?;
         let expression = form_inspection_expression(&selector_json);
-        let (_, response) = self.send_cdp(
+        let (_, response) = self.send_cdp_until(
             "Runtime.evaluate",
             serde_json::json!({
                 "expression": expression,
@@ -1681,6 +1724,7 @@ impl BrowserAdapter {
                 "awaitPromise": false,
             }),
             Some(self.session_id.clone()),
+            deadline,
         )?;
         let value = runtime_value(&response, "Runtime.evaluate")?;
         if value.get("found").and_then(serde_json::Value::as_bool) != Some(true) {
@@ -1735,8 +1779,26 @@ impl BrowserAdapter {
         action: &BrowserAction,
         approved_form: Option<&BrowserFormInspectionReceipt>,
     ) -> Result<BrowserDispatchedAction, BrowserError> {
+        let deadline = Instant::now() + Duration::from_millis(self.config.request_timeout_ms);
+        self.dispatch_intercepted_action_until(lease, action, approved_form, deadline)
+    }
+
+    /// Dispatches an intercepted navigation action under one absolute caller-owned deadline. A
+    /// `SubmitForm` fresh-binding inspection consumes the same deadline.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::dispatch_intercepted_action`] and fails once `deadline` is
+    /// exhausted.
+    pub fn dispatch_intercepted_action_until(
+        &mut self,
+        lease: &BrowserLease,
+        action: &BrowserAction,
+        approved_form: Option<&BrowserFormInspectionReceipt>,
+        deadline: Instant,
+    ) -> Result<BrowserDispatchedAction, BrowserError> {
         self.verify_lease(lease)?;
         action.validate_shape()?;
+        ensure_deadline(deadline, "intercepted browser action dispatch")?;
         if self.pending_action.is_some() {
             return Err(BrowserError::InvalidRequest(
                 "another browser action is already dispatched".to_owned(),
@@ -1759,7 +1821,7 @@ impl BrowserAdapter {
                     "SubmitForm requires an approved form inspection binding".to_owned(),
                 )
             })?;
-            let fresh = self.inspect_form(lease, selector, payload_digest)?;
+            let fresh = self.inspect_form_until(lease, selector, payload_digest, deadline)?;
             if fresh.binding_digest() != approved.binding_digest() {
                 return Err(BrowserError::InvalidRequest(
                     "form inspection binding changed before submit dispatch".to_owned(),
@@ -1800,6 +1862,7 @@ impl BrowserAdapter {
                 ));
             }
         };
+        ensure_deadline(deadline, "intercepted browser action dispatch")?;
         let request_id =
             self.dispatch_cdp_request(method, params, Some(self.session_id.clone()))?;
         self.pending_action = Some(PendingBrowserAction {
@@ -1835,10 +1898,42 @@ impl BrowserAdapter {
                 "document observation timeout is outside configured browser bounds".to_owned(),
             ));
         }
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        self.next_document_request_until(lease, deadline)
+    }
+
+    /// Waits for the next paused top-level document request until an absolute caller-owned deadline.
+    ///
+    /// # Errors
+    /// Returns the same protocol/transport errors as [`Self::next_document_request`] and fails once
+    /// `deadline` is exhausted.
+    pub fn next_document_request_until(
+        &mut self,
+        lease: &BrowserLease,
+        deadline: Instant,
+    ) -> Result<BrowserDocumentRequestObservation, BrowserError> {
+        self.verify_lease(lease)?;
+        if Instant::now() >= deadline {
+            let (request_id, method) = self
+                .pending_action
+                .as_ref()
+                .map_or((0, "Fetch.requestPaused"), |pending| {
+                    (pending.cdp_request_id, pending.response_method)
+                });
+            if request_id == 0 {
+                return Err(BrowserError::Protocol(
+                    "timed out waiting for a paused top-level document request".to_owned(),
+                ));
+            }
+            return Err(self.mark_transport_uncertain(
+                request_id,
+                method,
+                "timed out while an intercepted browser action remained in flight".to_owned(),
+            ));
+        }
         if let Some(observation) = self.document_requests.pop_front() {
             return Ok(observation);
         }
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
             if let Some(observation) = self.document_requests.pop_front() {
                 return Ok(observation);
@@ -1877,7 +1972,40 @@ impl BrowserAdapter {
         observation: &BrowserDocumentRequestObservation,
         decision: BrowserDocumentRequestDecision,
     ) -> Result<(), BrowserError> {
+        let deadline = Instant::now() + Duration::from_millis(self.config.request_timeout_ms);
+        self.resolve_document_request_until(lease, observation, decision, deadline)
+    }
+
+    /// Resolves one paused top-level document request under an absolute caller-owned deadline.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::resolve_document_request`] and fails once `deadline` is
+    /// exhausted without extending it for the continuation response.
+    pub fn resolve_document_request_until(
+        &mut self,
+        lease: &BrowserLease,
+        observation: &BrowserDocumentRequestObservation,
+        decision: BrowserDocumentRequestDecision,
+        deadline: Instant,
+    ) -> Result<(), BrowserError> {
         self.verify_lease(lease)?;
+        if Instant::now() >= deadline {
+            if let Some((request_id, method)) = self
+                .pending_action
+                .as_ref()
+                .map(|pending| (pending.cdp_request_id, pending.response_method))
+            {
+                return Err(self.mark_transport_uncertain(
+                    request_id,
+                    method,
+                    "absolute browser action deadline expired before document request resolution"
+                        .to_owned(),
+                ));
+            }
+            return Err(BrowserError::Protocol(
+                "browser deadline expired before document request resolution".to_owned(),
+            ));
+        }
         let current = self
             .paused_document_requests
             .get(&observation.interception_id)
@@ -1913,7 +2041,7 @@ impl BrowserAdapter {
                 }),
             ),
         };
-        let _ = self.send_cdp(method, params, Some(self.session_id.clone()))?;
+        let _ = self.send_cdp_until(method, params, Some(self.session_id.clone()), deadline)?;
         self.paused_document_requests
             .remove(&observation.interception_id);
         Ok(())
@@ -1931,8 +2059,44 @@ impl BrowserAdapter {
         &mut self,
         lease: &BrowserLease,
     ) -> Result<BrowserActionReceipt, BrowserError> {
-        self.verify_lease(lease)?;
         let deadline = Instant::now() + Duration::from_millis(self.config.request_timeout_ms);
+        self.finish_dispatched_action_until(lease, deadline)
+    }
+
+    /// Finishes one dispatched action under an absolute caller-owned deadline shared by terminal
+    /// load waiting and single-tab enforcement.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::finish_dispatched_action`] and fails once `deadline` is
+    /// exhausted without creating a fresh completion timeout.
+    pub fn finish_dispatched_action_until(
+        &mut self,
+        lease: &BrowserLease,
+        deadline: Instant,
+    ) -> Result<BrowserActionReceipt, BrowserError> {
+        self.verify_lease(lease)?;
+        if Instant::now() >= deadline {
+            if let Some((request_id, method)) = self
+                .pending_action
+                .as_ref()
+                .map(|pending| (pending.cdp_request_id, pending.response_method))
+            {
+                return Err(self.mark_transport_uncertain(
+                    request_id,
+                    method,
+                    "absolute browser action deadline expired while action remained in flight"
+                        .to_owned(),
+                ));
+            }
+            return Err(BrowserError::Protocol(
+                "browser deadline expired before dispatched action completion".to_owned(),
+            ));
+        }
+        self.wait_for_dispatched_action_until(deadline)?;
+        self.complete_dispatched_action_until(deadline)
+    }
+
+    fn wait_for_dispatched_action_until(&mut self, deadline: Instant) -> Result<(), BrowserError> {
         loop {
             if !self.document_requests.is_empty() || !self.paused_document_requests.is_empty() {
                 return Err(BrowserError::InvalidRequest(
@@ -1957,9 +2121,12 @@ impl BrowserAdapter {
                         || self.main_frame_load_state == MainFrameLoadState::Stopped
                 }
                 BrowserAction::SubmitForm { .. } => {
-                    (self.main_frame_load_state == MainFrameLoadState::Idle
-                        && self.document_chain_index == 0)
-                        || self.main_frame_load_state == MainFrameLoadState::Stopped
+                    // `Idle` is the initial state immediately after dispatch. Treating that state as
+                    // completion can commit the form action before Chrome surfaces the resulting
+                    // top-level POST/navigation, leaving the next observation to race a paused
+                    // document request. A typed HTML form submission is complete only after the
+                    // main frame has reached an observed terminal load state.
+                    self.main_frame_load_state == MainFrameLoadState::Stopped
                 }
                 BrowserAction::CaptureSynopsis { .. } | BrowserAction::CaptureScreenshot { .. } => {
                     true
@@ -1972,7 +2139,13 @@ impl BrowserAdapter {
             let response_method = pending.response_method;
             self.receive_and_process_until(deadline, request_id, response_method)?;
         }
+        Ok(())
+    }
 
+    fn complete_dispatched_action_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<BrowserActionReceipt, BrowserError> {
         let pending = self.pending_action.clone().ok_or_else(|| {
             BrowserError::Protocol("pending browser action disappeared".to_owned())
         })?;
@@ -1995,10 +2168,21 @@ impl BrowserAdapter {
                 ));
             }
         };
-        self.enforce_single_page_target(pending.cdp_request_id, pending.action.kind_name())?;
+        if Instant::now() >= deadline {
+            return Err(self.mark_transport_uncertain(
+                pending.cdp_request_id,
+                pending.response_method,
+                "absolute browser action deadline expired before single-tab enforcement".to_owned(),
+            ));
+        }
+        self.enforce_single_page_target_until(
+            pending.cdp_request_id,
+            pending.action.kind_name(),
+            deadline,
+        )?;
         if !self.document_requests.is_empty() || !self.paused_document_requests.is_empty() {
             return Err(BrowserError::InvalidRequest(
-                "top-level document redirect became paused while finalizing the browser action"
+                "top-level document request/redirect is paused awaiting caller authorization"
                     .to_owned(),
             ));
         }
@@ -2073,6 +2257,27 @@ impl BrowserAdapter {
         lease: &BrowserLease,
         timeout_ms: u64,
     ) -> Result<BrowserDownloadTerminalObservation, BrowserError> {
+        if timeout_ms == 0 || timeout_ms > self.config.request_timeout_ms {
+            return Err(BrowserError::InvalidRequest(
+                "download observation timeout is outside configured browser bounds".to_owned(),
+            ));
+        }
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        self.next_download_terminal_until(lease, deadline)
+    }
+
+    /// Waits for one mechanically observed terminal Chrome download event until an absolute
+    /// caller-owned deadline.
+    ///
+    /// # Errors
+    /// Returns the same validation, protocol, and transport errors as
+    /// [`Self::next_download_terminal`], and fails once `deadline` is exhausted without creating a
+    /// replacement inner timeout.
+    pub fn next_download_terminal_until(
+        &mut self,
+        lease: &BrowserLease,
+        deadline: Instant,
+    ) -> Result<BrowserDownloadTerminalObservation, BrowserError> {
         self.verify_lease(lease)?;
         if self.download_policy != BrowserDownloadPolicy::Allow || self.download_root.is_none() {
             return Err(BrowserError::InvalidRequest(
@@ -2080,12 +2285,7 @@ impl BrowserAdapter {
                     .to_owned(),
             ));
         }
-        if timeout_ms == 0 || timeout_ms > self.config.request_timeout_ms {
-            return Err(BrowserError::InvalidRequest(
-                "download observation timeout is outside configured browser bounds".to_owned(),
-            ));
-        }
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        ensure_deadline(deadline, "download terminal observation")?;
         loop {
             if let Some(terminal) = self.download_tracker.pop_terminal() {
                 return Ok(BrowserDownloadTerminalObservation {
@@ -2132,8 +2332,13 @@ impl BrowserAdapter {
     }
 
     fn initialize_cdp(&mut self) -> Result<(), BrowserError> {
+        // Browser process startup can legitimately take longer than a bounded action request on a
+        // constrained local machine. Keep initialization under one separate static deadline so a
+        // product can narrow per-action request_timeout_ms without making the launch handshake
+        // inherit that narrower action bound.
+        let deadline = Instant::now() + Duration::from_millis(CDP_INITIALIZATION_TIMEOUT_MS);
         let (_, version_response) =
-            self.send_cdp("Browser.getVersion", serde_json::json!({}), None)?;
+            self.send_cdp_until("Browser.getVersion", serde_json::json!({}), None, deadline)?;
         let version = cdp_result(&version_response, "Browser.getVersion")?;
         self.browser_version = BrowserVersion {
             product: required_string(version, "product", "Browser.getVersion")?,
@@ -2141,21 +2346,28 @@ impl BrowserAdapter {
             user_agent: required_string(version, "userAgent", "Browser.getVersion")?,
         };
 
-        let (_, discover_response) = self.send_cdp(
+        self.initialize_cdp_target(deadline)?;
+        self.initialize_cdp_downloads(deadline)
+    }
+
+    fn initialize_cdp_target(&mut self, deadline: Instant) -> Result<(), BrowserError> {
+        let (_, discover_response) = self.send_cdp_until(
             "Target.setDiscoverTargets",
             serde_json::json!({"discover": true}),
             None,
+            deadline,
         )?;
         let _ = cdp_result(&discover_response, "Target.setDiscoverTargets")?;
 
         let (_, target_response) =
-            self.send_cdp("Target.getTargets", serde_json::json!({}), None)?;
+            self.send_cdp_until("Target.getTargets", serde_json::json!({}), None, deadline)?;
         let mut page_target_ids = page_target_ids(&target_response)?;
         if page_target_ids.is_empty() {
-            let (_, create_response) = self.send_cdp(
+            let (_, create_response) = self.send_cdp_until(
                 "Target.createTarget",
                 serde_json::json!({"url": "about:blank"}),
                 None,
+                deadline,
             )?;
             let create_result = cdp_result(&create_response, "Target.createTarget")?;
             page_target_ids.push(required_string(
@@ -2171,16 +2383,17 @@ impl BrowserAdapter {
             )));
         }
         self.target_id.clone_from(&page_target_ids[0]);
-        let (_, attach_response) = self.send_cdp(
+        let (_, attach_response) = self.send_cdp_until(
             "Target.attachToTarget",
             serde_json::json!({"targetId": self.target_id, "flatten": true}),
             None,
+            deadline,
         )?;
         let attach_result = cdp_result(&attach_response, "Target.attachToTarget")?;
         self.session_id = required_string(attach_result, "sessionId", "Target.attachToTarget")?;
 
         let session = Some(self.session_id.clone());
-        let (_, auto_attach_response) = self.send_cdp(
+        let (_, auto_attach_response) = self.send_cdp_until(
             "Target.setAutoAttach",
             serde_json::json!({
                 "autoAttach": true,
@@ -2188,18 +2401,20 @@ impl BrowserAdapter {
                 "flatten": true,
             }),
             session.clone(),
+            deadline,
         )?;
         let _ = cdp_result(&auto_attach_response, "Target.setAutoAttach")?;
         let (_, page_enable_response) =
-            self.send_cdp("Page.enable", serde_json::json!({}), session)?;
+            self.send_cdp_until("Page.enable", serde_json::json!({}), session, deadline)?;
         let _ = cdp_result(&page_enable_response, "Page.enable")?;
-        let (_, frame_tree_response) = self.send_cdp(
+        let (_, frame_tree_response) = self.send_cdp_until(
             "Page.getFrameTree",
             serde_json::json!({}),
             Some(self.session_id.clone()),
+            deadline,
         )?;
         self.main_frame_id = main_frame_id(&frame_tree_response)?;
-        let (_, interception_response) = self.send_cdp(
+        let (_, interception_response) = self.send_cdp_until(
             "Fetch.enable",
             serde_json::json!({
                 "patterns": [{
@@ -2209,8 +2424,13 @@ impl BrowserAdapter {
                 "handleAuthRequests": self.proxy_auth.is_some(),
             }),
             Some(self.session_id.clone()),
+            deadline,
         )?;
         let _ = cdp_result(&interception_response, "Fetch.enable")?;
+        Ok(())
+    }
+
+    fn initialize_cdp_downloads(&mut self, deadline: Instant) -> Result<(), BrowserError> {
         let download_params = match self.download_policy {
             BrowserDownloadPolicy::Deny => serde_json::json!({
                 "behavior": "deny",
@@ -2230,18 +2450,24 @@ impl BrowserAdapter {
                 })
             }
         };
-        let (_, download_response) =
-            self.send_cdp("Browser.setDownloadBehavior", download_params, None)?;
+        let (_, download_response) = self.send_cdp_until(
+            "Browser.setDownloadBehavior",
+            download_params,
+            None,
+            deadline,
+        )?;
         let _ = cdp_result(&download_response, "Browser.setDownloadBehavior")?;
         Ok(())
     }
 
-    fn enforce_single_page_target(
+    fn enforce_single_page_target_until(
         &mut self,
         dispatched_request_id: u64,
         action_kind: &str,
+        deadline: Instant,
     ) -> Result<(), BrowserError> {
-        let (_, response) = self.send_cdp("Target.getTargets", serde_json::json!({}), None)?;
+        let (_, response) =
+            self.send_cdp_until("Target.getTargets", serde_json::json!({}), None, deadline)?;
         let page_targets = page_target_ids(&response)?;
         let (expected_present, unexpected) = assess_single_tab_targets(
             &self.target_id,
@@ -2256,17 +2482,18 @@ impl BrowserAdapter {
             .iter()
             .filter(|target_id| page_targets.contains(target_id))
         {
-            let _ = self.send_cdp(
+            let _ = self.send_cdp_until(
                 "Target.closeTarget",
                 serde_json::json!({"targetId": target_id}),
                 None,
+                deadline,
             )?;
         }
         self.unexpected_page_targets.clear();
 
         if !unexpected.is_empty() {
             let (_, verify_response) =
-                self.send_cdp("Target.getTargets", serde_json::json!({}), None)?;
+                self.send_cdp_until("Target.getTargets", serde_json::json!({}), None, deadline)?;
             let remaining = page_target_ids(&verify_response)?;
             if remaining.len() != 1 || remaining.first() != Some(&self.target_id) {
                 return Err(self.mark_transport_uncertain(
@@ -2294,10 +2521,13 @@ impl BrowserAdapter {
         ))
     }
 
-    fn capture_synopsis(&mut self) -> Result<(u64, BrowserStateSynopsis), BrowserError> {
+    fn capture_synopsis_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(u64, BrowserStateSynopsis), BrowserError> {
         let expression =
             synopsis_expression(self.config.max_synopsis_bytes, self.config.max_dom_bytes);
-        let (request_id, response) = self.send_cdp(
+        let (request_id, response) = self.send_cdp_until(
             "Runtime.evaluate",
             serde_json::json!({
                 "expression": expression,
@@ -2305,6 +2535,7 @@ impl BrowserAdapter {
                 "awaitPromise": false,
             }),
             Some(self.session_id.clone()),
+            deadline,
         )?;
         let value = runtime_value(&response, "Runtime.evaluate")?;
         let url = required_value_string(value, "url", "browser synopsis")?;
@@ -2382,8 +2613,11 @@ impl BrowserAdapter {
         ))
     }
 
-    fn capture_screenshot(&mut self) -> Result<(u64, BrowserScreenshot), BrowserError> {
-        let (request_id, response) = self.send_cdp(
+    fn capture_screenshot_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(u64, BrowserScreenshot), BrowserError> {
+        let (request_id, response) = self.send_cdp_until(
             "Page.captureScreenshot",
             serde_json::json!({
                 "format": "png",
@@ -2392,6 +2626,7 @@ impl BrowserAdapter {
                 "optimizeForSpeed": true,
             }),
             Some(self.session_id.clone()),
+            deadline,
         )?;
         let result = cdp_result(&response, "Page.captureScreenshot")?;
         let png_base64 = required_value_string(result, "data", "Page.captureScreenshot")?;
@@ -2423,14 +2658,15 @@ impl BrowserAdapter {
         ))
     }
 
-    fn send_cdp(
+    fn send_cdp_until(
         &mut self,
         method: &str,
         params: serde_json::Value,
         session_id: Option<String>,
+        deadline: Instant,
     ) -> Result<(u64, serde_json::Value), BrowserError> {
+        ensure_deadline(deadline, method)?;
         let request_id = self.dispatch_cdp_request(method, params, session_id)?;
-        let deadline = Instant::now() + Duration::from_millis(self.config.request_timeout_ms);
         loop {
             if let Some(response) = self.pending_responses.remove(&request_id) {
                 return Ok((request_id, response));
@@ -3009,9 +3245,16 @@ fn chrome_args(profile_root: &Path, caller_chrome_args: &[String]) -> Vec<String
         "--no-default-browser-check".to_owned(),
         "--disable-background-networking".to_owned(),
         "--disable-component-update".to_owned(),
+        "--disable-default-apps".to_owned(),
+        "--disable-domain-reliability".to_owned(),
+        "--disable-extensions".to_owned(),
         "--disable-sync".to_owned(),
+        "--disable-search-engine-choice-screen".to_owned(),
         "--metrics-recording-only".to_owned(),
         "--disable-breakpad".to_owned(),
+        "--no-pings".to_owned(),
+        "--password-store=basic".to_owned(),
+        "--use-mock-keychain".to_owned(),
     ];
     args.extend(caller_chrome_args.iter().cloned());
     args.push(format!("--user-data-dir={}", profile_root.display()));
@@ -3968,24 +4211,477 @@ fn digest_field(hasher: &mut Sha256, value: &str) {
     hasher.update(value.as_bytes());
 }
 
+fn ensure_deadline(deadline: Instant, operation: &str) -> Result<(), BrowserError> {
+    if Instant::now() >= deadline {
+        return Err(BrowserError::Protocol(format!(
+            "browser deadline expired before {operation}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         AttachedTargetDisposition, BROWSER_SCHEMA_VERSION, BrowserAction, BrowserAdapter,
-        BrowserAdapterConfig, BrowserDocumentRequestKind, BrowserDownloadPolicy,
-        BrowserDownloadTerminalState, BrowserDownloadTracker, BrowserError, BrowserLease,
-        BrowserProxyAuthBinding, BrowserSensitivePageReason, BrowserSpawnBinding,
-        BrowserSpawnFailure, BrowserSpawnState, FetchAuthDecision, FetchPausedRequest,
-        assess_single_tab_targets, classify_attached_target, classify_fetch_auth_required,
-        classify_fetch_request_paused, navigation_response_is_download,
-        non_top_level_request_method_allowed, request_method_allowed_by_ceiling,
+        BrowserAdapterConfig, BrowserDocumentRequestDecision, BrowserDocumentRequestKind,
+        BrowserDownloadPolicy, BrowserDownloadTerminalState, BrowserDownloadTracker, BrowserError,
+        BrowserLease, BrowserProxyAuthBinding, BrowserSensitivePageReason, BrowserSpawnBinding,
+        BrowserSpawnFailure, BrowserSpawnState, BrowserVersion, CdpFrameReader, FetchAuthDecision,
+        FetchPausedRequest, MainFrameLoadState, assess_single_tab_targets,
+        classify_attached_target, classify_fetch_auth_required, classify_fetch_request_paused,
+        navigation_response_is_download, non_top_level_request_method_allowed,
+        request_method_allowed_by_ceiling,
     };
     use serde_json::json;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::Path;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::os::unix::process::CommandExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    const SCRIPTED_SUBMIT_FORM_CDP: &str = r"
+import json
+import sys
+import threading
+import time
+
+write_lock = threading.Lock()
+
+def emit(value):
+    encoded = json.dumps(value, separators=(',', ':')).encode()
+    with write_lock:
+        sys.stdout.buffer.write(encoded + b'\0')
+        sys.stdout.buffer.flush()
+
+def reply(request_id, result):
+    emit({'id': request_id, 'result': result})
+
+def delayed_stop():
+    time.sleep(0.25)
+    emit({
+        'method': 'Page.frameStoppedLoading',
+        'params': {'frameId': 'frame-main'}
+    })
+
+def delayed_download_terminal():
+    time.sleep(0.08)
+    emit({
+        'method': 'Browser.downloadWillBegin',
+        'params': {
+            'guid': 'guid-deadline-download',
+            'url': 'http://127.0.0.1/download',
+            'suggestedFilename': 'ignored.bin'
+        }
+    })
+    time.sleep(0.20)
+    emit({
+        'method': 'Browser.downloadProgress',
+        'params': {'guid': 'guid-deadline-download', 'state': 'completed'}
+    })
+
+buffer = bytearray()
+while True:
+    byte = sys.stdin.buffer.read(1)
+    if not byte:
+        break
+    if byte != b'\0':
+        buffer.extend(byte)
+        continue
+    if not buffer:
+        continue
+    request = json.loads(buffer.decode())
+    buffer.clear()
+    request_id = request['id']
+    method = request['method']
+    params = request.get('params', {})
+
+    if method == 'Runtime.evaluate':
+        expression = params.get('expression', '')
+        if 'const controls = Array.from(form.querySelectorAll' in expression:
+            if 'form#deadline' in expression:
+                time.sleep(0.15)
+            reply(request_id, {'result': {'value': {
+                'found': True,
+                'pageUrl': 'http://127.0.0.1/form',
+                'actionUrl': 'http://127.0.0.1/submit',
+                'method': 'POST',
+                'structure': 'form|input:text:name::required|count=1',
+                'sensitiveInputsPresent': False,
+            }}})
+        elif 'requestSubmit' in expression:
+            # The regression-critical order: the synchronous submit result arrives before Chrome
+            # surfaces the top-level POST. Idle must therefore remain non-terminal.
+            reply(request_id, {'result': {'value': {'submitted': True}}})
+            emit({
+                'method': 'Fetch.requestPaused',
+                'params': {
+                    'requestId': 'fetch-post',
+                    'frameId': 'frame-main',
+                    'resourceType': 'Document',
+                    'request': {'url': 'http://127.0.0.1/submit', 'method': 'POST'}
+                }
+            })
+        else:
+            reply(request_id, {'result': {'value': {
+                'url': 'http://127.0.0.1/done',
+                'title': 'done',
+                'text': 'done after redirect',
+                'textTruncated': False,
+                'dom': '<html><body>done after redirect</body></html>',
+                'domTruncated': False,
+                'sensitive': False,
+                'formControlsPresent': False,
+                'passwordControlPresent': False,
+                'sensitiveAttributePresent': False,
+                'credentialTextPatternPresent': False,
+            }}})
+    elif method == 'Fetch.continueRequest':
+        interception_id = params.get('requestId')
+        reply(request_id, {})
+        if interception_id == 'fetch-post':
+            emit({
+                'method': 'Fetch.requestPaused',
+                'params': {
+                    'requestId': 'fetch-get',
+                    'frameId': 'frame-main',
+                    'resourceType': 'Document',
+                    'request': {'url': 'http://127.0.0.1/done', 'method': 'GET'}
+                }
+            })
+        elif interception_id == 'fetch-get':
+            emit({
+                'method': 'Page.frameStartedLoading',
+                'params': {'frameId': 'frame-main'}
+            })
+            threading.Thread(target=delayed_stop, daemon=True).start()
+    elif method == 'Target.getTargets':
+        reply(request_id, {'targetInfos': [{
+            'targetId': 'page-main',
+            'type': 'page',
+            'url': 'http://127.0.0.1/done'
+        }]})
+    elif method == 'Browser.getVersion':
+        reply(request_id, {})
+        threading.Thread(target=delayed_download_terminal, daemon=True).start()
+    elif method == 'Browser.close':
+        reply(request_id, {})
+        break
+    else:
+        reply(request_id, {})
+";
+
+    fn scripted_submit_form_adapter(lease: &BrowserLease) -> (BrowserAdapter, PathBuf) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_else(|error| panic!("clock failed for scripted browser test: {error}"))
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "sovereign-browser-submit-race-{}-{}-{nonce}",
+            std::process::id(),
+            lease.lease_id
+        ));
+        let profile_root = root.join("profile");
+        fs::create_dir_all(&profile_root)
+            .unwrap_or_else(|error| panic!("create scripted browser root failed: {error}"));
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|error| panic!("chmod scripted browser root failed: {error}"));
+        fs::set_permissions(&profile_root, fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|error| panic!("chmod scripted browser profile failed: {error}"));
+
+        let mut child = Command::new("/usr/bin/python3")
+            .args(["-u", "-c", SCRIPTED_SUBMIT_FORM_CDP])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn scripted CDP peer failed: {error}"));
+        let process_group_id = child.id();
+        let identity_deadline = Instant::now() + Duration::from_secs(1);
+        let process_group_identity = loop {
+            if let Some(identity) = crate::process_group_leader_identity(process_group_id)
+                .unwrap_or_else(|error| panic!("observe scripted CDP process failed: {error}"))
+            {
+                break identity;
+            }
+            assert!(
+                Instant::now() < identity_deadline,
+                "scripted CDP process never exposed a stable identity"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let cdp_writer = child
+            .stdin
+            .take()
+            .unwrap_or_else(|| panic!("scripted CDP stdin missing"));
+        let cdp_stdout = child
+            .stdout
+            .take()
+            .unwrap_or_else(|| panic!("scripted CDP stdout missing"));
+        let config = BrowserAdapterConfig::default();
+        let cdp_reader = CdpFrameReader::spawn(cdp_stdout, config.max_cdp_frame_bytes);
+        let adapter = BrowserAdapter {
+            child,
+            cdp_writer: Some(cdp_writer),
+            cdp_reader: Some(cdp_reader),
+            process_group_id,
+            process_group_identity,
+            private_parent: root.clone(),
+            profile_root,
+            download_root: None,
+            lease_id: lease.lease_id.clone(),
+            lease_binding_digest: lease.binding_digest(),
+            execution_epoch: lease.execution_epoch,
+            session_id: "session-main".to_owned(),
+            target_id: "page-main".to_owned(),
+            browser_version: BrowserVersion {
+                product: "scripted-chrome".to_owned(),
+                protocol_version: "scripted-cdp".to_owned(),
+                user_agent: "scripted-agent".to_owned(),
+            },
+            config,
+            download_policy: BrowserDownloadPolicy::Deny,
+            cleanup_profile_on_shutdown: false,
+            next_request_id: 1,
+            main_frame_id: "frame-main".to_owned(),
+            pending_action: None,
+            pending_responses: BTreeMap::new(),
+            internal_requests: BTreeMap::new(),
+            document_requests: VecDeque::new(),
+            paused_document_requests: BTreeMap::new(),
+            document_chain_index: 0,
+            main_frame_load_state: MainFrameLoadState::Idle,
+            unexpected_page_targets: BTreeSet::new(),
+            download_tracker: BrowserDownloadTracker::default(),
+            proxy_auth: None,
+            request_method_ceiling: None,
+            transport_uncertain: false,
+            closed: false,
+        };
+        (adapter, root)
+    }
+
+    fn scripted_submit_form_lease(
+        lease_id: &str,
+        attempt_id: &str,
+        execution_epoch: i64,
+        token: &str,
+    ) -> BrowserLease {
+        BrowserLease {
+            schema_version: BROWSER_SCHEMA_VERSION,
+            lease_id: lease_id.to_owned(),
+            task_id: "PD-T03".to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            execution_epoch,
+            token: token.to_owned(),
+        }
+    }
+
+    #[test]
+    fn submit_form_terminal_load_waits_through_post_redirect_chain() {
+        let lease = scripted_submit_form_lease(
+            "submit-terminal-race",
+            "attempt-submit-terminal-race",
+            11,
+            "submit-terminal-race-token",
+        );
+        let (mut adapter, root) = scripted_submit_form_adapter(&lease);
+        let payload_digest = format!("sha256:{}", "d".repeat(64));
+        let inspection = adapter
+            .inspect_form(&lease, "form#inventory", &payload_digest)
+            .unwrap_or_else(|error| panic!("inspect scripted submit form failed: {error}"));
+        let submit = BrowserAction::SubmitForm {
+            action_id: "submit-terminal-race-action".to_owned(),
+            selector: "form#inventory".to_owned(),
+            payload_digest,
+        };
+        let dispatched = adapter
+            .dispatch_intercepted_action(&lease, &submit, Some(&inspection))
+            .unwrap_or_else(|error| panic!("dispatch scripted submit failed: {error}"));
+
+        assert_eq!(adapter.main_frame_load_state, MainFrameLoadState::Idle);
+        let idle_finish = adapter.finish_dispatched_action(&lease);
+        assert!(
+            matches!(idle_finish, Err(BrowserError::InvalidRequest(_))),
+            "Idle must not commit SubmitForm before paused POST observation: {idle_finish:?}"
+        );
+        assert!(adapter.pending_action.is_some());
+
+        let post = adapter
+            .next_document_request(&lease, 1_000)
+            .unwrap_or_else(|error| panic!("observe paused POST failed: {error}"));
+        assert_eq!(post.kind, BrowserDocumentRequestKind::Initial);
+        assert_eq!(post.chain_index, 0);
+        assert_eq!(post.method, "POST");
+        assert_eq!(post.url, "http://127.0.0.1/submit");
+
+        let racing_synopsis = adapter.execute(
+            &lease,
+            &BrowserAction::CaptureSynopsis {
+                action_id: "synopsis-before-post-resolution".to_owned(),
+            },
+        );
+        assert!(
+            matches!(racing_synopsis, Err(BrowserError::InvalidRequest(_))),
+            "synopsis must not race an unresolved top-level POST"
+        );
+        adapter
+            .resolve_document_request(&lease, &post, BrowserDocumentRequestDecision::Continue)
+            .unwrap_or_else(|error| panic!("continue paused POST failed: {error}"));
+
+        let redirect_finish = adapter.finish_dispatched_action(&lease);
+        assert!(
+            matches!(redirect_finish, Err(BrowserError::InvalidRequest(_))),
+            "POST -> 303 -> GET must not commit before redirected GET authorization: {redirect_finish:?}"
+        );
+        assert!(adapter.pending_action.is_some());
+
+        let redirect = adapter
+            .next_document_request(&lease, 1_000)
+            .unwrap_or_else(|error| panic!("observe redirect GET failed: {error}"));
+        assert_eq!(redirect.kind, BrowserDocumentRequestKind::Redirect);
+        assert_eq!(redirect.chain_index, 1);
+        assert_eq!(redirect.method, "GET");
+        assert_eq!(redirect.url, "http://127.0.0.1/done");
+        adapter
+            .resolve_document_request(&lease, &redirect, BrowserDocumentRequestDecision::Continue)
+            .unwrap_or_else(|error| panic!("continue redirect GET failed: {error}"));
+
+        adapter
+            .receive_and_process_until(
+                Instant::now() + Duration::from_secs(1),
+                dispatched.cdp_request_id,
+                "Runtime.evaluate",
+            )
+            .unwrap_or_else(|error| panic!("observe main-frame start failed: {error}"));
+        assert_eq!(adapter.main_frame_load_state, MainFrameLoadState::Started);
+
+        let terminal_wait = Instant::now();
+        let receipt = adapter
+            .finish_dispatched_action(&lease)
+            .unwrap_or_else(|error| panic!("finish redirected submit failed: {error}"));
+        assert!(
+            terminal_wait.elapsed() >= Duration::from_millis(100),
+            "SubmitForm completed before frameStoppedLoading"
+        );
+        assert_eq!(receipt.action_id, submit.action_id());
+        assert_eq!(adapter.main_frame_load_state, MainFrameLoadState::Idle);
+        assert!(adapter.pending_action.is_none());
+
+        let final_synopsis = adapter
+            .execute(
+                &lease,
+                &BrowserAction::CaptureSynopsis {
+                    action_id: "synopsis-after-terminal-submit".to_owned(),
+                },
+            )
+            .unwrap_or_else(|error| panic!("capture terminal synopsis failed: {error}"));
+        assert!(
+            final_synopsis
+                .synopsis
+                .as_ref()
+                .is_some_and(|synopsis| synopsis.text == "done after redirect")
+        );
+
+        adapter
+            .shutdown()
+            .unwrap_or_else(|error| panic!("shutdown scripted browser failed: {error}"));
+        fs::remove_dir_all(&root)
+            .unwrap_or_else(|error| panic!("remove scripted browser root failed: {error}"));
+    }
+
+    #[test]
+    fn caller_owned_deadline_is_not_refreshed_by_fresh_form_inspection() {
+        let lease = scripted_submit_form_lease(
+            "absolute-deadline-submit",
+            "attempt-absolute-deadline-submit",
+            12,
+            "absolute-deadline-submit-token",
+        );
+        let (mut adapter, root) = scripted_submit_form_adapter(&lease);
+        let payload_digest = format!("sha256:{}", "e".repeat(64));
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(250);
+        let inspection = adapter
+            .inspect_form_until(&lease, "form#deadline", &payload_digest, deadline)
+            .unwrap_or_else(|error| panic!("initial deadline-bound inspection failed: {error}"));
+        assert!(started.elapsed() >= Duration::from_millis(120));
+
+        let submit = BrowserAction::SubmitForm {
+            action_id: "absolute-deadline-submit-action".to_owned(),
+            selector: "form#deadline".to_owned(),
+            payload_digest,
+        };
+        let Err(error) =
+            adapter.dispatch_intercepted_action_until(&lease, &submit, Some(&inspection), deadline)
+        else {
+            panic!("fresh form inspection must not receive a refreshed inner timeout");
+        };
+        assert!(
+            error.is_transport_uncertain()
+                || matches!(
+                    &error,
+                    BrowserError::Protocol(message) if message.contains("deadline expired")
+                ),
+            "unexpected deadline-bound submit error: {error}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "fresh form inspection extended the caller-owned deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(adapter.pending_action.is_none());
+
+        adapter
+            .shutdown()
+            .unwrap_or_else(|error| panic!("shutdown deadline scripted browser failed: {error}"));
+        fs::remove_dir_all(&root).unwrap_or_else(|error| {
+            panic!("remove deadline scripted browser root failed: {error}")
+        });
+    }
+
+    #[test]
+    fn download_terminal_wait_does_not_refresh_caller_owned_deadline() {
+        let lease = scripted_submit_form_lease(
+            "absolute-deadline-download",
+            "attempt-absolute-deadline-download",
+            13,
+            "absolute-deadline-download-token",
+        );
+        let (mut adapter, root) = scripted_submit_form_adapter(&lease);
+        let download_root = root.join("downloads");
+        fs::create_dir_all(&download_root)
+            .unwrap_or_else(|error| panic!("create scripted download root failed: {error}"));
+        adapter.download_policy = BrowserDownloadPolicy::Allow;
+        adapter.download_root = Some(download_root);
+
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(180);
+        adapter
+            .send_cdp_until("Browser.getVersion", json!({}), None, deadline)
+            .unwrap_or_else(|error| panic!("trigger scripted download failed: {error}"));
+        let Err(error) = adapter.next_download_terminal_until(&lease, deadline) else {
+            panic!("download terminal wait must not receive a refreshed inner timeout");
+        };
+        assert!(error.is_transport_uncertain());
+        assert!(
+            started.elapsed() < Duration::from_millis(260),
+            "download terminal wait extended the caller-owned deadline: {:?}",
+            started.elapsed()
+        );
+
+        adapter.cdp_writer.take();
+        let _ = adapter.child.kill();
+        let _ = adapter.child.wait();
+        adapter.cdp_reader.take();
+        adapter.closed = true;
+        fs::remove_dir_all(&root).unwrap_or_else(|error| {
+            panic!("remove download deadline browser root failed: {error}")
+        });
+    }
 
     #[test]
     fn spawn_failure_unknown_preserves_exact_binding() {
@@ -4552,6 +5248,21 @@ mod tests {
         assert!(!screenshot_json.contains("iVBORw0KGgo"));
     }
 
+    fn inject_sensitive_dom(adapter: &mut BrowserAdapter) {
+        let expression = r#"document.title='Credential token page';document.body.innerHTML='<form id="login" method="post" action="https://example.test/submit?token=action-secret"><input name="username" value="alice"><input type="password" name="password" value="hunter2"><textarea name="secret_note">textarea-secret</textarea><select name="credential_choice"><option selected>option-secret</option></select></form><div data-token="attribute-secret">visible token: body-secret</div>';({ok:true})"#;
+        let deadline = Instant::now() + Duration::from_millis(adapter.config.request_timeout_ms);
+        let (_, response) = adapter
+            .send_cdp_until(
+                "Runtime.evaluate",
+                json!({"expression": expression, "returnByValue": true}),
+                Some(adapter.session_id.clone()),
+                deadline,
+            )
+            .unwrap_or_else(|error| panic!("inject sensitive DOM failed: {error}"));
+        let _ = super::runtime_value(&response, "Runtime.evaluate")
+            .unwrap_or_else(|error| panic!("sensitive DOM injection result failed: {error}"));
+    }
+
     #[test]
     fn real_chrome_sensitive_synopsis_redacts_values_and_form_inspection_is_value_free() {
         let chrome = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
@@ -4581,16 +5292,7 @@ mod tests {
         };
         let mut adapter = BrowserAdapter::launch(chrome, &root, &lease, config)
             .unwrap_or_else(|error| panic!("launch sensitive browser test failed: {error}"));
-        let expression = r#"document.title='Credential token page';document.body.innerHTML='<form id="login" method="post" action="https://example.test/submit?token=action-secret"><input name="username" value="alice"><input type="password" name="password" value="hunter2"><textarea name="secret_note">textarea-secret</textarea><select name="credential_choice"><option selected>option-secret</option></select></form><div data-token="attribute-secret">visible token: body-secret</div>';({ok:true})"#;
-        let (_, response) = adapter
-            .send_cdp(
-                "Runtime.evaluate",
-                json!({"expression": expression, "returnByValue": true}),
-                Some(adapter.session_id.clone()),
-            )
-            .unwrap_or_else(|error| panic!("inject sensitive DOM failed: {error}"));
-        let _ = super::runtime_value(&response, "Runtime.evaluate")
-            .unwrap_or_else(|error| panic!("sensitive DOM injection result failed: {error}"));
+        inject_sensitive_dom(&mut adapter);
 
         let receipt = adapter
             .execute(

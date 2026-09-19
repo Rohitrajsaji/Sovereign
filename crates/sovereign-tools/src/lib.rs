@@ -1927,10 +1927,157 @@ pub struct ProcessRunner<'a, I: ExecutionIsolationBackend> {
     poll_interval: Duration,
 }
 
+/// One exact long-lived process group started through the canonical `ActionJournal` authority.
+///
+/// The durable process lease remains authoritative. This value is only an in-process ownership
+/// handle that allows the Controller to prove liveness and perform exact identity-bound shutdown.
+/// Dropping it may best-effort terminate the owned process group, but never mutates durable lease
+/// state or claims cleanup; recovery must reconcile any lease still recorded as active.
+#[derive(Debug)]
+pub struct ManagedProcess {
+    action: AuthorizedAction,
+    process_group_id: u32,
+    leader_identity: String,
+    stop_requested: Arc<AtomicBool>,
+    supervisor: Option<thread::JoinHandle<ManagedProcessTerminal>>,
+    terminal: Option<ManagedProcessTerminal>,
+    lease_settled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagedProcessTerminal {
+    Stopped,
+    Exited,
+    Limited(ResourceLimitKind),
+    RecoveryBlocked(String),
+}
+
+impl ManagedProcess {
+    #[must_use]
+    pub fn action_id(&self) -> &str {
+        &self.action.action_id
+    }
+
+    #[must_use]
+    pub const fn process_group_id(&self) -> u32 {
+        self.process_group_id
+    }
+
+    #[must_use]
+    pub fn leader_identity(&self) -> &str {
+        &self.leader_identity
+    }
+
+    /// Proves that the exact spawned leader identity still owns a live process group.
+    ///
+    /// # Errors
+    /// Returns a recovery-blocking error for exit, PID reuse, missing identity, or OS observation
+    /// failure.
+    pub fn verify_live(&mut self) -> Result<(), ToolError> {
+        self.refresh_terminal()?;
+        if let Some(terminal) = &self.terminal {
+            return Err(managed_terminal_error(terminal));
+        }
+        match process_group_leader_identity(self.process_group_id)? {
+            Some(identity) if identity == self.leader_identity => Ok(()),
+            Some(_) => Err(ToolError::RecoveryBlocked(format!(
+                "managed process group {} leader identity changed",
+                self.process_group_id
+            ))),
+            None => {
+                self.refresh_terminal()?;
+                if let Some(terminal) = &self.terminal {
+                    Err(managed_terminal_error(terminal))
+                } else {
+                    Err(ToolError::RecoveryBlocked(format!(
+                        "managed process group {} lost its recorded leader identity",
+                        self.process_group_id
+                    )))
+                }
+            }
+        }
+    }
+
+    fn refresh_terminal(&mut self) -> Result<(), ToolError> {
+        if self.terminal.is_some() {
+            return Ok(());
+        }
+        let finished = self
+            .supervisor
+            .as_ref()
+            .is_some_and(thread::JoinHandle::is_finished);
+        if !finished {
+            return Ok(());
+        }
+        let supervisor = self.supervisor.take().ok_or_else(|| {
+            ToolError::RecoveryBlocked("managed process supervisor disappeared".to_owned())
+        })?;
+        self.terminal = Some(supervisor.join().map_err(|_| {
+            ToolError::RecoveryBlocked("managed process supervisor panicked".to_owned())
+        })?);
+        Ok(())
+    }
+
+    fn request_stop_and_join(&mut self) -> Result<ManagedProcessTerminal, ToolError> {
+        if self.lease_settled {
+            return Err(ToolError::RecoveryBlocked(
+                "managed process was already closed".to_owned(),
+            ));
+        }
+        self.stop_requested.store(true, Ordering::Release);
+        if self.terminal.is_none() {
+            let supervisor = self.supervisor.take().ok_or_else(|| {
+                ToolError::RecoveryBlocked("managed process supervisor disappeared".to_owned())
+            })?;
+            self.terminal = Some(supervisor.join().map_err(|_| {
+                ToolError::RecoveryBlocked("managed process supervisor panicked".to_owned())
+            })?);
+        }
+        self.terminal.clone().ok_or_else(|| {
+            ToolError::RecoveryBlocked("managed process supervisor produced no outcome".to_owned())
+        })
+    }
+}
+
+impl Drop for ManagedProcess {
+    fn drop(&mut self) {
+        self.stop_requested.store(true, Ordering::Release);
+        if let Some(supervisor) = self.supervisor.take() {
+            let _ = supervisor.join();
+        }
+        let _ = reap_owned_process_group(self.process_group_id, &self.leader_identity);
+    }
+}
+
+fn managed_terminal_error(terminal: &ManagedProcessTerminal) -> ToolError {
+    match terminal {
+        ManagedProcessTerminal::Stopped => {
+            ToolError::RecoveryBlocked("managed process ownership handle is closed".to_owned())
+        }
+        ManagedProcessTerminal::Exited => ToolError::RecoveryBlocked(
+            "managed process exited before lifecycle shutdown".to_owned(),
+        ),
+        ManagedProcessTerminal::Limited(limit) => ToolError::ResourceLimit(format!(
+            "managed process exceeded {} limit",
+            resource_limit_name(*limit)
+        )),
+        ManagedProcessTerminal::RecoveryBlocked(message) => {
+            ToolError::RecoveryBlocked(message.clone())
+        }
+    }
+}
+
 struct PreparedExecution {
     isolated: IsolatedCommand,
     environment: BTreeMap<String, String>,
     baseline_disk: u64,
+}
+
+struct PreparedManagedProcess {
+    environment: BTreeMap<String, String>,
+    managed_write_root: PathBuf,
+    baseline_disk: u64,
+    deadline: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -2003,6 +2150,313 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
         journal.record_process_lease(action, None, None, "pending_spawn")?;
         self.execute_dispatched(journal, action, artifacts, prepared, cancellation)
+    }
+
+    /// Starts one long-lived process from an already-built isolation wrapper while preserving the
+    /// canonical command-policy, authorization, approval, `ActionJournal`, and process-lease path.
+    ///
+    /// The returned action remains `dispatched` until [`Self::commit_managed_started`] is called
+    /// after Controller-owned readiness proof. This prevents a live process from being represented
+    /// as committed before the Controller has observed the intended service state.
+    ///
+    /// # Errors
+    /// Returns fail-closed for authority/policy/isolation drift or any spawn/identity ambiguity.
+    pub fn start_managed_preisolated(
+        &self,
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        isolated: &IsolatedCommand,
+        isolation_policy_digest: &str,
+    ) -> Result<ManagedProcess, ToolError> {
+        let managed_write_root = action.command.working_directory.clone();
+        self.start_managed_preisolated_with_write_root(
+            journal,
+            action,
+            isolated,
+            isolation_policy_digest,
+            &managed_write_root,
+        )
+    }
+
+    /// Starts one long-lived process while measuring disk growth from an explicit managed write
+    /// root for the full process lifetime.
+    ///
+    /// This is the managed-runtime variant for services whose persistent data is intentionally
+    /// outside the command working directory. The same authorized action remains the sole resource
+    /// authority; no additional ledger or governor is introduced.
+    ///
+    /// # Errors
+    /// Returns fail-closed for authority/policy/isolation drift, an unreadable write root, or any
+    /// spawn/identity ambiguity.
+    pub fn start_managed_preisolated_with_write_root(
+        &self,
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        isolated: &IsolatedCommand,
+        isolation_policy_digest: &str,
+        managed_write_root: &Path,
+    ) -> Result<ManagedProcess, ToolError> {
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(action.command.timeout_ms))
+            .ok_or_else(|| {
+                ToolError::ResourceLimit(
+                    "managed process lifetime deadline overflowed monotonic clock".to_owned(),
+                )
+            })?;
+        self.start_managed_preisolated_with_write_root_until(
+            journal,
+            action,
+            isolated,
+            isolation_policy_digest,
+            managed_write_root,
+            deadline,
+        )
+    }
+
+    /// Starts one long-lived process under both its authorized command timeout and a caller-owned
+    /// absolute monotonic deadline. The caller deadline may only narrow the authorized lifetime;
+    /// it can never extend the command's durable wall reservation.
+    ///
+    /// # Errors
+    /// Returns fail-closed for expired caller authority, authority/policy/isolation drift, an
+    /// unreadable write root, or any spawn/identity ambiguity.
+    pub fn start_managed_preisolated_with_write_root_until(
+        &self,
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        isolated: &IsolatedCommand,
+        isolation_policy_digest: &str,
+        managed_write_root: &Path,
+        caller_deadline: Instant,
+    ) -> Result<ManagedProcess, ToolError> {
+        journal.verify_authorized(action)?;
+        journal.verify_dispatch_approval(action)?;
+        let prepared = self.prepare_managed_process(
+            action,
+            isolated,
+            isolation_policy_digest,
+            managed_write_root,
+            caller_deadline,
+        )?;
+
+        journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
+        journal.record_process_lease(action, None, None, "pending_spawn")?;
+        let mut command = Command::new(&isolated.executable);
+        command
+            .args(&isolated.args)
+            .current_dir(&action.command.working_directory)
+            .env_clear()
+            .envs(&prepared.environment)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0);
+        let (child, process_group_id, leader_identity) =
+            Self::spawn_owned_process(journal, action, &mut command)?;
+        self.finish_managed_process_start(
+            journal,
+            action,
+            child,
+            process_group_id,
+            leader_identity,
+            prepared,
+        )
+    }
+
+    fn prepare_managed_process(
+        &self,
+        action: &AuthorizedAction,
+        isolated: &IsolatedCommand,
+        isolation_policy_digest: &str,
+        managed_write_root: &Path,
+        caller_deadline: Instant,
+    ) -> Result<PreparedManagedProcess, ToolError> {
+        if action.permission_class != PermissionClass::ProcessExec {
+            return Err(ToolError::Authority(
+                "managed process start requires exact process_exec action authority".to_owned(),
+            ));
+        }
+        if action.command.mode != sovereign_policy::CommandMode::Direct {
+            return Err(ToolError::Authority(
+                "managed process start requires direct structured command mode".to_owned(),
+            ));
+        }
+        let effective_risk = self.command_policy.authorize(&action.command)?;
+        if matches!(
+            effective_risk,
+            CommandRisk::PackageInstall | CommandRisk::Destructive | CommandRisk::Shell
+        ) {
+            return Err(ToolError::Authority(format!(
+                "managed process start forbids {effective_risk:?} command risk"
+            )));
+        }
+        let pinned = self
+            .command_policy
+            .pinned_executable(&action.command.executable)?;
+        if pinned.sha256 != action.executable_digest {
+            return Err(ToolError::Authority(
+                "managed process executable digest no longer matches pinned executable".to_owned(),
+            ));
+        }
+        if action.isolation_policy_digest != isolation_policy_digest {
+            return Err(ToolError::Authority(
+                "managed process isolation digest differs from authorized action".to_owned(),
+            ));
+        }
+        if !isolated.executable.is_absolute() || !isolated.executable.is_file() {
+            return Err(ToolError::Authority(
+                "managed process isolation wrapper must be an existing absolute executable"
+                    .to_owned(),
+            ));
+        }
+        let mut environment = sanitized_environment(
+            &action.command.environment,
+            &action.individually_authorized_environment,
+        )?;
+        environment.insert("PATH".to_owned(), self.command_policy.approved_path());
+        let managed_write_root = managed_write_root.canonicalize()?;
+        if !managed_write_root.is_dir() {
+            return Err(ToolError::Authority(
+                "managed process write root must be an existing directory".to_owned(),
+            ));
+        }
+        let baseline_disk = directory_size(&managed_write_root)?;
+        let now = Instant::now();
+        if caller_deadline <= now {
+            return Err(ToolError::ResourceLimit(
+                "managed process caller-owned deadline expired before dispatch".to_owned(),
+            ));
+        }
+        let command_deadline = now
+            .checked_add(Duration::from_millis(action.command.timeout_ms))
+            .ok_or_else(|| {
+                ToolError::ResourceLimit(
+                    "managed process lifetime deadline overflowed monotonic clock".to_owned(),
+                )
+            })?;
+        let deadline = command_deadline.min(caller_deadline);
+        Ok(PreparedManagedProcess {
+            environment,
+            managed_write_root,
+            baseline_disk,
+            deadline,
+        })
+    }
+
+    fn finish_managed_process_start(
+        &self,
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        child: Child,
+        process_group_id: u32,
+        leader_identity: String,
+        prepared: PreparedManagedProcess,
+    ) -> Result<ManagedProcess, ToolError> {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let supervisor_stop = Arc::clone(&stop_requested);
+        let supervisor_identity = leader_identity.clone();
+        let monitor = ManagedProcessMonitorConfig {
+            process_group_id,
+            leader_identity: supervisor_identity,
+            deadline: prepared.deadline,
+            managed_write_root: prepared.managed_write_root,
+            baseline_disk: prepared.baseline_disk,
+            disk_write_limit_bytes: action.command.disk_write_limit_bytes,
+            subprocess_limit: action.command.subprocess_limit,
+            stop_requested: supervisor_stop,
+            poll_interval: self.poll_interval,
+        };
+        let supervisor = thread::Builder::new()
+            .name(format!("managed-process-{process_group_id}"))
+            .spawn(move || supervise_managed_process(child, &monitor));
+        let supervisor = match supervisor {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                match reap_owned_process_group(process_group_id, &leader_identity) {
+                    Ok(()) => journal.record_process_lease(
+                        action,
+                        Some(process_group_id),
+                        Some(&leader_identity),
+                        "reaped",
+                    )?,
+                    Err(cleanup_error) => {
+                        return Err(ToolError::RecoveryBlocked(format!(
+                            "managed process supervisor spawn failed: {error}; exact cleanup failed: {cleanup_error}"
+                        )));
+                    }
+                }
+                return Err(ToolError::Io(error));
+            }
+        };
+        Ok(ManagedProcess {
+            action: action.clone(),
+            process_group_id,
+            leader_identity,
+            stop_requested,
+            supervisor: Some(supervisor),
+            terminal: None,
+            lease_settled: false,
+        })
+    }
+
+    /// Commits a dispatched managed-process start only after exact live process identity has been
+    /// re-proven by the Controller following its readiness check.
+    ///
+    /// # Errors
+    /// Returns fail-closed for process/action drift, lost liveness, or CAS/journal failure.
+    pub fn commit_managed_started(
+        &self,
+        journal: &mut ActionJournal<'_>,
+        action: &AuthorizedAction,
+        artifacts: &ArtifactStore,
+        process: &mut ManagedProcess,
+    ) -> Result<String, ToolError> {
+        if &process.action != action {
+            return Err(ToolError::Authority(
+                "managed process ownership does not match exact start action".to_owned(),
+            ));
+        }
+        process.verify_live()?;
+        let receipt = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "kind": "managed_process_started",
+            "action_id": action.action_id,
+            "task_id": action.task_id,
+            "attempt_id": action.attempt_id,
+            "execution_epoch": action.execution_epoch,
+            "process_group_id": process.process_group_id,
+            "leader_identity": process.leader_identity,
+        }))
+        .map_err(|error| ToolError::Authority(format!("managed start receipt failed: {error}")))?;
+        let digest = journal.observe_with_receipt(action, artifacts, &receipt)?;
+        journal.commit_with_bound_result(action, ActionState::Observed)?;
+        Ok(digest)
+    }
+
+    /// Terminates/reaps one exact live managed process and marks only its existing durable process
+    /// lease as reaped after physical absence has been proven.
+    ///
+    /// # Errors
+    /// Returns recovery-blocking when PID identity changed or exact group absence cannot be proven.
+    pub fn stop_managed(
+        &self,
+        journal: &mut ActionJournal<'_>,
+        process: &mut ManagedProcess,
+    ) -> Result<(), ToolError> {
+        let terminal = process.request_stop_and_join()?;
+        if !matches!(terminal, ManagedProcessTerminal::RecoveryBlocked(_)) {
+            journal.record_process_lease(
+                &process.action,
+                Some(process.process_group_id),
+                Some(&process.leader_identity),
+                "reaped",
+            )?;
+            process.lease_settled = true;
+        }
+        match terminal {
+            ManagedProcessTerminal::Stopped => Ok(()),
+            other => Err(managed_terminal_error(&other)),
+        }
     }
 
     /// Executes one exact temporary-file secret lease through durable observation, but deliberately
@@ -2579,6 +3033,170 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
         journal.transition(action, ActionState::Unknown, ActionState::Reconciled)?;
         journal.transition(action, ActionState::Reconciled, ActionState::Failed)?;
         Ok(())
+    }
+}
+
+struct ManagedProcessMonitorConfig {
+    process_group_id: u32,
+    leader_identity: String,
+    deadline: Instant,
+    managed_write_root: PathBuf,
+    baseline_disk: u64,
+    disk_write_limit_bytes: u64,
+    subprocess_limit: u32,
+    stop_requested: Arc<AtomicBool>,
+    poll_interval: Duration,
+}
+
+fn supervise_managed_process(
+    mut child: Child,
+    monitor: &ManagedProcessMonitorConfig,
+) -> ManagedProcessTerminal {
+    loop {
+        if let Some(terminal) = managed_process_exit_state(&mut child, monitor) {
+            return terminal;
+        }
+
+        if let Err(terminal) = verify_managed_process_identity(&mut child, monitor) {
+            return terminal;
+        }
+
+        let limit = match managed_process_limit(monitor) {
+            Ok(limit) => limit,
+            Err(message) => {
+                return managed_supervision_failure(
+                    &mut child,
+                    monitor.process_group_id,
+                    &monitor.leader_identity,
+                    message,
+                );
+            }
+        };
+
+        if let Some(limit) = limit {
+            return terminate_managed_for_limit(&mut child, monitor, limit);
+        }
+
+        if monitor.stop_requested.load(Ordering::Acquire) {
+            return terminate_managed_for_stop(&mut child, monitor);
+        }
+
+        let remaining = monitor.deadline.saturating_duration_since(Instant::now());
+        thread::sleep(monitor.poll_interval.min(remaining));
+    }
+}
+
+fn managed_process_exit_state(
+    child: &mut Child,
+    monitor: &ManagedProcessMonitorConfig,
+) -> Option<ManagedProcessTerminal> {
+    match child.try_wait() {
+        Ok(None) => None,
+        Ok(Some(_)) => Some(
+            match wait_group_absent(monitor.process_group_id, Duration::from_millis(500)) {
+                Ok(true) => ManagedProcessTerminal::Exited,
+                Ok(false) => ManagedProcessTerminal::RecoveryBlocked(format!(
+                    "managed process group {} retained members after leader exit",
+                    monitor.process_group_id
+                )),
+                Err(error) => ManagedProcessTerminal::RecoveryBlocked(format!(
+                    "managed process exit cleanup could not be proven: {error}"
+                )),
+            },
+        ),
+        Err(error) => Some(managed_supervision_failure(
+            child,
+            monitor.process_group_id,
+            &monitor.leader_identity,
+            format!("managed process status observation failed: {error}"),
+        )),
+    }
+}
+
+fn verify_managed_process_identity(
+    child: &mut Child,
+    monitor: &ManagedProcessMonitorConfig,
+) -> Result<(), ManagedProcessTerminal> {
+    match process_group_leader_identity(monitor.process_group_id) {
+        Ok(Some(identity)) if identity == monitor.leader_identity => Ok(()),
+        Ok(Some(_)) => Err(ManagedProcessTerminal::RecoveryBlocked(format!(
+            "managed process group {} leader identity changed",
+            monitor.process_group_id
+        ))),
+        Ok(None) => Err(managed_supervision_failure(
+            child,
+            monitor.process_group_id,
+            &monitor.leader_identity,
+            format!(
+                "managed process group {} lost its recorded leader identity",
+                monitor.process_group_id
+            ),
+        )),
+        Err(error) => Err(managed_supervision_failure(
+            child,
+            monitor.process_group_id,
+            &monitor.leader_identity,
+            format!("managed process identity observation failed: {error}"),
+        )),
+    }
+}
+
+fn managed_process_limit(
+    monitor: &ManagedProcessMonitorConfig,
+) -> Result<Option<ResourceLimitKind>, String> {
+    if Instant::now() >= monitor.deadline {
+        return Ok(Some(ResourceLimitKind::Timeout));
+    }
+    let disk_size = directory_size(&monitor.managed_write_root)
+        .map_err(|error| format!("managed process disk observation failed: {error}"))?;
+    if disk_size.saturating_sub(monitor.baseline_disk) > monitor.disk_write_limit_bytes {
+        return Ok(Some(ResourceLimitKind::DiskBytes));
+    }
+    let descendants = descendant_count(monitor.process_group_id)
+        .map_err(|error| format!("managed process descendant observation failed: {error}"))?;
+    if descendants > monitor.subprocess_limit {
+        return Ok(Some(ResourceLimitKind::Subprocesses));
+    }
+    Ok(None)
+}
+
+fn terminate_managed_for_limit(
+    child: &mut Child,
+    monitor: &ManagedProcessMonitorConfig,
+    limit: ResourceLimitKind,
+) -> ManagedProcessTerminal {
+    match terminate_owned_process_group(child, monitor.process_group_id, &monitor.leader_identity) {
+        Ok(_) => ManagedProcessTerminal::Limited(limit),
+        Err(error) => ManagedProcessTerminal::RecoveryBlocked(format!(
+            "managed process exceeded {} limit but exact cleanup failed: {error}",
+            resource_limit_name(limit)
+        )),
+    }
+}
+
+fn terminate_managed_for_stop(
+    child: &mut Child,
+    monitor: &ManagedProcessMonitorConfig,
+) -> ManagedProcessTerminal {
+    match terminate_owned_process_group(child, monitor.process_group_id, &monitor.leader_identity) {
+        Ok(_) => ManagedProcessTerminal::Stopped,
+        Err(error) => ManagedProcessTerminal::RecoveryBlocked(format!(
+            "managed process exact stop failed: {error}"
+        )),
+    }
+}
+
+fn managed_supervision_failure(
+    child: &mut Child,
+    process_group_id: u32,
+    leader_identity: &str,
+    message: String,
+) -> ManagedProcessTerminal {
+    match terminate_owned_process_group(child, process_group_id, leader_identity) {
+        Ok(_) => ManagedProcessTerminal::RecoveryBlocked(message),
+        Err(cleanup_error) => ManagedProcessTerminal::RecoveryBlocked(format!(
+            "{message}; exact cleanup also failed: {cleanup_error}"
+        )),
     }
 }
 
@@ -3935,4 +4553,340 @@ fn parse_http_headers(raw: &[u8]) -> Result<BTreeMap<String, String>, ToolError>
         }
     }
     Ok(headers)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod managed_process_tests {
+    use super::*;
+    use sovereign_policy::{IsolationCapabilities, PinnedExecutable};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos());
+            let path = std::env::temp_dir().join(format!(
+                "sovereign-tools-managed-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path)
+                .unwrap_or_else(|error| panic!("create managed test dir: {error}"));
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct UnusedIsolation;
+
+    impl ExecutionIsolationBackend for UnusedIsolation {
+        fn capabilities(&self) -> IsolationCapabilities {
+            panic!("managed preisolated tests must not query isolation capabilities")
+        }
+
+        fn isolate(
+            &self,
+            _spec: &CommandSpec,
+            _request: &IsolationRequest,
+        ) -> Result<IsolatedCommand, PolicyError> {
+            panic!("managed preisolated tests must not invoke isolation")
+        }
+    }
+
+    struct ManagedFixture {
+        _temp: TestDir,
+        repo: PathBuf,
+        data_root: PathBuf,
+        store: StateStore,
+        policy: CommandPolicy,
+        action: AuthorizedAction,
+        isolated: IsolatedCommand,
+        manifest: ToolManifest,
+        permission_decision: PermissionDecision,
+    }
+
+    fn test_digest(byte: char) -> String {
+        format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    fn managed_fixture(
+        label: &str,
+        script: &str,
+        timeout_ms: u64,
+        disk_write_limit_bytes: u64,
+        subprocess_limit: u32,
+    ) -> ManagedFixture {
+        let temp = TestDir::new(label);
+        let repo = temp.0.join("repo");
+        let data_root = temp.0.join("data");
+        fs::create_dir_all(&repo).unwrap_or_else(|error| panic!("create repo: {error}"));
+        fs::create_dir_all(&data_root).unwrap_or_else(|error| panic!("create data root: {error}"));
+        let store = StateStore::open(temp.0.join("state.sqlite3"))
+            .unwrap_or_else(|error| panic!("open state: {error}"));
+        let pin = PinnedExecutable::from_path("/usr/bin/python3", "macos-system")
+            .unwrap_or_else(|error| panic!("pin python: {error}"));
+        let executable = pin.path.clone();
+        let executable_digest = pin.sha256.clone();
+        let toolchain_root = executable
+            .parent()
+            .unwrap_or_else(|| panic!("python has no parent"))
+            .to_path_buf();
+        let policy = CommandPolicy::new([pin], [toolchain_root])
+            .unwrap_or_else(|error| panic!("managed command policy: {error}"));
+        let manifest = ToolManifest {
+            tool_id: "tool.managed-test".to_owned(),
+            version: "1".to_owned(),
+            content_digest: test_digest('1'),
+            permission_ceiling: BTreeSet::from([PermissionClass::ProcessExec]),
+            declared_risk_floor: CommandRisk::UntrustedCode,
+            reconciliation_policy: ReconciliationPolicy::idempotent_local(),
+        };
+        let policy_digest = test_digest('2');
+        let isolation_policy_digest = test_digest('3');
+        let mut action = AuthorizedAction {
+            action_id: format!("action.managed.{label}"),
+            plan_id: "plan.managed-test".to_owned(),
+            plan_revision: 1,
+            task_id: "task.managed-test".to_owned(),
+            attempt_id: format!("attempt.managed.{label}"),
+            tool_id: manifest.tool_id.clone(),
+            tool_version: manifest.version.clone(),
+            tool_digest: manifest.content_digest.clone(),
+            executable_digest,
+            repository_id: "repo.managed-test".to_owned(),
+            destination_digest: None,
+            permission_class: PermissionClass::ProcessExec,
+            execution_epoch: 0,
+            policy_digest: policy_digest.clone(),
+            permission_decision_digest: String::new(),
+            isolation_policy_digest: isolation_policy_digest.clone(),
+            nonce: format!("nonce.managed.{label}"),
+            expires_at_ms: unix_millis()
+                .unwrap_or_else(|error| panic!("managed clock: {error}"))
+                .saturating_add(60_000),
+            command: CommandSpec {
+                executable: executable.clone(),
+                args: vec!["-c".to_owned(), script.to_owned()],
+                working_directory: repo.clone(),
+                environment: BTreeMap::new(),
+                mode: sovereign_policy::CommandMode::Direct,
+                declared_risk: CommandRisk::UntrustedCode,
+                timeout_ms,
+                output_limit_bytes: 64 * 1024,
+                disk_write_limit_bytes,
+                subprocess_limit,
+            },
+            individually_authorized_environment: BTreeSet::new(),
+            approval_required: false,
+            reconciliation_mode: ReconciliationMode::IdempotentRead,
+        };
+        let layers = CapabilityLayers {
+            global: CapabilitySet::all(),
+            project: CapabilitySet::all(),
+            task: CapabilitySet::all(),
+            role: CapabilitySet::all(),
+            tool: CapabilitySet::all(),
+            user: CapabilitySet::all(),
+        };
+        let permission_decision = PermissionDecision::new(
+            action.plan_id.clone(),
+            action.plan_revision,
+            action.task_id.clone(),
+            test_digest('4'),
+            policy_digest,
+            action.tool_id.clone(),
+            action.tool_version.clone(),
+            action.tool_digest.clone(),
+            layers,
+        )
+        .unwrap_or_else(|error| panic!("managed permission decision: {error}"));
+        action.permission_decision_digest = permission_decision.digest();
+        let isolated = IsolatedCommand {
+            executable,
+            args: action.command.args.clone(),
+        };
+        ManagedFixture {
+            _temp: temp,
+            repo,
+            data_root,
+            store,
+            policy,
+            action,
+            isolated,
+            manifest,
+            permission_decision,
+        }
+    }
+
+    fn start_managed(fixture: &mut ManagedFixture, managed_write_root: &Path) -> ManagedProcess {
+        let runner = ProcessRunner::new(&fixture.policy, &UnusedIsolation);
+        let mut journal = ActionJournal::new(&mut fixture.store);
+        journal
+            .authorize(
+                &fixture.action,
+                &fixture.manifest,
+                &fixture.permission_decision,
+            )
+            .unwrap_or_else(|error| panic!("authorize managed process: {error}"));
+        runner
+            .start_managed_preisolated_with_write_root(
+                &mut journal,
+                &fixture.action,
+                &fixture.isolated,
+                &fixture.action.isolation_policy_digest,
+                managed_write_root,
+            )
+            .unwrap_or_else(|error| panic!("start managed process: {error}"))
+    }
+
+    fn start_managed_until(
+        fixture: &mut ManagedFixture,
+        managed_write_root: &Path,
+        deadline: Instant,
+    ) -> ManagedProcess {
+        let runner = ProcessRunner::new(&fixture.policy, &UnusedIsolation);
+        let mut journal = ActionJournal::new(&mut fixture.store);
+        journal
+            .authorize(
+                &fixture.action,
+                &fixture.manifest,
+                &fixture.permission_decision,
+            )
+            .unwrap_or_else(|error| panic!("authorize managed process: {error}"));
+        runner
+            .start_managed_preisolated_with_write_root_until(
+                &mut journal,
+                &fixture.action,
+                &fixture.isolated,
+                &fixture.action.isolation_policy_digest,
+                managed_write_root,
+                deadline,
+            )
+            .unwrap_or_else(|error| panic!("start managed process until deadline: {error}"))
+    }
+
+    fn assert_managed_limit_and_settle(
+        fixture: &mut ManagedFixture,
+        process: &mut ManagedProcess,
+        expected_limit: ResourceLimitKind,
+    ) {
+        let pgid = process.process_group_id();
+        assert!(
+            wait_group_absent(pgid, Duration::from_secs(3))
+                .unwrap_or_else(|error| panic!("wait managed group absent: {error}")),
+            "managed process group {pgid} was not reaped by runtime enforcement"
+        );
+        let live_error = process
+            .verify_live()
+            .err()
+            .unwrap_or_else(|| panic!("managed process remained live after {expected_limit:?}"));
+        assert!(
+            live_error
+                .to_string()
+                .contains(resource_limit_name(expected_limit)),
+            "unexpected managed limit result: {live_error}"
+        );
+        let runner = ProcessRunner::new(&fixture.policy, &UnusedIsolation);
+        let stop_error = {
+            let mut journal = ActionJournal::new(&mut fixture.store);
+            runner
+                .stop_managed(&mut journal, process)
+                .err()
+                .unwrap_or_else(|| panic!("limited managed process stop reported normal success"))
+        };
+        assert!(
+            stop_error
+                .to_string()
+                .contains(resource_limit_name(expected_limit)),
+            "managed stop lost limit result: {stop_error}"
+        );
+        let lease_raw = fixture
+            .store
+            .get_state(
+                "controller.process_lease",
+                fixture.action.action_id.as_str(),
+            )
+            .unwrap_or_else(|error| panic!("read managed process lease: {error}"))
+            .unwrap_or_else(|| panic!("managed process lease missing"));
+        let lease: serde_json::Value = serde_json::from_str(&lease_raw)
+            .unwrap_or_else(|error| panic!("decode managed process lease: {error}"));
+        assert_eq!(lease["state"], "reaped");
+        assert_eq!(
+            process_group_leader_identity(pgid)
+                .unwrap_or_else(|error| panic!("observe settled managed process: {error}")),
+            None
+        );
+    }
+
+    #[test]
+    fn managed_process_timeout_enforces_full_runtime_without_caller_polling() {
+        let mut fixture =
+            managed_fixture("timeout", "import time; time.sleep(30)", 120, 64 * 1024, 0);
+        let repo = fixture.repo.clone();
+        let mut process = start_managed(&mut fixture, &repo);
+        thread::sleep(Duration::from_millis(300));
+        assert_managed_limit_and_settle(&mut fixture, &mut process, ResourceLimitKind::Timeout);
+    }
+
+    #[test]
+    fn managed_process_caller_deadline_can_only_narrow_authorized_lifetime() {
+        let mut fixture = managed_fixture(
+            "caller-deadline",
+            "import time; time.sleep(30)",
+            5_000,
+            64 * 1024,
+            0,
+        );
+        let repo = fixture.repo.clone();
+        let deadline = Instant::now() + Duration::from_millis(120);
+        let mut process = start_managed_until(&mut fixture, &repo, deadline);
+        thread::sleep(Duration::from_millis(300));
+        assert_managed_limit_and_settle(&mut fixture, &mut process, ResourceLimitKind::Timeout);
+    }
+
+    #[test]
+    fn managed_process_disk_limit_measures_explicit_data_root() {
+        let mut fixture = managed_fixture(
+            "data-root-disk",
+            "import pathlib,sys,time; pathlib.Path(sys.argv[1]).joinpath('growth.bin').write_bytes(b'x'*8192); time.sleep(30)",
+            5_000,
+            128,
+            0,
+        );
+        fixture
+            .action
+            .command
+            .args
+            .push(fixture.data_root.display().to_string());
+        fixture.isolated.args = fixture.action.command.args.clone();
+        let data_root = fixture.data_root.clone();
+        let mut process = start_managed(&mut fixture, &data_root);
+        assert_managed_limit_and_settle(&mut fixture, &mut process, ResourceLimitKind::DiskBytes);
+        assert!(!fixture.repo.join("growth.bin").exists());
+        assert!(fixture.data_root.join("growth.bin").exists());
+    }
+
+    #[test]
+    fn managed_process_subprocess_limit_reaps_descendant_excess() {
+        let mut fixture = managed_fixture(
+            "descendants",
+            "import subprocess,time; subprocess.Popen(['/bin/sleep','30']); subprocess.Popen(['/bin/sleep','30']); time.sleep(30)",
+            5_000,
+            64 * 1024,
+            1,
+        );
+        let repo = fixture.repo.clone();
+        let mut process = start_managed(&mut fixture, &repo);
+        assert_managed_limit_and_settle(
+            &mut fixture,
+            &mut process,
+            ResourceLimitKind::Subprocesses,
+        );
+    }
 }

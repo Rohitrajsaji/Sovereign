@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Sovereign Inventory</title>
+  </head>
+  <body>
+    <main>
+      <h1>Inventory</h1>
+      <p id="validation">{{ERROR}}</p>
+      <form id="create-widget" method="post" action="/create">
+        <input name="name" value="Widget">
+        <input name="quantity" value="3">
+        <button type="submit">Create Widget</button>
+      </form>
+      <form id="invalid-create" method="post" action="/create">
+        <input name="name" value="">
+        <input name="quantity" value="0">
+        <button type="submit">Create invalid item</button>
+      </form>
+      <form id="search-widget" method="get" action="/">
+        <input name="q" value="Widget Pro">
+        <button type="submit">Search</button>
+      </form>
+      <p>Search query: {{QUERY}}</p>
+      <ul id="inventory-items">{{ROWS}}</ul>
+    </main>
+  </body>
+</html>

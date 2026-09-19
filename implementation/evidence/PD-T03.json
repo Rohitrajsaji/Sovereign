@@ -1,0 +1,185 @@
+{
+  "schema": "sovereign-product-task-evidence-v1",
+  "task": "PD-T03",
+  "title": "Inventory application delivery proof",
+  "status": "completed",
+  "completed_at": "2026-09-19T20:24:31Z",
+  "verified_at": "2026-09-19T20:24:31Z",
+  "acceptance_base": "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md",
+  "scheduling_overlay": "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md",
+  "dependencies": [
+    "PD-T05",
+    "M7-T03"
+  ],
+  "profile_prerequisites": [
+    "M1"
+  ],
+  "base_head": "383f967f8037534086faab7f88898e7c69e26e88",
+  "objective": "Prove the selected local_full_stack_v1 inventory application can be planned from a natural-language goal, generated and boundedly repaired under Controller authority, verified through deterministic tests and real browser flows, stopped/restarted with Controller-owned SQLite persistence, and resumed after Sovereign recovery without replaying consequential browser writes.",
+  "acceptance": {
+    "natural_language_goal_compiled_by_canonical_plan_compiler": true,
+    "real_local_full_stack_application_repository": true,
+    "persistent_inventory_survives_application_restart": true,
+    "invalid_inputs_deterministically_rejected": true,
+    "create_edit_delete_search_use_real_application": true,
+    "deterministic_code_and_test_verification_passed": true,
+    "real_controller_owned_browser_flows_verified": true,
+    "bounded_model_backed_repair_demonstrated": true,
+    "sovereign_restart_resume_without_chat_replay": true,
+    "setup_run_instructions_generated_and_verified_locally": true,
+    "publication_without_explicit_approval": false,
+    "payment_without_explicit_approval": false,
+    "real_secret_access_without_explicit_approval": false,
+    "destructive_external_action_without_explicit_approval": false
+  },
+  "browser_and_network_authority": {
+    "single_caller_owned_absolute_action_deadline": true,
+    "deadline_begins_before_initial_submit_form_inspection": true,
+    "fresh_submit_form_reinspection_reuses_same_deadline": true,
+    "redirect_paused_request_finalize_observation_and_download_reuse_same_deadline": true,
+    "consequential_post_requires_network_write_authority": true,
+    "redirect_authority_exactly_one": true,
+    "ambient_external_network_authority_added": false,
+    "browser_output_reservation_is_bounded_and_charged": true,
+    "oversized_receipt_becomes_unknown_before_cas_publication": true,
+    "browser_residency_must_be_proven_absent_before_resume_completion": true
+  },
+  "managed_loopback_authority": {
+    "canonical_server_path_must_remain_under_canonical_repository_root": true,
+    "repository_baseline_revalidated_immediately_before_dispatch": true,
+    "exact_task_loopback_bind_only": true,
+    "arbitrary_outbound_network_denied": true,
+    "repository_readable_but_not_writable": true,
+    "controller_data_root_read_write_only": true,
+    "protected_user_home_and_extra_roots_read_denied": true,
+    "adjacent_loopback_ports_denied": true,
+    "lifetime_bounded_by_remaining_loopback_grant_and_durable_timeout": true,
+    "disk_growth_bounded_on_controller_data_root": true,
+    "subprocess_descendant_ceiling_enforced": true,
+    "exact_process_group_and_leader_identity_enforced": true,
+    "resource_limit_cleanup_reaps_existing_lease": true,
+    "resource_limited_generation_can_be_marked_normally_stopped": false,
+    "second_process_disk_wall_ledger_or_governor_created": false
+  },
+  "durable_product_proof": {
+    "two_managed_generations": true,
+    "same_controller_owned_sqlite_path": true,
+    "distinct_process_group_ids": true,
+    "distinct_leader_identities": true,
+    "persisted_widget_quantity_after_restart": 3,
+    "both_generation_start_actions_committed": true,
+    "both_generation_process_leases_terminal": true,
+    "unique_ordered_ready_stopped_events": true,
+    "controller_semantic_contract_and_proof": true,
+    "controller_reopen_revalidates_receipt_action_and_cas_evidence": true,
+    "consequential_post_replay_on_resume": false,
+    "recovery_mutation_blocked": false,
+    "unknown_action_ids_empty": true,
+    "final_action_states_exclude_dispatched_observed_unknown": true,
+    "ui_runbook_browser_tasks_succeeded": true
+  },
+  "runbook": {
+    "verification_command": "/usr/bin/python3 -B -m unittest discover -s tests -p 'test_*.py' -q",
+    "server_command": "/usr/bin/python3 -B server.py --host 127.0.0.1 --port 8765 --db inventory.sqlite3",
+    "verification_command_exercised_by_governed_product_e2e": true,
+    "server_command_literal_smoke": "deferred_environmental_condition",
+    "server_command_literal_smoke_detail": "127.0.0.1:8765 remained occupied by unrelated Chat On Steroids PID 45671 at the final PD-T03 recheck. Standing instructions require the literal server smoke only when the port is actually free and explicitly forbid killing or disturbing that host. Controller-managed real server/restart/browser behavior was freshly exercised on an available exact loopback grant."
+  },
+  "frozen_tree": {
+    "head": "383f967f8037534086faab7f88898e7c69e26e88",
+    "dirty_or_new_path_count": 16,
+    "git_diff_check": "passed",
+    "frozen_contract_hashes_match": true
+  },
+  "source_hashes": {
+    "crates/sovereign-controller/src/browser.rs": "sha256:bdf20e0c412d7aa7bac260170c860f1ead37d402e0f770e0856292151a04a7a4",
+    "crates/sovereign-controller/src/lib.rs": "sha256:c480345cf39021208ab581ff3fa40a5814e6d275fa1769ac3556b7fbed1cacb3",
+    "crates/sovereign-controller/tests/t07.rs": "sha256:363ec9d7fdc8169716e79d0b5882410f069d040a8ea3b23c17563f35eb3deb53",
+    "crates/sovereign-plan/src/compiler.rs": "sha256:e682219fc9d26f30778cf5d84a042ffdd0525293b2b17f165bce7de5ec95e652",
+    "crates/sovereign-plan/src/lib.rs": "sha256:a5aa998de07f0d1ec67668cede87c7167184d2bcee766c67785422d666540b2e",
+    "crates/sovereign-plan/tests/minimal_compiler.rs": "sha256:c40f4f932026a7ee7f70b2d1209a68f46f336a4f0dbbefad7588d043bd5f99e8",
+    "crates/sovereign-policy/src/browser.rs": "sha256:84efed14d34d2e2f6dfd3d5d57a8f635f1bb8214fa019c21e9dbfa5bd3a45389",
+    "crates/sovereign-policy/tests/browser.rs": "sha256:ce9a393dc188e5ceec1321551c01c53fe5d56edc584e422225c541ec70f8117e",
+    "crates/sovereign-tools/src/browser.rs": "sha256:700e4ad90bb91116909f1ffa540191508e7e69e5afdbba1ff93dcc7e73085bdd",
+    "crates/sovereign-tools/src/lib.rs": "sha256:e17f1936254f08de24742d729b9a8a9bc744f4401954584862f016cb883e172d",
+    "crates/sovereign-eval/tests/product_delivery.rs": "sha256:544ce5098e79961b46c94a3bef11923a4d60565156d07f131847537081381c13"
+  },
+  "fixture_hashes": {
+    "crates/sovereign-eval/tests/fixtures/product_inventory/index.html": "sha256:9b1697184dbeeb7702938739a551ee7d84078e212c7f1a41309ecc10d0f5dc93",
+    "crates/sovereign-eval/tests/fixtures/product_inventory/Makefile": "sha256:86738e5c61f04d937f333702864dec8f6f1c9f0f044374877286177c8758773b",
+    "crates/sovereign-eval/tests/fixtures/product_inventory/RUNBOOK.md": "sha256:a15b503ed1582409667689c2403ed58ac68d210b929dcb0c936719c5e3ae58e5",
+    "crates/sovereign-eval/tests/fixtures/product_inventory/server.py": "sha256:746491615b5724da2de9212e7a8b903a3fdfc6b703dfc90e311d1ba660d72976",
+    "crates/sovereign-eval/tests/fixtures/product_inventory/test_inventory.py": "sha256:067bdeeccf1a25bcebf009be37d6b9d4e4926f45e4121a5ebd8e2588ce66dddf"
+  },
+  "verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check -p sovereign-tools --all-targets --offline && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-tools --all-targets --offline && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-tools --all-targets --offline -- -D warnings",
+      "result": "passed",
+      "detail": "18 library tests, 17 browser integration tests, and 33 runner integration tests passed."
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check -p sovereign-policy --all-targets --offline && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-policy --all-targets --offline && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-policy --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check -p sovereign-plan --all-targets --offline && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-plan --all-targets --offline && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-plan --all-targets --offline -- -D warnings",
+      "result": "passed",
+      "detail": "compiler_m3 17/17, depth 7/7, minimal_compiler 26/26, validator 34/34."
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check -p sovereign-controller --all-targets --all-features --offline && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-controller --all-targets --all-features --offline && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-controller --all-targets --all-features --offline -- -D warnings",
+      "result": "passed",
+      "detail": "controller lib 92/92, M6 resilience 6/6, T07 67/67 including managed_limit_cleanup_reaps_existing_lease_without_durable_stopped_acceptance."
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check -p sovereign-eval --test product_delivery --offline && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy -p sovereign-eval --test product_delivery --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "env CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test -p sovereign-eval --test product_delivery local_full_stack_inventory_product_delivery_proof --offline -- --nocapture",
+      "result": "passed",
+      "detail": "1 passed, 0 failed, 1 filtered out; fresh governed proof finished in 23.88s."
+    },
+    {
+      "command": "$HOME/.cargo/bin/cargo fmt --all -- --check && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo check --workspace --all-targets --offline && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo test --workspace --all-targets --offline && CARGO_NET_OFFLINE=true $HOME/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings && git diff --check",
+      "result": "passed",
+      "detail": "Fresh strict workspace batch completed with exit code 0 on the stabilized PD-T03 tree."
+    }
+  ],
+  "independent_audit": {
+    "worker": "worker-5",
+    "mode": "fresh exact-tree read-only PD-T03 closure audit",
+    "head": "383f967f8037534086faab7f88898e7c69e26e88",
+    "result": "CLOSABLE",
+    "verdict": "PD-T03: CLOSABLE",
+    "blockers": [],
+    "changes_made_by_auditor": false,
+    "notes": [
+      "All prior code and contract blockers are closed on the live exact tree.",
+      "The occupied literal RUNBOOK port 8765 is a standing-instruction conditional environmental deferred check, not a PD-T03 closure blocker."
+    ]
+  },
+  "intentional_final_release_tests_deferred": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false,
+    "network_package_install": false
+  }
+}

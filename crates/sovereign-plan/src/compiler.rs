@@ -229,6 +229,32 @@ impl ControllerExternalIntelligenceBindingEvidence {
     }
 }
 
+/// Digest-only provenance for one Controller-owned exact loopback browser
+/// binding. Concrete browser/network scope remains in validated Plan IR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControllerBrowserLoopbackBindingEvidence {
+    source_plan_digest: String,
+    target_task_id: String,
+    binding_digest: String,
+}
+
+impl ControllerBrowserLoopbackBindingEvidence {
+    #[must_use]
+    pub fn source_plan_digest(&self) -> &str {
+        &self.source_plan_digest
+    }
+
+    #[must_use]
+    pub fn target_task_id(&self) -> &str {
+        &self.target_task_id
+    }
+
+    #[must_use]
+    pub fn binding_digest(&self) -> &str {
+        &self.binding_digest
+    }
+}
+
 /// Immutable provenance record for a successful compilation candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompilationEvidence {
@@ -246,6 +272,8 @@ pub struct CompilationEvidence {
     controller_bindings: Vec<ControllerBindingEvidence>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     controller_external_intelligence_bindings: Vec<ControllerExternalIntelligenceBindingEvidence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    controller_browser_loopback_bindings: Vec<ControllerBrowserLoopbackBindingEvidence>,
     validator_passed: bool,
     plan_digest: String,
 }
@@ -296,6 +324,13 @@ impl CompilationEvidence {
         &self,
     ) -> &[ControllerExternalIntelligenceBindingEvidence] {
         &self.controller_external_intelligence_bindings
+    }
+
+    #[must_use]
+    pub fn controller_browser_loopback_bindings(
+        &self,
+    ) -> &[ControllerBrowserLoopbackBindingEvidence] {
+        &self.controller_browser_loopback_bindings
     }
 
     #[must_use]
@@ -550,6 +585,84 @@ impl PlanCompilationResult {
         })
     }
 
+    /// Enables one exact Controller-owned loopback browser task without exposing
+    /// browser/network authority to planning-model output.
+    ///
+    /// The global policy must already authorize the exact loopback host, scheme,
+    /// port, GET/POST methods, one bounded redirect, browser/network capabilities,
+    /// BROWSER lease, network-byte ceiling, and frozen network-write approval. The binding only
+    /// narrows that authority onto the selected task, then revalidates the full
+    /// Plan IR and recomputes provenance digests.
+    ///
+    /// # Errors
+    /// Returns a fail-closed binding rejection for stale source compilation,
+    /// malformed tool pin, missing global authority, duplicate/pre-existing
+    /// browser authority, unknown target, or invalid transformed Plan IR.
+    pub fn bind_controller_loopback_browser(
+        &self,
+        validator: &PlanValidator,
+        target_task_id: &str,
+        browser_tool_pin: &Value,
+        port: u16,
+        max_network_bytes: u64,
+    ) -> Result<Self, PlanCompilationError> {
+        self.validate_binding_source(validator)?;
+        validate_versioned_capability(browser_tool_pin, "browser tool")?;
+        validate_sha256_capability_digest(browser_tool_pin, "browser tool")?;
+        if target_task_id.trim().is_empty() || port == 0 || max_network_bytes == 0 {
+            return Err(PlanCompilationError::ControllerBindingRejected(
+                "loopback browser binding requires a task id, nonzero port, and positive network-byte ceiling"
+                    .to_owned(),
+            ));
+        }
+
+        let source_plan_digest = self.plan_digest.clone();
+        let mut document = self.plan.as_value().clone();
+        validate_browser_binding_global_policy(&document, port, max_network_bytes)?;
+        let tasks = document
+            .get_mut("tasks")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                PlanCompilationError::ControllerBindingRejected(
+                    "source plan does not contain tasks[]".to_owned(),
+                )
+            })?;
+        let target_index = browser_binding_target_index(tasks, target_task_id, browser_tool_pin)?;
+        narrow_browser_resource_authority(tasks, target_index)?;
+        let binding_digest = apply_browser_binding_to_task(
+            &mut tasks[target_index],
+            target_task_id,
+            browser_tool_pin,
+            port,
+            max_network_bytes,
+        )?;
+
+        let plan = PlanIr::from_value(canonicalize(&document));
+        let diagnostics = validator.validate(&plan);
+        if !diagnostics.is_empty() {
+            return Err(PlanCompilationError::ValidationRejected(diagnostics));
+        }
+        let plan_digest = plan.canonical_digest()?;
+        let mut compilation_evidence = self.compilation_evidence.clone();
+        compilation_evidence
+            .controller_browser_loopback_bindings
+            .push(ControllerBrowserLoopbackBindingEvidence {
+                source_plan_digest,
+                target_task_id: target_task_id.to_owned(),
+                binding_digest,
+            });
+        compilation_evidence.plan_digest.clone_from(&plan_digest);
+        compilation_evidence.validator_passed = true;
+        let compilation_evidence_digest = canonical_digest(&compilation_evidence)?;
+
+        Ok(Self {
+            plan,
+            plan_digest,
+            compilation_evidence,
+            compilation_evidence_digest,
+        })
+    }
+
     fn validate_binding_source(
         &self,
         validator: &PlanValidator,
@@ -570,6 +683,10 @@ impl PlanCompilationResult {
                 .compilation_evidence
                 .controller_external_intelligence_bindings
                 .is_empty()
+            || !self
+                .compilation_evidence
+                .controller_browser_loopback_bindings
+                .is_empty()
         {
             return Err(PlanCompilationError::ControllerBindingRejected(
                 "source compilation already contains a Controller authority binding".to_owned(),
@@ -582,6 +699,380 @@ impl PlanCompilationResult {
         }
         Ok(())
     }
+}
+
+fn validate_browser_binding_global_policy(
+    document: &Value,
+    port: u16,
+    max_network_bytes: u64,
+) -> Result<(), PlanCompilationError> {
+    let capabilities = string_set(document.pointer("/policy/capability_ceiling"));
+    for required in ["browser_interactive", "network_read", "network_write"] {
+        if !capabilities.contains(required) {
+            return Err(PlanCompilationError::ControllerBindingRejected(format!(
+                "global policy capability ceiling does not include {required}"
+            )));
+        }
+    }
+    let network = document.pointer("/policy/network").ok_or_else(|| {
+        PlanCompilationError::ControllerBindingRejected(
+            "global policy does not define network authority".to_owned(),
+        )
+    })?;
+    if network.get("default").and_then(Value::as_str) != Some("task_scoped")
+        || network.get("allow_task_loopback").and_then(Value::as_bool) != Some(true)
+        || !string_set(network.get("allowed_hosts")).contains("127.0.0.1")
+        || !string_set(network.get("allowed_schemes")).contains("http")
+        || !string_set(network.get("allowed_methods"))
+            .is_superset(&["GET", "POST"].into_iter().collect::<BTreeSet<_>>())
+        || !network
+            .get("allowed_ports")
+            .and_then(Value::as_array)
+            .is_some_and(|ports| {
+                ports
+                    .iter()
+                    .any(|value| value.as_u64() == Some(u64::from(port)))
+            })
+        || network.get("follow_redirects").and_then(Value::as_bool) != Some(true)
+        || network
+            .get("max_redirects")
+            .and_then(Value::as_u64)
+            .is_none_or(|redirects| redirects < 1)
+    {
+        return Err(PlanCompilationError::ControllerBindingRejected(
+            "global network policy does not preauthorize exact 127.0.0.1/http/port GET+POST task-loopback scope with one bounded redirect"
+                .to_owned(),
+        ));
+    }
+    let resources = document.pointer("/policy/resources").ok_or_else(|| {
+        PlanCompilationError::ControllerBindingRejected(
+            "global policy does not define resource authority".to_owned(),
+        )
+    })?;
+    if !string_set(resources.get("heavy_leases")).contains("BROWSER")
+        || resources
+            .get("max_network_bytes")
+            .and_then(Value::as_u64)
+            .is_none_or(|ceiling| max_network_bytes > ceiling)
+        || resources
+            .get("max_subprocesses")
+            .and_then(Value::as_u64)
+            .is_none_or(|count| count == 0)
+    {
+        return Err(PlanCompilationError::ControllerBindingRejected(
+            "global resources do not preauthorize BROWSER, network bytes, and subprocess capacity"
+                .to_owned(),
+        ));
+    }
+    if !string_set(document.pointer("/policy/approval/required_permissions"))
+        .contains("network_write")
+    {
+        return Err(PlanCompilationError::ControllerBindingRejected(
+            "global approval policy must retain network_write approval".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn task_has_browser_network_authority(task: &Value) -> bool {
+    let permissions = string_set(task.get("permissions"));
+    permissions.contains("browser_interactive")
+        || permissions.contains("network_read")
+        || permissions.contains("network_write")
+        || task
+            .pointer("/action_policy/browser/allowed")
+            .and_then(Value::as_bool)
+            == Some(true)
+        || task
+            .pointer("/action_policy/network/default")
+            .and_then(Value::as_str)
+            != Some("offline")
+        || !string_set(task.pointer("/action_policy/network/allowed_hosts")).is_empty()
+        || !string_set(task.pointer("/action_policy/network/allowed_methods")).is_empty()
+}
+
+fn browser_binding_target_index(
+    tasks: &[Value],
+    target_task_id: &str,
+    browser_tool_pin: &Value,
+) -> Result<usize, PlanCompilationError> {
+    if let Some(task) = tasks
+        .iter()
+        .find(|task| task_has_browser_network_authority(task))
+    {
+        let task_id = task
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        return Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "source plan already contains task-level browser/network authority on {task_id}"
+        )));
+    }
+    let browser_tool_id = browser_tool_pin
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            PlanCompilationError::ControllerBindingRejected(
+                "browser tool pin omitted id".to_owned(),
+            )
+        })?;
+    if tasks.iter().any(|task| {
+        task.get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool.get("id").and_then(Value::as_str) == Some(browser_tool_id))
+            })
+    }) {
+        return Err(PlanCompilationError::ControllerBindingRejected(
+            "source plan already contains the Controller-selected browser tool pin".to_owned(),
+        ));
+    }
+
+    let matching = tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, task)| task.get("task_id").and_then(Value::as_str) == Some(target_task_id))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let [target_index] = matching.as_slice() else {
+        return Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "target task {target_task_id} must exist exactly once"
+        )));
+    };
+    Ok(*target_index)
+}
+
+fn narrow_browser_resource_authority(
+    tasks: &mut [Value],
+    target_index: usize,
+) -> Result<(), PlanCompilationError> {
+    for (index, task) in tasks.iter_mut().enumerate() {
+        let task_id = task
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>")
+            .to_owned();
+        let heavy_leases = task
+            .pointer_mut("/resource_budget/heavy_leases")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                PlanCompilationError::ControllerBindingRejected(format!(
+                    "task {task_id} lacks resource_budget.heavy_leases[]"
+                ))
+            })?;
+        if index == target_index {
+            if !heavy_leases
+                .iter()
+                .any(|lease| lease.as_str() == Some("BROWSER"))
+            {
+                return Err(PlanCompilationError::ControllerBindingRejected(format!(
+                    "target task {task_id} lacks preauthorized BROWSER resource authority"
+                )));
+            }
+            heavy_leases.retain(|lease| lease.as_str() != Some("MODEL"));
+            task["resource_budget"]["max_model_calls"] = json!(0);
+        } else {
+            heavy_leases.retain(|lease| lease.as_str() != Some("BROWSER"));
+        }
+    }
+    Ok(())
+}
+
+fn apply_browser_lifecycle_binding(
+    target: &mut Value,
+    target_task_id: &str,
+) -> Result<(Value, Value, Value), PlanCompilationError> {
+    let failure_policy = target
+        .get_mut("failure_policy")
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| {
+            PlanCompilationError::ControllerBindingRejected(format!(
+                "target task {target_task_id} lacks failure_policy"
+            ))
+        })?;
+    failure_policy.insert("on_execution_failure".to_owned(), json!("block"));
+
+    let next_state_rules = target
+        .get_mut("next_state_rules")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            PlanCompilationError::ControllerBindingRejected(format!(
+                "target task {target_task_id} lacks next_state_rules[]"
+            ))
+        })?;
+    let mut execution_failure_bound = false;
+    for rule in next_state_rules.iter_mut() {
+        if rule.get("event").and_then(Value::as_str) == Some("execution_failure") {
+            rule["transition"] = json!("block");
+            execution_failure_bound = true;
+        }
+    }
+    if !execution_failure_bound {
+        next_state_rules.push(json!({
+            "event": "execution_failure",
+            "guards": ["plan_revision_active"],
+            "transition": "block"
+        }));
+    }
+    if !next_state_rules.iter().any(|rule| {
+        rule.get("event").and_then(Value::as_str) == Some("unknown_action")
+            && rule.get("transition").and_then(Value::as_str) == Some("reconcile")
+    }) {
+        next_state_rules.push(json!({
+            "event": "unknown_action",
+            "guards": ["plan_revision_active"],
+            "transition": "reconcile"
+        }));
+    }
+    let next_state_rules_binding = Value::Array(next_state_rules.clone());
+
+    let task_id_fragment = sanitize_id_fragment(target_task_id);
+    let compensation_artifact_id = format!("artifact.{task_id_fragment}.browser-compensation");
+    let compensation_artifact = json!({
+        "artifact_id": compensation_artifact_id,
+        "kind": "evidence",
+        "locator": format!(
+            "controller://rollback/browser-compensation/{task_id_fragment}"
+        ),
+        "required": false
+    });
+    let expected_artifacts = target
+        .get_mut("expected_artifacts")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            PlanCompilationError::ControllerBindingRejected(format!(
+                "target task {target_task_id} lacks expected_artifacts[]"
+            ))
+        })?;
+    if expected_artifacts.iter().any(|artifact| {
+        artifact.get("artifact_id").and_then(Value::as_str)
+            == compensation_artifact
+                .get("artifact_id")
+                .and_then(Value::as_str)
+    }) {
+        return Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "target task {target_task_id} already contains the reserved browser compensation artifact id"
+        )));
+    }
+    expected_artifacts.push(compensation_artifact.clone());
+
+    let rollback = json!({
+        "mode": "compensating_action",
+        "procedure": "No automatic compensation is authorized. First reconcile the exact original browser write outcome. If compensation is then required, dispatch only a fresh Controller-governed compensating action under current authority and typed verification; never replay an unknown write.",
+        "preconditions": [
+            "The active plan/task/epoch bindings and exact committed browser-action receipts remain current."
+        ],
+        "verification_steps": [{
+            "step_id": format!("rollback.{task_id_fragment}.browser-compensation"),
+            "kind": "artifact",
+            "evidence_type": "browser_compensation_receipt",
+            "artifact_id": compensation_artifact["artifact_id"]
+        }]
+    });
+    target["rollback"] = rollback.clone();
+    Ok((next_state_rules_binding, rollback, compensation_artifact))
+}
+
+fn apply_browser_binding_to_task(
+    target: &mut Value,
+    target_task_id: &str,
+    browser_tool_pin: &Value,
+    port: u16,
+    max_network_bytes: u64,
+) -> Result<String, PlanCompilationError> {
+    let heavy_leases = string_set(target.pointer("/resource_budget/heavy_leases"));
+    if !heavy_leases.contains("BROWSER") {
+        return Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "target task {target_task_id} lacks preauthorized BROWSER resource authority"
+        )));
+    }
+    if target.pointer("/rollback/mode").and_then(Value::as_str) != Some("none") {
+        return Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "target task {target_task_id} must be a non-repository-mutating task with rollback mode none before browser binding"
+        )));
+    }
+    let permissions = target
+        .get_mut("permissions")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            PlanCompilationError::ControllerBindingRejected(format!(
+                "target task {target_task_id} lacks permissions[]"
+            ))
+        })?;
+    if permissions.iter().any(|permission| {
+        matches!(
+            permission.as_str(),
+            Some(
+                "repo_write"
+                    | "sandbox_write"
+                    | "package_install"
+                    | "external_side_effect"
+                    | "destructive"
+            )
+        )
+    }) {
+        return Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "target task {target_task_id} must be a non-repository-mutating task with rollback mode none before browser binding"
+        )));
+    }
+    for permission in ["browser_interactive", "network_read", "network_write"] {
+        permissions.push(Value::String(permission.to_owned()));
+    }
+    target
+        .get_mut("tools")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            PlanCompilationError::ControllerBindingRejected(format!(
+                "target task {target_task_id} lacks tools[]"
+            ))
+        })?
+        .push(browser_tool_pin.clone());
+
+    let network = json!({
+        "default": "task_scoped",
+        "allowed_hosts": ["127.0.0.1"],
+        "allowed_schemes": ["http"],
+        "allowed_ports": [port],
+        "allowed_methods": ["GET", "POST"],
+        "follow_redirects": true,
+        "max_redirects": 1,
+        "allow_private_ranges": false,
+        "dns_revalidation": true,
+        "connected_peer_validation": true,
+        "ambient_proxy": "deny",
+        "allow_task_loopback": true
+    });
+    let browser = json!({
+        "allowed": true,
+        "allowed_domains": ["127.0.0.1"],
+        "max_tabs": 1,
+        "downloads": "deny",
+        "persistent_profile": false,
+        "auto_open_downloads": false,
+        "allow_local_file_navigation": false,
+        "download_root": Value::Null
+    });
+    target["action_policy"]["network"] = network.clone();
+    target["action_policy"]["browser"] = browser.clone();
+    target["resource_budget"]["max_network_bytes"] = json!(max_network_bytes);
+    let (next_state_rules_binding, rollback, compensation_artifact) =
+        apply_browser_lifecycle_binding(target, target_task_id)?;
+    let failure_policy_binding = target["failure_policy"].clone();
+    let resource_budget_binding = target["resource_budget"].clone();
+
+    canonical_digest(&json!({
+        "tool": browser_tool_pin,
+        "permissions": ["browser_interactive", "network_read", "network_write"],
+        "network": network,
+        "browser": browser,
+        "resource_budget": resource_budget_binding,
+        "failure_policy": failure_policy_binding,
+        "next_state_rules": next_state_rules_binding,
+        "rollback": rollback,
+        "compensation_artifact": compensation_artifact
+    }))
 }
 
 fn normalize_external_binding_scope(
@@ -942,6 +1433,7 @@ impl<'a> PlanCompiler<'a> {
                         model_attempts: attempts,
                         controller_bindings: Vec::new(),
                         controller_external_intelligence_bindings: Vec::new(),
+                        controller_browser_loopback_bindings: Vec::new(),
                         validator_passed: true,
                         plan_digest: plan_digest.clone(),
                     };
@@ -4012,6 +4504,26 @@ fn validate_versioned_capability(value: &Value, label: &str) -> Result<(), PlanC
     } else {
         Err(PlanCompilationError::InvalidInput(format!(
             "Controller-supplied {label} pin is not a versioned capability"
+        )))
+    }
+}
+
+fn validate_sha256_capability_digest(
+    value: &Value,
+    label: &str,
+) -> Result<(), PlanCompilationError> {
+    let valid = value
+        .get("digest")
+        .and_then(Value::as_str)
+        .and_then(|digest| digest.strip_prefix("sha256:"))
+        .is_some_and(|hex| {
+            hex.len() == 64 && hex.chars().all(|character| character.is_ascii_hexdigit())
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(PlanCompilationError::ControllerBindingRejected(format!(
+            "Controller-supplied {label} pin must use an exact sha256:<64-hex> digest"
         )))
     }
 }
