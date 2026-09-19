@@ -3,6 +3,8 @@
 //! Models and repository content may propose actions, but this crate requires exact
 //! Controller-created authority to exist durably before an operating-system process starts.
 
+pub mod browser;
+
 use sha2::{Digest, Sha256};
 use sovereign_evidence::{ArtifactStore, EvidenceError, Redactor};
 pub use sovereign_policy::{

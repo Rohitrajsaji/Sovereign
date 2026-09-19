@@ -34,6 +34,22 @@ fn assert_code(diagnostics: &[ValidationDiagnostic], code: DiagnosticCode) {
     );
 }
 
+fn assert_diagnostic_at(
+    diagnostics: &[ValidationDiagnostic],
+    code: DiagnosticCode,
+    path: &str,
+    message_fragment: &str,
+) {
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == code
+                && diagnostic.path == path
+                && diagnostic.message.contains(message_fragment)
+        }),
+        "expected diagnostic {code} at {path} containing {message_fragment:?}, got {diagnostics:#?}"
+    );
+}
+
 fn task_mut(value: &mut Value, index: usize) -> &mut Value {
     let Some(tasks) = value["tasks"].as_array_mut() else {
         panic!("fixture tasks must be an array");
@@ -305,6 +321,254 @@ fn write_like_network_and_browser_scope_require_authority_and_reconciliation() {
     let mut browser = fixture();
     task_mut(&mut browser, 0)["action_policy"]["browser"]["allowed"] = json!(true);
     assert_code(&diagnostics(browser), DiagnosticCode::PermissionPolicy);
+}
+
+fn enable_browser_scope(value: &mut serde_json::Value, host: &str, port: u64) {
+    value["policy"]["capability_ceiling"] = json!([
+        "read",
+        "repo_write",
+        "process_exec",
+        "browser_interactive",
+        "network_read"
+    ]);
+    value["policy"]["network"] = json!({
+        "default": "task_scoped",
+        "allowed_hosts": [host],
+        "allowed_schemes": ["http"],
+        "allowed_ports": [port],
+        "allowed_methods": ["GET"],
+        "follow_redirects": false,
+        "max_redirects": 0,
+        "allow_private_ranges": false,
+        "dns_revalidation": true,
+        "connected_peer_validation": true,
+        "ambient_proxy": "deny",
+        "allow_task_loopback": false
+    });
+    value["policy"]["resources"]["heavy_leases"] = json!(["MODEL", "BUILD_HEAVY", "BROWSER"]);
+    task_mut(value, 0)["permissions"] = json!([
+        "read",
+        "repo_write",
+        "process_exec",
+        "browser_interactive",
+        "network_read"
+    ]);
+    task_mut(value, 0)["action_policy"]["network"] = json!({
+        "default": "task_scoped",
+        "allowed_hosts": [host],
+        "allowed_schemes": ["http"],
+        "allowed_ports": [port],
+        "allowed_methods": ["GET"],
+        "follow_redirects": false,
+        "max_redirects": 0,
+        "allow_private_ranges": false,
+        "dns_revalidation": true,
+        "connected_peer_validation": true,
+        "ambient_proxy": "deny",
+        "allow_task_loopback": false
+    });
+    task_mut(value, 0)["action_policy"]["browser"]["allowed"] = json!(true);
+    task_mut(value, 0)["action_policy"]["browser"]["allowed_domains"] = json!([host]);
+    task_mut(value, 0)["resource_budget"]["heavy_leases"] =
+        json!(["MODEL", "BUILD_HEAVY", "BROWSER"]);
+}
+
+#[test]
+fn browser_requires_browser_resource_and_network_scope_narrowing() {
+    let mut valid = fixture();
+    enable_browser_scope(&mut valid, "example.test", 8080);
+    let valid_diagnostics = diagnostics(valid.clone());
+    assert!(
+        !valid_diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic.code,
+            DiagnosticCode::PermissionPolicy | DiagnosticCode::ResourcePolicy
+        )),
+        "{valid_diagnostics:#?}"
+    );
+
+    let mut no_lease = valid.clone();
+    task_mut(&mut no_lease, 0)["resource_budget"]["heavy_leases"] = json!(["MODEL", "BUILD_HEAVY"]);
+    assert_code(&diagnostics(no_lease), DiagnosticCode::ResourcePolicy);
+
+    let mut host_escape = valid.clone();
+    task_mut(&mut host_escape, 0)["action_policy"]["browser"]["allowed_domains"] =
+        json!(["other.test"]);
+    assert_code(&diagnostics(host_escape), DiagnosticCode::PermissionPolicy);
+
+    let mut method_escape = valid.clone();
+    method_escape["policy"]["network"]["allowed_methods"] = json!([]);
+    assert_code(
+        &diagnostics(method_escape),
+        DiagnosticCode::PermissionPolicy,
+    );
+
+    let mut wildcard = valid.clone();
+    wildcard["policy"]["network"]["allowed_hosts"] = json!(["*.example.test"]);
+    task_mut(&mut wildcard, 0)["action_policy"]["network"]["allowed_hosts"] =
+        json!(["*.example.test"]);
+    task_mut(&mut wildcard, 0)["action_policy"]["browser"]["allowed_domains"] =
+        json!(["*.example.test"]);
+    assert_code(&diagnostics(wildcard), DiagnosticCode::PermissionPolicy);
+
+    let mut private_ranges = valid;
+    task_mut(&mut private_ranges, 0)["action_policy"]["network"]["allow_private_ranges"] =
+        json!(true);
+    assert_code(
+        &diagnostics(private_ranges),
+        DiagnosticCode::PermissionPolicy,
+    );
+}
+
+#[test]
+fn browser_task_loopback_requires_exact_literal_port_and_global_ceiling() {
+    let mut value = fixture();
+    enable_browser_scope(&mut value, "127.0.0.1", 3000);
+    task_mut(&mut value, 0)["action_policy"]["network"]["allow_task_loopback"] = json!(true);
+    assert_code(
+        &diagnostics(value.clone()),
+        DiagnosticCode::PermissionPolicy,
+    );
+
+    value["policy"]["network"]["allow_task_loopback"] = json!(true);
+    let valid = diagnostics(value.clone());
+    assert!(
+        !valid.iter().any(|diagnostic| matches!(
+            diagnostic.code,
+            DiagnosticCode::PermissionPolicy | DiagnosticCode::ResourcePolicy
+        )),
+        "{valid:#?}"
+    );
+
+    task_mut(&mut value, 0)["action_policy"]["network"]["allowed_hosts"] = json!(["localhost"]);
+    task_mut(&mut value, 0)["action_policy"]["browser"]["allowed_domains"] = json!(["localhost"]);
+    value["policy"]["network"]["allowed_hosts"] = json!(["localhost"]);
+    assert_code(&diagnostics(value), DiagnosticCode::PermissionPolicy);
+}
+
+#[test]
+fn browser_download_root_is_coherent_with_task_and_global_download_authority() {
+    let valid = valid_browser_download_plan();
+    let valid_diagnostics = diagnostics(valid.clone());
+    assert!(
+        !valid_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == DiagnosticCode::PermissionPolicy),
+        "{valid_diagnostics:#?}"
+    );
+
+    let mut denied_absent = fixture();
+    enable_browser_scope(&mut denied_absent, "example.test", 8080);
+    let browser = task_mut(&mut denied_absent, 0)["action_policy"]["browser"]
+        .as_object_mut()
+        .unwrap_or_else(|| panic!("browser policy must be an object"));
+    browser.remove("download_root");
+    let denied_absent_diagnostics = diagnostics(denied_absent);
+    assert!(
+        !denied_absent_diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .path
+                .ends_with("/action_policy/browser/download_root")
+        }),
+        "deny + absent root must be accepted: {denied_absent_diagnostics:#?}"
+    );
+
+    let mut denied_null = fixture();
+    enable_browser_scope(&mut denied_null, "example.test", 8080);
+    task_mut(&mut denied_null, 0)["action_policy"]["browser"]["download_root"] = Value::Null;
+    let denied_null_diagnostics = diagnostics(denied_null);
+    assert!(
+        !denied_null_diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .path
+                .ends_with("/action_policy/browser/download_root")
+        }),
+        "deny + null root must be accepted: {denied_null_diagnostics:#?}"
+    );
+
+    let mut denied_with_root = fixture();
+    enable_browser_scope(&mut denied_with_root, "example.test", 8080);
+    task_mut(&mut denied_with_root, 0)["action_policy"]["browser"]["download_root"] =
+        json!("downloads");
+    let denied_with_root_diagnostics = diagnostics(denied_with_root);
+    assert_diagnostic_at(
+        &denied_with_root_diagnostics,
+        DiagnosticCode::PermissionPolicy,
+        "/tasks/0/action_policy/browser/download_root",
+        "denied browser downloads cannot carry a download root",
+    );
+
+    let mut no_global_ceiling = valid.clone();
+    no_global_ceiling["policy"]["browser"]["downloads"] = json!("deny");
+    let no_global_ceiling_diagnostics = diagnostics(no_global_ceiling);
+    assert_diagnostic_at(
+        &no_global_ceiling_diagnostics,
+        DiagnosticCode::PermissionPolicy,
+        "/tasks/0/action_policy/browser/downloads",
+        "exceed the global browser download ceiling",
+    );
+
+    for missing_root in [None, Some(Value::Null)] {
+        let mut missing = valid.clone();
+        let browser = task_mut(&mut missing, 0)["action_policy"]["browser"]
+            .as_object_mut()
+            .unwrap_or_else(|| panic!("browser policy must be an object"));
+        match missing_root {
+            Some(value) => {
+                browser.insert("download_root".to_owned(), value);
+            }
+            None => {
+                browser.remove("download_root");
+            }
+        }
+        let missing_diagnostics = diagnostics(missing);
+        assert_diagnostic_at(
+            &missing_diagnostics,
+            DiagnosticCode::PermissionPolicy,
+            "/tasks/0/action_policy/browser/download_root",
+            "require a strict relative download root",
+        );
+    }
+}
+
+#[test]
+fn browser_download_root_rejects_non_normal_or_platform_prefixed_components() {
+    let valid = valid_browser_download_plan();
+    for root in [
+        "",
+        "   ",
+        ".",
+        "..",
+        "../escape",
+        "/absolute",
+        "nested/../escape",
+        "./relative",
+        "nested/./downloads",
+        "nested//downloads",
+        "nested/downloads/",
+        "C:/absolute",
+        r"C:\absolute",
+        r"nested\..\escape",
+    ] {
+        let mut invalid_root = valid.clone();
+        task_mut(&mut invalid_root, 0)["action_policy"]["browser"]["download_root"] = json!(root);
+        let invalid_diagnostics = diagnostics(invalid_root);
+        assert_diagnostic_at(
+            &invalid_diagnostics,
+            DiagnosticCode::PermissionPolicy,
+            "/tasks/0/action_policy/browser/download_root",
+            "non-empty strict relative path",
+        );
+    }
+}
+
+fn valid_browser_download_plan() -> Value {
+    let mut value = fixture();
+    enable_browser_scope(&mut value, "example.test", 8080);
+    value["policy"]["browser"]["downloads"] = json!("task_scoped");
+    task_mut(&mut value, 0)["action_policy"]["browser"]["downloads"] = json!("task_scoped");
+    task_mut(&mut value, 0)["action_policy"]["browser"]["download_root"] =
+        json!("artifacts/browser-downloads");
+    value
 }
 
 #[test]

@@ -10,7 +10,8 @@ use sovereign_policy::{Capability, CapabilitySet};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ROLE_PROFILE_SCHEMA_VERSION: u32 = 1;
-pub const ROLE_PROFILE_VERSION: &str = "1.1.0";
+pub const ROLE_PROFILE_VERSION: &str = "1.2.0";
+const PRE_BROWSER_ROLE_PROFILE_VERSION: &str = "1.1.0";
 const LEGACY_ROLE_PROFILE_VERSION: &str = "1.0.0";
 pub const ROLE_OUTPUT_SCHEMA_VERSION: u32 = 1;
 const ROLE_OUTPUT_TOKEN_CEILING: u32 = 512;
@@ -212,6 +213,7 @@ pub struct RoleOutputV1 {
 #[derive(Debug, Clone)]
 pub struct RoleRegistry {
     profiles: BTreeMap<RoleId, RoleProfile>,
+    pre_browser_profiles: BTreeMap<RoleId, RoleProfile>,
     legacy_profiles: BTreeMap<RoleId, RoleProfile>,
 }
 
@@ -225,10 +227,22 @@ impl RoleRegistry {
     #[must_use]
     pub fn canonical() -> Self {
         let profiles = [
-            explorer_profile(),
+            explorer_profile(true),
             planner_profile(),
-            implementer_profile(true),
-            debugger_profile(true),
+            implementer_profile(true, true),
+            debugger_profile(true, true),
+            reviewer_profile(),
+            security_reviewer_profile(),
+            verifier_profile(),
+        ]
+        .into_iter()
+        .map(|profile| (profile.role, profile))
+        .collect();
+        let pre_browser_profiles = [
+            explorer_profile(false),
+            planner_profile(),
+            implementer_profile(true, false),
+            debugger_profile(true, false),
             reviewer_profile(),
             security_reviewer_profile(),
             verifier_profile(),
@@ -237,10 +251,10 @@ impl RoleRegistry {
         .map(|profile| (profile.role, profile))
         .collect();
         let legacy_profiles = [
-            explorer_profile(),
+            explorer_profile(false),
             planner_profile(),
-            implementer_profile(false),
-            debugger_profile(false),
+            implementer_profile(false, false),
+            debugger_profile(false, false),
             reviewer_profile(),
             security_reviewer_profile(),
             verifier_profile(),
@@ -250,6 +264,7 @@ impl RoleRegistry {
         .collect();
         Self {
             profiles,
+            pre_browser_profiles,
             legacy_profiles,
         }
     }
@@ -289,6 +304,10 @@ impl RoleRegistry {
         })?;
         let profile = match version {
             ROLE_PROFILE_VERSION => self.profile(role),
+            PRE_BROWSER_ROLE_PROFILE_VERSION => self
+                .pre_browser_profiles
+                .get(&role)
+                .unwrap_or_else(|| unreachable!("pre-browser role registry is complete")),
             LEGACY_ROLE_PROFILE_VERSION => self
                 .legacy_profiles
                 .get(&role)
@@ -381,6 +400,31 @@ impl RoleRegistry {
 }
 
 impl PermissionContext {
+    /// Explicit opt-in local profile for deterministic browser execution.
+    ///
+    /// This profile is a user/Controller ceiling only. Effective browser/network authority still
+    /// requires the active global/task Plan IR request, canonical role ceiling, exact tool manifest,
+    /// and persisted task grant to independently contain the same capability. The M1 profile is not
+    /// widened by this constructor.
+    #[must_use]
+    pub fn m7_local_browser_execution() -> Self {
+        let granted = BTreeSet::from([
+            Capability::ProcessExec,
+            Capability::RepositoryWrite,
+            Capability::NetworkRead,
+            Capability::NetworkWrite,
+            Capability::BrowserInteractive,
+            Capability::ExternalSideEffect,
+        ]);
+        Self {
+            controller_ceiling: granted.clone(),
+            project_ceiling: granted.clone(),
+            role_ceiling: granted.clone(),
+            persisted_grants: granted,
+            persisted_grant_issuer: "user:local-browser-execution-profile".to_owned(),
+        }
+    }
+
     /// Applies a role as an additional ceiling. It can only remove permissions
     /// from the pre-existing Controller/project/grant intersection; it cannot
     /// manufacture a permission that was absent from the current role ceiling.
@@ -400,7 +444,7 @@ impl PermissionContext {
     }
 }
 
-fn explorer_profile() -> RoleProfile {
+fn explorer_profile(browser_read_ceiling: bool) -> RoleProfile {
     RoleProfile {
         schema_version: ROLE_PROFILE_SCHEMA_VERSION,
         role: RoleId::Explorer,
@@ -414,7 +458,15 @@ fn explorer_profile() -> RoleProfile {
             EvidenceKind::Instruction,
             EvidenceKind::ToolSchema,
         ]),
-        allowed_tool_classes_ceiling: BTreeSet::from([Capability::ProcessExec]),
+        allowed_tool_classes_ceiling: if browser_read_ceiling {
+            BTreeSet::from([
+                Capability::ProcessExec,
+                Capability::NetworkRead,
+                Capability::BrowserInteractive,
+            ])
+        } else {
+            BTreeSet::from([Capability::ProcessExec])
+        },
         output_schema: "RoleOutputV1".to_owned(),
         allowed_dispositions: BTreeSet::from([
             RoleDisposition::Proposed,
@@ -450,11 +502,19 @@ fn planner_profile() -> RoleProfile {
     }
 }
 
-fn implementer_profile(secret_use_ceiling: bool) -> RoleProfile {
+fn implementer_profile(secret_use_ceiling: bool, browser_ceiling: bool) -> RoleProfile {
     let mut allowed_tool_classes_ceiling =
         BTreeSet::from([Capability::ProcessExec, Capability::RepositoryWrite]);
     if secret_use_ceiling {
         allowed_tool_classes_ceiling.insert(Capability::SecretUse);
+    }
+    if browser_ceiling {
+        allowed_tool_classes_ceiling.extend([
+            Capability::NetworkRead,
+            Capability::NetworkWrite,
+            Capability::BrowserInteractive,
+            Capability::ExternalSideEffect,
+        ]);
     }
     RoleProfile {
         schema_version: ROLE_PROFILE_SCHEMA_VERSION,
@@ -481,11 +541,19 @@ fn implementer_profile(secret_use_ceiling: bool) -> RoleProfile {
     }
 }
 
-fn debugger_profile(secret_use_ceiling: bool) -> RoleProfile {
+fn debugger_profile(secret_use_ceiling: bool, browser_ceiling: bool) -> RoleProfile {
     let mut allowed_tool_classes_ceiling =
         BTreeSet::from([Capability::ProcessExec, Capability::RepositoryWrite]);
     if secret_use_ceiling {
         allowed_tool_classes_ceiling.insert(Capability::SecretUse);
+    }
+    if browser_ceiling {
+        allowed_tool_classes_ceiling.extend([
+            Capability::NetworkRead,
+            Capability::NetworkWrite,
+            Capability::BrowserInteractive,
+            Capability::ExternalSideEffect,
+        ]);
     }
     RoleProfile {
         schema_version: ROLE_PROFILE_SCHEMA_VERSION,
@@ -946,6 +1014,45 @@ mod tests {
     }
 
     #[test]
+    fn browser_execution_profile_and_role_ceiling_are_explicit_and_non_elevating() {
+        let registry = RoleRegistry::canonical();
+        let m1 = PermissionContext::m1_local_autonomous();
+        for capability in [
+            Capability::BrowserInteractive,
+            Capability::NetworkRead,
+            Capability::NetworkWrite,
+            Capability::ExternalSideEffect,
+        ] {
+            assert!(!m1.permits(capability));
+        }
+
+        let browser = PermissionContext::m7_local_browser_execution();
+        for capability in [
+            Capability::BrowserInteractive,
+            Capability::NetworkRead,
+            Capability::NetworkWrite,
+            Capability::ExternalSideEffect,
+        ] {
+            assert!(browser.permits(capability));
+        }
+        let implementer = browser.narrow_for_role(registry.profile(RoleId::Implementer));
+        assert!(implementer.permits(Capability::BrowserInteractive));
+        assert!(implementer.permits(Capability::NetworkRead));
+        assert!(implementer.permits(Capability::NetworkWrite));
+        assert!(implementer.permits(Capability::ExternalSideEffect));
+
+        let explorer = browser.narrow_for_role(registry.profile(RoleId::Explorer));
+        assert!(explorer.permits(Capability::BrowserInteractive));
+        assert!(explorer.permits(Capability::NetworkRead));
+        assert!(!explorer.permits(Capability::NetworkWrite));
+        assert!(!explorer.permits(Capability::ExternalSideEffect));
+
+        let reviewer = browser.narrow_for_role(registry.profile(RoleId::Reviewer));
+        assert!(!reviewer.permits(Capability::BrowserInteractive));
+        assert!(!reviewer.permits(Capability::NetworkRead));
+    }
+
+    #[test]
     fn role_ceiling_accepts_the_full_canonical_twelve_capability_domain() {
         let mut profile = RoleRegistry::canonical()
             .profile(RoleId::Implementer)
@@ -1017,7 +1124,29 @@ mod tests {
         );
         assert!(registry.resolve_pin(&pin.id, "0.9.0", &pin.digest).is_err());
 
-        let legacy = implementer_profile(false);
+        let pre_browser = implementer_profile(true, false);
+        let pre_browser_digest = pre_browser
+            .digest()
+            .unwrap_or_else(|error| panic!("pre-browser implementer digest: {error}"));
+        let resolved_pre_browser = registry
+            .resolve_pin(
+                RoleId::Implementer.plan_ir_id(),
+                PRE_BROWSER_ROLE_PROFILE_VERSION,
+                &pre_browser_digest,
+            )
+            .unwrap_or_else(|error| panic!("resolve pre-browser implementer pin: {error}"));
+        assert!(
+            resolved_pre_browser
+                .capability_ceiling()
+                .contains(Capability::SecretUse)
+        );
+        assert!(
+            !resolved_pre_browser
+                .capability_ceiling()
+                .contains(Capability::BrowserInteractive)
+        );
+
+        let legacy = implementer_profile(false, false);
         let legacy_digest = legacy
             .digest()
             .unwrap_or_else(|error| panic!("legacy implementer digest: {error}"));

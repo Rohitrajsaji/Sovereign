@@ -22,6 +22,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::net::IpAddr;
+use std::path::{Component, Path};
 
 const PLAN_SCHEMA: &str = include_str!("../../../schemas/plan-ir-v1.json");
 pub const PLAN_IR_VERSION: &str = "1.2";
@@ -838,14 +840,16 @@ fn validate_permissions(
             "package installation policy requires package_install permission",
         ));
     }
-    if bool_at(task, &["action_policy", "browser", "allowed"]) == Some(true)
-        && !task_permissions.contains("browser_interactive")
-    {
+    let browser_allowed = bool_at(task, &["action_policy", "browser", "allowed"]) == Some(true);
+    if browser_allowed && !task_permissions.contains("browser_interactive") {
         diagnostics.push(ValidationDiagnostic::new(
             DiagnosticCode::PermissionPolicy,
             format!("{path}/action_policy/browser"),
             "browser use requires browser_interactive permission",
         ));
+    }
+    if browser_allowed {
+        validate_browser_network_scope(task, path, document, &task_permissions, diagnostics);
     }
     if task
         .pointer("/action_policy/secret_refs")
@@ -896,6 +900,313 @@ fn validate_permissions(
     }
 
     validate_external_intelligence(task, path, document, &task_permissions, diagnostics);
+}
+
+fn validate_browser_network_scope(
+    task: &Value,
+    path: &str,
+    document: &Value,
+    task_permissions: &BTreeSet<&str>,
+    diagnostics: &mut Vec<ValidationDiagnostic>,
+) {
+    let task_hosts = strings_at(task, &["action_policy", "network", "allowed_hosts"])
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let global_hosts = strings_at(document, &["policy", "network", "allowed_hosts"])
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let task_schemes = strings_at(task, &["action_policy", "network", "allowed_schemes"])
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let global_schemes = strings_at(document, &["policy", "network", "allowed_schemes"])
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let task_ports = u64_set_at(task, &["action_policy", "network", "allowed_ports"]);
+    let global_ports = u64_set_at(document, &["policy", "network", "allowed_ports"]);
+    let browser_domains = strings_at(task, &["action_policy", "browser", "allowed_domains"])
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let task_methods = strings_at(task, &["action_policy", "network", "allowed_methods"]);
+    let global_methods = strings_at(document, &["policy", "network", "allowed_methods"])
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+
+    validate_browser_network_baseline(task, path, document, task_permissions, diagnostics);
+    if browser_domains.is_empty() || browser_domains.iter().any(|domain| domain.contains('*')) {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/browser/allowed_domains"),
+            "browser use requires explicit exact domains without wildcards",
+        ));
+    }
+    if !task_methods
+        .iter()
+        .any(|method| matches!(*method, "GET" | "HEAD"))
+    {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/network/allowed_methods"),
+            "browser navigation requires GET or HEAD network authority",
+        ));
+    }
+    if task_schemes.is_empty() || task_ports.is_empty() {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/network"),
+            "browser network scope requires exact allowed scheme and port sets",
+        ));
+    }
+    if browser_domains
+        .iter()
+        .any(|domain| !task_hosts.contains(domain) || !global_hosts.contains(domain))
+    {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/browser/allowed_domains"),
+            "browser domains must be exact members of both task and global network host allowlists",
+        ));
+    }
+    if task_schemes
+        .iter()
+        .any(|scheme| !global_schemes.contains(scheme))
+        || task_ports.iter().any(|port| !global_ports.contains(port))
+        || task_methods
+            .iter()
+            .any(|method| !global_methods.contains(method))
+    {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/network"),
+            "browser task network scheme/port/method scope exceeds global network ceiling",
+        ));
+    }
+    if bool_at(task, &["action_policy", "network", "allow_private_ranges"]) == Some(true) {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/network/allow_private_ranges"),
+            "browser network policy cannot enable private ranges; use only an exact task-loopback grant",
+        ));
+    }
+    validate_browser_loopback_scope(
+        task,
+        path,
+        document,
+        (&task_hosts, &global_hosts, &task_ports, &browser_domains),
+        diagnostics,
+    );
+    validate_browser_download_scope(task, path, document, diagnostics);
+}
+
+fn validate_browser_download_scope(
+    task: &Value,
+    path: &str,
+    document: &Value,
+    diagnostics: &mut Vec<ValidationDiagnostic>,
+) {
+    let global_mode = document
+        .pointer("/policy/browser/downloads")
+        .and_then(Value::as_str);
+    let task_mode = task
+        .pointer("/action_policy/browser/downloads")
+        .and_then(Value::as_str);
+    let root = task.pointer("/action_policy/browser/download_root");
+    match task_mode {
+        Some("deny") => {
+            if root.is_some_and(|value| !value.is_null()) {
+                diagnostics.push(ValidationDiagnostic::new(
+                    DiagnosticCode::PermissionPolicy,
+                    format!("{path}/action_policy/browser/download_root"),
+                    "denied browser downloads cannot carry a download root",
+                ));
+            }
+        }
+        Some("task_scoped") => {
+            if global_mode != Some("task_scoped") {
+                diagnostics.push(ValidationDiagnostic::new(
+                    DiagnosticCode::PermissionPolicy,
+                    format!("{path}/action_policy/browser/downloads"),
+                    "task-scoped browser downloads exceed the global browser download ceiling",
+                ));
+            }
+            let Some(root) = root.and_then(Value::as_str) else {
+                diagnostics.push(ValidationDiagnostic::new(
+                    DiagnosticCode::PermissionPolicy,
+                    format!("{path}/action_policy/browser/download_root"),
+                    "task-scoped browser downloads require a strict relative download root",
+                ));
+                return;
+            };
+            if !is_strict_relative_normal_path(root) {
+                diagnostics.push(ValidationDiagnostic::new(
+                    DiagnosticCode::PermissionPolicy,
+                    format!("{path}/action_policy/browser/download_root"),
+                    "browser download root must be a non-empty strict relative path without traversal or special components",
+                ));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_strict_relative_normal_path(value: &str) -> bool {
+    if value.trim().is_empty() || value.contains('\\') {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return false;
+    }
+    let path = Path::new(value);
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return false;
+    }
+    value
+        .split('/')
+        .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn validate_browser_network_baseline(
+    task: &Value,
+    path: &str,
+    document: &Value,
+    task_permissions: &BTreeSet<&str>,
+    diagnostics: &mut Vec<ValidationDiagnostic>,
+) {
+    if !task_permissions.contains("network_read") && !task_permissions.contains("network_write") {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/permissions"),
+            "browser navigation requires network_read or network_write permission",
+        ));
+    }
+    if task
+        .pointer("/action_policy/network/default")
+        .and_then(Value::as_str)
+        == Some("offline")
+        || document
+            .pointer("/policy/network/default")
+            .and_then(Value::as_str)
+            == Some("offline")
+    {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/network/default"),
+            "browser use requires explicit non-offline task and global network policy",
+        ));
+    }
+}
+
+fn validate_browser_loopback_scope(
+    task: &Value,
+    path: &str,
+    document: &Value,
+    scope: (
+        &BTreeSet<&str>,
+        &BTreeSet<&str>,
+        &BTreeSet<u64>,
+        &BTreeSet<&str>,
+    ),
+    diagnostics: &mut Vec<ValidationDiagnostic>,
+) {
+    let (task_hosts, global_hosts, task_ports, browser_domains) = scope;
+    let task_loopback =
+        bool_at(task, &["action_policy", "network", "allow_task_loopback"]) == Some(true);
+    let global_loopback =
+        bool_at(document, &["policy", "network", "allow_task_loopback"]) == Some(true);
+    let has_loopback_alias = browser_domains
+        .iter()
+        .any(|host| is_loopback_hostname_alias(host));
+    if has_loopback_alias {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/browser/allowed_domains"),
+            "browser loopback scope requires an exact loopback IP literal, not a hostname alias",
+        ));
+    }
+    let browser_uses_loopback = browser_domains
+        .iter()
+        .any(|host| is_exact_loopback_host(host));
+    if browser_uses_loopback && !task_loopback {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/network/allow_task_loopback"),
+            "loopback browser domain requires explicit task-loopback authority",
+        ));
+    }
+    if !task_loopback {
+        return;
+    }
+    if !global_loopback {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/network/allow_task_loopback"),
+            "task loopback authority exceeds the global network ceiling",
+        ));
+    }
+    let loopback_hosts = task_hosts
+        .iter()
+        .filter(|host| is_exact_loopback_host(host))
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if loopback_hosts.is_empty() || task_ports.is_empty() {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/network"),
+            "task loopback authority requires an exact loopback IP literal and exact port",
+        ));
+    }
+    if loopback_hosts
+        .iter()
+        .any(|host| !global_hosts.contains(host))
+    {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::PermissionPolicy,
+            format!("{path}/action_policy/network/allowed_hosts"),
+            "task loopback host exceeds the global exact-host ceiling",
+        ));
+    }
+}
+
+fn is_loopback_hostname_alias(host: &str) -> bool {
+    let canonical = host.trim_end_matches('.').to_ascii_lowercase();
+    canonical == "localhost" || canonical.ends_with(".localhost")
+}
+
+fn is_exact_loopback_host(host: &str) -> bool {
+    let literal = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let Ok(address) = literal.parse::<IpAddr>() else {
+        return false;
+    };
+    if !address.is_loopback() {
+        return false;
+    }
+    match address {
+        IpAddr::V4(address) => host == address.to_string(),
+        IpAddr::V6(address) => host == format!("[{address}]"),
+    }
+}
+
+fn u64_set_at(value: &Value, path: &[&str]) -> BTreeSet<u64> {
+    let mut current = value;
+    for component in path {
+        let Some(next) = current.get(*component) else {
+            return BTreeSet::new();
+        };
+        current = next;
+    }
+    current
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_u64)
+        .collect()
 }
 
 fn validate_external_intelligence(
@@ -997,6 +1308,15 @@ fn validate_resources(
     let task_heavy_leases = strings_at(task_resources, &["heavy_leases"])
         .into_iter()
         .collect::<BTreeSet<_>>();
+    if bool_at(task, &["action_policy", "browser", "allowed"]) == Some(true)
+        && !task_heavy_leases.contains("BROWSER")
+    {
+        diagnostics.push(ValidationDiagnostic::new(
+            DiagnosticCode::ResourcePolicy,
+            format!("{path}/resource_budget/heavy_leases"),
+            "browser use requires BROWSER task resource authority",
+        ));
+    }
     if has_command_verification && !task_heavy_leases.contains("BUILD_HEAVY") {
         diagnostics.push(ValidationDiagnostic::new(
             DiagnosticCode::ResourcePolicy,

@@ -5,9 +5,11 @@ use sovereign_policy::{
     M6ResourceGovernorSnapshotV1, OsMemoryPressure, ResourceAdmissionDecisionV1,
     ResourceGovernorRestoreError, ResourceLeaseRequestV1, ResourceLeaseV1, ResourcePolicyEventV1,
     ResourcePressureEventV1, ResourcePressureSnapshotV1, ThermalPressure,
+    browser::BrowserLoopbackCapabilityV1,
 };
 use std::collections::BTreeSet;
 use std::io;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,8 +18,10 @@ pub(crate) const RESOURCE_PRESSURE_NAMESPACE: &str = "controller.resource_pressu
 pub(crate) const RESOURCE_RESIDENCY_NAMESPACE: &str = "controller.resource_residency";
 pub(crate) const RESOURCE_GOVERNOR_NAMESPACE: &str = "controller.resource_governor";
 pub(crate) const MODEL_RESIDENCY_KEY: &str = "model";
+pub(crate) const BROWSER_RESIDENCY_KEY: &str = "cdp_browser";
 pub(crate) const RESOURCE_GOVERNOR_KEY: &str = "active";
 pub(crate) const RESOURCE_RESIDENCY_SCHEMA_VERSION: u32 = 1;
+pub(crate) const BROWSER_RESOURCE_RESIDENCY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -54,84 +58,77 @@ impl ResourceResidencyV1 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserResourceResidencyStateV1 {
+    Reserved,
+    Resident,
+    Stopping,
+    Absent,
+    Unknown,
+}
+
+/// Durable Controller binding between one logical `CDP_BROWSER` lease and its physical Chrome
+/// process-group/root/loopback authority.
+///
+/// `Reserved` intentionally does *not* prove physical absence after restart. The Controller writes
+/// it before spawning Chrome so a crash in the spawn-to-identity window fails closed as Unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserResourceResidencyV1 {
+    pub schema_version: u32,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub task_id: String,
+    pub task_contract_digest: String,
+    pub execution_epoch: i64,
+    pub policy_lease: ResourceLeaseV1,
+    pub browser_lease_id: String,
+    pub browser_lease_binding_digest: String,
+    pub loopback_capability: BrowserLoopbackCapabilityV1,
+    pub state: BrowserResourceResidencyStateV1,
+    pub process_group_id: Option<u32>,
+    pub process_group_leader_identity: Option<String>,
+    pub private_parent: PathBuf,
+    pub profile_root: PathBuf,
+    pub download_root: Option<PathBuf>,
+    pub ephemeral_profile: bool,
+    pub updated_at_ms: i64,
+}
+
+impl BrowserResourceResidencyV1 {
+    #[must_use]
+    pub fn exact_process_binding(&self) -> Option<(u32, &str)> {
+        self.process_group_id
+            .zip(self.process_group_leader_identity.as_deref())
+    }
+}
+
 /// Controller-side resource coordinator. The policy crate decides admission; this type owns the
 /// runtime binding to physical residency but performs no persistence by itself.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ControllerResourceCoordinator {
     governor: M6ResourceGovernor,
     model_residency: Option<ResourceResidencyV1>,
+    browser_residency: Option<BrowserResourceResidencyV1>,
 }
 
 impl ControllerResourceCoordinator {
     pub(crate) fn restore(
         snapshot: &M6ResourceGovernorSnapshotV1,
         model_residency: Option<ResourceResidencyV1>,
+        browser_residency: Option<BrowserResourceResidencyV1>,
     ) -> Result<Self, ResourceGovernorRestoreError> {
         let governor = M6ResourceGovernor::restore(HardwareProfileV1::m1_8gb(), snapshot)?;
-        let active_model_leases = governor
-            .active_leases()
-            .filter(|lease| lease.class == HeavyLeaseClass::Model)
-            .cloned()
-            .collect::<Vec<_>>();
-        if active_model_leases.len() > 1 {
-            return Err(ResourceGovernorRestoreError::InvalidLease {
-                lease_id: active_model_leases
-                    .first()
-                    .map_or_else(|| "MODEL".to_owned(), |lease| lease.lease_id.clone()),
-                reason: "more than one active MODEL lease survived durable restore".to_owned(),
-            });
-        }
-        match model_residency.as_ref() {
-            Some(residency) => {
-                if residency.schema_version != RESOURCE_RESIDENCY_SCHEMA_VERSION {
-                    return Err(ResourceGovernorRestoreError::InvalidLease {
-                        lease_id: residency.policy_lease.lease_id.clone(),
-                        reason: "unsupported Controller residency schema version".to_owned(),
-                    });
-                }
-                if residency.policy_lease.class != HeavyLeaseClass::Model
-                    || residency.policy_lease.owner.plan_id != residency.plan_id
-                    || residency.policy_lease.owner.plan_revision != residency.plan_revision
-                    || residency.policy_lease.owner.task_id != residency.task_id
-                {
-                    return Err(ResourceGovernorRestoreError::InvalidLease {
-                        lease_id: residency.policy_lease.lease_id.clone(),
-                        reason: "MODEL residency scope disagrees with its policy lease".to_owned(),
-                    });
-                }
-                let active = active_model_leases
-                    .iter()
-                    .find(|lease| lease.lease_id == residency.policy_lease.lease_id);
-                if residency.state != ResourceResidencyStateV1::Absent {
-                    if active != Some(&residency.policy_lease) {
-                        return Err(ResourceGovernorRestoreError::InvalidLease {
-                            lease_id: residency.policy_lease.lease_id.clone(),
-                            reason: "possibly-resident MODEL is not backed by the exact active logical lease"
-                                .to_owned(),
-                        });
-                    }
-                } else if let Some(active) = active
-                    && active != &residency.policy_lease
-                {
-                    return Err(ResourceGovernorRestoreError::InvalidLease {
-                        lease_id: residency.policy_lease.lease_id.clone(),
-                        reason: "absent MODEL residency disagrees with active logical lease bytes"
-                            .to_owned(),
-                    });
-                }
-            }
-            None if !active_model_leases.is_empty() => {
-                return Err(ResourceGovernorRestoreError::InvalidLease {
-                    lease_id: active_model_leases[0].lease_id.clone(),
-                    reason: "active MODEL lease has no durable physical-residency record"
-                        .to_owned(),
-                });
-            }
-            None => {}
-        }
+        let active_model_leases = active_leases_for(&governor, HeavyLeaseClass::Model);
+        validate_single_active_lease(&active_model_leases, "MODEL")?;
+        let active_browser_leases = active_leases_for(&governor, HeavyLeaseClass::CdpBrowser);
+        validate_single_active_lease(&active_browser_leases, "CDP_BROWSER")?;
+        validate_model_residency(model_residency.as_ref(), &active_model_leases)?;
+        validate_browser_residency(browser_residency.as_ref(), &active_browser_leases)?;
         Ok(Self {
             governor,
             model_residency,
+            browser_residency,
         })
     }
 
@@ -159,6 +156,32 @@ impl ControllerResourceCoordinator {
         self.governor.release(lease_id)
     }
 
+    // Browser lifecycle integration calls this from controller/browser.rs; keep the seam
+    // crate-private until that owner wires the lifecycle without widening resource authority.
+    #[allow(dead_code)]
+    pub(crate) fn touch(&mut self, lease_id: &str, now_ms: i64) -> Option<ResourcePolicyEventV1> {
+        self.governor.touch(lease_id, now_ms)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn mark_idle(
+        &mut self,
+        lease_id: &str,
+        now_ms: i64,
+    ) -> Option<ResourcePolicyEventV1> {
+        self.governor.mark_idle(lease_id, now_ms)
+    }
+
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn eviction_decisions(
+        &self,
+        pressure: &ResourcePressureEventV1,
+        now_ms: i64,
+    ) -> Vec<ResourcePolicyEventV1> {
+        self.governor.eviction_decisions(pressure, now_ms)
+    }
+
     pub(crate) fn record_eviction(
         &mut self,
         lease_id: &str,
@@ -181,6 +204,19 @@ impl ControllerResourceCoordinator {
     }
 
     #[must_use]
+    pub(crate) fn browser_residency(&self) -> Option<&BrowserResourceResidencyV1> {
+        self.browser_residency.as_ref()
+    }
+
+    pub(crate) fn set_browser_residency(&mut self, residency: BrowserResourceResidencyV1) {
+        self.browser_residency = Some(residency);
+    }
+
+    pub(crate) fn clear_browser_residency(&mut self) {
+        self.browser_residency = None;
+    }
+
+    #[must_use]
     pub(crate) fn profile(&self) -> &HardwareProfileV1 {
         self.governor.profile()
     }
@@ -197,6 +233,265 @@ impl ControllerResourceCoordinator {
     pub(crate) fn admission_is_success(decision: &ResourceAdmissionDecisionV1) -> bool {
         decision.status == AdmissionStatus::Admitted && decision.lease.is_some()
     }
+}
+
+#[cfg(test)]
+mod coordinator_tests {
+    use super::ControllerResourceCoordinator;
+    use sovereign_policy::{
+        AdmissionStatus, ConditionalLeaseContextV1, HeavyLeaseClass, LeaseStateV1,
+        OsMemoryPressure, ResourceLeaseOwnerV1, ResourceLeaseRequestV1, ResourcePolicyEventV1,
+        ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
+    };
+
+    fn green_snapshot(observed_at_ms: i64) -> ResourcePressureSnapshotV1 {
+        ResourcePressureSnapshotV1 {
+            schema_version: 1,
+            observed_at_ms,
+            controlled_working_set_mib: 512,
+            host_headroom_mib: 6_000,
+            swap_used_mib: Some(0),
+            swap_out_growth_mib_per_min: 0,
+            compressor_growth_mib_per_min: 0,
+            os_memory_pressure: OsMemoryPressure::Normal,
+            recent_pressure_event: false,
+            thermal_pressure: ThermalPressure::Normal,
+            allocation_failure: false,
+            repeated_resource_kill: false,
+            uncontrolled_child_growth: false,
+            host_free_disk_mib: Some(64 * 1_024),
+        }
+    }
+
+    fn browser_request(lease_id: &str) -> ResourceLeaseRequestV1 {
+        ResourceLeaseRequestV1 {
+            lease_id: lease_id.to_owned(),
+            owner: ResourceLeaseOwnerV1 {
+                plan_id: "plan.browser".to_owned(),
+                plan_revision: 1,
+                task_id: "task.browser".to_owned(),
+            },
+            class: HeavyLeaseClass::CdpBrowser,
+            calibrated: true,
+            calibrated_p95_rss_mib: 512,
+            evictable_idle_rss_mib: 512,
+            task_budget: TaskResourceBudgetV1::new(
+                5_500,
+                8,
+                [HeavyLeaseClass::CdpBrowser.plan_ir_class()],
+            ),
+            conditional: ConditionalLeaseContextV1::default(),
+            automatic_reload: false,
+            disk_expanding: false,
+        }
+    }
+
+    #[test]
+    fn coordinator_browser_lifecycle_passthroughs_preserve_governor_state_and_eviction_rules() {
+        let mut coordinator = ControllerResourceCoordinator::default();
+        let pressure = coordinator.observe_pressure(green_snapshot(1_000));
+        let request = browser_request("browser.lease");
+        let admission = coordinator.admit(&request, &pressure);
+        assert_eq!(admission.status, AdmissionStatus::Admitted);
+        assert!(coordinator.active_lease("browser.lease").is_some());
+
+        let idle = coordinator.mark_idle("browser.lease", 2_000);
+        assert_eq!(
+            idle,
+            Some(ResourcePolicyEventV1::MarkIdle {
+                lease_id: "browser.lease".to_owned(),
+            })
+        );
+        let lease = coordinator
+            .active_lease("browser.lease")
+            .unwrap_or_else(|| panic!("admitted browser lease disappeared after mark_idle"));
+        assert_eq!(lease.state, LeaseStateV1::Idle);
+        assert_eq!(lease.idle_since_ms, Some(2_000));
+        assert!(coordinator.eviction_decisions(&pressure, 61_999).is_empty());
+        assert_eq!(
+            coordinator.eviction_decisions(&pressure, 62_000),
+            vec![ResourcePolicyEventV1::Evict {
+                lease_id: "browser.lease".to_owned(),
+                class: HeavyLeaseClass::CdpBrowser,
+            }]
+        );
+        assert_eq!(
+            coordinator
+                .active_lease("browser.lease")
+                .unwrap_or_else(|| panic!("eviction decision must not mutate lease state"))
+                .state,
+            LeaseStateV1::Idle
+        );
+
+        let touch = coordinator.touch("browser.lease", 62_001);
+        assert_eq!(
+            touch,
+            Some(ResourcePolicyEventV1::Touch {
+                lease_id: "browser.lease".to_owned(),
+            })
+        );
+        let lease = coordinator
+            .active_lease("browser.lease")
+            .unwrap_or_else(|| panic!("browser lease disappeared after touch"));
+        assert_eq!(lease.state, LeaseStateV1::Active);
+        assert_eq!(lease.last_used_at_ms, 62_001);
+        assert_eq!(lease.idle_since_ms, None);
+        assert!(
+            coordinator
+                .eviction_decisions(&pressure, 200_000)
+                .is_empty()
+        );
+        assert_eq!(coordinator.touch("missing", 1), None);
+        assert_eq!(coordinator.mark_idle("missing", 1), None);
+    }
+}
+
+fn active_leases_for(
+    governor: &M6ResourceGovernor,
+    class: HeavyLeaseClass,
+) -> Vec<ResourceLeaseV1> {
+    governor
+        .active_leases()
+        .filter(|lease| lease.class == class)
+        .cloned()
+        .collect()
+}
+
+fn validate_single_active_lease(
+    leases: &[ResourceLeaseV1],
+    label: &str,
+) -> Result<(), ResourceGovernorRestoreError> {
+    if leases.len() <= 1 {
+        return Ok(());
+    }
+    Err(ResourceGovernorRestoreError::InvalidLease {
+        lease_id: leases
+            .first()
+            .map_or_else(|| label.to_owned(), |lease| lease.lease_id.clone()),
+        reason: format!("more than one active {label} lease survived durable restore"),
+    })
+}
+
+fn validate_model_residency(
+    residency: Option<&ResourceResidencyV1>,
+    active_model_leases: &[ResourceLeaseV1],
+) -> Result<(), ResourceGovernorRestoreError> {
+    let Some(residency) = residency else {
+        if let Some(active) = active_model_leases.first() {
+            return Err(ResourceGovernorRestoreError::InvalidLease {
+                lease_id: active.lease_id.clone(),
+                reason: "active MODEL lease has no durable physical-residency record".to_owned(),
+            });
+        }
+        return Ok(());
+    };
+    if residency.schema_version != RESOURCE_RESIDENCY_SCHEMA_VERSION {
+        return Err(ResourceGovernorRestoreError::InvalidLease {
+            lease_id: residency.policy_lease.lease_id.clone(),
+            reason: "unsupported Controller residency schema version".to_owned(),
+        });
+    }
+    if residency.policy_lease.class != HeavyLeaseClass::Model
+        || residency.policy_lease.owner.plan_id != residency.plan_id
+        || residency.policy_lease.owner.plan_revision != residency.plan_revision
+        || residency.policy_lease.owner.task_id != residency.task_id
+    {
+        return Err(ResourceGovernorRestoreError::InvalidLease {
+            lease_id: residency.policy_lease.lease_id.clone(),
+            reason: "MODEL residency scope disagrees with its policy lease".to_owned(),
+        });
+    }
+    validate_residency_logical_lease(
+        &residency.policy_lease,
+        residency.state == ResourceResidencyStateV1::Absent,
+        active_model_leases,
+        "MODEL",
+    )
+}
+
+fn validate_browser_residency(
+    residency: Option<&BrowserResourceResidencyV1>,
+    active_browser_leases: &[ResourceLeaseV1],
+) -> Result<(), ResourceGovernorRestoreError> {
+    let Some(residency) = residency else {
+        if let Some(active) = active_browser_leases.first() {
+            return Err(ResourceGovernorRestoreError::InvalidLease {
+                lease_id: active.lease_id.clone(),
+                reason: "active CDP_BROWSER lease has no durable physical-residency record"
+                    .to_owned(),
+            });
+        }
+        return Ok(());
+    };
+    if residency.schema_version != BROWSER_RESOURCE_RESIDENCY_SCHEMA_VERSION {
+        return Err(ResourceGovernorRestoreError::InvalidLease {
+            lease_id: residency.policy_lease.lease_id.clone(),
+            reason: "unsupported Controller browser residency schema version".to_owned(),
+        });
+    }
+    if residency.policy_lease.class != HeavyLeaseClass::CdpBrowser
+        || residency.policy_lease.owner.plan_id != residency.plan_id
+        || residency.policy_lease.owner.plan_revision != residency.plan_revision
+        || residency.policy_lease.owner.task_id != residency.task_id
+        || residency.browser_lease_id != residency.policy_lease.lease_id
+        || residency.loopback_capability.lease_id != residency.browser_lease_id
+        || residency.loopback_capability.execution_epoch != residency.execution_epoch
+    {
+        return Err(ResourceGovernorRestoreError::InvalidLease {
+            lease_id: residency.policy_lease.lease_id.clone(),
+            reason: "CDP_BROWSER residency scope disagrees with its logical/browser/loopback lease binding"
+                .to_owned(),
+        });
+    }
+    let process_binding_is_complete =
+        residency.process_group_id.is_some() == residency.process_group_leader_identity.is_some();
+    if !process_binding_is_complete
+        || matches!(
+            residency.state,
+            BrowserResourceResidencyStateV1::Resident | BrowserResourceResidencyStateV1::Stopping
+        ) && residency.exact_process_binding().is_none()
+    {
+        return Err(ResourceGovernorRestoreError::InvalidLease {
+            lease_id: residency.policy_lease.lease_id.clone(),
+            reason: "CDP_BROWSER residency has an incomplete physical process-group binding"
+                .to_owned(),
+        });
+    }
+    validate_residency_logical_lease(
+        &residency.policy_lease,
+        residency.state == BrowserResourceResidencyStateV1::Absent,
+        active_browser_leases,
+        "CDP_BROWSER",
+    )
+}
+
+fn validate_residency_logical_lease(
+    policy_lease: &ResourceLeaseV1,
+    physically_absent: bool,
+    active_leases: &[ResourceLeaseV1],
+    label: &str,
+) -> Result<(), ResourceGovernorRestoreError> {
+    let active = active_leases
+        .iter()
+        .find(|lease| lease.lease_id == policy_lease.lease_id);
+    if !physically_absent && active != Some(policy_lease) {
+        return Err(ResourceGovernorRestoreError::InvalidLease {
+            lease_id: policy_lease.lease_id.clone(),
+            reason: format!(
+                "possibly-resident {label} is not backed by the exact active logical lease"
+            ),
+        });
+    }
+    if physically_absent
+        && let Some(active) = active
+        && active != policy_lease
+    {
+        return Err(ResourceGovernorRestoreError::InvalidLease {
+            lease_id: policy_lease.lease_id.clone(),
+            reason: format!("absent {label} residency disagrees with active logical lease bytes"),
+        });
+    }
+    Ok(())
 }
 
 /// Live pressure source. Production uses [`MacOsResourceProbe`]; deterministic tests inject a

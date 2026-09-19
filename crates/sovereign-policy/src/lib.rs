@@ -3,6 +3,7 @@
 //! This crate owns admission policy only. It does not execute tools and it does
 //! not grant itself authority from repository/model/tool text.
 
+pub mod browser;
 mod resources;
 
 pub use resources::{

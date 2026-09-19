@@ -1,0 +1,247 @@
+{
+  "schema_version": 1,
+  "task_id": "M7-T03",
+  "title": "Add isolated CDP browser lease",
+  "status": "completed",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "beb65d822791da52cccb6af28b9e3d2afcc662c0",
+  "completed_at": "2026-09-19T03:09:16Z",
+  "verified_at": "2026-09-19T03:09:16Z",
+  "dependencies": [
+    "M7-T02",
+    "M6-T01",
+    "M6-T04"
+  ],
+  "interfaces": [
+    "BrowserAdapter",
+    "BrowserLease",
+    "BrowserStateSynopsis"
+  ],
+  "objective": "Provide deterministic page navigation/DOM/actions/screenshots/downloads under domain/profile/download-root policy with browser process lifecycle controlled by ResourceGovernor.",
+  "frozen_tree": {
+    "head": "beb65d822791da52cccb6af28b9e3d2afcc662c0",
+    "dirty_path_count": 13,
+    "git_status": [
+      "M crates/sovereign-controller/src/lib.rs",
+      "M crates/sovereign-controller/src/resources.rs",
+      "M crates/sovereign-controller/src/roles.rs",
+      "M crates/sovereign-plan/src/lib.rs",
+      "M crates/sovereign-plan/tests/validator.rs",
+      "M crates/sovereign-policy/src/lib.rs",
+      "M crates/sovereign-tools/src/lib.rs",
+      "?? crates/sovereign-controller/src/browser.rs",
+      "?? crates/sovereign-eval/tests/browser_policy.rs",
+      "?? crates/sovereign-policy/src/browser.rs",
+      "?? crates/sovereign-policy/tests/browser.rs",
+      "?? crates/sovereign-tools/src/browser.rs",
+      "?? crates/sovereign-tools/tests/browser.rs"
+    ],
+    "git_diff_check": "passed"
+  },
+  "source_hashes": {
+    "crates/sovereign-controller/src/lib.rs": "sha256:a3761a3852641fc9f1527da1e68a47f42984338871933eaad6d811c2942e98fe",
+    "crates/sovereign-controller/src/resources.rs": "sha256:80976d2d9106b63bd675f6fc606219955a3e0c0e2b2f870496820c981a338283",
+    "crates/sovereign-controller/src/roles.rs": "sha256:d0f5efc631bced51d76a09e60b7fa9dbab5f5360df48e8a2858d77e2df3eb058",
+    "crates/sovereign-controller/src/browser.rs": "sha256:363dd2bff7ed595f953f943ba77ead1f8a5452560bb4955a8f0b77f05c86f4ab",
+    "crates/sovereign-plan/src/lib.rs": "sha256:9794f37129d2c1765b8e155d3dfc73b4014dd39314634401824f0dbd9aa20774",
+    "crates/sovereign-plan/tests/validator.rs": "sha256:2408b9bd518a61f9a33655352a7ebd37c165b564846a047dbe34545ddc2807e7",
+    "crates/sovereign-policy/src/lib.rs": "sha256:12cbb7f4e8c3c82b9c6ca5ddcaf38f8404027819e0a576eccbe4cd5a99f0fbbd",
+    "crates/sovereign-policy/src/browser.rs": "sha256:228bb80ae1f63dc6968fabd04d413966d836a7078e83c4de3b2086239963bd18",
+    "crates/sovereign-policy/tests/browser.rs": "sha256:843a66006098a9cd94f07317c937d6847b86504fc260b016b1572f761bb90a3d",
+    "crates/sovereign-tools/src/lib.rs": "sha256:e379dfcc4b815f2e8e646e0da41b9afaf1e2dfd85b00defe1b18436b6a301c5d",
+    "crates/sovereign-tools/src/browser.rs": "sha256:13587154137f844c6a75298e5d253e4549ddd68d9071787951bae6c839397672",
+    "crates/sovereign-tools/tests/browser.rs": "sha256:0fd76cb4c05a93b414c2245a39321bb87f463eef4e9fe11b748ea9d94e800489",
+    "crates/sovereign-eval/tests/browser_policy.rs": "sha256:cb70cd602c647dadd49e2e7d43e6d042f27efe18048dbfcbf4e88a63a7e3d7ce"
+  },
+  "browser_authority_contract": {
+    "controller_is_sole_browser_lifecycle_authority": true,
+    "browser_interactive_capability_required": true,
+    "read_methods_require_network_read_or_network_write": true,
+    "write_methods_require_network_write_or_external_side_effect": true,
+    "per_launch_gateway_token_and_capability_bound": true,
+    "privileged_top_level_schemes_denied": true,
+    "redirect_popup_child_target_and_connected_peer_checks_enforced": true,
+    "non_top_level_state_changing_page_requests_denied": true,
+    "top_level_submit_form_requires_controller_authorization": true,
+    "acquired_browser_content_cannot_expand_controller_authority": true
+  },
+  "profile_process_contract": {
+    "isolated_profile_default": true,
+    "persistent_profile_requires_explicit_persisted_grant": true,
+    "persistent_profile_unrelated_storage_non_leak_proven": true,
+    "ambient_home_omitted": true,
+    "environment_cleared": true,
+    "tmpdir_equals_profile_root": true,
+    "explicit_user_data_dir": true,
+    "graceful_browser_close_before_term_kill_fallback": true,
+    "exact_process_group_absence_required_before_release": true,
+    "persistent_profile_preserved_on_shutdown_and_recovery": true
+  },
+  "download_and_screenshot_contract": {
+    "download_behavior_allow_and_name": true,
+    "completed_download_path_exact_guid_leaf": true,
+    "suggested_filename_is_not_authority": true,
+    "retained_artifact_hashed_typed_size_bounded": true,
+    "downloads_never_auto_opened_or_executed": true,
+    "retained_download_charges_task_budget_exact_bytes": true,
+    "retained_download_charges_goal_budget_exact_bytes": true,
+    "identical_retention_retry_idempotent": true,
+    "same_key_drift_rejected": true,
+    "canceled_exact_guid_leaf_cleanup_only": true,
+    "malformed_or_misbound_terminal_never_cleaned": true,
+    "capture_screenshot_supported": true,
+    "credential_bearing_raw_screenshot_retention_fails_closed_without_redaction": true,
+    "screenshots_do_not_become_context_authority": true
+  },
+  "durable_network_accounting_contract": {
+    "active_reservation_subtracts_task_and_goal_remaining": true,
+    "reservation_does_not_precharge_used_bytes": true,
+    "clean_settlement_charges_exact_observed_bytes": true,
+    "unused_reservation_becomes_available_after_settlement": true,
+    "repeated_identical_settlement_idempotent": true,
+    "different_repeated_settlement_rejected": true,
+    "crash_recovery_active_reservation_charged_full_once": true,
+    "legacy_browser_reservation_charge_compatibility_preserved": true,
+    "second_network_budget_ledger_created": false
+  },
+  "journal_recovery_context_contract": {
+    "action_journal_dispatched_before_transport_completion": true,
+    "post_dispatch_failure_becomes_unknown": true,
+    "ambiguous_submit_form_cannot_auto_resubmit": true,
+    "browser_not_marked_idle_after_post_dispatch_unknown": true,
+    "fresh_lease_restart_after_transport_uncertainty_proven": true,
+    "one_consequential_post_proven_across_kill_restart": true,
+    "capture_synopsis_context_only_after_committed_receipt": true,
+    "capture_synopsis_context_is_bounded_sanitized_untrusted_tool_evidence": true,
+    "exact_cas_expansion_binding_proven": true,
+    "sensitive_synopsis_content_suppressed": true
+  },
+  "resource_contract": {
+    "existing_resource_governor_reused": true,
+    "second_resource_governor_created": false,
+    "model_handoff_requires_proven_physical_absence": true,
+    "unknown_model_absence_retains_logical_model_authority": true,
+    "browser_resource_lease_copies_synchronized": true,
+    "browser_action_touches_active_then_committed_receipt_idles": true,
+    "live_eviction_requires_exact_live_browser_session": true,
+    "browser_build_heavy_serialized_on_m1": true,
+    "browser_embedder_serialized_on_m1": true,
+    "arm64_architecture": "arm64",
+    "chrome_version": "Google Chrome 154.0.8037.44",
+    "one_tab_resource_samples": 17,
+    "one_tab_p95_rss_kib": 916560,
+    "one_tab_peak_rss_kib": 916560,
+    "one_tab": true,
+    "zero_resident_after_release": true,
+    "production_calibrated": false
+  },
+  "verification": [
+    {
+      "command": "Google Chrome --version",
+      "result": "passed",
+      "detail": "Google Chrome 154.0.8037.44"
+    },
+    {
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check --workspace --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test --workspace --all-targets --offline",
+      "result": "passed",
+      "details": [
+        "sovereign-policy browser 10/10 passed",
+        "sovereign-plan validator 32/32 passed",
+        "sovereign-tools browser unit 11/11 passed",
+        "sovereign-tools real Chrome browser 17/17 passed",
+        "sovereign-controller lib 59/59 passed",
+        "sovereign-eval browser_policy 12/12 passed",
+        "sovereign-eval crash_resume 30/30 passed",
+        "sovereign-eval m1_8gb_resource_sim 6/6 passed",
+        "sovereign-eval web_acquire 8/8 passed",
+        "all non-ignored workspace tests passed",
+        "compiler_real_local_8k_smoke remained intentionally ignored for mandatory final-tree qualification",
+        "m1_real_qwen_implementation_repair_restart_qualification remained intentionally ignored for mandatory final-tree qualification"
+      ]
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy --workspace --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --lib browser_handoff_ --offline -- --nocapture",
+      "result": "passed",
+      "detail": "2/2 passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --lib browser_download_terminal_tests --offline -- --nocapture",
+      "result": "passed",
+      "detail": "11/11 passed"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --test browser_policy transport_uncertainty_cleanup_and_fresh_lease_restart_never_replays_submit --offline -- --nocapture",
+      "result": "passed",
+      "detail": "1/1 passed"
+    },
+    {
+      "command": "cargo test -p sovereign-eval --test browser_policy <arm64 one-tab resource proof>",
+      "result": "passed",
+      "detail": "architecture=arm64 samples=17 p95_rss_kib=916560 peak_rss_kib=916560 one_tab=true zero-resident completion passed"
+    }
+  ],
+  "independent_audit": {
+    "worker": "worker-79",
+    "mode": "fresh exact-tree read-only closure audit",
+    "result": "CLOSABLE",
+    "verdict": "M7-T03 frozen task: CLOSABLE",
+    "blockers": [],
+    "exact_tree_reverified": true,
+    "independent_focused_validation": [
+      "sovereign-controller browser lib 14/14 passed",
+      "sovereign-eval browser_policy 12/12 passed",
+      "sovereign-policy browser 10/10 passed",
+      "sovereign-tools browser 17/17 passed",
+      "git diff --check passed"
+    ]
+  },
+  "state_authority": {
+    "controller_sole_execution_and_lifecycle_authority": true,
+    "state_store_remains_single_authoritative_execution_database": true,
+    "action_journal_remains_single_authoritative_action_journal": true,
+    "resource_governor_remains_single_resource_authority": true,
+    "second_authority_database_created": false,
+    "second_action_journal_created": false,
+    "second_network_budget_ledger_created": false,
+    "second_disk_budget_ledger_created": false
+  },
+  "intentional_final_release_tests_deferred": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false,
+    "network_package_install": false
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  }
+}

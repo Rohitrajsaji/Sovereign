@@ -68,22 +68,28 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod browser;
 mod local_control;
 mod resources;
 mod roles;
 mod skills;
+
+pub use browser::{
+    AuthorizedBrowserAction, BrowserDestinationV1, BrowserTaskAuthorityV1, browser_destination,
+};
 
 pub use local_control::{
     LOCAL_CONTROL_READ_MODEL_SCHEMA_VERSION, LocalControl, LocalControlCheckpointV1,
     LocalControlReadModelV1, LocalControlRecoveryProjectionV1,
 };
 use resources::{
-    ControllerResourceCoordinator, MODEL_RESIDENCY_KEY, RESOURCE_GOVERNOR_KEY,
-    RESOURCE_GOVERNOR_NAMESPACE, RESOURCE_LEASE_NAMESPACE, RESOURCE_PRESSURE_NAMESPACE,
-    RESOURCE_RESIDENCY_NAMESPACE, resource_event_payload,
+    BROWSER_RESIDENCY_KEY, ControllerResourceCoordinator, MODEL_RESIDENCY_KEY,
+    RESOURCE_GOVERNOR_KEY, RESOURCE_GOVERNOR_NAMESPACE, RESOURCE_LEASE_NAMESPACE,
+    RESOURCE_PRESSURE_NAMESPACE, RESOURCE_RESIDENCY_NAMESPACE, resource_event_payload,
 };
 pub use resources::{
-    MacOsResourceProbe, ResourcePressureProbe, ResourceResidencyStateV1, ResourceResidencyV1,
+    BrowserResourceResidencyStateV1, BrowserResourceResidencyV1, MacOsResourceProbe,
+    ResourcePressureProbe, ResourceResidencyStateV1, ResourceResidencyV1,
 };
 pub use roles::{
     ROLE_OUTPUT_SCHEMA_VERSION, ROLE_PROFILE_SCHEMA_VERSION, ROLE_PROFILE_VERSION, RoleDisposition,
@@ -137,6 +143,13 @@ const EXTERNAL_MAX_OUTPUT_TOKENS: u32 = 1_024;
 const EXTERNAL_MAX_EVIDENCE_ITEMS: usize = 16;
 const MAX_PROPOSAL_EVIDENCE_IDS: usize = 16;
 const MAX_PROPOSAL_EVIDENCE_ID_BYTES: usize = 512;
+
+#[derive(Debug, Default)]
+struct NetworkChargePersistence {
+    records: Vec<(String, String, String)>,
+    events: Vec<(String, String, Value)>,
+}
+
 const ATOMIC_REPLACE_HELPER: &str = r"import hashlib, os, pathlib, sys
 p=pathlib.Path(sys.argv[1]); expected=sys.argv[2]; old=sys.argv[3]; new=sys.argv[4]
 data=p.read_bytes()
@@ -945,6 +958,7 @@ pub struct ControllerResourceSnapshotV1 {
     pub execution_epoch: i64,
     pub governor: M6ResourceGovernorSnapshotV1,
     pub model_residency: Option<ResourceResidencyV1>,
+    pub browser_residency: Option<BrowserResourceResidencyV1>,
 }
 
 impl ReadyLease {
@@ -2160,6 +2174,7 @@ impl Controller {
             execution_epoch: self.state.current_execution_epoch()?,
             governor: self.resources.snapshot(),
             model_residency: self.resources.model_residency().cloned(),
+            browser_residency: self.resources.browser_residency().cloned(),
         })
     }
 
@@ -2996,27 +3011,44 @@ impl Controller {
     }
 
     fn external_network_remaining(&self, task_id: &str) -> Result<u64, ControllerError> {
+        self.network_remaining(task_id, "external network")
+    }
+
+    fn network_remaining(&self, task_id: &str, label: &str) -> Result<u64, ControllerError> {
         let active = self.active_ref()?;
         let task = active
             .tasks
             .get(task_id)
             .ok_or_else(|| ControllerError::InvalidPlan(format!("unknown task {task_id}")))?;
         let task_budget = task.autonomy_budget.as_ref().ok_or_else(|| {
-            ControllerError::NotReady(
-                "task has no durable autonomy budget; external network is blocked".to_owned(),
-            )
+            ControllerError::NotReady(format!(
+                "task has no durable autonomy budget; {label} is blocked"
+            ))
         })?;
         task_budget.validate()?;
         active.goal_autonomy_budget.validate()?;
-        Ok(task_budget
+        let (task_reserved, goal_reserved) =
+            self.active_browser_network_reservation_bytes(task_id)?;
+        let task_remaining = task_budget
             .max_network_bytes
             .saturating_sub(task_budget.used_network_bytes)
-            .min(
-                active
-                    .goal_autonomy_budget
-                    .max_network_bytes
-                    .saturating_sub(active.goal_autonomy_budget.used_network_bytes),
-            ))
+            .checked_sub(task_reserved)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "active browser network reservations exceed the task network budget".to_owned(),
+                )
+            })?;
+        let goal_remaining = active
+            .goal_autonomy_budget
+            .max_network_bytes
+            .saturating_sub(active.goal_autonomy_budget.used_network_bytes)
+            .checked_sub(goal_reserved)
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "active browser network reservations exceed the goal network budget".to_owned(),
+                )
+            })?;
+        Ok(task_remaining.min(goal_remaining))
     }
 
     fn charge_external_transport_usage(
@@ -3047,7 +3079,13 @@ impl Controller {
         phase: &str,
         bytes: u64,
     ) -> Result<(), ControllerError> {
-        self.persist_external_network_charge(task_id, action_id, phase, bytes)?;
+        self.persist_network_charge(
+            task_id,
+            action_id,
+            "external_network_budget_charged",
+            phase,
+            bytes,
+        )?;
         self.checkpoint_now()?;
         Ok(())
     }
@@ -3059,6 +3097,42 @@ impl Controller {
         phase: &str,
         bytes: u64,
     ) -> Result<(), ControllerError> {
+        self.persist_network_charge(
+            task_id,
+            action_id,
+            "external_network_budget_charged",
+            phase,
+            bytes,
+        )
+    }
+
+    fn persist_network_charge(
+        &mut self,
+        task_id: &str,
+        action_id: &str,
+        event_kind: &str,
+        phase: &str,
+        bytes: u64,
+    ) -> Result<(), ControllerError> {
+        self.persist_network_charge_with_persistence(
+            task_id,
+            action_id,
+            event_kind,
+            phase,
+            bytes,
+            NetworkChargePersistence::default(),
+        )
+    }
+
+    fn persist_network_charge_with_persistence(
+        &mut self,
+        task_id: &str,
+        action_id: &str,
+        event_kind: &str,
+        phase: &str,
+        bytes: u64,
+        mut additional: NetworkChargePersistence,
+    ) -> Result<(), ControllerError> {
         let (previous_task_budget, previous_goal_budget) = {
             let active = self.active_ref()?;
             let task = active
@@ -3068,7 +3142,7 @@ impl Controller {
             (
                 task.autonomy_budget.clone().ok_or_else(|| {
                     ControllerError::NotReady(
-                        "task has no durable autonomy budget; external network is blocked"
+                        "task has no durable autonomy budget; network transfer is blocked"
                             .to_owned(),
                     )
                 })?,
@@ -3099,22 +3173,23 @@ impl Controller {
                 serde_json::to_string(self.active_ref()?.tasks.get(task_id).ok_or_else(|| {
                     ControllerError::InvalidPlan(format!("unknown task {task_id}"))
                 })?)?;
-            self.persist_runtime_records_with_events(
-                &[("controller.task".to_owned(), task_id.to_owned(), task_json)],
-                &[(
-                    "external_network_budget_charged".to_owned(),
-                    task_id.to_owned(),
-                    json!({
-                        "action_id": action_id,
-                        "phase": phase,
-                        "bytes": bytes,
-                        "task_runtime": task_runtime,
-                        "autonomy_budget_digest": digest_json(&serde_json::to_value(&task_budget)?)?,
-                        "goal_autonomy_budget": goal_budget,
-                        "goal_autonomy_budget_digest": digest_json(&serde_json::to_value(&goal_budget)?)?,
-                    }),
-                )],
-            )?;
+            let mut records = vec![("controller.task".to_owned(), task_id.to_owned(), task_json)];
+            records.append(&mut additional.records);
+            let mut events = vec![(
+                event_kind.to_owned(),
+                task_id.to_owned(),
+                json!({
+                    "action_id": action_id,
+                    "phase": phase,
+                    "bytes": bytes,
+                    "task_runtime": task_runtime,
+                    "autonomy_budget_digest": digest_json(&serde_json::to_value(&task_budget)?)?,
+                    "goal_autonomy_budget": goal_budget,
+                    "goal_autonomy_budget_digest": digest_json(&serde_json::to_value(&goal_budget)?)?,
+                }),
+            )];
+            events.append(&mut additional.events);
+            self.persist_runtime_records_with_events(&records, &events)?;
             Ok(())
         })();
         if let Err(error) = persistence {
@@ -6870,6 +6945,33 @@ impl Controller {
                 json!({
                     "residency": residency,
                     "post_image_digests": post_image_digests
+                }),
+            )],
+        )?;
+        Ok(())
+    }
+
+    fn persist_browser_resource_residency(
+        &mut self,
+        residency: &BrowserResourceResidencyV1,
+        event_kind: &str,
+    ) -> Result<(), ControllerError> {
+        let key = {
+            let active = self.active_ref()?;
+            active_scoped_key(active, BROWSER_RESIDENCY_KEY)
+        };
+        let value_json = serde_json::to_string(residency)?;
+        let binding_key = format!("{RESOURCE_RESIDENCY_NAMESPACE}:{key}");
+        let post_image_digests =
+            BTreeMap::from([(binding_key, sha256_prefixed(value_json.as_bytes()))]);
+        self.persist_runtime_records_with_events(
+            &[(RESOURCE_RESIDENCY_NAMESPACE.to_owned(), key, value_json)],
+            &[(
+                event_kind.to_owned(),
+                residency.task_id.clone(),
+                json!({
+                    "browser_residency": residency,
+                    "post_image_digests": post_image_digests,
                 }),
             )],
         )?;
@@ -13824,6 +13926,7 @@ impl Controller {
             RESOURCE_LEASE_NAMESPACE,
             RESOURCE_RESIDENCY_NAMESPACE,
             RESOURCE_GOVERNOR_NAMESPACE,
+            browser::BROWSER_NETWORK_RESERVATION_NAMESPACE,
             SECRET_ACTION_LIFECYCLE_NAMESPACE,
         ] {
             for record in self.state.state_records(namespace)? {
@@ -14571,8 +14674,12 @@ fn restore_controller_resources(
 ) -> Result<ControllerResourceCoordinator, ControllerError> {
     let governor_key = revision_scoped_key(&active.plan_id, active.revision, RESOURCE_GOVERNOR_KEY);
     let residency_key = revision_scoped_key(&active.plan_id, active.revision, MODEL_RESIDENCY_KEY);
+    let browser_residency_key =
+        revision_scoped_key(&active.plan_id, active.revision, BROWSER_RESIDENCY_KEY);
     let governor_raw = state.get_state(RESOURCE_GOVERNOR_NAMESPACE, &governor_key)?;
     let residency_raw = state.get_state(RESOURCE_RESIDENCY_NAMESPACE, &residency_key)?;
+    let browser_residency_raw =
+        state.get_state(RESOURCE_RESIDENCY_NAMESPACE, &browser_residency_key)?;
     let current_epoch = state.current_execution_epoch()?;
     let mut durable_active_leases = BTreeMap::new();
     for record in state.state_records(RESOURCE_LEASE_NAMESPACE)? {
@@ -14618,7 +14725,10 @@ fn restore_controller_resources(
     }
 
     let Some(governor_raw) = governor_raw else {
-        if residency_raw.is_some() || !durable_active_leases.is_empty() {
+        if residency_raw.is_some()
+            || browser_residency_raw.is_some()
+            || !durable_active_leases.is_empty()
+        {
             return Err(ControllerError::InvalidPlan(
                 "durable active resource state exists without a resource-governor snapshot"
                     .to_owned(),
@@ -14681,11 +14791,55 @@ fn restore_controller_resources(
             ));
         }
     }
-    ControllerResourceCoordinator::restore(&snapshot, residency).map_err(|error| {
-        ControllerError::InvalidPlan(format!(
-            "durable resource-governor state cannot be restored safely: {error}"
-        ))
-    })
+    let browser_residency = browser_residency_raw
+        .as_deref()
+        .map(serde_json::from_str::<BrowserResourceResidencyV1>)
+        .transpose()?;
+    if let Some(residency) = browser_residency.as_ref() {
+        if residency.plan_id != active.plan_id || residency.plan_revision != active.revision {
+            return Err(ControllerError::InvalidPlan(
+                "durable CDP_BROWSER residency is scoped to a different active plan revision"
+                    .to_owned(),
+            ));
+        }
+        if residency.execution_epoch > current_epoch {
+            return Err(ControllerError::InvalidPlan(format!(
+                "durable CDP_BROWSER residency epoch {} is ahead of current execution epoch {current_epoch}",
+                residency.execution_epoch
+            )));
+        }
+        let task = active.tasks.get(&residency.task_id).ok_or_else(|| {
+            ControllerError::InvalidPlan(format!(
+                "durable CDP_BROWSER residency targets missing task {}",
+                residency.task_id
+            ))
+        })?;
+        if task.task_contract_digest != residency.task_contract_digest {
+            return Err(ControllerError::InvalidPlan(
+                "durable CDP_BROWSER residency task-contract digest is stale".to_owned(),
+            ));
+        }
+        let budget = task_resource_budget_from_value(&task.task)?;
+        if !budget.permits(HeavyLeaseClass::CdpBrowser) {
+            return Err(ControllerError::InvalidPlan(
+                "durable CDP_BROWSER residency is no longer authorized by the active task contract"
+                    .to_owned(),
+            ));
+        }
+        if residency.policy_lease.task_max_peak_rss_mib != budget.max_peak_rss_mib {
+            return Err(ControllerError::InvalidPlan(
+                "durable CDP_BROWSER residency max-RSS binding differs from the active task contract"
+                    .to_owned(),
+            ));
+        }
+    }
+    ControllerResourceCoordinator::restore(&snapshot, residency, browser_residency).map_err(
+        |error| {
+            ControllerError::InvalidPlan(format!(
+                "durable resource-governor state cannot be restored safely: {error}"
+            ))
+        },
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -14738,6 +14892,14 @@ fn reconcile_recovered_resources_before_epoch(
             "resource_recovery_build_heavy_released",
             &lease.owner.task_id,
         )?;
+    }
+
+    let active_leases = controller.resources.snapshot().active_leases;
+    for lease in active_leases
+        .iter()
+        .filter(|lease| lease.class == HeavyLeaseClass::CdpBrowser)
+    {
+        reconcile_recovered_browser_lease(controller, lease, recovery_epoch)?;
     }
 
     let active_leases = controller.resources.snapshot().active_leases;
@@ -14823,6 +14985,178 @@ fn reconcile_recovered_resources_before_epoch(
         &residency.task_id,
     )?;
     controller.resources.clear_model_residency();
+    Ok(())
+}
+
+fn reconcile_recovered_browser_lease(
+    controller: &mut Controller,
+    lease: &ResourceLeaseV1,
+    recovery_epoch: i64,
+) -> Result<(), ControllerError> {
+    let Some(mut residency) = controller.resources.browser_residency().cloned() else {
+        return Err(ControllerError::InvalidPlan(
+            "active recovered CDP_BROWSER lease has no durable browser residency record".to_owned(),
+        ));
+    };
+    if residency.policy_lease != *lease
+        || residency.browser_lease_id != lease.lease_id
+        || residency.execution_epoch > recovery_epoch
+    {
+        return Err(ControllerError::InvalidPlan(
+            "recovered CDP_BROWSER residency is stale or does not bind the exact logical lease"
+                .to_owned(),
+        ));
+    }
+    controller.reconcile_recovered_browser_network_reservation(&residency)?;
+
+    if residency.state != BrowserResourceResidencyStateV1::Absent {
+        let Some((process_group_id, leader_identity)) = residency
+            .exact_process_binding()
+            .map(|(pgid, identity)| (pgid, identity.to_owned()))
+        else {
+            if residency.state != BrowserResourceResidencyStateV1::Unknown {
+                residency.state = BrowserResourceResidencyStateV1::Unknown;
+                residency.updated_at_ms = unix_millis()?;
+                controller.persist_browser_resource_residency(
+                    &residency,
+                    "resource_recovery_browser_spawn_unknown",
+                )?;
+                controller.resources.set_browser_residency(residency);
+                controller.checkpoint_now()?;
+            }
+            return Err(ControllerError::NotReady(
+                "recovery cannot prove whether pre-crash browser spawn occurred; logical CDP_BROWSER authority remains held and execution epoch was not advanced"
+                    .to_owned(),
+            ));
+        };
+
+        if let Err(error) = reap_owned_process_group(process_group_id, &leader_identity) {
+            residency.state = BrowserResourceResidencyStateV1::Unknown;
+            residency.updated_at_ms = unix_millis()?;
+            controller.persist_browser_resource_residency(
+                &residency,
+                "resource_recovery_browser_cleanup_unknown",
+            )?;
+            controller.resources.set_browser_residency(residency);
+            controller.checkpoint_now()?;
+            return Err(ControllerError::NotReady(format!(
+                "recovery could not prove exact CDP_BROWSER process-group cleanup; logical authority remains held: {error}"
+            )));
+        }
+        if let Err(error) = cleanup_recovered_browser_profile(&residency) {
+            residency.state = BrowserResourceResidencyStateV1::Unknown;
+            residency.updated_at_ms = unix_millis()?;
+            controller.persist_browser_resource_residency(
+                &residency,
+                "resource_recovery_browser_profile_cleanup_unknown",
+            )?;
+            controller.resources.set_browser_residency(residency);
+            controller.checkpoint_now()?;
+            return Err(error);
+        }
+        residency.state = BrowserResourceResidencyStateV1::Absent;
+        residency.updated_at_ms = unix_millis()?;
+        controller
+            .persist_browser_resource_residency(&residency, "resource_recovery_browser_absent")?;
+        controller
+            .resources
+            .set_browser_residency(residency.clone());
+        controller.checkpoint_now()?;
+    }
+
+    let policy_event = controller
+        .resources
+        .release(&lease.lease_id)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "recovered absent CDP_BROWSER logical lease disappeared before cleanup".to_owned(),
+            )
+        })?;
+    let mut released = lease.clone();
+    released.state = LeaseStateV1::Released;
+    released.last_used_at_ms = unix_millis()?;
+    controller.persist_resource_lease_transition(
+        &released,
+        &policy_event,
+        "resource_recovery_absent_browser_released",
+        &residency.task_id,
+    )?;
+    controller.resources.clear_browser_residency();
+    controller.checkpoint_now()?;
+    Ok(())
+}
+
+fn cleanup_recovered_browser_profile(
+    residency: &BrowserResourceResidencyV1,
+) -> Result<(), ControllerError> {
+    if !residency.ephemeral_profile {
+        return Ok(());
+    }
+    if !residency.private_parent.is_absolute()
+        || !residency.profile_root.is_absolute()
+        || residency.profile_root.parent() != Some(residency.private_parent.as_path())
+        || !residency
+            .profile_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(".sovereign-browser-"))
+        || residency.download_root.as_ref().is_some_and(|root| {
+            !root.is_absolute()
+                || root.parent() != Some(residency.private_parent.as_path())
+                || root == &residency.profile_root
+                || !root
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.strip_prefix("downloads-"))
+                    .is_some_and(|digest| {
+                        digest.len() == 64
+                            && digest
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    })
+        })
+    {
+        return Err(ControllerError::NotReady(
+            "recovered browser profile ownership path is unsafe; refusing cleanup".to_owned(),
+        ));
+    }
+    let parent_metadata = fs::symlink_metadata(&residency.private_parent)?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || residency.private_parent.canonicalize()? != residency.private_parent
+    {
+        return Err(ControllerError::NotReady(
+            "recovered browser private parent is no longer a stable canonical directory".to_owned(),
+        ));
+    }
+    if let Some(download_root) = residency.download_root.as_ref() {
+        let download_metadata = fs::symlink_metadata(download_root)?;
+        if download_metadata.file_type().is_symlink()
+            || !download_metadata.is_dir()
+            || download_root.canonicalize()? != *download_root
+        {
+            return Err(ControllerError::NotReady(
+                "recovered browser download root is no longer a stable canonical directory"
+                    .to_owned(),
+            ));
+        }
+    }
+    match fs::symlink_metadata(&residency.profile_root) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || residency.profile_root.canonicalize()? != residency.profile_root
+            {
+                return Err(ControllerError::NotReady(
+                    "recovered browser profile root is no longer a stable canonical directory"
+                        .to_owned(),
+                ));
+            }
+            fs::remove_dir_all(&residency.profile_root)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ControllerError::Io(error)),
+    }
     Ok(())
 }
 
@@ -15896,6 +16230,8 @@ fn replay_post_checkpoint_goal_autonomy_budget(
                 "task_model_call_consumed"
                     | "autonomy_action_charged"
                     | "external_network_budget_charged"
+                    | "browser_network_budget_charged"
+                    | "browser_download_retained"
                     | "plan_revision_activated"
             ) {
                 return Err(ControllerError::InvalidPlan(format!(
@@ -16130,6 +16466,7 @@ fn validate_post_checkpoint_resource_correlation(
         RESOURCE_LEASE_NAMESPACE,
         RESOURCE_RESIDENCY_NAMESPACE,
         RESOURCE_GOVERNOR_NAMESPACE,
+        browser::BROWSER_NETWORK_RESERVATION_NAMESPACE,
     ];
     let mut replayed = BTreeMap::new();
     for (binding_key, digest) in &manifest.evidence_binding_digests {
@@ -21051,7 +21388,8 @@ fn unix_millis() -> Result<i64, ControllerError> {
 mod tests {
     use super::{
         ACTION_INTENT_SCHEMA_VERSION, APPROVAL_REQUEST_NAMESPACE, ActivePlan, ApprovalDecisionV1,
-        ApprovalRequestStatusV1, CancellationScopeKindV1, CancellationScopeV1, CancellationTree,
+        ApprovalRequestStatusV1, BrowserResourceResidencyStateV1, BrowserResourceResidencyV1,
+        CancellationScopeKindV1, CancellationScopeV1, CancellationTree,
         CommandVerificationResultV1, Controller, ControllerError, DecodedPersistedActionIntent,
         ExactRequirementProbe, FailureClassification, FailureClassificationKind,
         LEGACY_ACTION_INTENT_SCHEMA_VERSION, PersistedActionIntent,
@@ -21061,17 +21399,18 @@ mod tests {
         VERIFICATION_COMMAND_INTENT_NAMESPACE, VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION,
         VerificationResultV1, VerifiedOutputBindingV1, WorktreeLifecycle,
         acceptance_permits_cross_revision_carry, aggregate_command_verification,
-        build_superseding_runtime, command_verification_failure_code,
-        compilation_inputs_are_fresh_for_carry, compiled_acceptance_contract,
-        dependency_bindings_permit_cross_revision_carry, digest_json, exact_requirement_probe,
-        explicit_replace_relation, fresh_task_runtime, has_unresolved_process_lease,
-        heavy_build_action_id, heavy_build_attempt_id, initial_task_autonomy_budget,
-        inject_build_parallel_job_cap, lineage_records_for_supersession,
-        normalize_persisted_action_intent, normalized_failure_signature, output_binding_key,
-        plan_instruction_fingerprint_digest, process_lease_is_terminal, ready_lease_digest,
-        rebase_goal_autonomy_budget, repair_allowed, required_command_verification_steps,
-        revision_record_key, revision_scoped_key, scope_lineage_id, sha256_prefixed,
-        validate_post_checkpoint_action_authority_correlation, verification_build_lease_id,
+        build_superseding_runtime, cleanup_recovered_browser_profile,
+        command_verification_failure_code, compilation_inputs_are_fresh_for_carry,
+        compiled_acceptance_contract, dependency_bindings_permit_cross_revision_carry, digest_json,
+        exact_requirement_probe, explicit_replace_relation, fresh_task_runtime,
+        has_unresolved_process_lease, heavy_build_action_id, heavy_build_attempt_id,
+        initial_task_autonomy_budget, inject_build_parallel_job_cap,
+        lineage_records_for_supersession, normalize_persisted_action_intent,
+        normalized_failure_signature, output_binding_key, plan_instruction_fingerprint_digest,
+        process_lease_is_terminal, ready_lease_digest, rebase_goal_autonomy_budget, repair_allowed,
+        required_command_verification_steps, revision_record_key, revision_scoped_key,
+        scope_lineage_id, sha256_prefixed, validate_post_checkpoint_action_authority_correlation,
+        verification_build_lease_id,
     };
     use serde_json::{Value, json};
     use sovereign_evidence::ArtifactStore;
@@ -21080,12 +21419,16 @@ mod tests {
         ModelResidencyProof,
     };
     use sovereign_plan::{PlanRevisionDiff, ReplanScope};
+    use sovereign_policy::browser::{
+        BROWSER_LOOPBACK_CAPABILITY_SCHEMA_VERSION, BrowserLoopbackCapabilityV1,
+    };
     use sovereign_policy::{
         AUTONOMY_BUDGET_SCHEMA_VERSION, AdmissionStatus, AutonomyBudgetV1, CapabilityLayers,
         CapabilitySet, CommandMode, CommandRisk, CommandSpec, ConditionalLeaseContextV1,
-        HeavyLeaseClass, OsMemoryPressure, PermissionDecision, PlanHeavyLeaseClass,
-        RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION, ReconciliationPolicy, ResourceLeaseOwnerV1,
-        ResourceLeaseRequestV1, ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
+        HeavyLeaseClass, LeaseStateV1, OsMemoryPressure, PermissionDecision, PlanHeavyLeaseClass,
+        RESOURCE_LEASE_SCHEMA_VERSION, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
+        ReconciliationPolicy, ResourceLeaseOwnerV1, ResourceLeaseRequestV1, ResourceLeaseV1,
+        ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
     };
     use sovereign_repo::{
         ExactRetriever, ProjectRegistry, RepositoryIntelligence, RepositorySnapshot, WorktreeLease,
@@ -21949,6 +22292,96 @@ mod tests {
         let state = StateStore::open(base.join("state.sqlite3"))
             .unwrap_or_else(|error| panic!("state: {error}"));
         (base, state)
+    }
+
+    #[test]
+    fn recovered_browser_cleanup_preserves_download_sibling_and_removes_only_ephemeral_profile() {
+        let (base, state) = temp_state("browser-recovery-download-sibling");
+        let private_parent = base.join("browser-runtime");
+        std::fs::create_dir(&private_parent)
+            .unwrap_or_else(|error| panic!("create browser runtime root: {error}"));
+        let private_parent = private_parent
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("canonical browser runtime root: {error}"));
+        let profile_root = private_parent.join(".sovereign-browser-recovered");
+        std::fs::create_dir(&profile_root)
+            .unwrap_or_else(|error| panic!("create recovered browser profile: {error}"));
+        std::fs::write(profile_root.join("Profile State"), b"ephemeral")
+            .unwrap_or_else(|error| panic!("write recovered profile fixture: {error}"));
+        let download_root = private_parent.join(format!("downloads-{}", "a".repeat(64)));
+        std::fs::create_dir(&download_root)
+            .unwrap_or_else(|error| panic!("create recovered download root: {error}"));
+        let retained_download = download_root.join("retained.txt");
+        std::fs::write(&retained_download, b"retain me")
+            .unwrap_or_else(|error| panic!("write retained download fixture: {error}"));
+
+        let lease_id = "browser:plan.fixture:r1:task.A:1".to_owned();
+        let policy_lease = ResourceLeaseV1 {
+            schema_version: RESOURCE_LEASE_SCHEMA_VERSION,
+            lease_id: lease_id.clone(),
+            owner: ResourceLeaseOwnerV1 {
+                plan_id: "plan.fixture".to_owned(),
+                plan_revision: 1,
+                task_id: "task.A".to_owned(),
+            },
+            class: HeavyLeaseClass::CdpBrowser,
+            plan_ir_class: PlanHeavyLeaseClass::Browser,
+            profile_id: "m1-8gb".to_owned(),
+            profile_digest: format!("sha256:{}", "1".repeat(64)),
+            admitted_pressure_event_id: "pressure.fixture".to_owned(),
+            admitted_at_ms: 1,
+            last_used_at_ms: 1,
+            idle_since_ms: None,
+            idle_ttl_seconds: 0,
+            state: LeaseStateV1::Active,
+            calibrated: false,
+            admission_rss_mib: 1_536,
+            projected_controlled_rss_mib: 2_048,
+            projected_host_headroom_mib: 4_096,
+            task_max_peak_rss_mib: 4_096,
+        };
+        let residency = BrowserResourceResidencyV1 {
+            schema_version: super::resources::BROWSER_RESOURCE_RESIDENCY_SCHEMA_VERSION,
+            plan_id: "plan.fixture".to_owned(),
+            plan_revision: 1,
+            task_id: "task.A".to_owned(),
+            task_contract_digest: format!("sha256:{}", "2".repeat(64)),
+            execution_epoch: 1,
+            policy_lease,
+            browser_lease_id: lease_id.clone(),
+            browser_lease_binding_digest: format!("sha256:{}", "3".repeat(64)),
+            loopback_capability: BrowserLoopbackCapabilityV1 {
+                schema_version: BROWSER_LOOPBACK_CAPABILITY_SCHEMA_VERSION,
+                lease_id,
+                execution_epoch: 1,
+                localhost_port: 43_219,
+                token_digest: format!("sha256:{}", "4".repeat(64)),
+                expires_at_ms: i64::MAX,
+            },
+            state: BrowserResourceResidencyStateV1::Resident,
+            process_group_id: Some(42),
+            process_group_leader_identity: Some("fixture-process".to_owned()),
+            private_parent: private_parent.clone(),
+            profile_root: profile_root.clone(),
+            download_root: Some(download_root.clone()),
+            ephemeral_profile: true,
+            updated_at_ms: 1,
+        };
+
+        cleanup_recovered_browser_profile(&residency)
+            .unwrap_or_else(|error| panic!("cleanup recovered browser profile: {error}"));
+
+        assert!(!profile_root.exists(), "ephemeral profile must be removed");
+        assert!(download_root.is_dir(), "download root must be preserved");
+        assert_eq!(
+            std::fs::read(&retained_download)
+                .unwrap_or_else(|error| panic!("read retained download after cleanup: {error}")),
+            b"retain me"
+        );
+
+        drop(state);
+        std::fs::remove_dir_all(base)
+            .unwrap_or_else(|error| panic!("remove browser recovery fixture: {error}"));
     }
 
     #[test]
