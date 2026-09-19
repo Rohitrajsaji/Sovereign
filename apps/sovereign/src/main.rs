@@ -3,6 +3,7 @@ mod control_api;
 use control_api::{ControlApiRequest, bind_loopback, serve_listener};
 use serde_json::Value;
 use sovereign_controller::{ApprovalDecisionV1, LocalControl};
+use sovereign_eval::{M1_8GB_PROFILE_ID, run_offline_profile};
 use sovereign_state::StateStore;
 use sovereign_types::ErrorCode;
 use std::net::SocketAddr;
@@ -64,6 +65,7 @@ fn run(args: &[String], state_path: &Path) -> Result<String, String> {
             let view = control.read_model().map_err(|error| error.to_string())?;
             serde_json::to_string_pretty(&view.status.evidence).map_err(|error| error.to_string())
         }
+        Some("eval") => run_eval(args),
         Some("pause") => {
             let reason = args.get(1..).unwrap_or_default().join(" ");
             let mut local_control = open_local_control(state_path)?;
@@ -108,29 +110,49 @@ fn run(args: &[String], state_path: &Path) -> Result<String, String> {
                 .map_err(|error| error.to_string())?;
             serde_json::to_string_pretty(&request).map_err(|error| error.to_string())
         }
-        Some("serve") => {
-            if args.len() > 2 {
-                return Err("serve accepts at most one loopback socket address".to_owned());
-            }
-            let address = args
-                .get(1)
-                .cloned()
-                .unwrap_or_else(|| "127.0.0.1:7777".to_owned())
-                .parse::<SocketAddr>()
-                .map_err(|error| format!("invalid serve address: {error}"))?;
-            let listener = bind_loopback(address)?;
-            let local_address = listener.local_addr().map_err(|error| error.to_string())?;
-            eprintln!("sovereign local dashboard listening on http://{local_address}/dashboard");
-            let mut control = open_read_control(state_path)?;
-            serve_listener(&listener, |request| {
-                handle_control_request(&mut control, request)
-            })?;
-            Ok(String::new())
-        }
+        Some("serve") => run_serve(args, state_path),
         Some(command) => Err(format!(
             "unsupported command {command:?}; run `sovereign help` for the local CLI surface"
         )),
     }
+}
+
+fn run_eval(args: &[String]) -> Result<String, String> {
+    if args
+        != [
+            "eval".to_owned(),
+            "--profile".to_owned(),
+            M1_8GB_PROFILE_ID.to_owned(),
+            "--offline".to_owned(),
+        ]
+    {
+        return Err(
+            "eval requires exactly --profile m1-8gb --offline for the frozen M9 local profile"
+                .to_owned(),
+        );
+    }
+    let report = run_offline_profile(M1_8GB_PROFILE_ID)?;
+    serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+}
+
+fn run_serve(args: &[String], state_path: &Path) -> Result<String, String> {
+    if args.len() > 2 {
+        return Err("serve accepts at most one loopback socket address".to_owned());
+    }
+    let address = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:7777".to_owned())
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid serve address: {error}"))?;
+    let listener = bind_loopback(address)?;
+    let local_address = listener.local_addr().map_err(|error| error.to_string())?;
+    eprintln!("sovereign local dashboard listening on http://{local_address}/dashboard");
+    let mut control = open_read_control(state_path)?;
+    serve_listener(&listener, |request| {
+        handle_control_request(&mut control, request)
+    })?;
+    Ok(String::new())
 }
 
 fn open_local_control(state_path: &Path) -> Result<LocalControl, String> {
@@ -195,6 +217,7 @@ fn help_text() -> String {
         "  goal <natural-language goal>  Durably queue a Controller-owned goal intent",
         "  status                        Inspect durable plan/task/attempt/control state",
         "  evidence                      Inspect durable verification evidence",
+        "  eval --profile m1-8gb --offline  Run deterministic local M9 evaluation corpus",
         "  pause [reason]                Pause Controller readiness/mutation",
         "  resume                         Resume Controller readiness/mutation",
         "  approvals                      Render durable approval-request facts",
@@ -248,6 +271,53 @@ mod tests {
             .unwrap_or_else(|error| panic!("status: {error}"));
         assert!(status.contains("Build inventory"));
         assert!(status.contains("queued_for_plan_compilation"));
+    }
+
+    #[test]
+    fn offline_eval_cli_emits_versioned_m1_report() {
+        let state_path = temp_state("eval");
+        let output = run(
+            &[
+                "eval".to_owned(),
+                "--profile".to_owned(),
+                "m1-8gb".to_owned(),
+                "--offline".to_owned(),
+            ],
+            &state_path,
+        )
+        .unwrap_or_else(|error| panic!("run eval: {error}"));
+        let report: serde_json::Value = serde_json::from_str(&output)
+            .unwrap_or_else(|error| panic!("parse eval report: {error}"));
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["profile_id"], "m1-8gb");
+        assert_eq!(report["offline"], true);
+        assert_eq!(report["aggregate"]["scenario_count"], 4);
+        assert_eq!(report["aggregate"]["scenario_pass_count"], 4);
+        assert_eq!(report["aggregate"]["false_completion_accepted"], 0);
+    }
+
+    #[test]
+    fn offline_eval_cli_rejects_profile_or_authority_drift() {
+        let state_path = temp_state("eval-reject");
+        for args in [
+            vec!["eval".to_owned()],
+            vec![
+                "eval".to_owned(),
+                "--profile".to_owned(),
+                "m1-8gb".to_owned(),
+            ],
+            vec![
+                "eval".to_owned(),
+                "--profile".to_owned(),
+                "other".to_owned(),
+                "--offline".to_owned(),
+            ],
+        ] {
+            let error = run(&args, &state_path)
+                .err()
+                .unwrap_or_else(|| panic!("invalid eval invocation unexpectedly succeeded"));
+            assert!(error.contains("eval requires exactly"));
+        }
     }
 
     #[test]

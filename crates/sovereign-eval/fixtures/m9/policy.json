@@ -1,0 +1,122 @@
+{
+  "capability_ceiling": ["read", "repo_write", "process_exec"],
+  "filesystem": {
+    "canonical_roots_required": true,
+    "symlink_escape": "deny",
+    "controller_state_protected": true,
+    "atomic_replace_untrusted_targets": true,
+    "revalidate_before_commit": true,
+    "sibling_repo_requires_scope": true,
+    "protected_path_classes": ["os_roots", "sovereign_internal"]
+  },
+  "process": {
+    "structured_commands": true,
+    "shell_mode": "disabled",
+    "inherit_environment": false,
+    "allowed_env_names": ["CI"],
+    "deny_hidden_execution": true,
+    "untrusted_code_isolation": "required_or_block",
+    "executable_resolution": "pinned_manifest_or_approved_path",
+    "strip_ambient_capabilities": true,
+    "kill_process_tree_on_timeout": true,
+    "default_max_subprocesses": 16
+  },
+  "network": {
+    "default": "offline",
+    "allowed_hosts": [],
+    "allowed_schemes": [],
+    "allowed_ports": [],
+    "allowed_methods": [],
+    "follow_redirects": false,
+    "max_redirects": 0,
+    "allow_private_ranges": false,
+    "dns_revalidation": true,
+    "connected_peer_validation": true,
+    "ambient_proxy": "deny",
+    "allow_task_loopback": false
+  },
+  "secrets": {
+    "allowed_providers": [],
+    "persist_values": false,
+    "redact_evidence": true,
+    "redact_model_context": true,
+    "model_secret_values": "never",
+    "ephemeral_resolution": true,
+    "temporary_file_private": true
+  },
+  "approval": {
+    "exact_action_binding": true,
+    "reapprove_on_payload_change": true,
+    "max_ttl_seconds": 900,
+    "required_permissions": [
+      "package_install",
+      "network_write",
+      "external_side_effect",
+      "external_intelligence",
+      "destructive"
+    ]
+  },
+  "browser": {
+    "default_profile_mode": "isolated",
+    "persistent_profile_requires_explicit_grant": true,
+    "downloads": "deny",
+    "clipboard": "deny",
+    "notifications": "deny",
+    "extensions": "deny_by_default",
+    "disable_web_security": false,
+    "trace_policy": "off",
+    "auto_open_downloads": false,
+    "local_file_navigation": "deny",
+    "offline_telemetry": "deny"
+  },
+  "audit": {
+    "append_only_events": true,
+    "hash_chain": true,
+    "record_policy_digest": true,
+    "record_provenance": true,
+    "on_corruption": "block_high_risk_until_reconciled"
+  },
+  "external_intelligence": {
+    "enabled_by_default": false,
+    "requires_explicit_grant": true,
+    "allowed_providers": [],
+    "allow_resolved_secrets": false,
+    "raw_repository_export": "deny",
+    "allow_raw_logs": false,
+    "output_trust": "untrusted_external_model",
+    "tool_authority": "none"
+  },
+  "retry": {
+    "default_max_attempts": 3,
+    "same_failure_limit": 2,
+    "max_tasks_per_revision": 16,
+    "max_plan_revisions": 4,
+    "max_replans_per_scope": 2
+  },
+  "escalation": ["L0", "L1", "L2", "L3", "L4"],
+  "checkpoint": {
+    "before_mutation": true,
+    "after_mutation": true,
+    "on_verification": true,
+    "periodic_seconds": 60,
+    "generation_required": true,
+    "verify_references": true,
+    "integrity": "hash_chain",
+    "on_corruption": "fallback_last_valid_or_block"
+  },
+  "resources": {
+    "max_wall_seconds": 600,
+    "max_model_calls": 2,
+    "max_model_call_seconds": 30,
+    "max_tool_actions": 12,
+    "max_single_tool_action_seconds": 30,
+    "max_peak_rss_mb": 4608,
+    "max_output_bytes": 8388608,
+    "max_retained_raw_bytes": 8388608,
+    "max_disk_write_mb": 32,
+    "max_network_bytes": 0,
+    "max_subprocesses": 8,
+    "max_child_cpu_seconds": 300,
+    "heavy_leases": ["MODEL"]
+  }
+}

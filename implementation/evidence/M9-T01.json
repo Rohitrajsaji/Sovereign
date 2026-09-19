@@ -1,0 +1,229 @@
+{
+  "schema_version": 1,
+  "task_id": "M9-T01",
+  "title": "Build deterministic evaluation corpus and metric reports",
+  "status": "completed",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "9382063af5f8765cb74159b2b1202a89abbd7862",
+  "completed_at": "2026-09-19T21:57:06Z",
+  "verified_at": "2026-09-19T21:57:06Z",
+  "dependencies": [
+    "M8-T01"
+  ],
+  "interfaces": [
+    "EvalScenario",
+    "EvalReport"
+  ],
+  "objective": "Create deterministic tiny/medium/large evaluation fixtures and versioned reports that distinguish verified correctness from model claims while measuring tokens, retrieval, retries, restart recovery, and resource provenance under existing Controller authority.",
+  "acceptance": {
+    "tiny_medium_large_fixtures_present": true,
+    "deterministic_fake_model_backend_exercised": true,
+    "context_telemetry_and_aggregate_metrics_used": true,
+    "correctness_distinguished_from_token_minimization": true,
+    "false_completion_attempts": 1,
+    "false_completion_accepted": 0,
+    "controller_verification_failure_required": true,
+    "controller_false_completion_state": "RepairPending",
+    "verified_success_count": 3,
+    "scenario_count": 4,
+    "scenario_pass_count": 4,
+    "restart_scenarios": 1,
+    "restart_recovered": 1,
+    "ordinary_offline_eval_requires_external_provider": false,
+    "second_authority_database_created": false,
+    "parallel_resource_or_recovery_governor_created": false
+  },
+  "deterministic_report": {
+    "schema_version": 1,
+    "profile_id": "m1-8gb",
+    "offline": true,
+    "scenario_count": 4,
+    "scenario_pass_count": 4,
+    "verified_success_count": 3,
+    "false_completion_attempts": 1,
+    "false_completion_accepted": 0,
+    "total_model_tokens": 947,
+    "total_retries": 1,
+    "max_peak_rss_kib": 393341,
+    "resource_source": "deterministic_simulation",
+    "restart_scenarios": 1,
+    "restart_recovered": 1,
+    "corpus_digest": "sha256:6317aa1eca5a308c9baaf56a3e86b0906da71b210791118f0dd032513109cef4",
+    "byte_repeatable": true,
+    "report_sha256": "sha256:f71450c08d8fa5908ba4c06b8b53d3c1a4e40a3d110ac706a6584f731eec6ed6",
+    "metric_provenance": {
+      "tokens": "context_telemetry_provider_authoritative_v1",
+      "retrieval": "aggregate_context_metrics_v1",
+      "fake_corpus_rss": "deterministic_simulation"
+    },
+    "note": "Fake-corpus RSS is intentionally simulated and is not represented as physical measurement."
+  },
+  "false_completion_proof": {
+    "real_controller_activation": true,
+    "ready_lease_derived_by_controller": true,
+    "mutation_executed_via": "Controller::execute_replace",
+    "expected_error": "ControllerError::VerificationFailed",
+    "required_post_state": "RepairPending",
+    "succeeded_state_observed": false
+  },
+  "restart_proof": {
+    "canonical_state_store_reopened": true,
+    "recovery_api": "RecoveryManager::recover",
+    "recovered_value_matches": true,
+    "unknown_actions": 0,
+    "mutation_blocked": false
+  },
+  "physical_local_model_smoke": {
+    "command": "CARGO_NET_OFFLINE=true SOVEREIGN_MODEL_RUNTIME='/Users/rohitrajsaji/Desktop/Sovereign/.tools/llama-b10516/llama-b10516/llama-server' SOVEREIGN_MODEL_PATH='/Users/rohitrajsaji/Desktop/Sovereign/.models/Qwen3-4B-Q4_K_M.gguf' /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --test local_model_smoke --offline local_model_smoke_records_usage_rss_and_unloads -- --ignored --exact --nocapture",
+    "result": "passed",
+    "tests": "1 passed, 0 failed",
+    "input_tokens_positive": true,
+    "output_tokens_positive": true,
+    "at_least_one_physical_rss_measurement_present": true,
+    "resource_source": "physical_local_model",
+    "process_absent_before_run": true,
+    "process_absent_after_unload": true,
+    "one_resident_local_model_constraint_preserved": true,
+    "model_sha256": "sha256:7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+    "runtime_sha256": "sha256:d0878274b8d6bd3c8ea26a78eb66cd1ffd943d007c62b9dff31c8aa99922d713"
+  },
+  "verification": [
+    {
+      "name": "workspace format",
+      "command": "cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "name": "sovereign-eval all-target check",
+      "command": "CARGO_NET_OFFLINE=true cargo check -p sovereign-eval --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "name": "sovereign-eval all-target tests",
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign-eval --all-targets --offline",
+      "result": "passed",
+      "details": [
+        "eval_corpus 4/4",
+        "crash_resume 30/30",
+        "cross_repo 9/9",
+        "external_intelligence_policy 10/10",
+        "m1_8gb_resource_sim 6/6",
+        "m3_scenario_gate 7/7",
+        "metrics 3/3",
+        "plan_failure 11/11",
+        "product_delivery governed proof passed",
+        "prompt_injection 9/9",
+        "repair_loop 2/2",
+        "security_resilience 5/5",
+        "vertical_slice 2/2",
+        "web_acquire 8/8"
+      ]
+    },
+    {
+      "name": "sovereign-eval strict Clippy",
+      "command": "CARGO_NET_OFFLINE=true cargo clippy -p sovereign-eval --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "name": "sovereign app all-target check",
+      "command": "CARGO_NET_OFFLINE=true cargo check -p sovereign --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "name": "sovereign app all-target tests",
+      "command": "CARGO_NET_OFFLINE=true cargo test -p sovereign --all-targets --offline",
+      "result": "passed",
+      "details": "13 passed, 0 failed"
+    },
+    {
+      "name": "sovereign app strict Clippy",
+      "command": "CARGO_NET_OFFLINE=true cargo clippy -p sovereign --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "name": "literal frozen offline CLI run 1",
+      "command": "CARGO_NET_OFFLINE=true cargo run -q -p sovereign -- eval --profile m1-8gb --offline",
+      "result": "passed"
+    },
+    {
+      "name": "literal frozen offline CLI run 2",
+      "command": "CARGO_NET_OFFLINE=true cargo run -q -p sovereign -- eval --profile m1-8gb --offline",
+      "result": "passed"
+    },
+    {
+      "name": "deterministic byte comparison",
+      "command": "cmp -s /tmp/sovereign-m9-t01-final-1.json /tmp/sovereign-m9-t01-final-2.json",
+      "result": "passed"
+    },
+    {
+      "name": "deterministic report hashes",
+      "command": "shasum -a 256 /tmp/sovereign-m9-t01-final-1.json /tmp/sovereign-m9-t01-final-2.json",
+      "result": "passed",
+      "details": "both f71450c08d8fa5908ba4c06b8b53d3c1a4e40a3d110ac706a6584f731eec6ed6"
+    },
+    {
+      "name": "diff integrity",
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "independent_audit": {
+    "worker": "worker-11",
+    "mode": "final exact-tree read-only M9-T01 closure audit",
+    "result": "CLOSABLE",
+    "blockers": [],
+    "changes_made_by_auditor": false
+  },
+  "source_hashes": {
+    "Cargo.lock": "sha256:74cbda5f298c62d707d13d695f7258893df0afa8ac99e4559c353077699fe19e",
+    "apps/sovereign/Cargo.toml": "sha256:74af137b4686c42a38723ddcf759515b4c498acb353dc193bfa1712ac34f8bee",
+    "apps/sovereign/src/main.rs": "sha256:5b397d5833297cab835db93945438e53e11f9bfa4c929b5b9d7529bf823c065d",
+    "crates/sovereign-eval/Cargo.toml": "sha256:7912deff1e476158b4d542a88d5f6816e7bdbc91621b6a1fe1758264e88707b7",
+    "crates/sovereign-eval/src/lib.rs": "sha256:090918f16c24b1468b8f935dfbccb18d965c69af62e44d64a07936db809111bd",
+    "crates/sovereign-eval/src/local_smoke.rs": "sha256:fb6726635153c192716aed622a816d07eab24df9df4099fa49c3a7790435afb9",
+    "crates/sovereign-eval/src/runner.rs": "sha256:8bd065e0b6ef4c479143bc53df0357036f06e8c24e5e1d9ef1670ca43684f06d",
+    "crates/sovereign-eval/src/schema.rs": "sha256:6eba27579a1271122c6e94d3ac9e6cb7e04109a857995e86686406ac5c149aa4",
+    "crates/sovereign-eval/tests/eval_corpus.rs": "sha256:c6b353feddbd4a4fa67f7ec04c4c592d7ea2936883f1a92263fd357e260cc0bf",
+    "crates/sovereign-eval/tests/local_model_smoke.rs": "sha256:8d8498061543cff158fdbdf6b6947c16c57bc97d8ba1340c29f4603036d258d3"
+  },
+  "fixture_hashes": {
+    "crates/sovereign-eval/fixtures/m9/tiny/app.txt": "sha256:0e0a7da62cc41a251f3dc2215f7d0f02755df5c031cf3638c71501a708c85ad6",
+    "crates/sovereign-eval/fixtures/m9/medium/source.txt": "sha256:1b35e1747c1e83a0740f1caa3261ef2a0a434160e5c36c52b77056651c0d5d72",
+    "crates/sovereign-eval/fixtures/m9/medium/test.txt": "sha256:037362a6f92ecd6968ed86feb4871e6f14d774d1e4c7c829709f249c9cba052f",
+    "crates/sovereign-eval/fixtures/m9/large/api.txt": "sha256:f9da06df54f490674974680e5ae73def77c595857d32e30e40d572a04d882508",
+    "crates/sovereign-eval/fixtures/m9/large/store.txt": "sha256:ddd9f54184b488b09e95b4520ea812fcb4ea1ac2bd4dd318ce4756045c80cfb0",
+    "crates/sovereign-eval/fixtures/m9/large/ui.txt": "sha256:2458de6f5cce299677d72d7e24e4352675901d4802f9180eb531e5aac54d8aff",
+    "crates/sovereign-eval/fixtures/m9/policy.json": "sha256:67f22c99808b4d8a257fde9fa0d02883967495077c7e3655c72f3cb2ccb1a35b"
+  },
+  "state_authority": {
+    "controller_remains_sole_execution_and_lifecycle_authority": true,
+    "state_store_remains_single_authoritative_execution_database": true,
+    "recovery_manager_reused": true,
+    "second_authority_database_created": false,
+    "second_action_or_retry_ledger_created": false,
+    "second_resource_process_disk_wall_or_recovery_governor_created": false
+  },
+  "intentional_final_release_tests_deferred": [
+    "compiler_real_local_8k_smoke",
+    "m1_real_qwen_implementation_repair_restart_qualification"
+  ],
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false,
+    "network_package_install": false
+  }
+}

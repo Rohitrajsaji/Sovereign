@@ -1,0 +1,2 @@
+flows=create,edit,delete,search
+browser=required

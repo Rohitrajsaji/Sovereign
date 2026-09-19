@@ -1,0 +1,3 @@
+component=settings-form
+label=Save
+submit=preserve

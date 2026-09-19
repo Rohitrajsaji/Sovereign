@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 serde_json.workspace = true
 sovereign-controller = { path = "../../crates/sovereign-controller" }
+sovereign-eval = { path = "../../crates/sovereign-eval" }
 sovereign-state = { path = "../../crates/sovereign-state" }
 sovereign-types = { path = "../../crates/sovereign-types" }
 

@@ -7,13 +7,10 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
-sovereign-context = { path = "../sovereign-context" }
-
-[dev-dependencies]
-rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-sovereign-controller = { path = "../sovereign-controller", features = ["recovery-test-hooks"] }
+sovereign-context = { path = "../sovereign-context" }
+sovereign-controller = { path = "../sovereign-controller" }
 sovereign-evidence = { path = "../sovereign-evidence" }
 sovereign-model = { path = "../sovereign-model" }
 sovereign-plan = { path = "../sovereign-plan" }
@@ -21,6 +18,15 @@ sovereign-policy = { path = "../sovereign-policy" }
 sovereign-repo = { path = "../sovereign-repo" }
 sovereign-state = { path = "../sovereign-state" }
 sovereign-tools = { path = "../sovereign-tools" }
+
+[dev-dependencies]
+rusqlite.workspace = true
+sovereign-controller = { path = "../sovereign-controller", features = ["recovery-test-hooks"] }
+sovereign-model = { path = "../sovereign-model" }
+sovereign-plan = { path = "../sovereign-plan" }
+sovereign-policy = { path = "../sovereign-policy" }
+sovereign-repo = { path = "../sovereign-repo" }
+sovereign-state = { path = "../sovereign-state" }
 
 [lints]
 workspace = true

@@ -1,0 +1,2 @@
+route=/inventory
+validation=name_required

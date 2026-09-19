@@ -712,6 +712,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "sovereign-controller",
+ "sovereign-eval",
  "sovereign-state",
  "sovereign-types",
 ]

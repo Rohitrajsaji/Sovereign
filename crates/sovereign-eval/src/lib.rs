@@ -1,8 +1,21 @@
 //! Deterministic evaluation aggregation over immutable attempt telemetry.
 
+mod local_smoke;
+mod runner;
+mod schema;
+
 use serde::{Deserialize, Serialize};
 use sovereign_context::{AttemptContextMetrics, MetricRatio, RetrievalRouteKind};
 use std::collections::BTreeMap;
+
+pub use local_smoke::{LocalModelSmokeConfig, run_local_model_smoke};
+pub use runner::run_offline_profile;
+pub use schema::{
+    EVAL_REPORT_SCHEMA_VERSION, EVAL_SCENARIO_SCHEMA_VERSION, EvalAggregateV1, EvalReportV1,
+    EvalResourceMetricsV1, EvalResourceSourceV1, EvalRestartExerciseV1, EvalRestartMetricsV1,
+    EvalRetrievalMetricsV1, EvalScale, EvalScenarioResultV1, EvalScenarioV1, EvalTokenMetricsV1,
+    LocalModelSmokeReportV1, M1_8GB_PROFILE_ID,
+};
 
 /// One attempt supplied to the deterministic M2 metric aggregator.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
