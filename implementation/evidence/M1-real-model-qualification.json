@@ -1,7 +1,7 @@
 {
   "attempt_1_failure": {
     "action_id": null,
-    "attempt_id": "attempt.c2de6e27ac92e3959d7d",
+    "attempt_id": "attempt.821248cc31f07aa2494f",
     "controlled_post_model_fault": false,
     "failure_category": "proposal_validation_failure",
     "failure_code": "proposal_evidence_outside_context",
@@ -13,28 +13,28 @@
       "file:repo.app:src/settings/SettingsForm.tsx",
       "proposal.output-schema"
     ],
-    "failure_record_digest": "sha256:98c0bfa41a7ee65e169924c9e9d01619b1c20956f6e9fcd7a9557ede92ab0616",
+    "failure_record_digest": "sha256:0218cfef7986e792dc85e8e8c2ac456a9f733176d4c65f5baaaf6c0b5a7de327",
     "failure_signature": "proposal_validation_failure:proposal_evidence_outside_context:faf7873234b4a5d2",
     "raw_real_response_preserved_only_as_sha256_and_metrics": true,
     "raw_response_exact_valid": false
   },
   "attempt_2_success": {
-    "action_id": "action.12dcfce1e2c8f0b3fb82",
-    "action_result_digest": "a88b4ec3e817cfd1bcf5cd355ca0addcd0e314d23602c2b519a0844cd7781835",
-    "attempt_id": "attempt.084ae30f6d663c4a4038",
+    "action_id": "action.55c92d6a15c9ee5983d8",
+    "action_result_digest": "63f1ba7204e273328f35e65e98e650fd9c0abeb2631c68511116a55cf1b13e4a",
+    "attempt_id": "attempt.c1ec34992fb9a345bf38",
     "verification_diff_digest": "sha256:0c588809a178a14c7fce65d4fa1da1c94377bed4055992c6079fd942fa6db8d7",
-    "verification_evidence_id": "evidence.verification.5d0b9bb234fe4d2e",
+    "verification_evidence_id": "evidence.verification.cecb917b83981cb9",
     "verification_evidence_ids": [
-      "a88b4ec3e817cfd1bcf5cd355ca0addcd0e314d23602c2b519a0844cd7781835",
+      "63f1ba7204e273328f35e65e98e650fd9c0abeb2631c68511116a55cf1b13e4a",
       "sha256:0c588809a178a14c7fce65d4fa1da1c94377bed4055992c6079fd942fa6db8d7",
       "sha256:efbfbf9d4a442248ce3527569505acfb28c09f7d29e86efef7bb43d6049609e7"
     ],
-    "verification_id": "verification.b4efb36e05977d08b605",
+    "verification_id": "verification.fd749200581b9890457f",
     "verification_passed": true,
-    "verification_post_snapshot_digest": "sha256:cfc3d7b52f2d620374b1e5f4a6b292d6e18d4b3a6635d4cb9e1c21d7fe361c72"
+    "verification_post_snapshot_digest": "sha256:3cc200fadbf76d0f6fd72149e9a05c5a1214b34c986228d2a6a2a68336b6eacd"
   },
   "compiler": {
-    "compilation_evidence_digest": "sha256:b08de33d6957fafd602988727a0fd0e4c4fbc36491319ab627fc959a5fdb256d",
+    "compilation_evidence_digest": "sha256:b1766b444b58dc6f2514417be115364ab22fc38b0d99572631881a4ae129d147",
     "exact_evidence_ids": [
       "file:repo.app:src/settings/SettingsForm.test.tsx",
       "file:repo.app:src/settings/SettingsForm.tsx"
@@ -45,38 +45,38 @@
         "accepted": true,
         "attempt": 1,
         "rejection_reason": null,
-        "request_digest": "sha256:1848072bf8c1a78d746aba9dc28d68e315fbf60e736e11232ad7a26c8f21a9b0",
-        "response_digest": "sha256:8d86f9f85fdf95e968705ad72b731e4a082e2afd0c36af7378bd365e2764e9a5"
+        "request_digest": "sha256:cdbb51a7cae5f533cbadf3b74b1c735c22ae0ef32adff8d31b8ed930516f066c",
+        "response_digest": "sha256:8c5189fcfc57de65a33f5a7b0b6f25af1d107229ef7aa5a22e6a5338fa52c6f9"
       }
     ],
     "model_calls_used": 1,
-    "plan_digest": "sha256:a94993b91d47aeb17925125c85ad491602db83288bd8c2b94b2e4b63902ab79c"
+    "plan_digest": "sha256:f8e92d702085d0f42231b1d1d5e1fbbcbe6cc7f7f50b0bacbeb0a5c0b2877528"
   },
   "controller": {
-    "acceptance_contract_sha256": "sha256:3b4f890e9f6cbdc761f16a45a603dc844410c99108a31f83dbe3b3e0d5f9c1c2",
+    "acceptance_contract_sha256": "sha256:1e899b2e7cbb1d44ec8e1e52deb3b40346d5c8063a9c8bc866ecdad11b991461",
     "attempts_started_after_repair": 2,
     "model_calls_used_after_repair": 2,
-    "plan_digest": "sha256:a94993b91d47aeb17925125c85ad491602db83288bd8c2b94b2e4b63902ab79c",
-    "plan_document_sha256": "sha256:a94993b91d47aeb17925125c85ad491602db83288bd8c2b94b2e4b63902ab79c",
-    "plan_id": "plan.d56b3ac04f3dea6c67e5",
-    "task_contract_digest": "sha256:992d6a1cd39ca960ff4059a7d77188717613f785f2c5cf28a910faade31432c6",
-    "task_id": "task.d56b3ac04f3dea6c67e5.01"
+    "plan_digest": "sha256:f8e92d702085d0f42231b1d1d5e1fbbcbe6cc7f7f50b0bacbeb0a5c0b2877528",
+    "plan_document_sha256": "sha256:f8e92d702085d0f42231b1d1d5e1fbbcbe6cc7f7f50b0bacbeb0a5c0b2877528",
+    "plan_id": "plan.53193233475e7fdef2e0",
+    "task_contract_digest": "sha256:8ce0b61fa0783fd700f84fdbd0bb8c6febaff624cda027b11c2612adcf0c2a84",
+    "task_id": "task.53193233475e7fdef2e0.01"
   },
   "host": {
     "after_qualification_before_unload": {
-      "memory_pressure": "The system has 8589934592 (524288 pages with a page size of 16384).\nSystem-wide memory free percentage: 12%",
-      "swapusage": "vm.swapusage: total = 7168.00M  used = 6292.19M  free = 875.81M  (encrypted)",
-      "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                3627.\nPages active:                             28818.\nPages inactive:                           26406.\nPages speculative:                         1610.\nPages throttled:                              0.\nPages wired down:                        338661.\nPages purgeable:                              0.\n\"Translation faults\":                 541945067.\nPages copy-on-write:                   20763597.\nPages zero filled:                    110320593.\nPages reactivated:                    203334498.\nPages purged:                           9921387.\nFile-backed pages:                        26669.\nAnonymous pages:                          30166.\nPages stored in compressor:              984713.\nPages occupied by compressor:             89295.\nDecompressions:                       190454980.\nCompressions:                         204454666.\nPageins:                               36296761.\nPageouts:                                189722.\nSwapins:                                4146474.\nSwapouts:                               4805766."
+      "memory_pressure": "The system has 8589934592 (524288 pages with a page size of 16384).\nSystem-wide memory free percentage: 67%",
+      "swapusage": "vm.swapusage: total = 3072.00M  used = 2445.19M  free = 626.81M  (encrypted)",
+      "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    79266.\nPages active:                                  80374.\nPages inactive:                               168372.\nPages speculative:                              3782.\nPages throttled:                                   0.\nPages wired down:                             100719.\nPages purgeable:                                2154.\n\"Translation faults\":                      223174766.\nPages copy-on-write:                        16209264.\nPages zero filled:                          81184194.\nPages reactivated:                          16481047.\nPages purged:                                 696386.\nFile-backed pages:                            177043.\nAnonymous pages:                               75485.\nPages stored in compressor:                   102307.\nPages occupied by compressor:                  56149.\nDecompressions:                             18140827.\nCompressions:                               21867929.\nPageins:                                    14506919.\nPageouts:                                     751480.\nSwapins:                                      515055.\nSwapouts:                                     728332."
     },
     "after_unload": {
-      "memory_pressure": "The system has 8589934592 (524288 pages with a page size of 16384).\nSystem-wide memory free percentage: 33%",
-      "swapusage": "vm.swapusage: total = 7168.00M  used = 6284.44M  free = 883.56M  (encrypted)",
-      "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                3773.\nPages active:                             42904.\nPages inactive:                          139845.\nPages speculative:                         2369.\nPages throttled:                              0.\nPages wired down:                        215727.\nPages purgeable:                              8.\n\"Translation faults\":                 541957300.\nPages copy-on-write:                   20763689.\nPages zero filled:                    110321287.\nPages reactivated:                    203336964.\nPages purged:                           9921452.\nFile-backed pages:                       150973.\nAnonymous pages:                          34145.\nPages stored in compressor:              954429.\nPages occupied by compressor:             83792.\nDecompressions:                       190462714.\nCompressions:                         204458401.\nPageins:                               36297965.\nPageouts:                                189722.\nSwapins:                                4146828.\nSwapouts:                               4805834."
+      "memory_pressure": "The system has 8589934592 (524288 pages with a page size of 16384).\nSystem-wide memory free percentage: 67%",
+      "swapusage": "vm.swapusage: total = 3072.00M  used = 2445.19M  free = 626.81M  (encrypted)",
+      "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                    79237.\nPages active:                                  80552.\nPages inactive:                               168384.\nPages speculative:                              3788.\nPages throttled:                                   0.\nPages wired down:                             100722.\nPages purgeable:                                2154.\n\"Translation faults\":                      223175532.\nPages copy-on-write:                        16209351.\nPages zero filled:                          81184407.\nPages reactivated:                          16481047.\nPages purged:                                 696386.\nFile-backed pages:                            177063.\nAnonymous pages:                               75661.\nPages stored in compressor:                   102133.\nPages occupied by compressor:                  55979.\nDecompressions:                             18141001.\nCompressions:                               21867929.\nPageins:                                    14506930.\nPageouts:                                     751480.\nSwapins:                                      515055.\nSwapouts:                                     728332."
     },
     "before_load": {
-      "memory_pressure": "The system has 8589934592 (524288 pages with a page size of 16384).\nSystem-wide memory free percentage: 63%",
-      "swapusage": "vm.swapusage: total = 6144.00M  used = 4821.88M  free = 1322.12M  (encrypted)",
-      "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               12860.\nPages active:                            149323.\nPages inactive:                          145036.\nPages speculative:                         3840.\nPages throttled:                              0.\nPages wired down:                         93147.\nPages purgeable:                           2580.\n\"Translation faults\":                 537308434.\nPages copy-on-write:                   20656795.\nPages zero filled:                    109955352.\nPages reactivated:                    200969764.\nPages purged:                           9891983.\nFile-backed pages:                       112354.\nAnonymous pages:                         185845.\nPages stored in compressor:              819448.\nPages occupied by compressor:             84283.\nDecompressions:                       187822273.\nCompressions:                         201573394.\nPageins:                               35589078.\nPageouts:                                188300.\nSwapins:                                3893204.\nSwapouts:                               4458778."
+      "memory_pressure": "The system has 8589934592 (524288 pages with a page size of 16384).\nSystem-wide memory free percentage: 71%",
+      "swapusage": "vm.swapusage: total = 3072.00M  used = 1766.19M  free = 1305.81M  (encrypted)",
+      "vm_stat": "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                                     4597.\nPages active:                                 172098.\nPages inactive:                               170427.\nPages speculative:                               972.\nPages throttled:                                   0.\nPages wired down:                              96236.\nPages purgeable:                                2354.\n\"Translation faults\":                      219059106.\nPages copy-on-write:                        16048118.\nPages zero filled:                          80503002.\nPages reactivated:                          14805850.\nPages purged:                                 676029.\nFile-backed pages:                            123435.\nAnonymous pages:                              220062.\nPages stored in compressor:                    91555.\nPages occupied by compressor:                  44332.\nDecompressions:                             16388982.\nCompressions:                               19922168.\nPageins:                                    14129164.\nPageouts:                                     749283.\nSwapins:                                      488915.\nSwapouts:                                     658252."
     }
   },
   "immutability": {
@@ -94,31 +94,31 @@
   "model_lease": {
     "context_input_tokens": 8192,
     "output_reserve_tokens": 1536,
-    "post_load_steady_rss_kb": 1860272,
+    "post_load_steady_rss_kb": 3119616,
     "process_absent_after_unload": true,
     "server_context_tokens": 9728,
-    "startup_peak_rss_kb": 2002720
+    "startup_peak_rss_kb": 3120624
   },
   "real_model_calls": [
     {
-      "delivered_response_sha256": "sha256:a51d3670d4041f438aed8382a0c7df8118dcc6b6a1f7a24ec08c39496ebeb858",
-      "elapsed_ms": 12074,
+      "delivered_response_sha256": "sha256:1625f4dd9601db66273ef39ba7fe3f5515da06ed1d8d9ba7a4b8c5b192e5d79c",
+      "elapsed_ms": 14256,
       "fault_injected": false,
       "finish_reason": "stop",
       "phase": "plan_compiler",
-      "prefill_decode_peak_rss_kb": 1941984,
-      "prompt_sha256": "sha256:868c2dc865762153e7374622b2a54e179f1c60272e1b0b0c01be947511cf3ea0",
+      "prefill_decode_peak_rss_kb": 3204848,
+      "prompt_sha256": "sha256:7b1fe1eb950ccc7ef01223b1bb9342cb857b4dfbd08c76a63a4374e75ee138ea",
       "provider_usage": {
-        "input_tokens": 361,
+        "input_tokens": 395,
         "output_tokens": 177
       },
       "raw_response_exact_valid": false,
-      "raw_response_sha256": "sha256:a51d3670d4041f438aed8382a0c7df8118dcc6b6a1f7a24ec08c39496ebeb858",
+      "raw_response_sha256": "sha256:1625f4dd9601db66273ef39ba7fe3f5515da06ed1d8d9ba7a4b8c5b192e5d79c",
       "repair_prompt_contains_failure_context": false,
       "request_id": "compile.scenario1.m1-real-qualification.proposal.1",
       "token_admission": {
-        "admitted_input_tokens": 624,
-        "rendered_input_tokens": 361,
+        "admitted_input_tokens": 658,
+        "rendered_input_tokens": 395,
         "reserved_output_tokens": 768,
         "server_context_tokens": 9728,
         "structured_output_tokens": 263
@@ -126,56 +126,56 @@
     },
     {
       "delivered_response_sha256": "sha256:e032f3e39a8349c19a54c8f477681b30ab1b06019c87c8254168167ea7c1767e",
-      "elapsed_ms": 10902,
+      "elapsed_ms": 12406,
       "fault_injected": false,
       "finish_reason": "stop",
       "phase": "controller_initial",
-      "prefill_decode_peak_rss_kb": 1959488,
-      "prompt_sha256": "sha256:46bae1776dcb78ee33e5e678a1ee475722eef52f0c4a3e876f78afeb72d773f2",
+      "prefill_decode_peak_rss_kb": 3939936,
+      "prompt_sha256": "sha256:1b641c791133490d9a7e85fd4de2e5c055debab402da82bf5ee399b813708671",
       "provider_usage": {
-        "input_tokens": 320,
+        "input_tokens": 354,
         "output_tokens": 160
       },
       "raw_response_exact_valid": false,
       "raw_response_sha256": "sha256:e032f3e39a8349c19a54c8f477681b30ab1b06019c87c8254168167ea7c1767e",
       "repair_prompt_contains_failure_context": false,
-      "request_id": "controller.task.d56b3ac04f3dea6c67e5.01.proposal",
+      "request_id": "controller.task.53193233475e7fdef2e0.01.proposal",
       "token_admission": {
-        "admitted_input_tokens": 553,
-        "rendered_input_tokens": 320,
+        "admitted_input_tokens": 587,
+        "rendered_input_tokens": 354,
         "reserved_output_tokens": 512,
-        "server_context_tokens": 9728,
+        "server_context_tokens": 9536,
         "structured_output_tokens": 233
       }
     },
     {
-      "delivered_response_sha256": "sha256:40df7360a1c459e84b9b87a8b076caa02c42fa5019f3bb38b511e8f93ad5c162",
-      "elapsed_ms": 22920,
+      "delivered_response_sha256": "sha256:2d951a5a44a5ee96d513c84c8edfa59a3b3f17a34c339c0068b105a793b7f735",
+      "elapsed_ms": 20903,
       "fault_injected": false,
       "finish_reason": "stop",
       "phase": "controller_repair",
-      "prefill_decode_peak_rss_kb": 1961072,
-      "prompt_sha256": "sha256:298328d1ae655bf3c8597005ebc1e2e7d47ce3aa29bd132c2769e4c9956ab9e6",
+      "prefill_decode_peak_rss_kb": 3942208,
+      "prompt_sha256": "sha256:ae9c492c30ac919460d794e3866834752035a60bced01540997eefff339de021",
       "provider_usage": {
-        "input_tokens": 1307,
-        "output_tokens": 196
+        "input_tokens": 1366,
+        "output_tokens": 184
       },
       "raw_response_exact_valid": false,
-      "raw_response_sha256": "sha256:40df7360a1c459e84b9b87a8b076caa02c42fa5019f3bb38b511e8f93ad5c162",
+      "raw_response_sha256": "sha256:2d951a5a44a5ee96d513c84c8edfa59a3b3f17a34c339c0068b105a793b7f735",
       "repair_prompt_contains_failure_context": true,
-      "request_id": "controller.task.d56b3ac04f3dea6c67e5.01.proposal",
+      "request_id": "controller.task.53193233475e7fdef2e0.01.proposal",
       "token_admission": {
-        "admitted_input_tokens": 1540,
-        "rendered_input_tokens": 1307,
+        "admitted_input_tokens": 1599,
+        "rendered_input_tokens": 1366,
         "reserved_output_tokens": 512,
-        "server_context_tokens": 9728,
+        "server_context_tokens": 9536,
         "structured_output_tokens": 233
       }
     }
   ],
   "recovery": {
-    "checkpoint_action_sequence": 6,
-    "checkpoint_generation": 4,
+    "checkpoint_action_sequence": 12,
+    "checkpoint_generation": 8,
     "execution_epoch_after": 2,
     "execution_epoch_before": 1,
     "fallback_checkpoint_used": false,
@@ -185,9 +185,9 @@
   "repair": {
     "contains_failure_synopsis": true,
     "contains_prior_transcript_or_raw_log": false,
-    "failure_record_digest": "sha256:98c0bfa41a7ee65e169924c9e9d01619b1c20956f6e9fcd7a9557ede92ab0616",
+    "failure_record_digest": "sha256:0218cfef7986e792dc85e8e8c2ac456a9f733176d4c65f5baaaf6c0b5a7de327",
     "failure_signature": "proposal_validation_failure:proposal_evidence_outside_context:faf7873234b4a5d2",
-    "prior_attempt_id": "attempt.c2de6e27ac92e3959d7d",
+    "prior_attempt_id": "attempt.821248cc31f07aa2494f",
     "repair_evidence_ids": [
       "controller.prefix",
       "task.contract",
@@ -195,10 +195,10 @@
       "file:repo.app:src/settings/SettingsForm.test.tsx",
       "file:repo.app:src/settings/SettingsForm.tsx",
       "diff:repo.app",
-      "failure:task.d56b3ac04f3dea6c67e5.01:attempt.c2de6e27ac92e3959d7d",
+      "failure:task.53193233475e7fdef2e0.01:attempt.821248cc31f07aa2494f",
       "proposal.output-schema"
     ],
-    "repair_packet_digest": "sha256:b7e184736c9efa27cc7d2b885ebe8cd8c70c652d3a2cbbb3abf0a7c7dbb501a2"
+    "repair_packet_digest": "sha256:78a044737805b2b85bb06f28a8d9ef241253745eada8fe08965afa25be43e0fc"
   },
   "repository_result": {
     "changed_files": [

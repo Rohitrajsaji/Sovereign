@@ -17,8 +17,9 @@
   "representative_real_model_gate": {
     "status": "passed",
     "evidence": "implementation/evidence/M1-real-model-qualification.json",
-    "evidence_sha256": "sha256:ecb06561f6e9dc40b8f26befb78e6ca2ca9684cf89c907cfc3e581fbab252086",
-    "command": "SOVEREIGN_MODEL_RUNTIME=\"$PWD/.tools/llama-b10516/llama-b10516/llama-server\" SOVEREIGN_MODEL_PATH=\"$PWD/.models/Qwen3-4B-Q4_K_M.gguf\" SOVEREIGN_M1_QUAL_REPORT=\"/tmp/sovereign-m1-real-qualification.json\" cargo test -p sovereign-eval --test m1_real_qualification --offline -- --ignored --nocapture",
+    "evidence_sha256": "sha256:fb227d7e57f6f462da61321e28b1c68e1953c59a38e7d2e899c1c91e99bac240",
+    "qualification_source_head": "3af569e8f48fa64e2ba7e446757a1a860906a9f7",
+    "command": "CARGO_NET_OFFLINE=true SOVEREIGN_MODEL_RUNTIME=\"$PWD/.tools/llama-b10516/llama-b10516/llama-server\" SOVEREIGN_MODEL_PATH=\"$PWD/.models/Qwen3-4B-Q4_K_M.gguf\" SOVEREIGN_M1_QUAL_REPORT=\"/tmp/sovereign-final-m1-real-qualification.json\" cargo test -p sovereign-eval --test m1_real_qualification m1_real_qwen_implementation_repair_restart_qualification --offline -- --ignored --exact --test-threads=1 --nocapture",
     "result": "1 passed; 0 failed",
     "observed_branch": "natural invalid initial Qwen proposal rejected by Controller; no fault injection; raw and delivered hashes equal; bounded real-Qwen repair succeeded after durable recovery",
     "model_sha256": "sha256:7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
@@ -29,11 +30,11 @@
     }
   },
   "current_tree_source_bindings": {
-    "crates/sovereign-plan/src/compiler.rs": "sha256:a17f7975b7e6c27f77ba44bf41985040f0875fa496c582402281ee3505420b88",
-    "crates/sovereign-controller/src/lib.rs": "sha256:af4ed6e957bc8a531822f67c4866de011777077c4429a5f81a5ab1628c32a9a4",
-    "crates/sovereign-eval/tests/m1_real_qualification.rs": "sha256:2d1c83c46f30b3e7dc6263eeace80c6caa51cdb22148835159041a7258ca0756",
-    "crates/sovereign-plan/tests/minimal_compiler.rs": "sha256:820d6b86f9c797cfbd16c2da981d499a7416c14538f6ae6649c8f31156e71e92",
-    "crates/sovereign-eval/tests/repair_loop.rs": "sha256:1f96a73e527652712e77d62c21868719188d0bfee57d74b45d11379b4989de8e"
+    "crates/sovereign-plan/src/compiler.rs": "sha256:e682219fc9d26f30778cf5d84a042ffdd0525293b2b17f165bce7de5ec95e652",
+    "crates/sovereign-controller/src/lib.rs": "sha256:69adc2d20d13fc5a67bb141a1874677611a7cc47f5492ff2dabf77430e3358ec",
+    "crates/sovereign-eval/tests/m1_real_qualification.rs": "sha256:9d74ba641bf674cf9429cf76c9ecaf51043dea66f51fb15a0e3adc6de4f1461a",
+    "crates/sovereign-plan/tests/minimal_compiler.rs": "sha256:c40f4f932026a7ee7f70b2d1209a68f46f336a4f0dbbefad7588d043bd5f99e8",
+    "crates/sovereign-eval/tests/repair_loop.rs": "sha256:e2b3a65bf290e7f09c93a705957547d96b5807db9dd24dde29da2081b375c060"
   },
   "milestone_gates": {
     "natural_language_compiler_controller_checkpoint_restart": "passed",
@@ -63,15 +64,15 @@
   ],
   "resource_truth": {
     "target_profile": "MacBook Air M1 / 8 GB",
-    "model_startup_peak_rss_kb": 2002720,
-    "model_post_load_steady_rss_kb": 1860272,
-    "max_observed_prefill_decode_peak_rss_kb": 1961072,
-    "memory_pressure_free_percent_before_load": 63,
-    "memory_pressure_free_percent_during_qualification": 12,
-    "memory_pressure_free_percent_after_unload": 33,
+    "model_startup_peak_rss_kb": 3120624,
+    "model_post_load_steady_rss_kb": 3119616,
+    "max_observed_prefill_decode_peak_rss_kb": 3942208,
+    "memory_pressure_free_percent_before_load": 71,
+    "memory_pressure_free_percent_during_qualification": 67,
+    "memory_pressure_free_percent_after_unload": 67,
     "swap_increased_during_run": true,
     "process_absent_after_unload": true,
-    "note": "Representative qualification passed but materially exercised memory pressure/swap on the 8 GB target; evidence is preserved rather than normalized away."
+    "note": "Fresh final representative qualification passed from the amended readiness threshold with real local Qwen, durable restart/recovery, bounded repair, and clean model unload; raw host observations are preserved in the evidence packet."
   },
   "network_runtime_dependency": false
 }
