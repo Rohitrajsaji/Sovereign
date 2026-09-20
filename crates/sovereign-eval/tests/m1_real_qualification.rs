@@ -34,7 +34,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SETTINGS_FORM: &[u8] = include_bytes!("fixtures/scenario1/src/settings/SettingsForm.tsx");
 const SETTINGS_FORM_TEST: &[u8] =
@@ -44,6 +45,11 @@ const WRITE_TOOL_DIGEST: &str =
 const FORM_EVIDENCE_ID: &str = "file:repo.app:src/settings/SettingsForm.tsx";
 const TARGET_PATH: &str = "src/settings/SettingsForm.tsx";
 const FAULT_OLD_LITERAL: &str = "Save button that does not exist";
+const M1_REAL_QUAL_MODEL_ADMISSION_MIB: u64 = 4_096;
+const M1_REAL_QUAL_LAUNCH_RESERVE_MIB: u64 = 1_536;
+const M1_REAL_QUAL_PHYSICAL_MEMORY_MIB: u64 = 8_192;
+const M1_REAL_QUAL_RESOURCE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(120);
+const M1_REAL_QUAL_RESOURCE_RECOVERY_POLL: Duration = Duration::from_millis(250);
 
 struct Fixture {
     base: PathBuf,
@@ -697,6 +703,46 @@ fn host_observation() -> Value {
     })
 }
 
+fn parse_memory_free_percent(observation: &str) -> Option<u64> {
+    observation.lines().find_map(|line| {
+        line.strip_prefix("System-wide memory free percentage:")
+            .and_then(|value| value.trim().strip_suffix('%'))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    })
+}
+
+fn wait_for_frozen_model_launch_headroom() {
+    let required_headroom_mib = M1_REAL_QUAL_MODEL_ADMISSION_MIB + M1_REAL_QUAL_LAUNCH_RESERVE_MIB;
+    let required_free_percent = required_headroom_mib
+        .saturating_mul(100)
+        .div_ceil(M1_REAL_QUAL_PHYSICAL_MEMORY_MIB);
+    let deadline = Instant::now() + M1_REAL_QUAL_RESOURCE_RECOVERY_TIMEOUT;
+    loop {
+        let observation = command_text("/usr/bin/memory_pressure", &["-Q"]);
+        if parse_memory_free_percent(&observation)
+            .is_some_and(|free_percent| free_percent >= required_free_percent)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "compiler Qwen unloaded but frozen MODEL admission headroom did not recover to {required_free_percent}% within {M1_REAL_QUAL_RESOURCE_RECOVERY_TIMEOUT:?}: {observation}"
+        );
+        thread::sleep(M1_REAL_QUAL_RESOURCE_RECOVERY_POLL);
+    }
+}
+
+#[test]
+fn parses_memory_pressure_free_percent_for_frozen_headroom_gate() {
+    assert_eq!(
+        parse_memory_free_percent(
+            "The system has 8589934592 bytes.\nSystem-wide memory free percentage: 73%"
+        ),
+        Some(73)
+    );
+    assert_eq!(parse_memory_free_percent("unavailable"), None);
+}
+
 fn process_absent(pid: Option<u32>) -> bool {
     pid.is_none_or(|value| {
         !Command::new("/bin/ps")
@@ -812,6 +858,7 @@ fn m1_real_qwen_implementation_repair_restart_qualification() {
         ModelResidencyProof::Absent,
         "Controller setup must begin only after compiler-owned model residency is proven absent"
     );
+    wait_for_frozen_model_launch_headroom();
 
     let state = StateStore::open(fixture.state_path())
         .unwrap_or_else(|error| panic!("open qualification state: {error}"));
