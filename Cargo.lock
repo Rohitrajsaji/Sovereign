@@ -760,6 +760,7 @@ dependencies = [
  "sovereign-context",
  "sovereign-controller",
  "sovereign-evidence",
+ "sovereign-memory",
  "sovereign-model",
  "sovereign-plan",
  "sovereign-policy",

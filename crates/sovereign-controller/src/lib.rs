@@ -2569,6 +2569,20 @@ fn cross_repo_contracts_for_plan(
         .collect()
 }
 
+fn validate_supported_plan_ir_document(plan: &Value) -> Result<(), ControllerError> {
+    let validator = PlanValidator::new(ValidationEnvironment::default()).map_err(|error| {
+        ControllerError::InvalidPlan(format!("Plan IR validator initialization failed: {error}"))
+    })?;
+    let plan_ir = PlanIr::from_value(plan.clone());
+    if let Some(diagnostic) = validator.validate(&plan_ir).first() {
+        return Err(ControllerError::InvalidPlan(format!(
+            "durable canonical Plan IR is unsupported or invalid: {}:{}:{}",
+            diagnostic.code, diagnostic.path, diagnostic.message
+        )));
+    }
+    Ok(())
+}
+
 fn plan_task_is_multi_repo_integration_gate(
     plan: &Value,
     task: &Value,
@@ -21187,6 +21201,7 @@ fn reconstruct_active_plan(
             "durable canonical plan document digest does not match active plan".to_owned(),
         ));
     }
+    validate_supported_plan_ir_document(&plan_document)?;
     let raw_baseline = state
         .get_state("controller.repository_baseline", "active")?
         .ok_or_else(|| {
@@ -31280,6 +31295,24 @@ mod tests {
 
         drop(controller);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn recovered_plan_document_rejects_unsupported_ir_version() {
+        let mut plan: Value = serde_json::from_str(include_str!(
+            "../../sovereign-plan/tests/fixtures/valid_trivial_plan.json"
+        ))
+        .unwrap_or_else(|error| panic!("parse current Plan IR fixture: {error}"));
+        super::validate_supported_plan_ir_document(&plan)
+            .unwrap_or_else(|error| panic!("current Plan IR fixture rejected: {error}"));
+
+        plan["ir_version"] = json!("9.9");
+        let error = super::validate_supported_plan_ir_document(&plan)
+            .err()
+            .unwrap_or_else(|| panic!("unsupported Plan IR version was accepted for recovery"));
+        let message = error.to_string();
+        assert!(message.contains("unsupported or invalid"));
+        assert!(message.contains("/ir_version"));
     }
 
     #[test]

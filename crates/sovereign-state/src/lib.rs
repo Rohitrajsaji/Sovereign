@@ -103,6 +103,10 @@ pub enum StateError {
         previous: i64,
         current: i64,
     },
+    UnsupportedSchemaVersion {
+        found: i64,
+        supported: i64,
+    },
     Integrity(String),
 }
 
@@ -131,6 +135,10 @@ impl Display for StateError {
             Self::InvalidMigrationOrder { previous, current } => write!(
                 f,
                 "migration versions must increase strictly: previous={previous}, current={current}"
+            ),
+            Self::UnsupportedSchemaVersion { found, supported } => write!(
+                f,
+                "state schema version {found} is newer than this binary supports ({supported})"
             ),
             Self::Integrity(message) => write!(f, "state integrity error: {message}"),
         }
@@ -1614,6 +1622,15 @@ impl MigrationRunner {
     pub fn apply(connection: &mut Connection, migrations: &[Migration]) -> Result<(), StateError> {
         ensure_migration_table(connection)?;
         validate_order(migrations)?;
+        let supported = migrations.last().map_or(0, |migration| migration.version);
+        let found: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
+            [],
+            |row| row.get(0),
+        )?;
+        if found > supported {
+            return Err(StateError::UnsupportedSchemaVersion { found, supported });
+        }
 
         for migration in migrations {
             let expected = migration.checksum();
@@ -2082,6 +2099,57 @@ mod tests {
         drop(StateStore::open(temp.db()).unwrap_or_else(|error| panic!("open 1: {error}")));
         let store = StateStore::open(temp.db()).unwrap_or_else(|error| panic!("open 2: {error}"));
         assert_eq!(store.schema_version().unwrap_or(-1), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn future_schema_version_is_rejected_without_mutating_existing_state() {
+        let temp = TestDir::new("future-schema");
+        let db = temp.db();
+        let mut store = StateStore::open(&db).unwrap_or_else(|error| panic!("open: {error}"));
+        store
+            .put_state("fixture", "preserved", "{\"value\":1}")
+            .unwrap_or_else(|error| panic!("seed fixture: {error}"));
+        store
+            .checkpoint_wal()
+            .unwrap_or_else(|error| panic!("checkpoint fixture: {error}"));
+        drop(store);
+
+        let connection = Connection::open(&db).unwrap_or_else(|error| panic!("raw open: {error}"));
+        connection
+            .execute(
+                "INSERT INTO schema_migrations(version, name, checksum, applied_at_ms) VALUES (?1, 'future', 'future-checksum', 1)",
+                [CURRENT_SCHEMA_VERSION + 1],
+            )
+            .unwrap_or_else(|error| panic!("seed future migration: {error}"));
+        drop(connection);
+
+        let error = StateStore::open(&db)
+            .err()
+            .unwrap_or_else(|| panic!("future schema unexpectedly opened"));
+        assert!(matches!(
+            error,
+            StateError::UnsupportedSchemaVersion {
+                found,
+                supported
+            } if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION
+        ));
+
+        let connection =
+            Connection::open(&db).unwrap_or_else(|error| panic!("verify open: {error}"));
+        let preserved: String = connection
+            .query_row(
+                "SELECT value_json FROM state_records WHERE namespace='fixture' AND record_key='preserved'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|error| panic!("read preserved fixture: {error}"));
+        let max_version: i64 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or_else(|error| panic!("read max migration: {error}"));
+        assert_eq!(preserved, "{\"value\":1}");
+        assert_eq!(max_version, CURRENT_SCHEMA_VERSION + 1);
     }
 
     #[test]

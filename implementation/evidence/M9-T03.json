@@ -1,0 +1,281 @@
+{
+  "schema_version": 1,
+  "task_id": "M9-T03",
+  "title": "Implement schema/provider migration and compatibility harness",
+  "status": "completed",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "93ce518ec5f1cfc1e57d09da879096d41a318d49",
+  "completed_at": "2026-09-20T02:35:08Z",
+  "verified_at": "2026-09-20T02:35:08Z",
+  "dependencies": [
+    "M9-T02"
+  ],
+  "interfaces": [
+    "MigrationCompatibilitySuite",
+    "ProviderConformanceSuite"
+  ],
+  "objective": "Guarantee old Plan IR/evidence/state remains readable across supported migrations and model-provider swaps do not alter Controller-visible semantics.",
+  "acceptance": {
+    "old_supported_database_upgrades_without_orphaning_plan_evidence_or_artifact_references": true,
+    "historical_controller_plan_revision_and_typed_compilation_evidence_preserved_and_cross_bound": true,
+    "numbered_sqlite_migration_failure_rolls_back_and_backup_remains_readable": true,
+    "future_state_schema_version_fails_closed_before_mutating_canonical_state": true,
+    "future_plan_ir_version_fails_closed_during_recovery_validation": true,
+    "historical_memory_migration_preserves_provenance_conflict_and_supersession": true,
+    "memory_projection_outbox_rebuilds_disposable_fts_from_canonical_state": true,
+    "lexical_symbol_and_dependency_projections_rebuild_from_repository_truth": true,
+    "derived_projection_rebuild_preserves_canonical_and_source_truth": true,
+    "optional_adapter_absence_leaves_core_durable_state_valid": true,
+    "provider_swap_preserves_normalized_controller_visible_semantics": true,
+    "supported_upgrade_orphans_no_covered_durable_plan_or_evidence": true,
+    "second_authority_database_created": false,
+    "second_action_or_retry_ledger_created": false,
+    "second_resource_or_process_governor_created": false
+  },
+  "plan_ir_v1_1_status": {
+    "authoritative_schema_or_fixture_present": false,
+    "historical_search_already_completed_before_this_closure": true,
+    "migration_transform_implemented": false,
+    "migration_support_claimed": false,
+    "rejection_counted_as_successful_v1_1_migration": false,
+    "reason": "No authoritative Plan IR v1.1 schema, fixture, or conversion contract exists in the live tree or previously searched Git history. This closure does not synthesize v1.1 semantics or authority. The frozen v1.1 migration subcase remains explicitly unavailable until an authoritative contract is supplied or authorized.",
+    "current_plan_ir_version": "1.2",
+    "unsupported_future_version_fixture": "9.9",
+    "unsupported_future_versions_fail_closed": true
+  },
+  "historical_controller_state_proof": {
+    "fixture_start_schema_version": 3,
+    "plan_namespace": "controller.plan_document",
+    "revision_namespace": "controller.plan_revision",
+    "compilation_evidence_namespace": "controller.compilation_evidence",
+    "revision_key": "plan.fixture-trivial@r1",
+    "revision_record_shape_preserved": [
+      "plan_id",
+      "revision",
+      "plan_digest",
+      "compilation_evidence_digest",
+      "plan_document"
+    ],
+    "compilation_evidence_schema": "sovereign-plan-compilation-evidence-v1",
+    "raw_revision_bytes_preserved": true,
+    "raw_compilation_evidence_bytes_preserved": true,
+    "revision_key_binds_plan_id_and_revision": true,
+    "plan_document_canonical_digest_binds_revision_plan_digest": true,
+    "typed_compilation_evidence_deserializes": true,
+    "typed_compilation_evidence_validator_passed": true,
+    "typed_compilation_evidence_plan_digest_binds_revision": true,
+    "canonical_compilation_evidence_digest_binds_revision": true,
+    "artifact_metadata_and_exact_reference_survive_upgrade": true
+  },
+  "memory_migration_proof": {
+    "fixture_start_schema_version": 4,
+    "crosses_v4_to_v5_then_current": true,
+    "governed_supersession_chain_preserved": true,
+    "lineage_backfill_preserved": true,
+    "validated_conflict_membership_preserved": true,
+    "source_evidence_provenance_preserved": true,
+    "source_fingerprint_provenance_preserved": true,
+    "v6_projection_outbox_seed_count": 4,
+    "v6_pre_startup_fts_row_count": 0,
+    "startup_drains_projection_outbox": true,
+    "post_startup_fts_row_count": 4,
+    "canonical_memory_remains_authority": true
+  },
+  "repository_projection_proof": {
+    "lexical_incompatible_schema_is_discarded_and_rebuilt": true,
+    "lexical_search_after_rebuild_returns_repository_truth": true,
+    "structural_incompatible_parser_fingerprint_is_discarded_and_rebuilt": true,
+    "symbol_definition_rebuilt": "CompatService",
+    "dependency_edge_rebuilt": "crate::util::helper",
+    "derived_databases_are_outside_repository_root": true,
+    "canonical_state_sentinel_unchanged": true,
+    "source_file_bytes_unchanged": true,
+    "repository_snapshot_unchanged": true,
+    "vector_projection_track_present": false,
+    "wiki_projection_track_present": false,
+    "codegraph_projection_track_present": false,
+    "absent_optional_tracks_fabricated": false
+  },
+  "provider_conformance_proof": {
+    "provider_neutral_seam": "ModelBackend",
+    "backends": [
+      "DeterministicFakeBackend A",
+      "DeterministicFakeBackend B"
+    ],
+    "different_model_identities_allowed": true,
+    "normalized_controller_visible_semantics_equal": true,
+    "provider_identity_does_not_become_plan_authority": true
+  },
+  "production_guards": {
+    "state_error": "UnsupportedSchemaVersion",
+    "future_schema_preflight_reads_max_schema_migration_before_apply": true,
+    "future_schema_refusal_mutates_no_existing_state": true,
+    "recovered_plan_document_is_digest_bound_before_validation": true,
+    "recovered_plan_document_must_pass_current_plan_validator": true,
+    "recovery_validation_environment": "ValidationEnvironment::default()",
+    "current_production_and_eval_paths_use_same_default_validation_environment": true
+  },
+  "compatibility_suite": {
+    "schema_version": 1,
+    "test_count": 9,
+    "passed": 9,
+    "failed": 0,
+    "cases": [
+      "old_database_upgrade_preserves_plan_evidence_and_artifact_reference",
+      "unsupported_future_plan_version_fails_closed_without_synthesizing_authority",
+      "future_state_schema_is_rejected_without_mutating_canonical_state",
+      "failed_numbered_migration_rolls_back_and_backup_stays_readable",
+      "memory_provenance_conflict_supersession_and_projection_rebuild_preserve_canonical_data",
+      "lexical_symbol_and_dependency_projections_rebuild_without_mutating_source_or_canonical_state",
+      "optional_adapter_absence_leaves_core_durable_state_valid",
+      "provider_swap_preserves_normalized_controller_visible_semantics",
+      "compatibility_report_schema_is_fail_closed"
+    ]
+  },
+  "verification": [
+    {
+      "name": "workspace format",
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "name": "upgrade compatibility focused suite",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --test upgrade_compat --offline",
+      "result": "passed",
+      "details": "9 passed, 0 failed"
+    },
+    {
+      "name": "upgrade compatibility strict Clippy",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy -p sovereign-eval --test upgrade_compat --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "name": "future state schema regression",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-state future_schema_version_is_rejected_without_mutating_existing_state --offline",
+      "result": "passed"
+    },
+    {
+      "name": "recovered Plan IR validation regression",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller recovered_plan_document_rejects_unsupported_ir_version --offline",
+      "result": "passed"
+    },
+    {
+      "name": "sovereign-eval all-target check",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check -p sovereign-eval --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "name": "sovereign-state all-target tests",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-state --all-targets --offline",
+      "result": "passed",
+      "details": "state 8/8; audit_budget_recovery 5/5; process_kill 1/1; security_kernel 7/7"
+    },
+    {
+      "name": "sovereign-plan all-target tests",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-plan --all-targets --offline",
+      "result": "passed",
+      "details": "compiler_m3 17/17; depth 7/7; minimal_compiler 26/26; validator 34/34"
+    },
+    {
+      "name": "sovereign-model all-target tests",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-model --all-targets --offline",
+      "result": "passed",
+      "details": "backend 11/11; external_intelligence 2/2"
+    },
+    {
+      "name": "sovereign-memory all-target tests",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-memory --all-targets --offline",
+      "result": "passed",
+      "details": "learning 8/8; lifecycle 25/25; projection 8/8; retrieval 18/18"
+    },
+    {
+      "name": "sovereign-repo all-target tests",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-repo --all-targets --offline",
+      "result": "passed"
+    },
+    {
+      "name": "sovereign-controller all-target tests",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --all-targets --offline",
+      "result": "passed",
+      "details": "controller lib 102/102; m6_t06_resilience 4/4; t07 62/62"
+    },
+    {
+      "name": "sovereign-eval all-target tests",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --all-targets --offline",
+      "result": "passed_on_full_rerun",
+      "details": "An initial run hit a transient browser process-group TERM permission race in transport_uncertainty_cleanup_and_fresh_lease_restart_never_replays_submit. The exact failed case passed immediately in isolation, and a fresh full all-target eval rerun completed successfully, including upgrade_compat 9/9. Physical local-model qualifications remain intentionally ignored here and are reserved for final exact-commit qualification."
+    },
+    {
+      "name": "changed-crate strict Clippy",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy -p sovereign-state -p sovereign-controller -p sovereign-eval --all-targets --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "name": "diff integrity",
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "name": "resident local model check",
+      "command": "pgrep -x llama-server || true",
+      "result": "empty"
+    }
+  ],
+  "independent_audits": [
+    {
+      "worker": "worker-16",
+      "mode": "final exact-tree plan/state/controller/provider compatibility audit",
+      "result": "CLOSABLE",
+      "blockers": [],
+      "limitations": [
+        "authoritative Plan IR v1.1 contract/fixture is absent; no migration support is claimed"
+      ],
+      "changes_made_by_auditor": false
+    },
+    {
+      "worker": "worker-18",
+      "mode": "final exact-tree memory/repository projection compatibility audit",
+      "result": "CLOSABLE",
+      "blockers": [],
+      "limitations": [
+        "authoritative Plan IR v1.1 contract/fixture is absent; no migration support is claimed"
+      ],
+      "changes_made_by_auditor": false
+    }
+  ],
+  "source_hashes": {
+    "crates/sovereign-state/src/lib.rs": "sha256:bfc26419600c71de3aae87fa0522539607c1119bba4fdbea5d45ef05390d66ab",
+    "crates/sovereign-controller/src/lib.rs": "sha256:69adc2d20d13fc5a67bb141a1874677611a7cc47f5492ff2dabf77430e3358ec",
+    "crates/sovereign-eval/Cargo.toml": "sha256:9f92ac96618307c8c5bdd7d6eb5ba63cd8d180ea5dcb53de231e6509260e4e67",
+    "crates/sovereign-eval/src/lib.rs": "sha256:999587138bd836067cee9639c9dbd6bd4487746f88a4095d1eacee29fd0a8e24",
+    "crates/sovereign-eval/src/compat.rs": "sha256:aa7738190d3dcc0674ad760153a0023e1a3585b8133c98b997414ca3eae04ad8",
+    "crates/sovereign-eval/tests/upgrade_compat.rs": "sha256:10e32eaad18b4930c1d2fa1fe139f0b97f166f13adc787474fa20b1dc46ca020",
+    "Cargo.lock": "sha256:23c3cb8da32311f0d2e7c8d948b072c82e6dcc124dc8d7a4209c9f71ebaa654d"
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "runtime_invariants": {
+    "canonical_execution_state": "SQLite StateStore",
+    "controller_remains_sole_execution_and_lifecycle_authority": true,
+    "offline_verification": true,
+    "resident_llama_server_after_verification": false,
+    "one_resident_local_model_constraint_preserved": true
+  },
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false,
+    "network_package_install": false
+  }
+}

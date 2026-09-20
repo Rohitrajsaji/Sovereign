@@ -22,6 +22,7 @@ sovereign-tools = { path = "../sovereign-tools" }
 [dev-dependencies]
 rusqlite.workspace = true
 sovereign-controller = { path = "../sovereign-controller", features = ["recovery-test-hooks"] }
+sovereign-memory = { path = "../sovereign-memory" }
 sovereign-model = { path = "../sovereign-model" }
 sovereign-plan = { path = "../sovereign-plan" }
 sovereign-policy = { path = "../sovereign-policy" }

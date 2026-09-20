@@ -1,5 +1,6 @@
 //! Deterministic evaluation aggregation over immutable attempt telemetry.
 
+mod compat;
 mod local_smoke;
 mod runner;
 mod schema;
@@ -8,6 +9,10 @@ use serde::{Deserialize, Serialize};
 use sovereign_context::{AttemptContextMetrics, MetricRatio, RetrievalRouteKind};
 use std::collections::BTreeMap;
 
+pub use compat::{
+    COMPATIBILITY_SUITE_SCHEMA_VERSION, CompatibilityCaseV1, MigrationCompatibilitySuite,
+    ProviderConformanceSuite,
+};
 pub use local_smoke::{LocalModelSmokeConfig, run_local_model_smoke};
 pub use runner::run_offline_profile;
 pub use schema::{
