@@ -2,6 +2,7 @@
 
 mod compat;
 mod local_smoke;
+mod release;
 mod runner;
 mod schema;
 
@@ -14,6 +15,10 @@ pub use compat::{
     ProviderConformanceSuite,
 };
 pub use local_smoke::{LocalModelSmokeConfig, run_local_model_smoke};
+pub use release::{
+    SOAK_REPORT_SCHEMA_VERSION, SoakCaseV1, SoakHardwareV1, SoakMeasurementV1, SoakProbeV1,
+    SoakReportV1, run_release_suite,
+};
 pub use runner::run_offline_profile;
 pub use schema::{
     EVAL_REPORT_SCHEMA_VERSION, EVAL_SCENARIO_SCHEMA_VERSION, EvalAggregateV1, EvalReportV1,

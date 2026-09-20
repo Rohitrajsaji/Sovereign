@@ -3,7 +3,7 @@ mod control_api;
 use control_api::{ControlApiRequest, bind_loopback, serve_listener};
 use serde_json::Value;
 use sovereign_controller::{ApprovalDecisionV1, LocalControl};
-use sovereign_eval::{M1_8GB_PROFILE_ID, run_offline_profile};
+use sovereign_eval::{M1_8GB_PROFILE_ID, run_offline_profile, run_release_suite};
 use sovereign_state::StateStore;
 use sovereign_types::ErrorCode;
 use std::net::SocketAddr;
@@ -117,22 +117,52 @@ fn run(args: &[String], state_path: &Path) -> Result<String, String> {
     }
 }
 
-fn run_eval(args: &[String]) -> Result<String, String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalInvocation {
+    Corpus,
+    Release,
+}
+
+fn parse_eval_invocation(args: &[String]) -> Result<EvalInvocation, String> {
     if args
-        != [
+        == [
+            "eval".to_owned(),
+            "--suite".to_owned(),
+            "release".to_owned(),
+            "--profile".to_owned(),
+            M1_8GB_PROFILE_ID.to_owned(),
+            "--offline".to_owned(),
+        ]
+    {
+        return Ok(EvalInvocation::Release);
+    }
+    if args
+        == [
             "eval".to_owned(),
             "--profile".to_owned(),
             M1_8GB_PROFILE_ID.to_owned(),
             "--offline".to_owned(),
         ]
     {
-        return Err(
-            "eval requires exactly --profile m1-8gb --offline for the frozen M9 local profile"
-                .to_owned(),
-        );
+        return Ok(EvalInvocation::Corpus);
     }
-    let report = run_offline_profile(M1_8GB_PROFILE_ID)?;
-    serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+    Err(
+        "eval requires exactly either --profile m1-8gb --offline or --suite release --profile m1-8gb --offline for the frozen M9 local profile"
+            .to_owned(),
+    )
+}
+
+fn run_eval(args: &[String]) -> Result<String, String> {
+    match parse_eval_invocation(args)? {
+        EvalInvocation::Release => {
+            let report = run_release_suite(M1_8GB_PROFILE_ID)?;
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+        }
+        EvalInvocation::Corpus => {
+            let report = run_offline_profile(M1_8GB_PROFILE_ID)?;
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())
+        }
+    }
 }
 
 fn run_serve(args: &[String], state_path: &Path) -> Result<String, String> {
@@ -218,6 +248,7 @@ fn help_text() -> String {
         "  status                        Inspect durable plan/task/attempt/control state",
         "  evidence                      Inspect durable verification evidence",
         "  eval --profile m1-8gb --offline  Run deterministic local M9 evaluation corpus",
+        "  eval --suite release --profile m1-8gb --offline  Run final M1/8GB release soak report",
         "  pause [reason]                Pause Controller readiness/mutation",
         "  resume                         Resume Controller readiness/mutation",
         "  approvals                      Render durable approval-request facts",
@@ -233,7 +264,7 @@ fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_control_request, run};
+    use super::{EvalInvocation, handle_control_request, parse_eval_invocation, run};
     use crate::control_api::{ControlApiRequest, bind_loopback, serve_one};
     use sovereign_controller::{Controller, LocalControl};
     use sovereign_state::StateStore;
@@ -294,6 +325,50 @@ mod tests {
         assert_eq!(report["aggregate"]["scenario_count"], 4);
         assert_eq!(report["aggregate"]["scenario_pass_count"], 4);
         assert_eq!(report["aggregate"]["false_completion_accepted"], 0);
+    }
+
+    #[test]
+    fn release_eval_cli_shape_is_exact_without_running_the_release_matrix() {
+        let exact = vec![
+            "eval".to_owned(),
+            "--suite".to_owned(),
+            "release".to_owned(),
+            "--profile".to_owned(),
+            "m1-8gb".to_owned(),
+            "--offline".to_owned(),
+        ];
+        assert_eq!(
+            parse_eval_invocation(&exact)
+                .unwrap_or_else(|error| panic!("parse exact release invocation: {error}")),
+            EvalInvocation::Release
+        );
+        for invalid in [
+            vec![
+                "eval".to_owned(),
+                "--suite".to_owned(),
+                "release".to_owned(),
+                "--profile".to_owned(),
+                "m1-8gb".to_owned(),
+            ],
+            vec![
+                "eval".to_owned(),
+                "--profile".to_owned(),
+                "m1-8gb".to_owned(),
+                "--suite".to_owned(),
+                "release".to_owned(),
+                "--offline".to_owned(),
+            ],
+            vec![
+                "eval".to_owned(),
+                "--suite".to_owned(),
+                "release".to_owned(),
+                "--profile".to_owned(),
+                "other".to_owned(),
+                "--offline".to_owned(),
+            ],
+        ] {
+            assert!(parse_eval_invocation(&invalid).is_err());
+        }
     }
 
     #[test]
