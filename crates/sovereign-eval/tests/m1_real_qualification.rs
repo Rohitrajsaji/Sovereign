@@ -963,6 +963,14 @@ fn m1_real_qwen_implementation_repair_restart_qualification() {
             .unwrap_or_else(|error| panic!("read recovered FailureRecord: {error}")),
         Some(failure.clone())
     );
+    assert_eq!(
+        backend
+            .residency_proof()
+            .unwrap_or_else(|error| panic!("prove post-restart Qwen absence: {error}")),
+        ModelResidencyProof::Absent,
+        "repair admission must begin only after the failed-attempt model residency is proven absent"
+    );
+    wait_for_frozen_model_launch_headroom();
 
     let success;
     let repair_packet;
