@@ -1097,6 +1097,11 @@ fn m1_real_qwen_implementation_repair_restart_qualification() {
         controller_repair.delivered_response_sha256
     );
     assert!(calls.iter().any(|call| call.phase == "plan_compiler"));
+    assert_eq!(lease.context_tokens, 8_192);
+    assert_eq!(lease.server_context_tokens, 9_728);
+    let controller_server_context_tokens = ContextBudget::m1_8k()
+        .max_input_tokens
+        .saturating_add(1_536);
     for call in &calls {
         assert!(call.admission.admitted_input_tokens <= 8_192);
         assert_eq!(
@@ -1110,7 +1115,15 @@ fn m1_real_qwen_implementation_repair_restart_qualification() {
             call.usage.input_tokens
         );
         assert!(call.admission.reserved_output_tokens <= 1_536);
-        assert_eq!(call.admission.server_context_tokens, 9_728);
+        let expected_server_context_tokens = match call.phase.as_str() {
+            "plan_compiler" => lease.server_context_tokens,
+            "controller_initial" | "controller_repair" => controller_server_context_tokens,
+            _ => unreachable!("unexpected captured real-model qualification phase"),
+        };
+        assert_eq!(
+            call.admission.server_context_tokens,
+            expected_server_context_tokens
+        );
     }
 
     let report = json!({
