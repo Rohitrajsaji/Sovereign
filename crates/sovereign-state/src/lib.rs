@@ -819,6 +819,28 @@ impl StateStore {
         })
     }
 
+    /// Returns whether one exact logical reference protects one exact artifact digest.
+    ///
+    /// This is a read-only integrity primitive over the existing artifact reference table. It
+    /// deliberately does not recreate a missing reference, so callers can fail closed when a
+    /// durable authority binding has been deleted or tampered with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database operation fails.
+    pub fn artifact_reference_exists(
+        &self,
+        reference_id: &str,
+        digest: &str,
+    ) -> Result<bool, StateError> {
+        let exists = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM artifact_references WHERE reference_id=?1 AND digest=?2)",
+            (reference_id, digest),
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(exists != 0)
+    }
+
     /// Removes a logical artifact reference while leaving immutable metadata
     /// and CAS bytes untouched for grace-period garbage collection.
     ///

@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "task_id": "M9-T02",
+  "title": "Implement completion governance and final scope audit",
+  "status": "completed",
+  "roadmap_version": "1.4-frozen",
+  "base_head": "8e20dc426977b0e441957f38309c11028e6f743a",
+  "completed_at": "2026-09-20T01:43:28Z",
+  "verified_at": "2026-09-20T01:43:28Z",
+  "dependencies": [
+    "M8-T01",
+    "M9-T01"
+  ],
+  "interfaces": [
+    "CompletionGate",
+    "CompletionRecord"
+  ],
+  "objective": "Require must-requirement coverage, fresh acceptance evidence, no unknown actions, no unexplained scope changes, and final repository revision manifests before goal completion.",
+  "acceptance": {
+    "all_eight_completion_gates_enforced": true,
+    "required_task_resolution_and_must_coverage_enforced": true,
+    "fresh_acceptance_bindings_and_required_evidence_types_enforced": true,
+    "required_artifact_and_evidence_proofs_enforced": true,
+    "unresolved_and_predispatch_action_authority_rejected": true,
+    "pending_approval_process_rollback_recovery_and_worktree_blockers_rejected": true,
+    "final_repository_revision_and_scope_audit_required": true,
+    "completion_record_canonical_cas_and_exact_reference_required": true,
+    "checkpoint_a_then_atomic_completion_row_and_single_event_then_checkpoint_b": true,
+    "project_completed_event_is_exact_checkpoint_a_successor": true,
+    "revision_one_completion_checkpoint_membership_supported": true,
+    "exact_repeat_is_idempotent": true,
+    "completion_recovery_replay_is_correlated_and_fail_closed": true,
+    "completed_revision_consequential_authority_is_terminal": true,
+    "false_completion_fixtures_all_fail_closed": true,
+    "second_authority_database_created": false,
+    "second_action_or_retry_ledger_created": false,
+    "second_resource_process_disk_wall_or_recovery_governor_created": false
+  },
+  "completion_governance_proof": {
+    "task_and_must_coverage": {
+      "all_required_tasks_must_be_terminal_success": true,
+      "must_requirements_require_explicit_succeeded_task_mapping": true,
+      "unmapped_must_rejected": true
+    },
+    "acceptance_and_evidence": {
+      "required_acceptance_bindings_validated": true,
+      "completion_check_required_evidence_types_nonempty_unique_and_present": true,
+      "verification_row_exact_sha256_must_match_bound_immutable_verification_artifact": true,
+      "checkpoint_immutable_binding_validation_includes_controller_verification": true
+    },
+    "recovery_and_authority_clear": {
+      "unresolved_dispatched_observed_unknown_actions_rejected": true,
+      "current_epoch_prepared_or_authorized_actions_rejected": true,
+      "current_revision_pending_approvals_rejected": true,
+      "nonterminal_process_leases_unresolved_rollbacks_recovery_and_worktree_conflicts_rejected": true
+    },
+    "repository_scope": {
+      "final_repository_snapshots_diffs_and_change_sets_bound": true,
+      "integration_checkpoint_proof_bound": true,
+      "out_of_scope_diff_rejected": true
+    },
+    "publication": {
+      "checkpoint_a_captured_before_publication": true,
+      "canonical_completion_record_written_to_cas": true,
+      "deterministic_exact_artifact_reference_required": true,
+      "completion_row_and_project_completed_event_persisted_atomically": true,
+      "exactly_one_project_completed_event_required": true,
+      "project_completed_sequence": "checkpoint_A.action_sequence + 1",
+      "overflow_is_fail_closed": true,
+      "checkpoint_b_seals_publication": true,
+      "exact_repeat_adds_no_event_or_checkpoint": true
+    },
+    "tamper_fail_closed": {
+      "missing_completion_row_or_malformed_record": true,
+      "completion_cas_digest_or_bytes_mismatch": true,
+      "missing_exact_artifact_reference": true,
+      "verification_row_differs_from_immutable_artifact": true,
+      "checkpoint_sealed_verification_row_changed": true,
+      "wrong_duplicate_or_non_immediate_project_completed_event": true
+    },
+    "recovery": {
+      "crash_after_atomic_publication_reuses_legitimate_a_plus_one_event": true,
+      "post_checkpoint_replay_correlated": true,
+      "future_or_superseding_completion_rejected": true
+    }
+  },
+  "terminal_authority_proof": {
+    "set_task_capability_grant_rejected_after_completion": true,
+    "respond_to_approval_rejected_after_completion": true,
+    "request_external_intelligence_rejected_after_completion": true,
+    "rollback_patch_reverse_rejected_after_completion": true,
+    "execute_build_heavy_dispatch_rejected_after_completion": true,
+    "request_task_cancellation_rejected_after_completion": true,
+    "record_exact_evidence_satisfaction_rejected_before_worktree_or_evidence_mutation": true,
+    "activate_superseding_revision_rejected_after_completion": true,
+    "ready_and_integration_lease_derivation_rejected_after_completion": true,
+    "stale_ready_and_integration_leases_cannot_dispatch": true,
+    "resume_recovered_and_resume_approved_execution_reenter_guarded_readiness": true,
+    "record_plan_failure_has_no_valid_terminal_success_path_to_mutation": true,
+    "record_attempt_episode_is_evidence_only_learning_and_grants_no_execution_authority": true,
+    "cleanup_or_release_paths_that_only_reduce_authority_remain_usable": true
+  },
+  "exact_five_case_eval": {
+    "test_count": 5,
+    "passed": 5,
+    "failed": 0,
+    "cases": [
+      "model DONE claim plus actual Controller verification failure",
+      "unmapped must requirement after real task success",
+      "real prepared -> authorized -> dispatched -> unknown lifecycle",
+      "out-of-scope diff via Controller verification",
+      "valid bound completion with checkpoint A/event/B and exact-repeat idempotence"
+    ],
+    "model_done_response_contains": "DONE: the model claims the implementation is complete; deterministic verification remains authoritative.",
+    "model_done_case_expected_error": "ControllerError::VerificationFailed(command_unexpected_exit)",
+    "model_done_case_completion_record_absent": true
+  },
+  "focused_regressions": {
+    "completion_filter": "6 passed, 0 failed",
+    "checkpoint_recovery_rejects_sealed_verification_row_tamper": "passed",
+    "completed_revision_rejects_permission_and_approval_mutation": "passed",
+    "completed_revision_rejects_evidence_satisfaction_without_state_advance": "passed",
+    "completion_publication_event_must_immediately_follow_checkpoint_a": "passed"
+  },
+  "verification": [
+    {
+      "name": "workspace format",
+      "command": "/Users/rohitrajsaji/.cargo/bin/cargo fmt --all -- --check",
+      "result": "passed"
+    },
+    {
+      "name": "sovereign-controller all-target/all-feature check",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check -p sovereign-controller --all-targets --all-features --offline",
+      "result": "passed"
+    },
+    {
+      "name": "sovereign-controller all-target/all-feature tests",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-controller --all-targets --all-features --offline",
+      "result": "passed",
+      "details": [
+        "controller lib 101/101",
+        "m6_t06_resilience 6/6",
+        "t07 67/67"
+      ]
+    },
+    {
+      "name": "sovereign-controller strict Clippy",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy -p sovereign-controller --all-targets --all-features --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "name": "sovereign-state all-target/all-feature check",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check -p sovereign-state --all-targets --all-features --offline",
+      "result": "passed"
+    },
+    {
+      "name": "sovereign-state all-target/all-feature tests",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-state --all-targets --all-features --offline",
+      "result": "passed",
+      "details": [
+        "state lib 7/7",
+        "audit_budget_recovery 5/5",
+        "process_kill 1/1",
+        "security_kernel 7/7"
+      ]
+    },
+    {
+      "name": "sovereign-state strict Clippy",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy -p sovereign-state --all-targets --all-features --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "name": "completion-governance eval check",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo check -p sovereign-eval --test completion_governance --offline",
+      "result": "passed"
+    },
+    {
+      "name": "completion-governance eval tests",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --test completion_governance --offline",
+      "result": "passed",
+      "details": "5 passed, 0 failed"
+    },
+    {
+      "name": "completion-governance eval strict Clippy",
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo clippy -p sovereign-eval --test completion_governance --offline -- -D warnings",
+      "result": "passed"
+    },
+    {
+      "name": "diff integrity",
+      "command": "git diff --check",
+      "result": "passed"
+    }
+  ],
+  "independent_audits": [
+    {
+      "worker": "worker-17",
+      "mode": "final exact-tree production audit",
+      "result": "CLOSABLE",
+      "blockers": [],
+      "changes_made_by_auditor": false
+    },
+    {
+      "worker": "worker-14",
+      "mode": "final exact-tree five-case semantic audit",
+      "result": "CLOSABLE",
+      "blockers": [],
+      "changes_made_by_auditor": false
+    }
+  ],
+  "source_hashes": {
+    "crates/sovereign-controller/src/lib.rs": "sha256:bbdd2623ff2dcbbb4347690b9deacd24a88def3aa98ad030eb25bc5749833f3b",
+    "crates/sovereign-state/src/lib.rs": "sha256:eae8da49e9567bccb5e2c742ca8e1b01930a32da0a207dd06310190ea29a047e",
+    "crates/sovereign-eval/tests/completion_governance.rs": "sha256:16145a6a31d25dfce538b298cfd55f666fcbb14b7c865815913ad97258288476"
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "runtime_invariants": {
+    "canonical_execution_state": "SQLite StateStore",
+    "controller_remains_sole_execution_and_lifecycle_authority": true,
+    "offline_verification": true,
+    "resident_llama_server_after_verification": false,
+    "one_resident_local_model_constraint_preserved": true
+  },
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false,
+    "network_package_install": false
+  }
+}

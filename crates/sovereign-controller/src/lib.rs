@@ -119,6 +119,8 @@ const VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION: u32 = 1;
 const TASK_CARRY_FINGERPRINT_SCHEMA_VERSION: u32 = 1;
 pub const INTEGRATION_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 const INTEGRATION_CHECKPOINT_NAMESPACE: &str = "controller.integration_checkpoint";
+pub const COMPLETION_RECORD_SCHEMA_VERSION: u32 = 1;
+const COMPLETION_RECORD_NAMESPACE: &str = "controller.completion_record";
 pub const LEGACY_CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 pub const AUTONOMY_SECURITY_CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 2;
 pub const CHECKPOINT_MANIFEST_SCHEMA_VERSION: u32 = 3;
@@ -1647,6 +1649,129 @@ pub struct IntegrationCheckpointV1 {
     pub checkpoint_digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionCheckV1 {
+    pub check_id: String,
+    pub kind: String,
+    pub required_evidence_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+// Plan IR v1.2 freezes these eight independent completion floors as explicit booleans.
+#[allow(clippy::struct_excessive_bools)]
+pub struct CompletionGate {
+    pub require_all_must_requirements: bool,
+    pub require_fresh_acceptance: bool,
+    pub require_all_required_tasks_resolved: bool,
+    pub require_no_unknown_actions: bool,
+    pub require_artifact_digests: bool,
+    pub require_scope_audit: bool,
+    pub require_final_checkpoint: bool,
+    pub require_final_repository_revisions: bool,
+    pub checks: Vec<CompletionCheckV1>,
+}
+
+type CompletionTaskCoverage = (BTreeMap<String, TaskState>, BTreeMap<String, Vec<String>>);
+type CompletionRepositoryAudit = (
+    BTreeMap<String, CompletionRepositoryRevisionV1>,
+    String,
+    BTreeMap<String, String>,
+);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionCheckpointBindingV1 {
+    pub generation: i64,
+    pub action_sequence: i64,
+    pub checkpoint_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionRepositoryRevisionV1 {
+    pub repository_id: String,
+    pub root: PathBuf,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub snapshot_digest: String,
+    pub dirty_digest: String,
+    pub diff_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionArtifactProofV1 {
+    pub task_id: String,
+    pub artifact_id: String,
+    pub locator: String,
+    pub output_binding_digest: String,
+    pub verification_id: String,
+    pub verification_artifact_digest: String,
+    pub concrete_digests: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletionRecordV1 {
+    pub schema_version: u32,
+    pub plan_id: String,
+    pub goal_id: String,
+    pub plan_revision: u32,
+    pub plan_digest: String,
+    pub policy_digest: String,
+    pub execution_epoch: i64,
+    pub completion_gate_digest: String,
+    pub completion_check_kinds: Vec<String>,
+    pub must_requirement_coverage: BTreeMap<String, Vec<String>>,
+    pub task_resolution: BTreeMap<String, TaskState>,
+    pub acceptance_binding_digests: BTreeMap<String, String>,
+    pub artifact_proofs: BTreeMap<String, CompletionArtifactProofV1>,
+    pub completion_evidence_digests: BTreeMap<String, Vec<String>>,
+    pub integration_checkpoint_digests: BTreeMap<String, String>,
+    pub action_recovery_clear: bool,
+    pub scope_audit_digest: String,
+    pub checkpoint: CompletionCheckpointBindingV1,
+    pub repository_revisions: BTreeMap<String, CompletionRepositoryRevisionV1>,
+}
+
+pub type CompletionRecord = CompletionRecordV1;
+
+impl CompletionRecordV1 {
+    fn canonical_value(&self) -> Result<Value, ControllerError> {
+        Ok(canonicalize(&serde_json::to_value(self)?))
+    }
+
+    fn canonical_bytes(&self) -> Result<Vec<u8>, ControllerError> {
+        Ok(serde_json::to_vec(&self.canonical_value()?)?)
+    }
+
+    fn canonical_digest(&self) -> Result<String, ControllerError> {
+        Ok(sha256_prefixed(&self.canonical_bytes()?))
+    }
+
+    fn validate_identity(&self, active: &ActivePlan) -> Result<(), ControllerError> {
+        if self.schema_version != COMPLETION_RECORD_SCHEMA_VERSION
+            || self.plan_id != active.plan_id
+            || self.goal_id != active.goal_id
+            || self.plan_revision != active.revision
+            || self.plan_digest != active.plan_digest
+            || self.policy_digest != active.policy_digest
+            || !self.action_recovery_clear
+            || self.scope_audit_digest.is_empty()
+            || self.checkpoint.generation <= 0
+            || self.checkpoint.action_sequence < 0
+            || self.checkpoint.checkpoint_hash.is_empty()
+        {
+            return Err(ControllerError::InvalidPlan(
+                "completion record is malformed or bound to another plan revision".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl IntegrationCheckpointV1 {
     fn canonical_value(&self) -> Value {
         json!({
@@ -2617,6 +2742,7 @@ impl Controller {
         task_id: &str,
         reason: &str,
     ) -> Result<CancellationRecordV1, ControllerError> {
+        self.require_active_revision_not_completed()?;
         let handle = self.task_cancellation_handle(task_id)?;
         handle.cancel()?;
         let scope = handle.cancellation_origin().ok_or_else(|| {
@@ -2791,6 +2917,7 @@ impl Controller {
         task_id: &str,
         capabilities: CapabilitySet,
     ) -> Result<i64, ControllerError> {
+        self.require_active_revision_not_completed()?;
         self.require_execution_not_paused()?;
         require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         if !capabilities.is_subset_of(&self.permission_context.persisted_grant_capabilities()) {
@@ -3082,6 +3209,7 @@ impl Controller {
         resume_action_id: Option<&str>,
         model_budget: &mut ModelCallBudget,
     ) -> Result<ExternalIntelligenceOutcome, ControllerError> {
+        self.require_active_revision_not_completed()?;
         self.require_execution_not_paused()?;
         if self.any_unresolved_action()? {
             return Err(ControllerError::NotReady(
@@ -5691,6 +5819,7 @@ impl Controller {
         decided_by: &str,
     ) -> Result<ApprovalRequestV1, ControllerError> {
         validate_durable_action_lifecycle_states(&self.state)?;
+        self.require_active_revision_not_completed()?;
         self.require_execution_not_paused()?;
         require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         let decided_by = decided_by.trim();
@@ -6952,6 +7081,7 @@ impl Controller {
         &self,
         classification: &FailureClassification,
     ) -> Result<PlanReplanInput, ControllerError> {
+        self.require_active_revision_not_completed()?;
         require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         if classification.kind != FailureClassificationKind::PlanFailure {
             return Err(ControllerError::InvalidPlan(
@@ -7008,6 +7138,7 @@ impl Controller {
         context: &ContextPacket,
         selected_evidence_ids: &[String],
     ) -> Result<String, ControllerError> {
+        self.require_active_revision_not_completed()?;
         self.require_current_baseline(registry)?;
         self.ensure_task_worktree(registry, task_id)?;
         let (plan_id, plan_revision, plan_digest, task_contract_digest, requirement) = {
@@ -7280,6 +7411,7 @@ impl Controller {
         classification: &FailureClassification,
         registry: &ProjectRegistry,
     ) -> Result<(ActivationSummary, PlanRevisionDiff), ControllerError> {
+        self.require_active_revision_not_completed()?;
         if classification.kind != FailureClassificationKind::PlanFailure {
             return Err(ControllerError::InvalidPlan(
                 "only a verified plan failure may supersede the active revision".to_owned(),
@@ -7691,6 +7823,7 @@ impl Controller {
         inputs: ReadinessInputs<'_>,
         tool_manifest: &ToolManifest,
     ) -> Result<ReadyLease, ControllerError> {
+        self.require_active_revision_not_completed()?;
         self.require_execution_not_paused()?;
         if self.cancellation_blocks_task(task_id)? {
             return Err(ControllerError::NotReady(
@@ -7732,6 +7865,7 @@ impl Controller {
         inputs: ReadinessInputs<'_>,
         tool_manifest: &ToolManifest,
     ) -> Result<IntegrationGateLeaseV1, ControllerError> {
+        self.require_active_revision_not_completed()?;
         self.require_execution_not_paused()?;
         if self.cancellation_blocks_task(task_id)? {
             return Err(ControllerError::NotReady(
@@ -9479,6 +9613,7 @@ impl Controller {
         tool_manifest: &ToolManifest,
         verification_command: Option<(&str, &RequiredCommandVerificationStep, &Path)>,
     ) -> Result<RawToolResult, ControllerError> {
+        self.require_active_revision_not_completed()?;
         self.validate_heavy_phase_lease(lease)?;
         if lease.completion.is_some() {
             return Err(ControllerError::NotReady(
@@ -11506,6 +11641,7 @@ impl Controller {
         original_action_id: &str,
         runtime: &ExecutionRuntime<'_, I>,
     ) -> Result<RollbackRecordV1, ControllerError> {
+        self.require_active_revision_not_completed()?;
         self.require_execution_not_paused()?;
         RecoveryIntegrityGate::verify_before_high_risk_mutation(&mut self.state)?;
         let original_action = self
@@ -13354,6 +13490,7 @@ impl Controller {
         tool_manifest: &ToolManifest,
         allowed_unresolved_secret_action_id: Option<&str>,
     ) -> Result<(), ControllerError> {
+        self.require_active_revision_not_completed()?;
         self.require_execution_not_paused()?;
         require_no_unresolved_secret_action_lifecycles(
             &self.state,
@@ -13409,6 +13546,7 @@ impl Controller {
         registry: &ProjectRegistry,
         tool_manifest: &ToolManifest,
     ) -> Result<(), ControllerError> {
+        self.require_active_revision_not_completed()?;
         self.require_execution_not_paused()?;
         require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
         if self.cancellation_blocks_task(&lease.task_id)? {
@@ -16499,6 +16637,761 @@ impl Controller {
         ))
     }
 
+    /// Returns the durable completion record for the exact active plan revision.
+    ///
+    /// The record is accepted only when its canonical CAS object, exact artifact reference,
+    /// plan identity, and trusted pre-completion checkpoint ancestry all still validate.
+    ///
+    /// # Errors
+    /// Returns a fail-closed Controller error for malformed, stale, missing, or tampered
+    /// completion authority.
+    pub fn completion_record(&self) -> Result<Option<CompletionRecordV1>, ControllerError> {
+        let active = self.active_ref()?;
+        current_completion_record_for(&self.state, active)
+    }
+
+    fn require_active_revision_not_completed(&self) -> Result<(), ControllerError> {
+        if let Some(record) = self.completion_record()? {
+            return Err(ControllerError::NotReady(format!(
+                "plan {} revision {} is durably completed at checkpoint generation {}",
+                record.plan_id, record.plan_revision, record.checkpoint.generation
+            )));
+        }
+        Ok(())
+    }
+
+    fn completion_task_resolution_and_coverage(
+        &self,
+    ) -> Result<CompletionTaskCoverage, ControllerError> {
+        let active = self.active_ref()?;
+        let mut task_resolution = BTreeMap::new();
+        for (task_id, runtime) in &active.tasks {
+            task_resolution.insert(task_id.clone(), runtime.state);
+            if runtime.state != TaskState::Succeeded {
+                return Err(ControllerError::NotReady(format!(
+                    "required task {task_id} is not succeeded"
+                )));
+            }
+        }
+
+        let must_requirements = required_array(&active.plan_document, "/requirements")?
+            .iter()
+            .filter(|requirement| optional_str(requirement, "/priority") == Some("must"))
+            .map(|requirement| {
+                Ok((
+                    required_str(requirement, "/requirement_id")?.to_owned(),
+                    requirement,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+        let mut coverage = BTreeMap::new();
+        for requirement_id in must_requirements.keys() {
+            let mut succeeded = Vec::new();
+            for (task_id, runtime) in &active.tasks {
+                if required_array(&runtime.task, "/requirement_ids")?
+                    .iter()
+                    .any(|value| value.as_str() == Some(requirement_id.as_str()))
+                    && runtime.state == TaskState::Succeeded
+                {
+                    succeeded.push(task_id.clone());
+                }
+            }
+            if succeeded.is_empty() {
+                return Err(ControllerError::NotReady(format!(
+                    "must requirement {requirement_id} has no succeeded task mapping"
+                )));
+            }
+            coverage.insert(requirement_id.clone(), succeeded);
+        }
+        Ok((task_resolution, coverage))
+    }
+
+    fn validated_completion_output_binding(
+        &self,
+        namespace: &str,
+        binding_kind: &str,
+        task_id: &str,
+        binding_id: &str,
+    ) -> Result<(String, VerifiedOutputBindingV1, VerificationResultV1), ControllerError> {
+        let active = self.active_ref()?;
+        let runtime = active.tasks.get(task_id).ok_or_else(|| {
+            ControllerError::NotReady(format!("completion task {task_id} disappeared"))
+        })?;
+        let key = active_scoped_key(active, &output_binding_key(task_id, binding_id));
+        let raw = self.state.get_state(namespace, &key)?.ok_or_else(|| {
+            ControllerError::NotReady(format!(
+                "completion output binding {task_id}/{binding_id} is missing"
+            ))
+        })?;
+        let binding: VerifiedOutputBindingV1 = serde_json::from_str(&raw)?;
+        if binding.schema_version != VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION
+            || binding.plan_id != active.plan_id
+            || binding.plan_revision != active.revision
+            || binding.plan_digest != active.plan_digest
+            || binding.task_id != task_id
+            || binding.task_contract_digest != runtime.task_contract_digest
+            || binding.binding_kind != binding_kind
+            || binding.binding_id != binding_id
+        {
+            return Err(ControllerError::NotReady(format!(
+                "completion output binding {task_id}/{binding_id} is stale or misbound"
+            )));
+        }
+        if self
+            .state
+            .artifact_metadata(&binding.verification_artifact_digest)?
+            .is_none()
+        {
+            return Err(ControllerError::NotReady(format!(
+                "completion output binding {task_id}/{binding_id} lost verification artifact metadata"
+            )));
+        }
+        let verification_revision = binding
+            .carried_from_plan_revision
+            .unwrap_or(binding.plan_revision);
+        let verification_plan_digest = binding
+            .carried_from_plan_digest
+            .as_deref()
+            .unwrap_or(binding.plan_digest.as_str());
+        let verification_key = revision_scoped_key(
+            &binding.plan_id,
+            verification_revision,
+            &binding.verification_id,
+        );
+        let verification_raw = self
+            .state
+            .get_state("controller.verification", &verification_key)?
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "completion output binding {task_id}/{binding_id} lost verification authority"
+                ))
+            })?;
+        validate_completion_verification_row_artifact_binding(
+            &verification_raw,
+            &binding.verification_artifact_digest,
+            task_id,
+            binding_id,
+        )?;
+        let verification: VerificationResultV1 = serde_json::from_str(&verification_raw)?;
+        if verification.schema_version != VERIFICATION_RESULT_SCHEMA_VERSION
+            || !verification.passed
+            || verification.plan_id != binding.plan_id
+            || verification.plan_revision != verification_revision
+            || verification.plan_digest != verification_plan_digest
+            || verification.task_id != task_id
+            || verification.task_contract_digest != runtime.task_contract_digest
+            || verification.verification_id != binding.verification_id
+            || verification.attempt_id != binding.attempt_id
+        {
+            return Err(ControllerError::NotReady(format!(
+                "completion output binding {task_id}/{binding_id} has invalid verification authority"
+            )));
+        }
+        self.validate_completion_carry_proof(&binding, task_id, binding_id)?;
+        Ok((
+            digest_json(&serde_json::to_value(&binding)?)?,
+            binding,
+            verification,
+        ))
+    }
+
+    fn validate_completion_carry_proof(
+        &self,
+        binding: &VerifiedOutputBindingV1,
+        task_id: &str,
+        binding_id: &str,
+    ) -> Result<(), ControllerError> {
+        if binding.carried_from_plan_revision.is_none() {
+            return Ok(());
+        }
+        let active = self.active_ref()?;
+        let runtime = active.tasks.get(task_id).ok_or_else(|| {
+            ControllerError::NotReady(format!("completion task {task_id} disappeared"))
+        })?;
+        let carry_raw = self
+            .state
+            .get_state(
+                "controller.task_carry_fingerprint",
+                &active_scoped_key(active, task_id),
+            )?
+            .ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "carried completion output {task_id}/{binding_id} lost carry proof"
+                ))
+            })?;
+        let carry: TaskCarryFingerprintV1 = serde_json::from_str(&carry_raw)?;
+        if carry.schema_version != TASK_CARRY_FINGERPRINT_SCHEMA_VERSION
+            || carry.plan_id != active.plan_id
+            || carry.plan_revision != active.revision
+            || carry.plan_digest != active.plan_digest
+            || carry.task_id != task_id
+            || carry.task_contract_digest != runtime.task_contract_digest
+            || carry.verification_id != binding.verification_id
+            || carry.verification_artifact_digest != binding.verification_artifact_digest
+        {
+            return Err(ControllerError::NotReady(format!(
+                "carried completion output {task_id}/{binding_id} has invalid carry proof"
+            )));
+        }
+        Ok(())
+    }
+
+    fn completion_acceptance_bindings(
+        &self,
+    ) -> Result<(BTreeMap<String, String>, BTreeSet<String>), ControllerError> {
+        let active = self.active_ref()?;
+        let mut bindings = BTreeMap::new();
+        let mut evidence_types = BTreeSet::new();
+        for (task_id, runtime) in &active.tasks {
+            let _ = compiled_acceptance_contract(&runtime.task)?;
+            for criterion in required_array(&runtime.task, "/acceptance_criteria")?
+                .iter()
+                .filter(|criterion| {
+                    criterion.get("required").and_then(Value::as_bool) == Some(true)
+                })
+            {
+                let criterion_id = required_str(criterion, "/criterion_id")?;
+                let (digest, binding, _) = self.validated_completion_output_binding(
+                    "controller.acceptance_binding",
+                    "acceptance",
+                    task_id,
+                    criterion_id,
+                )?;
+                match required_str(criterion, "/evidence_freshness")? {
+                    "current_attempt" if binding.carried_from_plan_revision.is_some() => {
+                        return Err(ControllerError::NotReady(format!(
+                            "acceptance criterion {criterion_id} requires current-attempt evidence"
+                        )));
+                    }
+                    "current_attempt" | "carry_forward_if_inputs_unchanged" => {}
+                    other => {
+                        return Err(ControllerError::InvalidPlan(format!(
+                            "unsupported acceptance evidence freshness {other}"
+                        )));
+                    }
+                }
+                evidence_types.insert(required_str(criterion, "/evidence_type")?.to_owned());
+                bindings.insert(format!("{task_id}:{criterion_id}"), digest);
+            }
+        }
+        Ok((bindings, evidence_types))
+    }
+
+    fn completion_concrete_evidence_digests(
+        &self,
+        verification: &VerificationResultV1,
+    ) -> Result<Vec<String>, ControllerError> {
+        let mut concrete = BTreeSet::new();
+        for evidence_id in &verification.evidence_ids {
+            if is_sha256_digest(evidence_id) {
+                let raw_digest = evidence_id.strip_prefix("sha256:").ok_or_else(|| {
+                    ControllerError::NotReady(
+                        "completion evidence digest lost SHA-256 prefix".to_owned(),
+                    )
+                })?;
+                if self.state.artifact_metadata(raw_digest)?.is_some()
+                    || verification.command_results.iter().any(|result| {
+                        result.passed
+                            && result
+                                .result_digest
+                                .as_deref()
+                                .is_some_and(|digest| digest == evidence_id || digest == raw_digest)
+                    })
+                {
+                    concrete.insert(evidence_id.clone());
+                    continue;
+                }
+            }
+            if is_sha256_hex_digest(evidence_id)
+                && self.state.artifact_metadata(evidence_id)?.is_some()
+            {
+                concrete.insert(format!("sha256:{evidence_id}"));
+                continue;
+            }
+            if verification.command_results.iter().any(|result| {
+                result.passed && result.result_digest.as_deref() == Some(evidence_id.as_str())
+            }) {
+                concrete.insert(if is_sha256_hex_digest(evidence_id) {
+                    format!("sha256:{evidence_id}")
+                } else {
+                    sha256_prefixed(evidence_id.as_bytes())
+                });
+                continue;
+            }
+            let mut matched = None;
+            for record in self.state.state_records("controller.evidence_item")? {
+                let item: EvidenceItem = serde_json::from_str(&record.value_json)?;
+                if item.evidence_id == *evidence_id {
+                    let digest = digest_json(&serde_json::to_value(&item)?)?;
+                    if matched.replace(digest).is_some() {
+                        return Err(ControllerError::NotReady(format!(
+                            "completion evidence id {evidence_id} is ambiguous"
+                        )));
+                    }
+                }
+            }
+            let digest = matched.ok_or_else(|| {
+                ControllerError::NotReady(format!(
+                    "completion evidence id {evidence_id} has no retained governed proof"
+                ))
+            })?;
+            concrete.insert(digest);
+        }
+        if concrete.is_empty() {
+            return Err(ControllerError::NotReady(
+                "controller-evidence-set is empty".to_owned(),
+            ));
+        }
+        Ok(concrete.into_iter().collect())
+    }
+
+    fn completion_artifact_proofs(
+        &self,
+    ) -> Result<BTreeMap<String, CompletionArtifactProofV1>, ControllerError> {
+        let active = self.active_ref()?;
+        let mut proofs = BTreeMap::new();
+        for (task_id, runtime) in &active.tasks {
+            for artifact in required_array(&runtime.task, "/expected_artifacts")?
+                .iter()
+                .filter(|artifact| artifact.get("required").and_then(Value::as_bool) == Some(true))
+            {
+                let artifact_id = required_str(artifact, "/artifact_id")?;
+                let locator = required_str(artifact, "/locator")?;
+                let (binding_digest, binding, verification) = self
+                    .validated_completion_output_binding(
+                        "controller.artifact_binding",
+                        "artifact",
+                        task_id,
+                        artifact_id,
+                    )?;
+                let mut concrete_digests = match locator {
+                    "controller-change-set" => {
+                        let change_set = validate_durable_change_set_binding(
+                            &self.state,
+                            &active_scoped_key(active, task_id),
+                            task_id,
+                            runtime,
+                        )?;
+                        let digest = change_set.digest()?;
+                        if binding.change_set_digest.as_deref() != Some(digest.as_str()) {
+                            return Err(ControllerError::NotReady(format!(
+                                "artifact {task_id}/{artifact_id} ChangeSet binding is stale"
+                            )));
+                        }
+                        vec![digest]
+                    }
+                    "controller-evidence-set" => {
+                        self.completion_concrete_evidence_digests(&verification)?
+                    }
+                    _ if locator.starts_with("verification:") => {
+                        let step_id = locator.strip_prefix("verification:").ok_or_else(|| {
+                            ControllerError::InvalidPlan(
+                                "verification artifact locator is malformed".to_owned(),
+                            )
+                        })?;
+                        let result = verification
+                            .command_results
+                            .iter()
+                            .find(|result| result.step_id == step_id && result.passed)
+                            .ok_or_else(|| {
+                                ControllerError::NotReady(format!(
+                                    "artifact {task_id}/{artifact_id} lacks passed verification step {step_id}"
+                                ))
+                            })?;
+                        let result_digest = result.result_digest.clone().ok_or_else(|| {
+                            ControllerError::NotReady(format!(
+                                "verification step {step_id} lacks a retained result digest"
+                            ))
+                        })?;
+                        vec![
+                            if is_sha256_hex_digest(&result_digest) {
+                                format!("sha256:{result_digest}")
+                            } else {
+                                result_digest
+                            },
+                            format!("sha256:{}", binding.verification_artifact_digest),
+                        ]
+                    }
+                    other => {
+                        return Err(ControllerError::InvalidPlan(format!(
+                            "unsupported completion artifact locator {other}"
+                        )));
+                    }
+                };
+                concrete_digests.sort();
+                concrete_digests.dedup();
+                let key = format!("{task_id}:{artifact_id}");
+                if proofs
+                    .insert(
+                        key.clone(),
+                        CompletionArtifactProofV1 {
+                            task_id: task_id.clone(),
+                            artifact_id: artifact_id.to_owned(),
+                            locator: locator.to_owned(),
+                            output_binding_digest: binding_digest,
+                            verification_id: binding.verification_id,
+                            verification_artifact_digest: binding.verification_artifact_digest,
+                            concrete_digests,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "duplicate completion artifact proof {key}"
+                    )));
+                }
+            }
+        }
+        Ok(proofs)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn completion_evidence_digests(
+        &self,
+        registry: &ProjectRegistry,
+    ) -> Result<BTreeMap<String, Vec<String>>, ControllerError> {
+        let active = self.active_ref()?;
+        let mut result = BTreeMap::new();
+        for (task_id, runtime) in &active.tasks {
+            let requirements = completion_evidence_requirements(&runtime.task)?;
+            if requirements.is_empty() {
+                continue;
+            }
+            let repository = active.single_task_repository(task_id)?;
+            let current_snapshot_digest =
+                snapshot_digest(&registry.snapshot(&repository.repository_id)?)?;
+            let mut task_digests = Vec::new();
+            for requirement in requirements {
+                let requirement_id = required_str(requirement, "/requirement_id")?;
+                let raw = self
+                    .state
+                    .get_state(
+                        "controller.evidence_satisfaction",
+                        &active_scoped_key(
+                            active,
+                            &evidence_satisfaction_key(task_id, requirement_id),
+                        ),
+                    )?
+                    .ok_or_else(|| {
+                        ControllerError::NotReady(format!(
+                            "completion evidence requirement {requirement_id} is unsatisfied"
+                        ))
+                    })?;
+                let record: EvidenceSatisfactionV1 = serde_json::from_str(&raw)?;
+                let query = required_str(requirement, "/query")?;
+                let probe = exact_requirement_probe(query).ok_or_else(|| {
+                    ControllerError::NotReady(format!(
+                        "completion evidence requirement {requirement_id} has no deterministic exact anchor"
+                    ))
+                })?;
+                let freshness = required_str(requirement, "/freshness")?;
+                let fresh = match freshness {
+                    "current_repository_snapshot" => {
+                        record.repository_snapshot_digest == current_snapshot_digest
+                    }
+                    "current_plan_revision" => true,
+                    _ => false,
+                };
+                if record.schema_version != EVIDENCE_SATISFACTION_SCHEMA_VERSION
+                    || record.plan_id != active.plan_id
+                    || record.plan_revision != active.revision
+                    || record.plan_digest != active.plan_digest
+                    || record.task_id != *task_id
+                    || record.task_contract_digest != runtime.task_contract_digest
+                    || record.requirement_id != requirement_id
+                    || record.requirement_digest != digest_json(requirement)?
+                    || record.query_digest != sha256_prefixed(query.as_bytes())
+                    || record.evidence_ids.len() != record.evidence_digests.len()
+                    || record.evidence_ids.len() != record.evidence_record_keys.len()
+                    || !fresh
+                {
+                    return Err(ControllerError::NotReady(format!(
+                        "completion evidence satisfaction {requirement_id} is stale or misbound"
+                    )));
+                }
+                let _ = validate_evidence_selection(requirement, &record.evidence_ids)?;
+                for ((evidence_id, evidence_digest), evidence_key) in record
+                    .evidence_ids
+                    .iter()
+                    .zip(&record.evidence_digests)
+                    .zip(&record.evidence_record_keys)
+                {
+                    let evidence_raw = self
+                        .state
+                        .get_state("controller.evidence_item", evidence_key)?
+                        .ok_or_else(|| {
+                            ControllerError::NotReady(format!(
+                                "completion evidence {requirement_id} lost retained item {evidence_id}"
+                            ))
+                        })?;
+                    let item: EvidenceItem = serde_json::from_str(&evidence_raw)?;
+                    if item.evidence_id != *evidence_id
+                        || digest_json(&serde_json::to_value(&item)?)? != *evidence_digest
+                    {
+                        return Err(ControllerError::NotReady(format!(
+                            "completion evidence item {evidence_id} no longer matches durable digest"
+                        )));
+                    }
+                    self.validate_task_exact_context_evidence(
+                        registry,
+                        task_id,
+                        &repository.repository_id,
+                        &item,
+                    )?;
+                    self.validate_task_requirement_bound_evidence(
+                        registry,
+                        task_id,
+                        &repository.repository_id,
+                        &item,
+                        &probe,
+                    )?;
+                }
+                task_digests.push(digest_json(&serde_json::to_value(&record)?)?);
+            }
+            task_digests.sort();
+            result.insert(task_id.clone(), task_digests);
+        }
+        Ok(result)
+    }
+
+    fn require_completion_recovery_clear(&self) -> Result<(), ControllerError> {
+        validate_durable_action_lifecycle_states(&self.state)?;
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
+        let active = self.active_ref()?;
+        let execution_epoch = self.state.current_execution_epoch()?;
+        if self.state.action_records()?.iter().any(|record| {
+            record.execution_epoch == execution_epoch
+                && matches!(
+                    record.state.as_str(),
+                    state if state == ActionState::Prepared.as_str()
+                        || state == ActionState::Authorized.as_str()
+                )
+        }) {
+            return Err(ControllerError::NotReady(
+                "completion is blocked by live pre-dispatch action authority".to_owned(),
+            ));
+        }
+        for record in self.state.state_records(APPROVAL_REQUEST_NAMESPACE)? {
+            let request: ApprovalRequestV1 = serde_json::from_str(&record.value_json)?;
+            if request.request_id != record.key {
+                return Err(ControllerError::InvalidPlan(
+                    "approval request durable key does not match request identity".to_owned(),
+                ));
+            }
+            if request.plan_id == active.plan_id
+                && request.plan_revision == active.revision
+                && request.status == ApprovalRequestStatusV1::Pending
+            {
+                self.validate_current_approval_request(&request)?;
+                return Err(ControllerError::NotReady(format!(
+                    "completion is blocked by pending approval request {}",
+                    request.request_id
+                )));
+            }
+        }
+        if self.any_unresolved_action()?
+            || has_unresolved_process_lease(&self.state)?
+            || has_unresolved_rollback(&self.state, None)?
+        {
+            return Err(ControllerError::NotReady(
+                "completion is blocked by unresolved action/process/rollback authority".to_owned(),
+            ));
+        }
+        for (task_id, runtime) in &active.tasks {
+            if runtime.state == TaskState::ReconcilingUnknown
+                || runtime.worktree_state == Some(WorktreeLifecycle::Conflict)
+                || runtime.worktree_conflict.is_some()
+                || runtime.integration_views.values().any(|view| {
+                    view.state == WorktreeLifecycle::Conflict || view.conflict.is_some()
+                })
+            {
+                return Err(ControllerError::NotReady(format!(
+                    "completion task {task_id} has unresolved recovery/worktree conflict"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn completion_repository_revisions(
+        &mut self,
+        registry: &ProjectRegistry,
+    ) -> Result<CompletionRepositoryAudit, ControllerError> {
+        self.require_current_baseline(registry)?;
+        let active = self.active_ref()?;
+        let retriever = ExactRetriever::new(registry);
+        let mut repositories = BTreeMap::new();
+        for repository_id in active.repositories.keys() {
+            let snapshot = registry.snapshot(repository_id)?;
+            let baseline = active.repository(repository_id)?;
+            if snapshot != baseline.baseline {
+                return Err(ControllerError::NotReady(format!(
+                    "completion repository {repository_id} drifted after baseline validation"
+                )));
+            }
+            let diff = retriever.current_diff(repository_id)?;
+            repositories.insert(
+                repository_id.clone(),
+                CompletionRepositoryRevisionV1 {
+                    repository_id: repository_id.clone(),
+                    root: snapshot.root.clone(),
+                    head: snapshot.head.clone(),
+                    branch: snapshot.branch.clone(),
+                    snapshot_digest: snapshot_digest(&snapshot)?,
+                    dirty_digest: snapshot.dirty_digest.clone(),
+                    diff_digest: diff.digest,
+                },
+            );
+        }
+        let mut change_sets = BTreeMap::new();
+        for (task_id, runtime) in &active.tasks {
+            if runtime.change_set.is_some() {
+                let change_set = validate_durable_change_set_binding(
+                    &self.state,
+                    &active_scoped_key(active, task_id),
+                    task_id,
+                    runtime,
+                )?;
+                change_sets.insert(task_id.clone(), change_set.digest()?);
+            }
+        }
+        let scope_audit_digest = digest_json(&json!({
+            "plan_id": active.plan_id,
+            "plan_revision": active.revision,
+            "plan_digest": active.plan_digest,
+            "repositories": repositories,
+            "change_sets": change_sets,
+        }))?;
+        Ok((repositories, scope_audit_digest, change_sets))
+    }
+
+    /// Completes the exact active goal revision only after every frozen completion guard has
+    /// been proven from Controller-owned durable state, repository truth, verification records,
+    /// and a trusted checkpoint.
+    ///
+    /// # Errors
+    /// Returns a fail-closed Controller error when any requirement, task, verification, artifact,
+    /// recovery, scope, checkpoint, or repository binding is missing, stale, or malformed.
+    #[allow(clippy::too_many_lines)]
+    pub fn complete_goal(
+        &mut self,
+        registry: &ProjectRegistry,
+    ) -> Result<CompletionRecordV1, ControllerError> {
+        if let Some(existing) = self.completion_record()? {
+            validate_completion_publication_event(&self.state, &existing)?;
+            return Ok(existing);
+        }
+        let (completion_gate, completion_gate_digest) =
+            parse_completion_gate(&self.active_ref()?.plan_document)?;
+        let (task_resolution, must_requirement_coverage) =
+            self.completion_task_resolution_and_coverage()?;
+        let (acceptance_binding_digests, acceptance_evidence_types) =
+            self.completion_acceptance_bindings()?;
+        validate_completion_check_evidence_types(&completion_gate, &acceptance_evidence_types)?;
+        let artifact_proofs = self.completion_artifact_proofs()?;
+        let completion_evidence_digests = self.completion_evidence_digests(registry)?;
+        self.require_completion_recovery_clear()?;
+        let (repository_revisions, scope_audit_digest, _) =
+            self.completion_repository_revisions(registry)?;
+
+        let mut integration_checkpoint_digests = BTreeMap::new();
+        let task_ids = self.active_ref()?.tasks.keys().cloned().collect::<Vec<_>>();
+        for task_id in task_ids {
+            if self.task_is_multi_repo_integration_gate(&task_id)? {
+                integration_checkpoint_digests.insert(
+                    task_id.clone(),
+                    self.validated_integration_checkpoint_digest(registry, &task_id)?,
+                );
+            }
+        }
+
+        self.checkpoint_now()?;
+        let (generation, action_sequence, checkpoint_hash) = self.current_checkpoint_binding()?;
+        let (plan_id, goal_id, plan_revision, plan_digest, policy_digest, execution_epoch) = {
+            let active = self.active_ref()?;
+            (
+                active.plan_id.clone(),
+                active.goal_id.clone(),
+                active.revision,
+                active.plan_digest.clone(),
+                active.policy_digest.clone(),
+                self.state.current_execution_epoch()?,
+            )
+        };
+        let mut completion_check_kinds = completion_gate
+            .checks
+            .iter()
+            .map(|check| check.kind.clone())
+            .collect::<Vec<_>>();
+        completion_check_kinds.sort();
+        completion_check_kinds.dedup();
+        let record = CompletionRecordV1 {
+            schema_version: COMPLETION_RECORD_SCHEMA_VERSION,
+            plan_id: plan_id.clone(),
+            goal_id,
+            plan_revision,
+            plan_digest,
+            policy_digest,
+            execution_epoch,
+            completion_gate_digest,
+            completion_check_kinds,
+            must_requirement_coverage,
+            task_resolution,
+            acceptance_binding_digests,
+            artifact_proofs,
+            completion_evidence_digests,
+            integration_checkpoint_digests,
+            action_recovery_clear: true,
+            scope_audit_digest,
+            checkpoint: CompletionCheckpointBindingV1 {
+                generation,
+                action_sequence,
+                checkpoint_hash,
+            },
+            repository_revisions,
+        };
+        record.validate_identity(self.active_ref()?)?;
+        let canonical_bytes = record.canonical_bytes()?;
+        let canonical_digest = record.canonical_digest()?;
+        let store = checkpoint_artifact_store(self.state.path())?;
+        let artifact = store.put(&mut self.state, &canonical_bytes)?;
+        if canonical_digest.strip_prefix("sha256:") != Some(artifact.digest.as_str()) {
+            return Err(ControllerError::InvalidPlan(
+                "completion CAS digest differs from canonical completion record".to_owned(),
+            ));
+        }
+        let reference_id = completion_record_reference_id(&plan_id, plan_revision);
+        self.state
+            .add_artifact_reference(&reference_id, &artifact.digest)?;
+        let key = completion_record_key(&plan_id, plan_revision);
+        let value_json = String::from_utf8(canonical_bytes).map_err(|_| {
+            ControllerError::InvalidPlan(
+                "canonical completion record unexpectedly became non-UTF-8".to_owned(),
+            )
+        })?;
+        self.persist_control_record_with_event(
+            COMPLETION_RECORD_NAMESPACE,
+            &key,
+            &value_json,
+            "project_completed",
+            &json!({
+                "plan_id": plan_id,
+                "plan_revision": plan_revision,
+                "plan_digest": record.plan_digest,
+                "record_key": key,
+                "record_digest": canonical_digest,
+                "artifact_digest": artifact.digest,
+                "checkpoint_generation": record.checkpoint.generation,
+                "checkpoint_action_sequence": record.checkpoint.action_sequence,
+                "checkpoint_hash": record.checkpoint.checkpoint_hash,
+            }),
+        )?;
+        recovery_test_hook("after_project_completion_commit");
+        validate_completion_publication_event(&self.state, &record)?;
+        self.checkpoint_now()?;
+        Ok(record)
+    }
+
     fn checkpoint_now(&mut self) -> Result<(), ControllerError> {
         let manifest = self.checkpoint_manifest()?;
         let bytes = serde_json::to_vec(&canonicalize(&serde_json::to_value(&manifest)?))?;
@@ -16561,6 +17454,7 @@ impl Controller {
             "controller.artifact_binding",
             "controller.acceptance_binding",
             "controller.verification",
+            COMPLETION_RECORD_NAMESPACE,
             "controller.action_intent",
             VERIFICATION_COMMAND_INTENT_NAMESPACE,
             "controller.failure_record",
@@ -16582,7 +17476,23 @@ impl Controller {
             SECRET_ACTION_LIFECYCLE_NAMESPACE,
         ] {
             for record in self.state.state_records(namespace)? {
-                let belongs_to_active_revision = if namespace == "controller.action_intent" {
+                let belongs_to_active_revision = if namespace == COMPLETION_RECORD_NAMESPACE {
+                    if record.key == completion_record_key(&active.plan_id, active.revision) {
+                        let completion = decode_completion_record(&record.value_json)?;
+                        completion.validate_identity(active)?;
+                        let canonical = serde_json::to_vec(&canonicalize(
+                            &serde_json::from_str::<Value>(&record.value_json)?,
+                        ))?;
+                        if canonical != record.value_json.as_bytes() {
+                            return Err(ControllerError::InvalidPlan(
+                                "checkpoint completion record is not canonical JSON".to_owned(),
+                            ));
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else if namespace == "controller.action_intent" {
                     true
                 } else if namespace == VERIFICATION_COMMAND_INTENT_NAMESPACE {
                     let intent: PersistedVerificationCommandIntentV1 =
@@ -18238,6 +19148,12 @@ impl RecoveryManager {
             trusted_checkpoint.action_sequence,
             supersession.as_ref(),
         )?;
+        validate_post_checkpoint_completion_correlation(
+            &state,
+            &manifest,
+            trusted_checkpoint.action_sequence,
+            supersession.as_ref(),
+        )?;
         let recovered_goal_autonomy_budget = replay_post_checkpoint_goal_autonomy_budget(
             &state,
             &manifest,
@@ -18894,11 +19810,13 @@ fn validate_checkpoint_immutable_bindings(
         if !matches!(
             namespace,
             "controller.action_intent"
+                | "controller.verification"
                 | VERIFICATION_COMMAND_INTENT_NAMESPACE
                 | "controller.failure_record"
                 | "controller.repair_packet"
                 | "controller.change_set"
                 | "controller.worktree_conflict"
+                | COMPLETION_RECORD_NAMESPACE
                 | APPROVAL_CLAIM_NAMESPACE
                 | ACTION_RECONCILIATION_NAMESPACE
                 | AUTONOMY_ACTION_CHARGE_NAMESPACE
@@ -18916,6 +19834,13 @@ fn validate_checkpoint_immutable_bindings(
             return Err(ControllerError::InvalidPlan(format!(
                 "checkpoint-bound immutable record {namespace}:{key} changed after checkpoint"
             )));
+        }
+        if namespace == COMPLETION_RECORD_NAMESPACE {
+            let record = decode_completion_record(&current)?;
+            validate_completion_record_manifest_identity(&record, manifest)?;
+            validate_completion_record_cas(state, &record)?;
+            validate_completion_checkpoint_ancestry(state, &record)?;
+            validate_completion_publication_event(state, &record)?;
         }
     }
     if manifest.schema_version == CHECKPOINT_MANIFEST_SCHEMA_VERSION {
@@ -18987,6 +19912,106 @@ fn validate_post_checkpoint_integration_checkpoint_correlation(
         )?;
     }
     validate_superseding_integration_checkpoint_absence(state, supersession)?;
+    Ok(())
+}
+
+fn validate_post_checkpoint_completion_correlation(
+    state: &StateStore,
+    manifest: &CheckpointManifest,
+    checkpoint_sequence: i64,
+    supersession: Option<&ValidatedSupersession>,
+) -> Result<(), ControllerError> {
+    if manifest.schema_version != CHECKPOINT_MANIFEST_SCHEMA_VERSION {
+        return Ok(());
+    }
+    let key = completion_record_key(&manifest.plan_id, manifest.plan_revision);
+    let binding_key = format!("{COMPLETION_RECORD_NAMESPACE}:{key}");
+    let sealed_digest = manifest.evidence_binding_digests.get(&binding_key);
+    let current_raw = state.get_state(COMPLETION_RECORD_NAMESPACE, &key)?;
+    let current = current_raw
+        .as_deref()
+        .map(|raw| -> Result<CompletionRecordV1, ControllerError> {
+            let record = decode_completion_record(raw)?;
+            validate_completion_record_manifest_identity(&record, manifest)?;
+            let canonical =
+                serde_json::to_vec(&canonicalize(&serde_json::from_str::<Value>(raw)?))?;
+            if canonical != raw.as_bytes() {
+                return Err(ControllerError::InvalidPlan(
+                    "durable completion record is not canonical JSON during recovery".to_owned(),
+                ));
+            }
+            validate_completion_record_cas(state, &record)?;
+            validate_completion_checkpoint_ancestry(state, &record)?;
+            validate_completion_publication_event(state, &record)?;
+            Ok(record)
+        })
+        .transpose()?;
+
+    if let Some(expected_digest) = sealed_digest {
+        let raw = current_raw.as_deref().ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "checkpoint seals a completion record that is missing from durable state"
+                    .to_owned(),
+            )
+        })?;
+        if sha256_prefixed(raw.as_bytes()) != *expected_digest {
+            return Err(ControllerError::InvalidPlan(
+                "checkpoint-sealed completion record changed after checkpoint".to_owned(),
+            ));
+        }
+    }
+
+    let mut current_revision_publications = 0usize;
+    for event in state.journal_after(checkpoint_sequence)? {
+        if event.event_kind != "project_completed" {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        let plan_id = required_str(&payload, "/plan_id")?;
+        let plan_revision = required_u32(&payload, "/plan_revision")?;
+        if plan_id == manifest.plan_id && plan_revision == manifest.plan_revision {
+            if event.entity_type != "controller" || event.entity_id != key {
+                return Err(ControllerError::InvalidPlan(
+                    "post-checkpoint completion publication targets a stale state key".to_owned(),
+                ));
+            }
+            current_revision_publications = current_revision_publications.saturating_add(1);
+            continue;
+        }
+        if supersession
+            .is_some_and(|next| plan_id == next.plan_id && plan_revision == next.revision)
+        {
+            return Err(ControllerError::InvalidPlan(
+                "superseding revision published completion authority without a trusted activation checkpoint"
+                    .to_owned(),
+            ));
+        }
+        if plan_id == manifest.plan_id && plan_revision > manifest.plan_revision {
+            return Err(ControllerError::InvalidPlan(
+                "post-checkpoint completion publication targets an untrusted plan revision"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    if sealed_digest.is_some() {
+        if current_revision_publications != 0 {
+            return Err(ControllerError::InvalidPlan(
+                "completion authority was republished after its trusted checkpoint binding"
+                    .to_owned(),
+            ));
+        }
+    } else if current.is_some() {
+        if current_revision_publications != 1 {
+            return Err(ControllerError::InvalidPlan(format!(
+                "unsealed completion state requires exactly one post-checkpoint publication, found {current_revision_publications}"
+            )));
+        }
+    } else if current_revision_publications != 0 {
+        return Err(ControllerError::InvalidPlan(
+            "project_completed event exists without its durable completion record".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -23621,6 +24646,201 @@ fn revision_record_key(plan_id: &str, revision: u32) -> String {
     format!("{plan_id}@r{revision}")
 }
 
+fn completion_record_key(plan_id: &str, revision: u32) -> String {
+    revision_record_key(plan_id, revision)
+}
+
+fn completion_record_reference_id(plan_id: &str, revision: u32) -> String {
+    format!(
+        "controller.completion_record:{}",
+        completion_record_key(plan_id, revision)
+    )
+}
+
+fn decode_completion_record(raw: &str) -> Result<CompletionRecordV1, ControllerError> {
+    let record: CompletionRecordV1 = serde_json::from_str(raw)?;
+    if record.schema_version != COMPLETION_RECORD_SCHEMA_VERSION {
+        return Err(ControllerError::InvalidPlan(format!(
+            "unsupported completion record schema version {}",
+            record.schema_version
+        )));
+    }
+    Ok(record)
+}
+
+fn validate_completion_checkpoint_ancestry(
+    state: &StateStore,
+    record: &CompletionRecordV1,
+) -> Result<(), ControllerError> {
+    let trusted = state
+        .latest_valid_checkpoint_ancestry()?
+        .into_iter()
+        .any(|checkpoint| {
+            checkpoint.generation == record.checkpoint.generation
+                && checkpoint.action_sequence == record.checkpoint.action_sequence
+                && checkpoint.checkpoint_hash == record.checkpoint.checkpoint_hash
+        });
+    if !trusted {
+        return Err(ControllerError::InvalidPlan(
+            "completion record checkpoint is absent from trusted checkpoint ancestry".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_completion_record_cas(
+    state: &StateStore,
+    record: &CompletionRecordV1,
+) -> Result<(), ControllerError> {
+    let canonical_bytes = record.canonical_bytes()?;
+    let canonical_digest = record.canonical_digest()?;
+    let artifact_digest = canonical_digest.strip_prefix("sha256:").ok_or_else(|| {
+        ControllerError::InvalidPlan(
+            "completion record canonical digest lost SHA-256 prefix".to_owned(),
+        )
+    })?;
+    let store = checkpoint_artifact_store(state.path())?;
+    let mut artifact = store.open_artifact(state, artifact_digest)?;
+    let mut stored = Vec::new();
+    artifact.read_to_end(&mut stored)?;
+    if stored != canonical_bytes {
+        return Err(ControllerError::InvalidPlan(
+            "completion record canonical CAS object differs from durable row".to_owned(),
+        ));
+    }
+    let reference_id = completion_record_reference_id(&record.plan_id, record.plan_revision);
+    if !state.artifact_reference_exists(&reference_id, artifact_digest)? {
+        return Err(ControllerError::InvalidPlan(
+            "completion record lost its exact durable artifact reference".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn current_completion_record_for(
+    state: &StateStore,
+    active: &ActivePlan,
+) -> Result<Option<CompletionRecordV1>, ControllerError> {
+    let key = completion_record_key(&active.plan_id, active.revision);
+    let Some(raw) = state.get_state(COMPLETION_RECORD_NAMESPACE, &key)? else {
+        return Ok(None);
+    };
+    let record = decode_completion_record(&raw)?;
+    record.validate_identity(active)?;
+    let durable_value: Value = serde_json::from_str(&raw)?;
+    let durable_bytes = serde_json::to_vec(&canonicalize(&durable_value))?;
+    if durable_bytes != raw.as_bytes() {
+        return Err(ControllerError::InvalidPlan(
+            "completion record durable JSON is not canonical".to_owned(),
+        ));
+    }
+    validate_completion_record_cas(state, &record)?;
+    validate_completion_checkpoint_ancestry(state, &record)?;
+    validate_completion_publication_event(state, &record)?;
+    Ok(Some(record))
+}
+
+fn validate_completion_record_manifest_identity(
+    record: &CompletionRecordV1,
+    manifest: &CheckpointManifest,
+) -> Result<(), ControllerError> {
+    if record.schema_version != COMPLETION_RECORD_SCHEMA_VERSION
+        || record.plan_id != manifest.plan_id
+        || record.goal_id != manifest.goal_id
+        || record.plan_revision != manifest.plan_revision
+        || record.plan_digest != manifest.plan_digest
+        || record.policy_digest != manifest.policy_digest
+        || !record.action_recovery_clear
+        || record.scope_audit_digest.is_empty()
+        || record.checkpoint.generation <= 0
+        || record.checkpoint.action_sequence < 0
+        || record.checkpoint.checkpoint_hash.is_empty()
+    {
+        return Err(ControllerError::InvalidPlan(
+            "completion record is malformed or misbound to checkpoint manifest identity".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_completion_publication_event(
+    state: &StateStore,
+    record: &CompletionRecordV1,
+) -> Result<(), ControllerError> {
+    let key = completion_record_key(&record.plan_id, record.plan_revision);
+    let record_digest = record.canonical_digest()?;
+    let artifact_digest = record_digest.strip_prefix("sha256:").ok_or_else(|| {
+        ControllerError::InvalidPlan(
+            "completion record canonical digest lost SHA-256 prefix".to_owned(),
+        )
+    })?;
+    let mut matching = Vec::new();
+    for event in state.journal()? {
+        if event.event_kind != "project_completed" {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        let payload_plan_id = required_str(&payload, "/plan_id")?;
+        let payload_revision = required_u32(&payload, "/plan_revision")?;
+        if payload_plan_id != record.plan_id || payload_revision != record.plan_revision {
+            continue;
+        }
+        if event.entity_type != "controller" || event.entity_id != key {
+            return Err(ControllerError::InvalidPlan(
+                "project completion publication targets the wrong controller entity".to_owned(),
+            ));
+        }
+        matching.push((event, payload));
+    }
+    if matching.len() != 1 {
+        return Err(ControllerError::InvalidPlan(format!(
+            "completion record requires exactly one project_completed event, found {}",
+            matching.len()
+        )));
+    }
+    let (event, payload) = &matching[0];
+    let checkpoint_generation = payload
+        .get("checkpoint_generation")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "project completion event checkpoint generation is missing".to_owned(),
+            )
+        })?;
+    let checkpoint_action_sequence = payload
+        .get("checkpoint_action_sequence")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "project completion event checkpoint action sequence is missing".to_owned(),
+            )
+        })?;
+    let expected_publication_sequence = record
+        .checkpoint
+        .action_sequence
+        .checked_add(1)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "project completion checkpoint action sequence cannot advance".to_owned(),
+            )
+        })?;
+    if required_str(payload, "/plan_digest")? != record.plan_digest
+        || required_str(payload, "/record_key")? != key
+        || required_str(payload, "/record_digest")? != record_digest
+        || required_str(payload, "/artifact_digest")? != artifact_digest
+        || checkpoint_generation != record.checkpoint.generation
+        || checkpoint_action_sequence != record.checkpoint.action_sequence
+        || required_str(payload, "/checkpoint_hash")? != record.checkpoint.checkpoint_hash
+        || event.sequence != expected_publication_sequence
+    {
+        return Err(ControllerError::InvalidPlan(
+            "project completion event is not exactly bound to the durable completion record and pre-completion checkpoint"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn dependency_closure_order(
     tasks: &BTreeMap<String, TaskRuntime>,
     task_id: &str,
@@ -24889,6 +26109,135 @@ fn execution_evidence_requirements(task: &Value) -> Result<Vec<&Value>, Controll
     Ok(requirements)
 }
 
+fn completion_evidence_requirements(task: &Value) -> Result<Vec<&Value>, ControllerError> {
+    let mut requirements = required_array(task, "/evidence_requirements")?
+        .iter()
+        .filter(|requirement| {
+            requirement.get("required_before").and_then(Value::as_str) == Some("completion")
+        })
+        .collect::<Vec<_>>();
+    for clause_path in [
+        "/implementation_contract/preconditions",
+        "/implementation_contract/invariants",
+    ] {
+        for clause in required_array(task, clause_path)? {
+            if let Some(nested) = clause
+                .get("evidence_requirements")
+                .and_then(Value::as_array)
+            {
+                requirements.extend(nested.iter().filter(|requirement| {
+                    requirement.get("required_before").and_then(Value::as_str) == Some("completion")
+                }));
+            }
+        }
+    }
+    Ok(requirements)
+}
+
+fn validate_completion_verification_row_artifact_binding(
+    verification_raw: &str,
+    verification_artifact_digest: &str,
+    task_id: &str,
+    binding_id: &str,
+) -> Result<(), ControllerError> {
+    let verification_row_digest = sha256_prefixed(verification_raw.as_bytes());
+    let verification_row_digest =
+        verification_row_digest
+            .strip_prefix("sha256:")
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "completion verification row digest lost SHA-256 prefix".to_owned(),
+                )
+            })?;
+    if verification_row_digest != verification_artifact_digest {
+        return Err(ControllerError::NotReady(format!(
+            "completion output binding {task_id}/{binding_id} verification row differs from immutable verification artifact"
+        )));
+    }
+    Ok(())
+}
+
+fn parse_completion_gate(
+    plan_document: &Value,
+) -> Result<(CompletionGate, String), ControllerError> {
+    let raw = plan_document
+        .get("completion_gate")
+        .ok_or_else(|| ControllerError::InvalidPlan("completion_gate is missing".to_owned()))?;
+    let gate: CompletionGate = serde_json::from_value(raw.clone())?;
+    if !gate.require_all_must_requirements
+        || !gate.require_fresh_acceptance
+        || !gate.require_all_required_tasks_resolved
+        || !gate.require_no_unknown_actions
+        || !gate.require_artifact_digests
+        || !gate.require_scope_audit
+        || !gate.require_final_checkpoint
+        || !gate.require_final_repository_revisions
+    {
+        return Err(ControllerError::InvalidPlan(
+            "completion_gate must enable all eight frozen completion requirements".to_owned(),
+        ));
+    }
+    let supported_kinds = BTreeSet::from([
+        "requirements",
+        "acceptance",
+        "task_resolution",
+        "unknown_actions",
+        "artifacts",
+        "scope_audit",
+        "checkpoint",
+        "repository_revisions",
+    ]);
+    let mut check_ids = BTreeSet::new();
+    for check in &gate.checks {
+        if check.check_id.trim().is_empty() || check.kind.trim().is_empty() {
+            return Err(ControllerError::InvalidPlan(
+                "completion check ID and kind must be non-empty".to_owned(),
+            ));
+        }
+        if !check_ids.insert(check.check_id.as_str()) {
+            return Err(ControllerError::InvalidPlan(format!(
+                "duplicate completion check id {}",
+                check.check_id
+            )));
+        }
+        if !supported_kinds.contains(check.kind.as_str()) {
+            return Err(ControllerError::InvalidPlan(format!(
+                "unsupported completion check kind {}",
+                check.kind
+            )));
+        }
+        let mut evidence_types = BTreeSet::new();
+        if check.required_evidence_types.is_empty()
+            || check.required_evidence_types.iter().any(|evidence_type| {
+                evidence_type.trim().is_empty() || !evidence_types.insert(evidence_type.as_str())
+            })
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "completion check {} requires non-empty unique evidence types",
+                check.check_id
+            )));
+        }
+    }
+    Ok((gate, digest_json(raw)?))
+}
+
+fn validate_completion_check_evidence_types(
+    gate: &CompletionGate,
+    accepted_evidence_types: &BTreeSet<String>,
+) -> Result<(), ControllerError> {
+    for check in &gate.checks {
+        for evidence_type in &check.required_evidence_types {
+            if !accepted_evidence_types.contains(evidence_type) {
+                return Err(ControllerError::NotReady(format!(
+                    "completion check {} lacks required accepted evidence type {}",
+                    check.check_id, evidence_type
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn resolve_execution_requirement(
     task: &Value,
     requirement_id: &str,
@@ -25790,10 +27139,10 @@ mod tests {
         ACTION_INTENT_SCHEMA_VERSION, APPROVAL_REQUEST_NAMESPACE, ActivePlan,
         ActiveRepositoryState, ApprovalDecisionV1, ApprovalRequestStatusV1,
         BrowserResourceResidencyStateV1, BrowserResourceResidencyV1, CancellationScopeKindV1,
-        CancellationScopeV1, CancellationTree, CommandVerificationResultV1, Controller,
-        ControllerError, DecodedPersistedActionIntent, ExactRequirementProbe,
+        CancellationScopeV1, CancellationTree, CommandVerificationResultV1, ContextPacket,
+        Controller, ControllerError, DecodedPersistedActionIntent, ExactRequirementProbe,
         FailureClassification, FailureClassificationKind, LEGACY_ACTION_INTENT_SCHEMA_VERSION,
-        OutputBindingValidationRequest, PersistedActionIntent,
+        NewJournalEvent, OutputBindingValidationRequest, PersistedActionIntent,
         PersistedVerificationCommandIntentV1, PlanValidity, ReadyLease, RecoveryIntegrityGate,
         RecoveryProcessLease, ResourceResidencyStateV1, ResourceResidencyV1,
         SupersedingRuntimeBuild, TaskCarryExecutionProvenanceV1, TaskCarryFingerprintV1,
@@ -25843,6 +27192,7 @@ mod tests {
         ToolManifest,
     };
     use std::collections::{BTreeMap, BTreeSet};
+    use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -29623,6 +30973,653 @@ mod tests {
         git(&["commit", "-qm", "baseline"]);
         root.canonicalize()
             .unwrap_or_else(|error| panic!("canonicalize {name}: {error}"))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn completion_ready_fixture(label: &str) -> (PathBuf, Controller, ProjectRegistry) {
+        let (base, mut state) = temp_state(label);
+        let repository_root = init_committed_test_repository(&base, "repo");
+        let mut registry = ProjectRegistry::new();
+        registry
+            .register("repo.app", &repository_root)
+            .unwrap_or_else(|error| panic!("register completion repo: {error}"));
+
+        let mut task = valid_task_fixture("task.completion", &["repo.app"], false);
+        task["expected_artifacts"] = json!([]);
+        let mut plan_document = valid_plan_ir_fixture();
+        plan_document["plan_id"] = json!("plan.completion");
+        plan_document["revision"] = json!(1);
+        plan_document["supersedes_revision"] = Value::Null;
+        plan_document["compiled_at"] = json!("2026-09-20T00:00:00Z");
+        plan_document["goal"]["goal_id"] = json!("goal.completion");
+        plan_document["policy"]["resources"] = test_goal_resource_policy();
+        plan_document["repositories"][0]["repository_id"] = json!("repo.app");
+        plan_document["repositories"][0]["root"] = json!(repository_root);
+        plan_document["repositories"][0]["instructions"] = json!([]);
+        plan_document["tasks"] = json!([task.clone()]);
+        plan_document["edges"] = json!([]);
+        plan_document["completion_gate"]["checks"] = json!([{
+            "check_id": "check.acceptance",
+            "kind": "acceptance",
+            "required_evidence_types": ["diff_result"]
+        }]);
+        let plan_digest = digest_json(&plan_document)
+            .unwrap_or_else(|error| panic!("completion plan digest: {error}"));
+        let baseline = registry
+            .snapshot("repo.app")
+            .unwrap_or_else(|error| panic!("completion baseline snapshot: {error}"));
+        let baseline_digest = super::snapshot_digest(&baseline)
+            .unwrap_or_else(|error| panic!("completion baseline digest: {error}"));
+        let baseline_diff = ExactRetriever::new(&registry)
+            .current_diff("repo.app")
+            .unwrap_or_else(|error| panic!("completion baseline diff: {error}"));
+        let mut task_runtime = fresh_task_runtime(&task)
+            .unwrap_or_else(|error| panic!("completion task runtime: {error}"));
+        task_runtime.state = TaskState::Succeeded;
+        task_runtime.attempts_started = 1;
+        let task_contract_digest = task_runtime.task_contract_digest.clone();
+        let attempt_id = "attempt.completion.1".to_owned();
+        let attempt = super::AttemptRuntime {
+            task_id: "task.completion".to_owned(),
+            attempt_id: attempt_id.clone(),
+            state: super::AttemptState::Succeeded,
+            task_contract_digest: task_contract_digest.clone(),
+            repair_origin: None,
+            baseline_digest: baseline_digest.clone(),
+            pre_snapshot_digest: baseline_digest.clone(),
+            pre_diff_digest: baseline_diff.digest.clone(),
+            pre_changed_fingerprints: BTreeMap::new(),
+        };
+        let (_, acceptance_contract_digest) = compiled_acceptance_contract(&task)
+            .unwrap_or_else(|error| panic!("completion acceptance contract: {error}"));
+        let verification = VerificationResultV1 {
+            schema_version: super::VERIFICATION_RESULT_SCHEMA_VERSION,
+            verification_id: "verification.completion.1".to_owned(),
+            plan_id: "plan.completion".to_owned(),
+            plan_revision: 1,
+            plan_digest: plan_digest.clone(),
+            task_id: "task.completion".to_owned(),
+            task_contract_digest: task_contract_digest.clone(),
+            attempt_id: attempt_id.clone(),
+            execution_epoch: state
+                .current_execution_epoch()
+                .unwrap_or_else(|error| panic!("completion execution epoch: {error}")),
+            evaluator: "builtin.diff.scoped_change.v1".to_owned(),
+            acceptance_contract_digest,
+            diff_digest: baseline_diff.digest.clone(),
+            post_snapshot_digest: baseline_digest,
+            expected_target_mode: 0,
+            observed_target_mode: 0,
+            evidence_ids: Vec::new(),
+            command_results: Vec::new(),
+            passed: true,
+            failure_code: None,
+        };
+        let verification_bytes = serde_json::to_vec(&verification)
+            .unwrap_or_else(|error| panic!("completion verification json: {error}"));
+        let verification_store = ArtifactStore::open(base.join("completion-verification-cas"))
+            .unwrap_or_else(|error| panic!("completion verification store: {error}"));
+        let verification_artifact = verification_store
+            .put(&mut state, &verification_bytes)
+            .unwrap_or_else(|error| panic!("completion verification artifact: {error}"));
+        state
+            .put_state(
+                "controller.verification",
+                &revision_scoped_key("plan.completion", 1, &verification.verification_id),
+                &serde_json::to_string(&verification)
+                    .unwrap_or_else(|error| panic!("completion verification state json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist completion verification: {error}"));
+        let criterion_id = task["acceptance_criteria"][0]["criterion_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("completion criterion id missing"));
+        let binding = VerifiedOutputBindingV1 {
+            schema_version: super::VERIFIED_OUTPUT_BINDING_SCHEMA_VERSION,
+            plan_id: "plan.completion".to_owned(),
+            plan_revision: 1,
+            plan_digest: plan_digest.clone(),
+            task_id: "task.completion".to_owned(),
+            task_contract_digest: task_contract_digest.clone(),
+            attempt_id,
+            binding_kind: "acceptance".to_owned(),
+            binding_id: criterion_id.to_owned(),
+            verification_id: verification.verification_id.clone(),
+            verification_artifact_digest: verification_artifact.digest,
+            repository_snapshot_digest: verification.post_snapshot_digest.clone(),
+            change_set_digest: None,
+            carried_from_plan_revision: None,
+            carried_from_plan_digest: None,
+        };
+        state
+            .put_state(
+                "controller.acceptance_binding",
+                &revision_scoped_key(
+                    "plan.completion",
+                    1,
+                    &output_binding_key("task.completion", criterion_id),
+                ),
+                &serde_json::to_string(&binding)
+                    .unwrap_or_else(|error| panic!("completion binding json: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("persist completion binding: {error}"));
+        let active = ActivePlan {
+            plan_document,
+            compiler_plan_digest: plan_digest.clone(),
+            plan_id: "plan.completion".to_owned(),
+            goal_id: "goal.completion".to_owned(),
+            revision: 1,
+            plan_digest,
+            compilation_evidence_digest: format!("sha256:{}", "e".repeat(64)),
+            policy_digest: format!("sha256:{}", "f".repeat(64)),
+            repositories: BTreeMap::from([(
+                "repo.app".to_owned(),
+                ActiveRepositoryState {
+                    repository_id: "repo.app".to_owned(),
+                    repository_root,
+                    baseline,
+                    baseline_diff_digest: baseline_diff.digest,
+                    baseline_diff_content: baseline_diff.content,
+                },
+            )]),
+            validity: PlanValidity::Current,
+            goal_autonomy_budget: test_goal_autonomy_budget(),
+            tasks: BTreeMap::from([("task.completion".to_owned(), task_runtime)]),
+            attempts: BTreeMap::from([("attempt.completion.1".to_owned(), attempt)]),
+        };
+        let mut controller = Controller::new(state);
+        controller.active = Some(active);
+        (base, controller, registry)
+    }
+
+    #[test]
+    fn completion_exact_repeat_is_idempotent_and_rev1_checkpoint_seals_record() {
+        let (base, mut controller, registry) =
+            completion_ready_fixture("completion-idempotent-rev1");
+        let first = controller
+            .complete_goal(&registry)
+            .unwrap_or_else(|error| panic!("complete goal: {error}"));
+        let completion_events = controller
+            .state
+            .journal()
+            .unwrap_or_else(|error| panic!("completion journal: {error}"))
+            .into_iter()
+            .filter(|event| event.event_kind == "project_completed")
+            .count();
+        assert_eq!(completion_events, 1);
+
+        let ancestry = controller
+            .state
+            .latest_valid_checkpoint_ancestry()
+            .unwrap_or_else(|error| panic!("completion checkpoint ancestry: {error}"));
+        let checkpoint_b = ancestry
+            .first()
+            .unwrap_or_else(|| panic!("completion checkpoint B missing"))
+            .clone();
+        assert!(checkpoint_b.generation > first.checkpoint.generation);
+        let store = super::checkpoint_artifact_store(controller.state.path())
+            .unwrap_or_else(|error| panic!("completion checkpoint store: {error}"));
+        let mut artifact = store
+            .open_artifact(&controller.state, &checkpoint_b.payload_digest)
+            .unwrap_or_else(|error| panic!("open completion checkpoint B: {error}"));
+        let mut bytes = Vec::new();
+        artifact
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|error| panic!("read completion checkpoint B: {error}"));
+        let manifest: super::CheckpointManifest = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("decode completion checkpoint B: {error}"));
+        let completion_key = super::completion_record_key(&first.plan_id, first.plan_revision);
+        let binding_key = format!("{}:{completion_key}", super::COMPLETION_RECORD_NAMESPACE);
+        let durable_raw = controller
+            .state
+            .get_state(super::COMPLETION_RECORD_NAMESPACE, &completion_key)
+            .unwrap_or_else(|error| panic!("read durable completion row: {error}"))
+            .unwrap_or_else(|| panic!("durable completion row missing"));
+        assert_eq!(
+            manifest.evidence_binding_digests.get(&binding_key),
+            Some(&sha256_prefixed(durable_raw.as_bytes())),
+            "revision-1 completion row must be sealed into checkpoint B"
+        );
+
+        let generation_before_repeat = checkpoint_b.generation;
+        let event_count_before_repeat = controller
+            .state
+            .latest_journal_sequence()
+            .unwrap_or_else(|error| panic!("completion journal sequence: {error}"));
+        let repeated = controller
+            .complete_goal(&registry)
+            .unwrap_or_else(|error| panic!("repeat completion: {error}"));
+        assert_eq!(repeated, first);
+        assert_eq!(
+            controller
+                .state
+                .latest_valid_checkpoint_ancestry()
+                .unwrap_or_else(|error| panic!("repeat checkpoint ancestry: {error}"))
+                .first()
+                .map(|checkpoint| checkpoint.generation),
+            Some(generation_before_repeat)
+        );
+        assert_eq!(
+            controller
+                .state
+                .latest_journal_sequence()
+                .unwrap_or_else(|error| panic!("repeat journal sequence: {error}")),
+            event_count_before_repeat
+        );
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn completion_check_required_evidence_types_fail_closed() {
+        let gate = super::CompletionGate {
+            require_all_must_requirements: true,
+            require_fresh_acceptance: true,
+            require_all_required_tasks_resolved: true,
+            require_no_unknown_actions: true,
+            require_artifact_digests: true,
+            require_scope_audit: true,
+            require_final_checkpoint: true,
+            require_final_repository_revisions: true,
+            checks: vec![super::CompletionCheckV1 {
+                check_id: "check.security".to_owned(),
+                kind: "acceptance".to_owned(),
+                required_evidence_types: vec!["security_result".to_owned()],
+            }],
+        };
+        let accepted = BTreeSet::from(["diff_result".to_owned()]);
+        let error = super::validate_completion_check_evidence_types(&gate, &accepted)
+            .err()
+            .unwrap_or_else(|| panic!("missing stricter completion evidence type was accepted"));
+        assert!(
+            error
+                .to_string()
+                .contains("lacks required accepted evidence type security_result")
+        );
+    }
+
+    #[test]
+    fn completion_rejects_live_predispatch_action_authority() {
+        let (base, mut controller, registry) =
+            completion_ready_fixture("completion-live-predispatch");
+        let execution_epoch = controller
+            .state
+            .current_execution_epoch()
+            .unwrap_or_else(|error| panic!("completion execution epoch: {error}"));
+        let policy_digest = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("completion active plan: {error}"))
+            .policy_digest
+            .clone();
+        controller
+            .state
+            .insert_action_record(NewActionRecord {
+                action_id: "action.completion.pending",
+                state: "authorized",
+                payload_digest:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                policy_digest: &policy_digest,
+                execution_epoch,
+                event_id: "event.completion.pending",
+                event_kind: "authorized",
+                payload_json: "{}",
+            })
+            .unwrap_or_else(|error| panic!("insert pre-dispatch action: {error}"));
+
+        let error = controller
+            .complete_goal(&registry)
+            .err()
+            .unwrap_or_else(|| panic!("live pre-dispatch action authority was accepted"));
+        assert!(error.to_string().contains("pre-dispatch action authority"));
+        assert!(
+            controller
+                .completion_record()
+                .unwrap_or_else(|error| panic!("read completion record: {error}"))
+                .is_none()
+        );
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn completed_revision_rejects_permission_and_approval_mutation() {
+        let (base, mut controller, registry) =
+            completion_ready_fixture("completion-terminal-mutation");
+        controller
+            .complete_goal(&registry)
+            .unwrap_or_else(|error| panic!("complete goal: {error}"));
+
+        let grant_error = controller
+            .set_task_capability_grant(
+                "task.completion",
+                CapabilitySet::new(std::iter::empty::<PermissionClass>()),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("completed revision accepted capability grant mutation"));
+        assert!(grant_error.to_string().contains("durably completed"));
+
+        let approval_error = controller
+            .respond_to_approval(
+                "approval.does-not-exist",
+                ApprovalDecisionV1::Deny,
+                "completion-test",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("completed revision accepted approval mutation"));
+        assert!(approval_error.to_string().contains("durably completed"));
+
+        let cancellation_error = controller
+            .request_task_cancellation("task.completion", "completion-test")
+            .err()
+            .unwrap_or_else(|| panic!("completed revision accepted cancellation mutation"));
+        assert!(cancellation_error.to_string().contains("durably completed"));
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn completed_revision_rejects_evidence_satisfaction_without_state_advance() {
+        let (base, mut controller, registry) =
+            completion_ready_fixture("completion-terminal-evidence");
+        controller
+            .complete_goal(&registry)
+            .unwrap_or_else(|error| panic!("complete goal: {error}"));
+        let journal_sequence_before = controller
+            .state
+            .latest_journal_sequence()
+            .unwrap_or_else(|error| panic!("read journal sequence before terminal call: {error}"));
+        let checkpoint_before = controller
+            .state
+            .latest_valid_checkpoint_ancestry()
+            .unwrap_or_else(|error| panic!("read checkpoint before terminal call: {error}"))
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("completed revision lost its checkpoint"));
+        let evidence_items_before = controller
+            .state
+            .state_records("controller.evidence_item")
+            .unwrap_or_else(|error| panic!("read evidence items before terminal call: {error}"))
+            .len();
+        let satisfactions_before = controller
+            .state
+            .state_records("controller.evidence_satisfaction")
+            .unwrap_or_else(|error| panic!("read satisfactions before terminal call: {error}"))
+            .len();
+        let empty_context = ContextPacket {
+            schema: "completion-terminal-guard".to_owned(),
+            mode: sovereign_context::ContextMode::Implementation,
+            budget: sovereign_context::ContextBudget::m1_8k(),
+            items: Vec::new(),
+            metrics: sovereign_context::ContextMetrics {
+                tokenizer_id: "completion-terminal-guard".to_owned(),
+                candidate_tokens_before_dedupe: 0,
+                evidence_candidate_tokens_before_dedupe: 0,
+                selected_tokens_after_dedupe: 0,
+                duplicate_tokens_removed: 0,
+                tokens_by_level: BTreeMap::new(),
+                tokens_by_kind: BTreeMap::new(),
+                tokens_by_section: BTreeMap::new(),
+                stable_prefix_tokens: 0,
+                reused_evidence_tokens: 0,
+                tool_schema_tokens: 0,
+                final_serialized_input_tokens: 0,
+            },
+            serialized_input: String::new(),
+        };
+        let error = controller
+            .record_exact_evidence_satisfaction(
+                &registry,
+                "task.completion",
+                "requirement.does-not-exist",
+                &empty_context,
+                &[],
+            )
+            .err()
+            .unwrap_or_else(|| panic!("completed revision accepted evidence satisfaction"));
+        assert!(error.to_string().contains("durably completed"));
+        assert_eq!(
+            controller
+                .state
+                .latest_journal_sequence()
+                .unwrap_or_else(|error| panic!(
+                    "read journal sequence after terminal call: {error}"
+                )),
+            journal_sequence_before
+        );
+        let checkpoint_after = controller
+            .state
+            .latest_valid_checkpoint_ancestry()
+            .unwrap_or_else(|error| panic!("read checkpoint after terminal call: {error}"))
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("completed revision lost checkpoint after terminal call"));
+        assert_eq!(checkpoint_after, checkpoint_before);
+        assert_eq!(
+            controller
+                .state
+                .state_records("controller.evidence_item")
+                .unwrap_or_else(|error| panic!("read evidence items after terminal call: {error}"))
+                .len(),
+            evidence_items_before
+        );
+        assert_eq!(
+            controller
+                .state
+                .state_records("controller.evidence_satisfaction")
+                .unwrap_or_else(|error| panic!("read satisfactions after terminal call: {error}"))
+                .len(),
+            satisfactions_before
+        );
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn completion_publication_event_must_immediately_follow_checkpoint_a() {
+        let (base, mut controller, registry) =
+            completion_ready_fixture("completion-publication-sequence-source");
+        let mut record = controller
+            .complete_goal(&registry)
+            .unwrap_or_else(|error| panic!("complete goal: {error}"));
+        record.checkpoint.action_sequence = 0;
+        record.checkpoint.generation = 1;
+        record.checkpoint.checkpoint_hash = "checkpoint.synthetic".to_owned();
+
+        let (journal_base, mut state) = temp_state("completion-publication-sequence-gap");
+        state
+            .append_event(NewJournalEvent {
+                event_id: "event.intervening",
+                entity_type: "controller",
+                entity_id: "unrelated",
+                event_kind: "intervening",
+                payload_json: "{}",
+            })
+            .unwrap_or_else(|error| panic!("append intervening event: {error}"));
+
+        let record_digest = record
+            .canonical_digest()
+            .unwrap_or_else(|error| panic!("completion record digest: {error}"));
+        let artifact_digest = record_digest
+            .strip_prefix("sha256:")
+            .unwrap_or_else(|| panic!("completion digest lost prefix"));
+        let key = super::completion_record_key(&record.plan_id, record.plan_revision);
+        let payload_json = serde_json::to_string(&json!({
+            "plan_id": record.plan_id,
+            "plan_revision": record.plan_revision,
+            "plan_digest": record.plan_digest,
+            "record_key": key,
+            "record_digest": record_digest,
+            "artifact_digest": artifact_digest,
+            "checkpoint_generation": record.checkpoint.generation,
+            "checkpoint_action_sequence": record.checkpoint.action_sequence,
+            "checkpoint_hash": record.checkpoint.checkpoint_hash,
+        }))
+        .unwrap_or_else(|error| panic!("encode project_completed payload: {error}"));
+        state
+            .append_event(NewJournalEvent {
+                event_id: "event.project-completed",
+                entity_type: "controller",
+                entity_id: &key,
+                event_kind: "project_completed",
+                payload_json: &payload_json,
+            })
+            .unwrap_or_else(|error| panic!("append project_completed event: {error}"));
+
+        let error = super::validate_completion_publication_event(&state, &record)
+            .err()
+            .unwrap_or_else(|| panic!("completion accepted an intervening post-checkpoint event"));
+        assert!(
+            error
+                .to_string()
+                .contains("not exactly bound to the durable completion record")
+        );
+
+        drop(controller);
+        drop(state);
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(journal_base);
+    }
+
+    #[test]
+    fn completion_record_rejects_missing_exact_artifact_reference() {
+        let (base, mut controller, registry) =
+            completion_ready_fixture("completion-missing-reference");
+        let record = controller
+            .complete_goal(&registry)
+            .unwrap_or_else(|error| panic!("complete goal: {error}"));
+        let artifact_digest = record
+            .canonical_digest()
+            .unwrap_or_else(|error| panic!("completion digest: {error}"))
+            .strip_prefix("sha256:")
+            .unwrap_or_else(|| panic!("completion digest lost prefix"))
+            .to_owned();
+        let reference_id =
+            super::completion_record_reference_id(&record.plan_id, record.plan_revision);
+        controller
+            .state
+            .remove_artifact_reference(&reference_id, &artifact_digest)
+            .unwrap_or_else(|error| panic!("remove completion reference: {error}"));
+
+        let error = controller
+            .completion_record()
+            .err()
+            .unwrap_or_else(|| panic!("completion survived missing exact artifact reference"));
+        assert!(
+            error
+                .to_string()
+                .contains("lost its exact durable artifact reference")
+        );
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn completion_rejects_verification_row_tamper_against_bound_artifact() {
+        let (base, mut controller, registry) =
+            completion_ready_fixture("completion-verification-row-tamper");
+        let verification_key =
+            revision_scoped_key("plan.completion", 1, "verification.completion.1");
+        let raw = controller
+            .state
+            .get_state("controller.verification", &verification_key)
+            .unwrap_or_else(|error| panic!("read completion verification row: {error}"))
+            .unwrap_or_else(|| panic!("completion verification row missing"));
+        let mut value: Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("decode completion verification row: {error}"));
+        value["evidence_ids"] =
+            json!(["sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]);
+        controller
+            .state
+            .put_state(
+                "controller.verification",
+                &verification_key,
+                &serde_json::to_string(&value)
+                    .unwrap_or_else(|error| panic!("encode tampered verification row: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("tamper completion verification row: {error}"));
+
+        let error = controller
+            .complete_goal(&registry)
+            .err()
+            .unwrap_or_else(|| panic!("completion accepted tampered verification row"));
+        assert!(
+            error
+                .to_string()
+                .contains("differs from immutable verification artifact")
+        );
+        assert!(
+            controller
+                .state
+                .get_state(super::COMPLETION_RECORD_NAMESPACE, "plan.completion@r1")
+                .unwrap_or_else(|read_error| panic!("read completion row: {read_error}"))
+                .is_none()
+        );
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn checkpoint_recovery_rejects_sealed_verification_row_tamper() {
+        let (base, mut controller, registry) =
+            completion_ready_fixture("completion-checkpoint-verification-tamper");
+        controller
+            .complete_goal(&registry)
+            .unwrap_or_else(|error| panic!("complete goal: {error}"));
+        let checkpoint = controller
+            .state
+            .latest_valid_checkpoint_ancestry()
+            .unwrap_or_else(|error| panic!("read completion checkpoint ancestry: {error}"))
+            .first()
+            .cloned()
+            .unwrap_or_else(|| panic!("completion checkpoint B missing"));
+        let store = super::checkpoint_artifact_store(controller.state.path())
+            .unwrap_or_else(|error| panic!("open checkpoint store: {error}"));
+        let mut artifact = store
+            .open_artifact(&controller.state, &checkpoint.payload_digest)
+            .unwrap_or_else(|error| panic!("open checkpoint manifest artifact: {error}"));
+        let mut bytes = Vec::new();
+        artifact
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|error| panic!("read checkpoint manifest artifact: {error}"));
+        let manifest: super::CheckpointManifest = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|error| panic!("decode checkpoint manifest: {error}"));
+
+        let verification_key =
+            revision_scoped_key("plan.completion", 1, "verification.completion.1");
+        let raw = controller
+            .state
+            .get_state("controller.verification", &verification_key)
+            .unwrap_or_else(|error| panic!("read sealed verification row: {error}"))
+            .unwrap_or_else(|| panic!("sealed verification row missing"));
+        let mut value: Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|error| panic!("decode sealed verification row: {error}"));
+        value["evidence_ids"] =
+            json!(["sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]);
+        controller
+            .state
+            .put_state(
+                "controller.verification",
+                &verification_key,
+                &serde_json::to_string(&value)
+                    .unwrap_or_else(|error| panic!("encode tampered sealed row: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("tamper sealed verification row: {error}"));
+
+        let error = super::validate_checkpoint_immutable_bindings(&controller.state, &manifest)
+            .err()
+            .unwrap_or_else(|| panic!("checkpoint accepted tampered verification row"));
+        assert!(
+            error.to_string().contains("controller.verification")
+                && error.to_string().contains("changed after checkpoint")
+        );
+
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
     }
 
     fn integration_gate_fixture(label: &str) -> (PathBuf, Controller, ProjectRegistry) {
