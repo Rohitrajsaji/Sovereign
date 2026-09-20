@@ -1,0 +1,201 @@
+{
+  "schema": "sovereign-product-task-evidence-v1",
+  "task": "PD-T04",
+  "title": "Product release acceptance",
+  "status": "completed",
+  "completed_at": "2026-09-20T03:40:50Z",
+  "verified_at": "2026-09-20T03:40:50Z",
+  "acceptance_base": "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md",
+  "scheduling_overlay": "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md",
+  "profile": "local_full_stack_v1",
+  "head": "5486ac361ccb5f276af40e03439960b764e0db35",
+  "dependencies": [
+    "PD-T01",
+    "PD-T02",
+    "PD-T03",
+    "M9-T04"
+  ],
+  "supporting_profile_tasks": [
+    "PD-T05",
+    "PD-T06",
+    "M7-T03"
+  ],
+  "acceptance": {
+    "evidence_bundle_maps_each_product_requirement_to_current_verification": true,
+    "unresolved_unknown_action_ids_empty": true,
+    "recovery_mutation_blocked": false,
+    "final_action_states_exclude_dispatched_observed_unknown": true,
+    "changed_code_gate_relies_only_on_historical_receipts": false,
+    "release_local_only": true,
+    "unrelated_scope_added": false
+  },
+  "product_requirement_map": {
+    "persistent_inventory_records": {
+      "current_proof": "fresh exact product_delivery proof",
+      "evidence": "implementation/evidence/PD-T03.json",
+      "result": "passed"
+    },
+    "deterministic_validation": {
+      "current_proof": "fresh exact product_delivery proof",
+      "evidence": "implementation/evidence/PD-T03.json",
+      "result": "passed"
+    },
+    "create_edit_delete_search": {
+      "current_proof": "fresh exact product_delivery proof with real Chrome",
+      "evidence": "implementation/evidence/PD-T03.json",
+      "result": "passed"
+    },
+    "application_restart_durability": {
+      "current_proof": "fresh exact product_delivery proof with two managed generations and one Controller-owned SQLite path",
+      "evidence": "implementation/evidence/PD-T03.json",
+      "result": "passed"
+    },
+    "deterministic_backend_frontend_verification": {
+      "current_proof": "fresh exact product_delivery proof reruns generated runbook verification under governed execution",
+      "evidence": "implementation/evidence/PD-T03.json",
+      "result": "passed"
+    },
+    "real_browser_flow_verification": {
+      "current_proof": "fresh exact product_delivery proof with real Chrome plus current M9-T04 browser-policy probe",
+      "evidence": [
+        "implementation/evidence/PD-T03.json",
+        "implementation/evidence/M9-T04.json"
+      ],
+      "result": "passed"
+    },
+    "setup_and_run_instructions": {
+      "current_proof": "fresh exact product_delivery proof executes generated verification instructions; literal port-8765 server smoke remains conditional when that exact port is occupied by Chat On Steroids",
+      "evidence": "implementation/evidence/PD-T03.json",
+      "result": "passed_with_environmental_port_condition"
+    },
+    "canonical_controller_plan_action_evidence_checkpoint_recovery_authority": {
+      "current_proof": "fresh exact product_delivery proof plus completed repository/control/browser prerequisites",
+      "evidence": [
+        "implementation/evidence/PD-T05.json",
+        "implementation/evidence/PD-T06.json",
+        "implementation/evidence/M7-T03.json",
+        "implementation/evidence/PD-T03.json"
+      ],
+      "result": "passed"
+    },
+    "controller_backed_cli": {
+      "current_proof": "fresh sovereign app test suite on current HEAD",
+      "evidence": "implementation/evidence/PD-T01.json",
+      "result": "passed"
+    },
+    "controller_backed_dashboard": {
+      "current_proof": "fresh sovereign app test suite on current HEAD",
+      "evidence": [
+        "implementation/evidence/PD-T02.json",
+        "implementation/evidence/PD-T06.json"
+      ],
+      "result": "passed"
+    },
+    "current_product_capable_m1_8gb_soak_security_gate": {
+      "current_proof": "M9-T04 was executed on the product-capable tree and its current release/app source hashes still match exactly",
+      "evidence": "implementation/evidence/M9-T04.json",
+      "result": "passed"
+    }
+  },
+  "current_tree_verification": [
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign --offline",
+      "result": "passed",
+      "details": "14 passed, 0 failed; current CLI/dashboard/LocalControl app surface"
+    },
+    {
+      "command": "CARGO_NET_OFFLINE=true /Users/rohitrajsaji/.cargo/bin/cargo test -p sovereign-eval --test product_delivery local_full_stack_inventory_product_delivery_proof --offline -- --exact --test-threads=1",
+      "result": "passed",
+      "details": "1 passed, 0 failed; fresh exact current-tree proof completed in 31.24s"
+    },
+    {
+      "command": "git diff --check",
+      "result": "passed"
+    },
+    {
+      "command": "git status --short",
+      "result": "clean_before_PD-T04_evidence_state_write"
+    }
+  ],
+  "fresh_product_proof_facts": {
+    "canonical_plan_compiler_used": true,
+    "controller_owned_actions_used": true,
+    "real_chrome_crud_search_validation_executed": true,
+    "application_restart_persistence_executed": true,
+    "sovereign_recovery_reopened_canonical_sqlite": true,
+    "generated_runbook_verification_executed": true,
+    "recovery_mutation_blocked": false,
+    "unknown_action_ids": [],
+    "final_dispatched_observed_unknown_action_count": 0
+  },
+  "changed_code_freshness": {
+    "current_head": "5486ac361ccb5f276af40e03439960b764e0db35",
+    "apps_sovereign_current_tests_fresh": true,
+    "product_delivery_current_test_fresh": true,
+    "m9_t04_release_report_reused_without_rerun": true,
+    "m9_t04_reuse_basis": "exact current source hashes for the M9-T04 release/app implementation match the committed M9-T04 evidence; no release implementation changed after commit",
+    "no_changed_code_gate_relies_solely_on_historical_receipts": true
+  },
+  "source_hashes": {
+    "apps/sovereign/src/main.rs": "sha256:18efdd94b6ff513d0ef37e98a04850671741d2db6d145ef4b0ee3086188e690f",
+    "apps/sovereign/src/control_api.rs": "sha256:2d536edf98b86b219cc74c849b073d6d1a56bedfe29861123555ee407d7dd306",
+    "crates/sovereign-controller/src/lib.rs": "sha256:69adc2d20d13fc5a67bb141a1874677611a7cc47f5492ff2dabf77430e3358ec",
+    "crates/sovereign-controller/src/browser.rs": "sha256:bdf20e0c412d7aa7bac260170c860f1ead37d402e0f770e0856292151a04a7a4",
+    "crates/sovereign-eval/tests/product_delivery.rs": "sha256:544ce5098e79961b46c94a3bef11923a4d60565156d07f131847537081381c13",
+    "crates/sovereign-eval/src/release.rs": "sha256:911c9aadab40db66f438f30e69f911bbb5f26a3bd087b6a55ec4b101e8574f35"
+  },
+  "dependency_evidence_hashes": {
+    "implementation/evidence/PD-T01.json": "sha256:1eb0e1391e5625279c51185e2ca45a25c01fed01acb44e63cdca4ef72d81f2da",
+    "implementation/evidence/PD-T02.json": "sha256:55e2d2acb728d244e651ad8b782b421a0e0b85ee0b4e231e368050402f4cf281",
+    "implementation/evidence/PD-T03.json": "sha256:89d34c2b9caa5b74ec15df11f3faafb648b5fdc94375fcd9895e0d16a49e7b59",
+    "implementation/evidence/M9-T04.json": "sha256:c47ee249db00f54253a99c2e1abdba5b04d1f68fae727894bd78e12b5f5855cc",
+    "implementation/evidence/PD-T05.json": "sha256:d3d7ea0b5f63ee778a0f44b7ade327594e0bd182ca421028da5f17d286be0f10",
+    "implementation/evidence/PD-T06.json": "sha256:a5ba96e70730ce76ad9ea554c8cd032852e505021e8005e1de5846cfd089aaf2",
+    "implementation/evidence/M7-T03.json": "sha256:276ba6dab0fc1fea79112f4010c94e514311c6e01efa33bc7544a197f793ffd6"
+  },
+  "authoritative_contract_hashes": {
+    "output/implementation-plan.json": "sha256:ee0d6a23f73f83ff7fd81f2d35aa611d97f2e81df42c079bac8efd3bc831950b",
+    "output/SOVEREIGN_ARCHITECTURE.md": "sha256:205e310ebe2120234c8e7d8da36052d6d38aac40e1b95f74783865ab7c85b962",
+    "output/RESOURCE_STRESS_TEST.md": "sha256:81c2e2eb8093fa3f9ebdc217d010c81292570d43cab317d871916f80be5cdad8",
+    "schemas/plan-ir-v1.json": "sha256:395e30768248cdef0874dd58722d147e48d2eb14c3951cb6b95635c70294e07d",
+    "output/PRODUCT_DELIVERY_AMENDMENT_v1.0.md": "sha256:7cae498a4395542706eda84d71be5056d62c3c0cb83b4d572f21824a2b585a5a",
+    "output/PRODUCT_DELIVERY_TASK_ID_AMENDMENT_v1.2.md": "sha256:e27f2b14bf6344515644e959969bc5509d020b1772436bea23e27ac3bc126429",
+    "implementation/AUDIT_REMEDIATION_2026-09-12.1.md": "sha256:c6cac5d2993a65dfb7a0f568265debd40c15c635d97c367543a5e54ebedb8446",
+    "output/PLAN_IR_SCENARIOS.md": "sha256:71812ad2eb205989852ae007582402a62a025f6bb4d9746706d8bb2957c30bab",
+    "output/CODEX_RELEASE_AUDIT_2026-09-13.md": "sha256:a9245805670dd60d004dd94f3b23709b813966f97df52f7adc57dfddb62c119c"
+  },
+  "runbook_port_condition": {
+    "port": 8765,
+    "status_at_pd_t04_audit": "occupied_by_Chat_On_Steroids",
+    "action_taken": "none",
+    "reason": "standing release instructions forbid killing or disturbing Chat On Steroids and require the exact literal server smoke only when port 8765 is free",
+    "final_release_recheck_required": true
+  },
+  "independent_audit": {
+    "worker": "worker-11",
+    "mode": "read-only exact-scope PD-T04 audit on clean current HEAD",
+    "result": "CLOSABLE-BY-EVIDENCE",
+    "blockers": [],
+    "production_changes_required": false,
+    "changes_made_by_auditor": false
+  },
+  "runtime_invariants": {
+    "controller_remains_sole_execution_and_lifecycle_authority": true,
+    "canonical_execution_state": "SQLite StateStore",
+    "parallel_execution_state_database_created": false,
+    "parallel_action_ledger_created": false,
+    "parallel_resource_governor_created": false,
+    "fail_closed_recovery_preserved": true,
+    "offline_operation_preserved": true,
+    "one_resident_local_model_constraint_preserved": true
+  },
+  "external_side_effects": {
+    "push": false,
+    "deploy": false,
+    "publish": false,
+    "spend": false,
+    "real_secret_access": false,
+    "destructive_external_action": false,
+    "network_package_install": false
+  }
+}
