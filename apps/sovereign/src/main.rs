@@ -1,4 +1,6 @@
 mod control_api;
+mod run_lock;
+mod runner;
 
 use control_api::{ControlApiRequest, bind_loopback, serve_listener};
 use serde_json::Value;
@@ -15,9 +17,16 @@ const STATE_DB_ENV: &str = "SOVEREIGN_STATE_DB";
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|command| command == "run") {
+        return render_result(runner::run_command(args.get(1..).unwrap_or_default()));
+    }
     let state_path = std::env::var_os(STATE_DB_ENV)
         .map_or_else(|| PathBuf::from(".sovereign/state.sqlite3"), PathBuf::from);
-    match run(&args, &state_path) {
+    render_result(run(&args, &state_path))
+}
+
+fn render_result(result: Result<String, String>) -> ExitCode {
+    match result {
         Ok(output) => {
             if !output.is_empty() {
                 println!("{output}");
@@ -111,6 +120,7 @@ fn run(args: &[String], state_path: &Path) -> Result<String, String> {
             serde_json::to_string_pretty(&request).map_err(|error| error.to_string())
         }
         Some("serve") => run_serve(args, state_path),
+        Some("run") => Err("`run` must be dispatched by the production runner entrypoint".to_owned()),
         Some(command) => Err(format!(
             "unsupported command {command:?}; run `sovereign help` for the local CLI surface"
         )),
@@ -245,6 +255,7 @@ fn help_text() -> String {
         "",
         "Commands:",
         "  goal <natural-language goal>  Durably queue a Controller-owned goal intent",
+        "  run [--once]                  Advance the Controller-owned production goal loop",
         "  status                        Inspect durable plan/task/attempt/control state",
         "  evidence                      Inspect durable verification evidence",
         "  eval --profile m1-8gb --offline  Run deterministic local M9 evaluation corpus",

@@ -1,6 +1,6 @@
 use sovereign_repo::{
-    ChangeSet, ChangeSetCompositionInput, ComposeChangeSetsOutcome, ProjectRegistry, RepoError,
-    RepositoryIntelligence, WorktreeLease,
+    ChangeSet, ChangeSetCompositionInput, ComposeChangeSetsOutcome, OfflineDependencyLimits,
+    ProjectRegistry, RepoError, RepositoryIntelligence, WorktreeLease,
 };
 use std::fs;
 use std::io::Write;
@@ -116,6 +116,45 @@ fn git_input(root: &Path, args: &[&str], input: &str) -> String {
         .trim()
         .to_owned()
 }
+
+fn configure_offline_node_project(fixture: &Fixture) {
+    fs::create_dir_all(fixture.primary.join("app"))
+        .unwrap_or_else(|error| panic!("create app: {error}"));
+    fs::write(
+        fixture.primary.join("app/package-lock.json"),
+        "{\"lockfileVersion\":3}\n",
+    )
+    .unwrap_or_else(|error| panic!("write package lock: {error}"));
+    fs::write(fixture.primary.join(".gitignore"), "app/node_modules/\n")
+        .unwrap_or_else(|error| panic!("write gitignore: {error}"));
+    git(
+        &fixture.primary,
+        &["add", ".gitignore", "app/package-lock.json"],
+    );
+    git(&fixture.primary, &["commit", "-qm", "offline node project"]);
+}
+
+fn materialized_offline_lease(fixture: &Fixture, registry: &ProjectRegistry) -> WorktreeLease {
+    let lease = registry
+        .prepare_worktree_lease(
+            "repo.fixture",
+            &fixture.worktrees,
+            "plan.offline-deps",
+            1,
+            "task.offline-deps",
+            "sha256:offline-dependency-contract",
+        )
+        .unwrap_or_else(|error| panic!("prepare offline dependency lease: {error}"));
+    registry
+        .materialize_worktree(&lease)
+        .unwrap_or_else(|error| panic!("materialize offline dependency lease: {error}"));
+    lease
+}
+
+const OFFLINE_LIMITS: OfflineDependencyLimits = OfflineDependencyLimits {
+    max_entries: 128,
+    max_bytes: 1024 * 1024,
+};
 
 #[test]
 fn worktree_dirty_primary_is_byte_for_byte_protected_and_cleanup_is_owned() {
@@ -1088,4 +1127,252 @@ fn worktree_join_conflict_is_evidence_and_never_auto_resolved() {
         "left\n",
         "failed incoming branch must not be auto-resolved or partially applied"
     );
+}
+
+#[test]
+fn offline_node_modules_materialization_is_bounded_hashed_and_primary_preserving() {
+    let fixture = Fixture::new("offline-node-modules-success");
+    configure_offline_node_project(&fixture);
+    let source = fixture.primary.join("app/node_modules");
+    fs::create_dir_all(source.join("pkg"))
+        .unwrap_or_else(|error| panic!("create source package: {error}"));
+    fs::write(source.join("pkg/index.js"), "module.exports = 42;\n")
+        .unwrap_or_else(|error| panic!("write source package: {error}"));
+    symlink("pkg/index.js", source.join("alias.js"))
+        .unwrap_or_else(|error| panic!("create internal dependency symlink: {error}"));
+    let primary_before = fs::read(source.join("pkg/index.js"))
+        .unwrap_or_else(|error| panic!("read primary dependency before: {error}"));
+
+    let registry = fixture.registry();
+    let lease = materialized_offline_lease(&fixture, &registry);
+    let provenance = registry
+        .materialize_existing_node_modules(&lease, Path::new("app"), OFFLINE_LIMITS)
+        .unwrap_or_else(|error| panic!("materialize offline node_modules: {error}"));
+
+    assert_eq!(provenance.repository_id, "repo.fixture");
+    assert_eq!(provenance.plan_id, "plan.offline-deps");
+    assert_eq!(provenance.task_id, "task.offline-deps");
+    assert_eq!(provenance.worktree_lease_id, lease.lease_id);
+    assert_eq!(provenance.project_root, PathBuf::from("app"));
+    assert_eq!(provenance.source_manifest, provenance.destination_manifest);
+    registry
+        .validate_existing_node_modules_provenance(&lease, &provenance, OFFLINE_LIMITS)
+        .unwrap_or_else(|error| panic!("verify materialized dependency receipt: {error}"));
+    assert_eq!(provenance.source_manifest.regular_file_count, 1);
+    assert_eq!(provenance.source_manifest.symlink_count, 1);
+    assert_eq!(provenance.source_manifest.directory_count, 1);
+    assert_eq!(provenance.source_manifest.entry_count, 3);
+    assert!(provenance.ignore_evidence_digest.starts_with("sha256:"));
+    assert_eq!(
+        fs::read(lease.worktree_path.join("app/node_modules/pkg/index.js"))
+            .unwrap_or_else(|error| panic!("read materialized dependency: {error}")),
+        primary_before
+    );
+    assert_eq!(
+        fs::read_link(lease.worktree_path.join("app/node_modules/alias.js"))
+            .unwrap_or_else(|error| panic!("read materialized symlink: {error}")),
+        PathBuf::from("pkg/index.js")
+    );
+    assert_eq!(
+        fs::read(source.join("pkg/index.js"))
+            .unwrap_or_else(|error| panic!("read primary dependency after: {error}")),
+        primary_before,
+        "offline materialization must not mutate the primary dependency tree"
+    );
+    assert!(
+        registry
+            .worktree_snapshot(&lease)
+            .unwrap_or_else(|error| panic!("snapshot worktree after materialization: {error}"))
+            .untracked
+            .paths
+            .iter()
+            .all(|path| !path.starts_with("app/node_modules")),
+        "Git-ignored runtime dependencies must stay outside repository change evidence"
+    );
+}
+
+#[test]
+fn offline_node_modules_receipt_validation_detects_tree_and_identity_drift() {
+    let fixture = Fixture::new("offline-node-modules-receipt-drift");
+    configure_offline_node_project(&fixture);
+    let source = fixture.primary.join("app/node_modules/pkg/index.js");
+    fs::create_dir_all(source.parent().expect("package parent")).expect("create source");
+    fs::write(&source, "original\n").expect("write source");
+    let registry = fixture.registry();
+    let lease = materialized_offline_lease(&fixture, &registry);
+    let receipt = registry
+        .materialize_existing_node_modules(&lease, Path::new("app"), OFFLINE_LIMITS)
+        .expect("copy ignored dependencies");
+    let mut misbound = receipt.clone();
+    misbound.worktree_lease_id = "worktree.unrelated".to_owned();
+    assert!(registry
+        .validate_existing_node_modules_provenance(&lease, &misbound, OFFLINE_LIMITS)
+        .is_err());
+    let destination = lease.worktree_path.join("app/node_modules/pkg/index.js");
+    fs::write(&destination, "destination drift\n").expect("drift destination");
+    assert!(registry
+        .validate_existing_node_modules_provenance(&lease, &receipt, OFFLINE_LIMITS)
+        .is_err());
+    fs::write(&destination, "original\n").expect("restore destination");
+    fs::write(&source, "source drift\n").expect("drift source");
+    assert!(registry
+        .validate_existing_node_modules_provenance(&lease, &receipt, OFFLINE_LIMITS)
+        .is_err());
+    fs::write(&source, "original\n").expect("restore source");
+    fs::write(fixture.primary.join(".gitignore"), "").expect("remove ignore rule");
+    assert!(registry
+        .validate_existing_node_modules_provenance(&lease, &receipt, OFFLINE_LIMITS)
+        .is_err());
+}
+
+#[test]
+fn offline_node_modules_materialization_rejects_nonignored_or_existing_destination() {
+    let nonignored = Fixture::new("offline-node-modules-nonignored");
+    fs::create_dir_all(nonignored.primary.join("app/node_modules/pkg"))
+        .unwrap_or_else(|error| panic!("create nonignored dependency: {error}"));
+    fs::write(nonignored.primary.join("app/package-lock.json"), "{}\n")
+        .unwrap_or_else(|error| panic!("write package lock: {error}"));
+    fs::write(
+        nonignored.primary.join("app/node_modules/pkg/index.js"),
+        "export {};\n",
+    )
+    .unwrap_or_else(|error| panic!("write nonignored dependency: {error}"));
+    git(&nonignored.primary, &["add", "app/package-lock.json"]);
+    git(&nonignored.primary, &["commit", "-qm", "app root"]);
+    let registry = nonignored.registry();
+    let lease = materialized_offline_lease(&nonignored, &registry);
+    assert!(matches!(
+        registry.materialize_existing_node_modules(&lease, Path::new("app"), OFFLINE_LIMITS),
+        Err(RepoError::InvalidOfflineDependency(_))
+    ));
+    assert!(!lease.worktree_path.join("app/node_modules").exists());
+
+    let existing = Fixture::new("offline-node-modules-existing-destination");
+    configure_offline_node_project(&existing);
+    fs::create_dir_all(existing.primary.join("app/node_modules/pkg"))
+        .unwrap_or_else(|error| panic!("create ignored source: {error}"));
+    fs::write(
+        existing.primary.join("app/node_modules/pkg/index.js"),
+        "export {};\n",
+    )
+    .unwrap_or_else(|error| panic!("write ignored source: {error}"));
+    let registry = existing.registry();
+    let lease = materialized_offline_lease(&existing, &registry);
+    fs::create_dir(lease.worktree_path.join("app/node_modules"))
+        .unwrap_or_else(|error| panic!("create preexisting destination: {error}"));
+    assert!(matches!(
+        registry.materialize_existing_node_modules(&lease, Path::new("app"), OFFLINE_LIMITS),
+        Err(RepoError::InvalidOfflineDependency(_))
+    ));
+}
+
+#[test]
+fn offline_node_modules_materialization_enforces_entry_and_byte_ceilings() {
+    let fixture = Fixture::new("offline-node-modules-limits");
+    configure_offline_node_project(&fixture);
+    let source = fixture.primary.join("app/node_modules");
+    fs::create_dir_all(source.join("pkg"))
+        .unwrap_or_else(|error| panic!("create package: {error}"));
+    fs::write(source.join("pkg/a.js"), "1234567890")
+        .unwrap_or_else(|error| panic!("write first package file: {error}"));
+    fs::write(source.join("pkg/b.js"), "abcdefghij")
+        .unwrap_or_else(|error| panic!("write second package file: {error}"));
+    let registry = fixture.registry();
+    let lease = materialized_offline_lease(&fixture, &registry);
+
+    assert!(matches!(
+        registry.materialize_existing_node_modules(
+            &lease,
+            Path::new("app"),
+            OfflineDependencyLimits {
+                max_entries: 2,
+                max_bytes: 1024,
+            },
+        ),
+        Err(RepoError::InvalidOfflineDependency(_))
+    ));
+    assert!(!lease.worktree_path.join("app/node_modules").exists());
+    assert!(matches!(
+        registry.materialize_existing_node_modules(
+            &lease,
+            Path::new("app"),
+            OfflineDependencyLimits {
+                max_entries: 16,
+                max_bytes: 5,
+            },
+        ),
+        Err(RepoError::InvalidOfflineDependency(_))
+    ));
+    assert!(!lease.worktree_path.join("app/node_modules").exists());
+}
+
+#[test]
+fn offline_node_modules_materialization_rejects_external_symlink_and_special_file() {
+    let symlink_fixture = Fixture::new("offline-node-modules-external-symlink");
+    configure_offline_node_project(&symlink_fixture);
+    let source = symlink_fixture.primary.join("app/node_modules");
+    fs::create_dir_all(&source).unwrap_or_else(|error| panic!("create source: {error}"));
+    fs::write(symlink_fixture.primary.join("outside.js"), "outside\n")
+        .unwrap_or_else(|error| panic!("write outside target: {error}"));
+    symlink("../../outside.js", source.join("escape.js"))
+        .unwrap_or_else(|error| panic!("create external symlink: {error}"));
+    let registry = symlink_fixture.registry();
+    let lease = materialized_offline_lease(&symlink_fixture, &registry);
+    assert!(matches!(
+        registry.materialize_existing_node_modules(&lease, Path::new("app"), OFFLINE_LIMITS),
+        Err(RepoError::InvalidOfflineDependency(_))
+    ));
+    assert!(!lease.worktree_path.join("app/node_modules").exists());
+
+    let special_fixture = Fixture::new("offline-node-modules-special-file");
+    configure_offline_node_project(&special_fixture);
+    let source = special_fixture.primary.join("app/node_modules");
+    fs::create_dir_all(&source).unwrap_or_else(|error| panic!("create source: {error}"));
+    let fifo = source.join("runtime.fifo");
+    let output = Command::new("/usr/bin/mkfifo")
+        .arg(&fifo)
+        .output()
+        .unwrap_or_else(|error| panic!("create FIFO dependency entry: {error}"));
+    assert!(
+        output.status.success(),
+        "mkfifo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let registry = special_fixture.registry();
+    let lease = materialized_offline_lease(&special_fixture, &registry);
+    assert!(matches!(
+        registry.materialize_existing_node_modules(&lease, Path::new("app"), OFFLINE_LIMITS),
+        Err(RepoError::InvalidOfflineDependency(_))
+    ));
+    assert!(!lease.worktree_path.join("app/node_modules").exists());
+}
+
+#[test]
+fn offline_node_modules_materialization_rejects_tracked_source_tree() {
+    let fixture = Fixture::new("offline-node-modules-tracked");
+    configure_offline_node_project(&fixture);
+    fs::create_dir_all(fixture.primary.join("app/node_modules/pkg"))
+        .unwrap_or_else(|error| panic!("create tracked dependency: {error}"));
+    fs::write(
+        fixture.primary.join("app/node_modules/pkg/index.js"),
+        "tracked\n",
+    )
+    .unwrap_or_else(|error| panic!("write tracked dependency: {error}"));
+    git(
+        &fixture.primary,
+        &["add", "-f", "app/node_modules/pkg/index.js"],
+    );
+    git(&fixture.primary, &["commit", "-qm", "tracked dependency"]);
+    let registry = fixture.registry();
+    let lease = materialized_offline_lease(&fixture, &registry);
+    assert!(
+        lease
+            .worktree_path
+            .join("app/node_modules/pkg/index.js")
+            .exists()
+    );
+    assert!(matches!(
+        registry.materialize_existing_node_modules(&lease, Path::new("app"), OFFLINE_LIMITS),
+        Err(RepoError::InvalidOfflineDependency(_))
+    ));
 }

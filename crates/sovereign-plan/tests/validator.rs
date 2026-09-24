@@ -97,6 +97,49 @@ fn valid_trivial_plan_is_accepted() {
 }
 
 #[test]
+fn repo_write_tasks_have_one_mutable_target_while_read_only_tasks_keep_multi_file_scope() {
+    let mut two_updates = fixture();
+    task_mut(&mut two_updates, 0)["scope"]["files"] = json!([
+        "src/settings/SettingsForm.tsx",
+        "src/settings/SettingsForm.test.tsx"
+    ]);
+    assert_diagnostic_at(
+        &diagnostics(two_updates),
+        DiagnosticCode::PermissionPolicy,
+        "/tasks/0/scope",
+        "repo_write task authorizes 2 mutable repository paths",
+    );
+
+    let mut update_and_create = fixture();
+    task_mut(&mut update_and_create, 0)["scope"]["allow_create"] =
+        json!(["src/settings/Generated.tsx"]);
+    assert_diagnostic_at(
+        &diagnostics(update_and_create),
+        DiagnosticCode::PermissionPolicy,
+        "/tasks/0/scope",
+        "repo_write task authorizes 2 mutable repository paths",
+    );
+
+    let mut read_only = fixture();
+    task_mut(&mut read_only, 0)["scope"]["files"] = json!([
+        "src/settings/SettingsForm.tsx",
+        "src/settings/SettingsForm.test.tsx"
+    ]);
+    task_mut(&mut read_only, 0)["permissions"] = json!(["read", "process_exec"]);
+    task_mut(&mut read_only, 0)["action_policy"]["write_roots"] = json!([]);
+    task_mut(&mut read_only, 0)["rollback"] = json!({
+        "mode": "none",
+        "procedure": "No repository mutation is authorized for this task.",
+        "reason_no_rollback": "Read-only task has no repository side effect."
+    });
+    let read_only_diagnostics = diagnostics(read_only);
+    assert!(
+        read_only_diagnostics.is_empty(),
+        "multi-file read-only scope should remain valid: {read_only_diagnostics:#?}"
+    );
+}
+
+#[test]
 fn hard_dependency_cycle_is_rejected() {
     let mut value = fixture();
     add_second_task(&mut value, "task.second");

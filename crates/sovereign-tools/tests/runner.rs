@@ -301,6 +301,8 @@ fn isolation(repo: &Path, home: &Path, allow_repository_write: bool) -> Isolatio
         repository_root: repo.to_path_buf(),
         user_home_root: home.to_path_buf(),
         extra_protected_read_roots: Vec::new(),
+        rust_toolchain: None,
+        build_scratch_root: None,
         network_offline: true,
         allow_repository_write,
         require_full_filesystem_read_jail: false,

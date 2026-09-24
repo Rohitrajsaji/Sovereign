@@ -10,8 +10,11 @@ use sovereign_controller::{
     CheckpointActionRecord, CheckpointManifest, CheckpointRepositoryBaselineV1, Controller,
     ControllerError, ExecutionRuntime, ExecutionSuccess, FailureClassification,
     FailureClassificationKind, LocalControl, ModelProposalV1, PermissionContext, PlanValidity,
-    ReadinessInputs, RecoveryManager, ResourcePressureProbe, RoleId, RoleRegistry, SchedulerView,
-    SecretProcessRuntime, TaskState, VERIFICATION_RESULT_SCHEMA_VERSION, VerificationResultV1,
+    ProductionAdvanceOutcome, ProductionAdvanceResources, ProductionBlockReason,
+    ProductionBrowserResources, ProductionCompilationResources, ProductionExecutionCatalog,
+    ProductionExecutionResources, ReadinessInputs, RecoveryManager,
+    ResourcePressureProbe, RoleId, RoleRegistry, SchedulerView, SecretProcessRuntime, TaskState,
+    VERIFICATION_RESULT_SCHEMA_VERSION, VerificationResultV1,
 };
 #[cfg(feature = "recovery-test-hooks")]
 use sovereign_controller::{
@@ -25,9 +28,13 @@ use sovereign_model::{
     ModelResponse, ModelUsage,
 };
 use sovereign_plan::{
-    DepthClassifier, DepthFeatureInput, DiagnosticCode, ExecutionDepth, M3PlanningInput,
-    PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationInput, PlanCompilationRepository,
-    PlanCompilationResult, PlanCompiler, PlanIr, PlanValidator, ValidationEnvironment,
+    BrowserAcceptanceActionV1, BrowserAcceptanceExpectationV1, BrowserAcceptanceSemanticV1,
+    BrowserAcceptanceStepV1, BrowserAcceptanceTemplateV1, BrowserManagedAppLaunchV1,
+    BrowserManagedArgBindingV1, BrowserManagedPersistenceBindingV1, BrowserManagedReadinessV1,
+    DepthClassifier, DepthFeatureInput, DiagnosticCode, ExecutionDepth,
+    M3PlanningInput, PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationInput,
+    PlanCompilationRepository, PlanCompilationResult, PlanCompiler, PlanIr, PlanValidator,
+    ValidationEnvironment,
 };
 use sovereign_policy::{
     CapabilityLayers, CapabilitySet, CommandMode, CommandPolicy, CommandRisk, CommandSpec,
@@ -38,7 +45,9 @@ use sovereign_policy::{
     SecretBroker, SecretInjection, SecretProviderBackend, SecretProviderKind, SecretRef,
     SecretValue, ThermalPressure,
 };
-use sovereign_repo::{ExactRetriever, ProjectRegistry, RepositoryIntelligence};
+use sovereign_repo::{
+    ExactRetriever, OfflineDependencyLimits, ProjectRegistry, RepositoryIntelligence,
+};
 use sovereign_state::{
     ActionTransition, NewActionRecord, NewCheckpointIntegrityRecord, NewJournalEvent,
     StateRecordUpdate, StateStore,
@@ -177,6 +186,8 @@ struct CompiledFixture {
     packet: ContextPacket,
     form_digest: String,
     compilation: Option<PlanCompilationResult>,
+    compilation_input: PlanCompilationInput,
+    planning_response: ModelResponse,
 }
 
 fn git(root: &Path, args: &[&str]) {
@@ -897,6 +908,40 @@ fn compiled_command_verification_fixture(
 }
 
 fn compiled_managed_loopback_fixture(label: &str, port: u16) -> CompiledFixture {
+    compiled_managed_loopback_fixture_with_launch(label, port, BrowserManagedAppLaunchV1::PythonManagedServerV1 {
+        server_relative_path: "src/other.txt".to_owned(),
+        database_filename: "managed.sqlite3".to_owned(),
+        required_generations: 2,
+    })
+}
+
+fn compiled_managed_loopback_fixture_with_launch(label: &str, port: u16, launch: BrowserManagedAppLaunchV1) -> CompiledFixture {
+    let acceptance = if label == "managed-node-production-driver" {
+        json!([{
+            "kind":"command", "description":"Run a bounded no-recipe Makefile gate",
+            "manual_gate_id":null,
+            "command_spec": {
+                "tool_id":"tool.patch", "mode":"exec", "program":"make",
+                "args":["-f", "Makefile", "all"], "repository_id":"repo.app",
+                "working_dir_relative":".", "literal_env":{}, "secret_env":{},
+                "timeout_seconds":15, "output_limit_bytes":65536
+            },
+            "expected_exit_codes":[0]
+        }])
+    } else {
+        json!([{
+            "kind": "command",
+            "description": "Run the bounded local verification command.",
+            "manual_gate_id": null,
+            "command_spec": {
+                "tool_id": "tool.patch", "mode": "exec", "program": "python3",
+                "args": ["-B", "-c", "pass"], "repository_id": "repo.app",
+                "working_dir_relative": ".", "literal_env": {}, "secret_env": {},
+                "timeout_seconds": 15, "output_limit_bytes": 65536
+            },
+            "expected_exit_codes": [0]
+        }])
+    };
     let planning = json!({
         "tasks": [{
             "local_id": "managed-loopback-browser",
@@ -910,24 +955,7 @@ fn compiled_managed_loopback_fixture(label: &str, port: u16) -> CompiledFixture 
             "dependencies": [],
             "evidence_needs": [],
             "expected_change": "No repository mutation; local browser verification succeeds.",
-            "acceptance": [{
-                "kind": "command",
-                "description": "Run the bounded local verification command.",
-                "manual_gate_id": Value::Null,
-                "command_spec": {
-                    "tool_id": "tool.patch",
-                    "mode": "exec",
-                    "program": "python3",
-                    "args": ["-B", "-c", "pass"],
-                    "repository_id": "repo.app",
-                    "working_dir_relative": ".",
-                    "literal_env": {},
-                    "secret_env": {},
-                    "timeout_seconds": 15,
-                    "output_limit_bytes": 65536
-                },
-                "expected_exit_codes": [0]
-            }]
+            "acceptance": acceptance
         }]
     });
     let mut fixture = compiled_fixture_inner(
@@ -957,16 +985,99 @@ fn compiled_managed_loopback_fixture(label: &str, port: u16) -> CompiledFixture 
         .map_or_else(|| panic!("managed loopback task id missing"), str::to_owned);
     fixture.compilation = Some(
         compilation
-            .bind_controller_loopback_browser(
+            .bind_controller_loopback_browser_acceptance(
                 &validator,
                 &task_id,
                 &capability("tool.browser", BROWSER_TOOL_DIGEST),
                 port,
                 MANAGED_LOOPBACK_NETWORK_BYTES,
+                &BrowserAcceptanceTemplateV1 {
+                    launch,
+                    steps: vec![
+                        BrowserAcceptanceStepV1 {
+                            step_id: "browser.initial".to_owned(),
+                            generation: 1,
+                            action: BrowserAcceptanceActionV1::Navigate {
+                                path: "/health".to_owned(),
+                            },
+                            expectation: BrowserAcceptanceExpectationV1 {
+                                semantic: BrowserAcceptanceSemanticV1::Read,
+                                required_contains: Vec::new(),
+                                forbidden_contains: Vec::new(),
+                            },
+                        },
+                        BrowserAcceptanceStepV1 {
+                            step_id: "browser.restart.navigate".to_owned(),
+                            generation: 2,
+                            action: BrowserAcceptanceActionV1::Navigate { path: "/".to_owned() },
+                            expectation: BrowserAcceptanceExpectationV1 {
+                                semantic: BrowserAcceptanceSemanticV1::Read,
+                                required_contains: Vec::new(),
+                                forbidden_contains: Vec::new(),
+                            },
+                        },
+                        BrowserAcceptanceStepV1 {
+                            step_id: "browser.restart".to_owned(),
+                            generation: 2,
+                            action: BrowserAcceptanceActionV1::CaptureSynopsis,
+                            expectation: BrowserAcceptanceExpectationV1 {
+                                semantic: BrowserAcceptanceSemanticV1::RestartPersistence,
+                                required_contains: vec!["persisted".to_owned()],
+                                forbidden_contains: Vec::new(),
+                            },
+                        },
+                    ],
+                },
             )
             .unwrap_or_else(|error| panic!("bind managed loopback browser authority: {error:?}")),
     );
     fixture
+}
+
+#[test]
+fn managed_loopback_compilation_binds_typed_browser_acceptance_without_symbol_heuristics() {
+    let fixture = compiled_managed_loopback_fixture("typed-browser-acceptance", 41_739);
+    let compilation = fixture
+        .compilation
+        .as_ref()
+        .unwrap_or_else(|| panic!("typed browser compilation missing"));
+    let task = &compilation.plan().as_value()["tasks"][0];
+    let acceptance = &task["browser_acceptance"];
+
+    assert_eq!(acceptance["schema_version"], json!(1));
+    assert_eq!(acceptance["loopback"]["scheme"], json!("http"));
+    assert_eq!(acceptance["loopback"]["host"], json!("127.0.0.1"));
+    assert_eq!(acceptance["loopback"]["port"], json!(41_739));
+    assert_eq!(
+        acceptance["launch"]["runtime"],
+        json!("python_managed_server_v1")
+    );
+    assert_eq!(acceptance["launch"]["required_generations"], json!(2));
+    assert_eq!(
+        acceptance["evidence_binding"]["receipt_digest"],
+        json!(true)
+    );
+    assert_eq!(
+        acceptance["evidence_binding"]["action_commit_sequence"],
+        json!(true)
+    );
+    assert_eq!(
+        acceptance["evidence_binding"]["managed_generation"],
+        json!(true)
+    );
+    assert!(
+        acceptance["steps"]
+            .as_array()
+            .is_some_and(|steps| steps.iter().any(|step| {
+                step["generation"] == json!(2)
+                    && step["expectation"]["semantic"] == json!("restart_persistence")
+            }))
+    );
+    assert!(task["scope"]["symbols"].as_array().is_some_and(|symbols| {
+        symbols
+            .iter()
+            .all(|symbol| symbol != "inventory-browser-proof")
+    }));
 }
 
 #[cfg(feature = "recovery-test-hooks")]
@@ -1078,6 +1189,85 @@ fn compiled_fixture_inner(
     m3_depth_override: Option<ExecutionDepth>,
 ) -> CompiledFixture {
     let repo = TestRepo::create(label);
+    if label == "managed-node-production-driver" {
+        fs::write(repo.root.join("Makefile"), "all:\n")
+            .unwrap_or_else(|error| panic!("write no-recipe fixture: {error}"));
+        git(&repo.root, &["add", "Makefile"]);
+        git(&repo.root, &["commit", "-qm", "bounded no-recipe gate"]);
+    }
+    if label.starts_with("managed-node-") || label.starts_with("managed-postgres-") {
+        fs::create_dir_all(repo.root.join("apps/inventory"))
+            .unwrap_or_else(|error| panic!("create Node fixture directory: {error}"));
+        let server_source = if label.starts_with("managed-postgres-") { r#"
+const http = require('node:http');
+const net = require('node:net');
+const args = process.argv.slice(2);
+const value = (name) => args[args.indexOf(name) + 1];
+const port = Number(value('--port'));
+const database = new URL(value('--database-url'));
+if (!Number.isInteger(port) || port <= 0 || database.pathname !== '/sovereign_app' || database.username !== 'sovereign_app_runtime') process.exit(2);
+const connection = net.connect(Number(database.port), database.hostname);
+let buffer = Buffer.alloc(0);
+let queried = false;
+let row = false;
+let ready = false;
+connection.on('connect', () => {
+  const body = Buffer.concat([Buffer.from([0, 3, 0, 0]), Buffer.from('user\0sovereign_app_runtime\0database\0sovereign_app\0\0')]);
+  const packet = Buffer.alloc(4); packet.writeUInt32BE(body.length + 4);
+  connection.write(Buffer.concat([packet, body]));
+});
+connection.on('data', (chunk) => {
+  buffer = Buffer.concat([buffer, chunk]);
+  while (buffer.length >= 5) {
+    const length = buffer.readUInt32BE(1);
+    if (length < 4 || length > 65536) process.exit(3);
+    if (buffer.length < length + 1) break;
+    const kind = String.fromCharCode(buffer[0]);
+    const body = buffer.subarray(5, length + 1);
+    buffer = buffer.subarray(length + 1);
+    if (kind === 'E') process.exit(4);
+    if (kind === 'D') row = body.includes(Buffer.from('sovereign_app_runtime')) && body.includes(Buffer.from('sovereign_app'));
+    if (kind === 'Z' && !queried) {
+      queried = true;
+      const query = Buffer.from('SELECT current_user,current_database()\0');
+      const packet = Buffer.alloc(5); packet[0] = 81; packet.writeUInt32BE(query.length + 4, 1);
+      connection.write(Buffer.concat([packet, query]));
+    } else if (kind === 'Z' && queried && row && !ready) {
+      ready = true;
+      const direct = net.connect(5432, '127.0.0.1');
+      direct.setTimeout(500);
+      direct.on('connect', () => process.exit(7));
+      let served = false;
+      const serve = () => { if (served) return; served = true; http.createServer((req, res) => {
+        res.writeHead(200, {'content-type': 'text/plain'});
+        res.end(req.url === '/health' ? 'ok' : 'sovereign_app');
+      }).listen(port, '127.0.0.1'); };
+      direct.on('error', serve);
+      direct.on('timeout', () => { direct.destroy(); serve(); });
+    }
+  }
+});
+connection.on('error', () => process.exit(5));
+connection.on('close', () => { if (!ready) process.exit(6); });
+"# } else { r#"
+const http = require('node:http');
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const value = (name) => args[args.indexOf(name) + 1];
+const port = Number(value('--port'));
+const db = value('--db');
+if (!Number.isInteger(port) || port <= 0 || !db) process.exit(2);
+fs.writeFileSync(db, fs.existsSync(db) ? fs.readFileSync(db) : 'persisted');
+http.createServer((req, res) => {
+  res.writeHead(200, {'content-type': 'text/plain'});
+  res.end(req.url === '/health' ? 'ok' : fs.readFileSync(db));
+}).listen(port, '127.0.0.1');
+"# };
+        fs::write(repo.root.join("apps/inventory/server.js"), server_source)
+            .unwrap_or_else(|error| panic!("write Node fixture: {error}"));
+        git(&repo.root, &["add", "apps/inventory/server.js"]);
+        git(&repo.root, &["commit", "-qm", "Node managed fixture"]);
+    }
     if let Some(mode) = target_mode {
         fs::set_permissions(
             repo.root.join("src/settings/SettingsForm.tsx"),
@@ -1204,10 +1394,11 @@ fn compiled_fixture_inner(
     let uses_general_repository_action = planning["tasks"]
         .as_array()
         .is_some_and(|tasks| tasks.iter().any(|task| task.get("create_files").is_some()));
-    let planner = backend(vec![model_response(
+    let planning_response = model_response(
         planning.to_string(),
         packet.metrics.final_serialized_input_tokens,
-    )]);
+    );
+    let planner = backend(vec![planning_response.clone()]);
     let validator = PlanValidator::new(ValidationEnvironment::default())
         .unwrap_or_else(|error| panic!("validator: {error}"));
     let compiler = PlanCompiler::new(&planner, &validator, "t07-test-compiler")
@@ -1317,6 +1508,8 @@ fn compiled_fixture_inner(
         packet,
         form_digest: form.digest,
         compilation: Some(compilation),
+        compilation_input: input,
+        planning_response,
     }
 }
 
@@ -1366,6 +1559,596 @@ fn controller_for(fixture: &mut CompiledFixture) -> (Controller, String) {
         .activate(compilation, &fixture.registry)
         .unwrap_or_else(|error| panic!("activate: {error}"));
     (controller, activation.task_ids[0].clone())
+}
+
+#[test]
+fn production_driver_compiles_executes_verifies_and_finalizes_queued_goal() {
+    let fixture = compiled_worktree_fixture("production-driver-complete");
+    let state = StateStore::open(&fixture.repo.state_path).expect("open production state");
+    let mut controller = Controller::new(state);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
+    let intent = controller
+        .submit_goal_intent(&fixture.compilation_input.goal_statement)
+        .expect("submit queued production goal");
+    let mut input = fixture.compilation_input.clone();
+    input.goal_id = intent.goal_id.clone();
+    let planner = backend(vec![fixture.planning_response.clone()]);
+    let validator = PlanValidator::new(ValidationEnvironment::default()).expect("validator");
+    let mut compile_budget = ModelCallBudget::new(1, 30_000);
+    let compilation = ProductionCompilationResources {
+        input: &input,
+        backend: &planner,
+        validator: &validator,
+        compiler_version: "t07-test-compiler",
+        model_budget: &mut compile_budget,
+    };
+    let compiled = controller
+        .advance_production_goal(
+            &fixture.registry,
+            ProductionAdvanceResources::<MacSandboxExecBackend> {
+                compilation: Some(compilation),
+                execution: None,
+            },
+        )
+        .expect("compile and activate queued goal");
+    assert!(matches!(
+        compiled,
+        ProductionAdvanceOutcome::PlanActivated { .. }
+    ));
+    planner.unload().expect("unload planning model");
+    drop(controller);
+    let state = StateStore::open(&fixture.repo.state_path).expect("reopen activated plan state");
+    let mut controller = Controller::reopen_local(state).expect("recover activated queued goal");
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
+
+    let execution = backend(vec![model_response(
+        valid_execution_proposal(&fixture.form_digest),
+        fixture.packet.metrics.final_serialized_input_tokens,
+    )]);
+    let parts = runtime_parts(&fixture);
+    let isolation = MacSandboxExecBackend::detect().expect("seatbelt isolation");
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut execution_budget = ModelCallBudget::new(1, 30_000);
+    let verified = controller
+        .advance_production_goal(
+            &fixture.registry,
+            ProductionAdvanceResources {
+                compilation: None,
+                execution: Some(ProductionExecutionResources {
+                    runtime: &runtime,
+                    context: &fixture.packet,
+                    tool_schemas: &[],
+                    readiness: readiness(),
+                    model_budget: &mut execution_budget,
+                }),
+            },
+        )
+        .expect("execute and verify compiled task");
+    assert!(matches!(
+        verified,
+        ProductionAdvanceOutcome::TaskVerified { .. }
+    ));
+    assert!(matches!(
+        controller
+            .advance_production_goal(
+                &fixture.registry,
+                ProductionAdvanceResources::<MacSandboxExecBackend>::default(),
+            )
+            .expect("complete verified goal"),
+        ProductionAdvanceOutcome::GoalCompleted { .. }
+    ));
+    assert!(matches!(
+        controller
+            .advance_production_goal(
+                &fixture.registry,
+                ProductionAdvanceResources::<MacSandboxExecBackend>::default(),
+            )
+            .expect("finalize completed goal"),
+        ProductionAdvanceOutcome::Complete { .. }
+    ));
+    assert!(
+        controller
+            .durable_status()
+            .expect("status")
+            .active_plan
+            .is_none()
+    );
+}
+
+#[test]
+fn production_compilation_failure_does_not_refill_model_calls_after_restart() {
+    let fixture = compiled_fixture("production-compile-restart", false);
+    let state = StateStore::open(&fixture.repo.state_path).expect("open production state");
+    let mut controller = Controller::new(state);
+    let intent = controller
+        .submit_goal_intent(&fixture.compilation_input.goal_statement)
+        .expect("submit queued goal");
+    let mut input = fixture.compilation_input.clone();
+    input.goal_id = intent.goal_id.clone();
+    let bad_backend = backend(vec![model_response(
+        "not a JSON planning proposal".to_owned(),
+        fixture.packet.metrics.final_serialized_input_tokens,
+    )]);
+    let validator = PlanValidator::new(ValidationEnvironment::default()).expect("validator");
+    let mut budget = ModelCallBudget::new(1, 30_000);
+    let failed = controller
+        .advance_production_goal(
+            &fixture.registry,
+            ProductionAdvanceResources::<MacSandboxExecBackend> {
+                compilation: Some(ProductionCompilationResources {
+                    input: &input,
+                    backend: &bad_backend,
+                    validator: &validator,
+                    compiler_version: "t07-test-compiler",
+                    model_budget: &mut budget,
+                }),
+                execution: None,
+            },
+        )
+        .expect("bounded compile rejection");
+    assert!(matches!(
+        failed,
+        ProductionAdvanceOutcome::Blocked {
+            reason: ProductionBlockReason::CompilationFailed(_),
+            ..
+        }
+    ));
+    assert_eq!(
+        controller
+            .next_queued_goal_intent()
+            .expect("queue")
+            .unwrap()
+            .goal_id,
+        intent.goal_id
+    );
+    drop(controller);
+    let state = StateStore::open(&fixture.repo.state_path).expect("reopen state");
+    let mut controller = Controller::reopen_local(state).expect("recover queued state");
+    let valid_backend = backend(vec![fixture.planning_response.clone()]);
+    let mut fresh_budget = ModelCallBudget::new(1, 30_000);
+    let exhausted = controller
+        .advance_production_goal(
+            &fixture.registry,
+            ProductionAdvanceResources::<MacSandboxExecBackend> {
+                compilation: Some(ProductionCompilationResources {
+                    input: &input,
+                    backend: &valid_backend,
+                    validator: &validator,
+                    compiler_version: "t07-test-compiler",
+                    model_budget: &mut fresh_budget,
+                }),
+                execution: None,
+            },
+        )
+        .expect("durable compile budget denial");
+    assert!(matches!(
+        exhausted,
+        ProductionAdvanceOutcome::Blocked {
+            reason: ProductionBlockReason::CompilationBudgetExhausted,
+            ..
+        }
+    ));
+    assert_eq!(
+        controller
+            .next_queued_goal_intent()
+            .expect("queue")
+            .unwrap()
+            .goal_id,
+        intent.goal_id
+    );
+}
+
+#[test]
+fn production_compilation_budget_rejects_tampered_reservation_history() {
+    let fixture = compiled_fixture("production-compile-tamper", false);
+    let state = StateStore::open(&fixture.repo.state_path).expect("open state");
+    let mut controller = Controller::new(state);
+    let intent = controller
+        .submit_goal_intent(&fixture.compilation_input.goal_statement)
+        .expect("submit goal");
+    let mut input = fixture.compilation_input.clone();
+    input.goal_id = intent.goal_id.clone();
+    let bad_backend = backend(vec![model_response(
+        "invalid planning proposal".to_owned(),
+        fixture.packet.metrics.final_serialized_input_tokens,
+    )]);
+    let validator = PlanValidator::new(ValidationEnvironment::default()).expect("validator");
+    let mut budget = ModelCallBudget::new(1, 30_000);
+    let _ = controller
+        .advance_production_goal(
+            &fixture.registry,
+            ProductionAdvanceResources::<MacSandboxExecBackend> {
+                compilation: Some(ProductionCompilationResources {
+                    input: &input,
+                    backend: &bad_backend,
+                    validator: &validator,
+                    compiler_version: "t07-test-compiler",
+                    model_budget: &mut budget,
+                }),
+                execution: None,
+            },
+        )
+        .expect("consume reserved call");
+    drop(controller);
+
+    let mut state = StateStore::open(&fixture.repo.state_path).expect("open tamper state");
+    let raw = state
+        .get_state("controller.goal_compilation_budget", &intent.goal_id)
+        .expect("read budget")
+        .expect("budget row");
+    let mut forged: Value = serde_json::from_str(&raw).expect("decode budget");
+    forged["calls_used"] = json!(0);
+    state
+        .put_state(
+            "controller.goal_compilation_budget",
+            &intent.goal_id,
+            &forged.to_string(),
+        )
+        .expect("forge budget row");
+    let mut controller = Controller::reopen_local(state).expect("reopen queued goal");
+    let valid_backend = backend(vec![fixture.planning_response.clone()]);
+    let mut fresh_budget = ModelCallBudget::new(1, 30_000);
+    let error = controller
+        .advance_production_goal(
+            &fixture.registry,
+            ProductionAdvanceResources::<MacSandboxExecBackend> {
+                compilation: Some(ProductionCompilationResources {
+                    input: &input,
+                    backend: &valid_backend,
+                    validator: &validator,
+                    compiler_version: "t07-test-compiler",
+                    model_budget: &mut fresh_budget,
+                }),
+                execution: None,
+            },
+        )
+        .expect_err("tampered budget cannot refill a model call");
+    assert!(error.to_string().contains("compilation budget version"));
+}
+
+#[test]
+fn production_driver_requests_browser_execution_inputs_instead_of_external_handoff() {
+    let mut fixture = compiled_managed_loopback_fixture("production-browser-handoff", 41_740);
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let outcome = controller
+        .advance_production_goal(
+            &fixture.registry,
+            ProductionAdvanceResources::<MacSandboxExecBackend>::default(),
+        )
+        .expect("browser resource request");
+    assert_eq!(
+        outcome,
+        ProductionAdvanceOutcome::Blocked {
+            task_id: Some(task_id),
+            reason: ProductionBlockReason::ExecutionInputsRequired,
+        }
+    );
+}
+
+#[test]
+fn production_driver_executes_typed_browser_task_without_external_handoff() {
+    let node_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("node"))
+        .find(|path| path.is_file())
+        .expect("installed Node fixture executable");
+    let node = PinnedExecutable::from_path(&node_path, "fixture-node").expect("pin Node");
+    let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python")
+        .expect("pin Python");
+    let make = PinnedExecutable::from_path("/usr/bin/make", "macos-system-make")
+        .expect("pin Make");
+    let policy = CommandPolicy::new(
+        [python.clone(), node.clone(), make.clone()],
+        [python.path.parent().unwrap().to_path_buf(), node.path.parent().unwrap().to_path_buf(), make.path.parent().unwrap().to_path_buf()],
+    ).expect("command policy");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("dynamic app port");
+    let port = listener.local_addr().expect("loopback address").port();
+    drop(listener);
+    let launch = BrowserManagedAppLaunchV1::NodeManagedServerV1 {
+        working_directory_relative_path: "apps/inventory".to_owned(),
+        entrypoint_relative_path: "server.js".to_owned(),
+        argv: Vec::new(),
+        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag { flag: "--port".to_owned() },
+        readiness: BrowserManagedReadinessV1 { path: "/health".to_owned(), status: 200, body: "ok".to_owned(), timeout_ms: 5_000 },
+        persistence: BrowserManagedPersistenceBindingV1::ArgvFlag { flag: "--db".to_owned(), filename: "inventory.sqlite3".to_owned() },
+        required_generations: 2,
+    };
+    let mut fixture = compiled_managed_loopback_fixture_with_launch("managed-node-production-driver", port, launch);
+    let state = StateStore::open(&fixture.repo.state_path).expect("open state");
+    let mut controller = Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
+    let mut pressure = green_pressure_snapshot(1_000);
+    pressure.host_free_disk_mib = Some(32_768);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(pressure)));
+    let activation = controller.activate(fixture.compilation.take().expect("plan"), &fixture.registry)
+        .expect("activate browser task");
+    controller.configure_managed_node_executable(&policy, &node.path).expect("pin Controller Node");
+    let parts = runtime_parts(&fixture);
+    let backend = backend(Vec::new());
+    backend.unload().expect("browser fixture has no Controller-owned MODEL residency");
+    let isolation = MacSandboxExecBackend::detect().expect("Seatbelt");
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry, backend: &backend, command_policy: &policy,
+        isolation_backend: &isolation, isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts, tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let browser_manifest = browser_tool_manifest();
+    let read_manifest = sovereign_tools::canonical_read_tool_manifest();
+    let catalog = ProductionExecutionCatalog {
+        read_tool_manifest: &read_manifest,
+        process_tool_manifest: &sovereign_tools::canonical_process_tool_manifest(),
+        browser: Some(ProductionBrowserResources {
+            tool_manifest: &browser_manifest,
+            chrome_path: Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            adapter_config: BrowserAdapterConfig { request_timeout_ms: 5_000, ..BrowserAdapterConfig::default() },
+        }),
+    };
+    let mut budget = ModelCallBudget::new(0, 30_000);
+    let context = controller
+        .production_task_context(&fixture.registry, &activation.task_ids[0])
+        .expect("Controller-created browser context");
+    let outcome = controller.advance_production_goal_with_catalog(
+        &fixture.registry,
+        ProductionAdvanceResources {
+            compilation: None,
+            execution: Some(ProductionExecutionResources {
+                runtime: &runtime, context: &context, tool_schemas: &[],
+                readiness: readiness(), model_budget: &mut budget,
+            }),
+        },
+        Some(&catalog),
+    ).expect("Controller-owned browser execution");
+    assert_eq!(outcome, ProductionAdvanceOutcome::TaskVerified { task_id: activation.task_ids[0].clone() });
+    assert_eq!(controller.task_state(&activation.task_ids[0]), Some(TaskState::Succeeded));
+}
+
+#[test]
+fn production_driver_respects_durable_pause_before_task_dispatch() {
+    let mut fixture = compiled_worktree_fixture("production-driver-pause");
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    controller
+        .pause(Some("operator pause"))
+        .expect("pause Controller");
+    let before = controller.task_state(&task_id);
+    let outcome = controller
+        .advance_production_goal(
+            &fixture.registry,
+            ProductionAdvanceResources::<MacSandboxExecBackend>::default(),
+        )
+        .expect("paused production step");
+    assert_eq!(outcome, ProductionAdvanceOutcome::Paused);
+    assert_eq!(controller.task_state(&task_id), before);
+}
+
+#[test]
+fn production_driver_preserves_non_write_permission_denial() {
+    let planning = json!({
+        "tasks": [{
+            "local_id": "non-write-command",
+            "repository_id": "repo.app",
+            "title": "Verify repository without mutation",
+            "objective": "Read the repository and run the bounded verification command.",
+            "rationale": "The command and no-write scope are frozen in the task contract.",
+            "files": [],
+            "create_files": [],
+            "symbols": [],
+            "dependencies": [],
+            "evidence_needs": [],
+            "expected_change": "No repository mutation; verification passes.",
+            "acceptance": [{
+                "kind": "command",
+                "description": "The exact read-only command exits successfully.",
+                "manual_gate_id": Value::Null,
+                "command_spec": {
+                    "tool_id": "tool.patch",
+                    "mode": "exec",
+                    "program": "python3",
+                    "args": ["-B", "-c", "pass"],
+                    "repository_id": "repo.app",
+                    "working_dir_relative": ".",
+                    "literal_env": {},
+                    "secret_env": {},
+                    "timeout_seconds": 15,
+                    "output_limit_bytes": 65536
+                },
+                "expected_exit_codes": [0]
+            }]
+        }]
+    });
+    let mut policy = global_policy();
+    policy["resources"]["heavy_leases"] = json!(["MODEL", "BUILD_HEAVY"]);
+    let mut fixture = compiled_fixture_inner(
+        "production-read-process",
+        false,
+        false,
+        None,
+        None,
+        false,
+        false,
+        Some(planning),
+        Some("Verify a repository without changing it.".to_owned()),
+        None,
+        Some(policy),
+        Some(ExecutionDepth::D2),
+    );
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    controller
+        .set_task_capability_grant(&task_id, CapabilitySet::new([PermissionClass::ProcessExec]))
+        .expect("narrow task grant to omit read");
+    let execution = backend(Vec::new());
+    let mut parts = runtime_parts(&fixture);
+    parts
+        .manifest
+        .permission_ceiling
+        .insert(PermissionClass::Read);
+    parts
+        .manifest
+        .permission_ceiling
+        .remove(&PermissionClass::RepositoryWrite);
+    parts.isolation_request.allow_repository_write = false;
+    let isolation = MacSandboxExecBackend::detect().expect("seatbelt isolation");
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut budget = ModelCallBudget::new(0, 30_000);
+    let outcome = controller
+        .advance_production_goal(
+            &fixture.registry,
+            ProductionAdvanceResources {
+                compilation: None,
+                execution: Some(ProductionExecutionResources {
+                    runtime: &runtime,
+                    context: &fixture.packet,
+                    tool_schemas: &[],
+                    readiness: readiness(),
+                    model_budget: &mut budget,
+                }),
+            },
+        )
+        .expect("governed non-write execution");
+    assert!(matches!(
+        outcome,
+        ProductionAdvanceOutcome::Blocked {
+            task_id: Some(blocked_task_id),
+            reason: ProductionBlockReason::Readiness(reason),
+        } if blocked_task_id == task_id && reason.contains("effective permission intersection")
+    ));
+}
+
+#[test]
+fn production_driver_completes_genuine_read_only_task() {
+    let planning = json!({
+        "tasks": [{
+            "local_id": "inspect-repository",
+            "repository_id": "repo.app",
+            "title": "Inspect repository evidence",
+            "objective": "Read the bounded repository snapshot and record the requested evidence.",
+            "rationale": "The task is read-only and requires no process or repository mutation authority.",
+            "files": [],
+            "create_files": [],
+            "symbols": [],
+            "dependencies": [],
+            "evidence_needs": [],
+            "expected_change": "A Controller evidence artifact is recorded without repository changes.",
+            "acceptance": [{
+                "kind": "artifact",
+                "description": "The Controller records the repository evidence artifact.",
+                "manual_gate_id": Value::Null
+            }]
+        }]
+    });
+    let fixture = compiled_fixture_inner(
+        "production-driver-read-only",
+        false,
+        false,
+        None,
+        None,
+        false,
+        false,
+        Some(planning),
+        Some("Inspect the repository without modifying it.".to_owned()),
+        None,
+        None,
+        Some(ExecutionDepth::D2),
+    );
+    let state = StateStore::open(&fixture.repo.state_path).expect("open read-only state");
+    let mut controller = Controller::new(state);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
+    let compilation = fixture
+        .compilation
+        .as_ref()
+        .expect("compiled fixture plan");
+    let activation = controller
+        .activate(compilation.clone(), &fixture.registry)
+        .expect("activate read-only plan");
+    let task_id = activation.task_ids[0].clone();
+    let compiled_task = &compilation.plan().as_value()["tasks"][0];
+    assert_eq!(compiled_task["permissions"], json!(["read"]));
+    assert!(
+        compiled_task["scope"]["files"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+    assert!(
+        compiled_task["scope"]["allow_create"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+
+    let mut parts = runtime_parts(&fixture);
+    parts.isolation_request.allow_repository_write = false;
+    let read_manifest = ToolManifest {
+        tool_id: "tool.read".to_owned(),
+        version: "1.0.0".to_owned(),
+        content_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+        permission_ceiling: BTreeSet::from([PermissionClass::Read]),
+        declared_risk_floor: CommandRisk::ReadOnly,
+        reconciliation_policy: ReconciliationPolicy::proof_required_local(),
+    };
+    let execution = backend(Vec::new());
+    let isolation = MacSandboxExecBackend::detect().expect("seatbelt isolation");
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry,
+        backend: &execution,
+        command_policy: &parts.command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let mut budget = ModelCallBudget::new(0, 30_000);
+    let context = controller
+        .production_task_context(&fixture.registry, &task_id)
+        .expect("Controller-created read-only context");
+    let outcome = controller
+        .advance_production_goal_with_catalog(
+            &fixture.registry,
+            ProductionAdvanceResources {
+                compilation: None,
+                execution: Some(ProductionExecutionResources {
+                    runtime: &runtime,
+                    context: &context,
+                    tool_schemas: &[],
+                    readiness: readiness(),
+                    model_budget: &mut budget,
+                }),
+            },
+            Some(&ProductionExecutionCatalog {
+                read_tool_manifest: &read_manifest,
+                process_tool_manifest: &sovereign_tools::canonical_process_tool_manifest(),
+                browser: None,
+            }),
+        )
+        .expect("advance read-only task");
+    assert_eq!(
+        outcome,
+        ProductionAdvanceOutcome::TaskVerified {
+            task_id: task_id.clone()
+        }
+    );
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Succeeded));
 }
 
 fn readiness() -> ReadinessInputs<'static> {
@@ -1455,6 +2238,8 @@ fn runtime_parts_for_paths(root: &Path, base: &Path) -> RuntimeParts {
             repository_root: root.to_path_buf(),
             user_home_root: home,
             extra_protected_read_roots: Vec::new(),
+            rust_toolchain: None,
+            build_scratch_root: None,
             network_offline: true,
             allow_repository_write: true,
             require_full_filesystem_read_jail: false,
@@ -1490,6 +2275,8 @@ fn runtime_parts_with_make(fixture: &CompiledFixture) -> RuntimeParts {
             repository_root: fixture.repo.root.clone(),
             user_home_root: home,
             extra_protected_read_roots: Vec::new(),
+            rust_toolchain: None,
+            build_scratch_root: None,
             network_offline: true,
             allow_repository_write: true,
             require_full_filesystem_read_jail: false,
@@ -6218,6 +7005,395 @@ fn worktree_d3_execution_persists_change_set_and_never_mutates_primary() {
 }
 
 #[test]
+fn controller_materializes_existing_ignored_dependencies_under_task_lease() {
+    let mut fixture = controller_offline_fixture("controller-offline-dependencies");
+    let source = fixture.repo.root.join("node_modules/pkg/index.js");
+    let original = fs::read(&source).expect("read source");
+    let primary_before = fixture
+        .registry
+        .snapshot("repo.app")
+        .expect("primary before copy");
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
+        .expect("derive ready worktree");
+    let lease = controller
+        .task_worktree_lease(&task_id)
+        .expect("task lease")
+        .clone();
+    assert!(!lease.worktree_path.join("node_modules").exists());
+    let receipt = controller
+        .materialize_task_existing_node_modules(
+            &fixture.registry,
+            &task_id,
+            Path::new(""),
+            offline_limits(),
+        )
+        .expect("materialize under controller lease");
+    assert_eq!(receipt.worktree_lease_id, lease.lease_id);
+    assert_eq!(receipt.source_manifest, receipt.destination_manifest);
+    assert_eq!(fs::read(&source).expect("source after"), original);
+    assert_eq!(
+        fixture
+            .registry
+            .snapshot("repo.app")
+            .expect("primary after copy"),
+        primary_before
+    );
+    assert_eq!(
+        fs::read(lease.worktree_path.join("node_modules/pkg/index.js")).expect("copied package"),
+        original
+    );
+    let state = StateStore::open(&fixture.repo.state_path).expect("read state");
+    let records = state
+        .state_records("controller.offline_node_modules")
+        .expect("receipt records");
+    assert_eq!(records.len(), 1);
+    let bound: Value = serde_json::from_str(&records[0].value_json).expect("receipt JSON");
+    assert_eq!(bound["state"], "committed");
+    assert_eq!(
+        bound["provenance"]["destination_manifest"]["digest"],
+        receipt.destination_manifest.digest
+    );
+    drop(state);
+    controller.cancel_ready_lease(ready).expect("cancel ready");
+    drop(controller);
+    let state = StateStore::open(&fixture.repo.state_path).expect("reopen state");
+    let (mut recovered, summary) =
+        RecoveryManager::recover(state, &fixture.registry).expect("recover verified dependencies");
+    assert!(!summary.mutation_blocked);
+    assert_eq!(
+        recovered
+            .materialize_task_existing_node_modules(
+                &fixture.registry,
+                &task_id,
+                Path::new(""),
+                offline_limits()
+            )
+            .expect("idempotent verified receipt"),
+        receipt
+    );
+}
+
+fn offline_limits() -> OfflineDependencyLimits {
+    OfflineDependencyLimits {
+        max_entries: 16,
+        max_bytes: 1024,
+    }
+}
+
+fn controller_offline_fixture(label: &str) -> CompiledFixture {
+    let fixture = compiled_worktree_fixture(label);
+    fs::write(
+        fixture.repo.root.join(".git/info/exclude"),
+        "node_modules/\n",
+    )
+    .expect("ignore fixture dependencies");
+    let source = fixture.repo.root.join("node_modules/pkg/index.js");
+    fs::create_dir_all(source.parent().expect("package parent")).expect("create package");
+    fs::write(&source, "module.exports = 42;\n").expect("write package");
+    fixture
+}
+
+#[test]
+fn controller_offline_dependencies_deny_stale_lease_before_copy() {
+    let mut fixture = controller_offline_fixture("controller-offline-stale-lease");
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
+        .expect("derive ready worktree");
+    let lease = controller
+        .task_worktree_lease(&task_id)
+        .expect("task lease")
+        .clone();
+    git(
+        &lease.worktree_path,
+        &["commit", "--allow-empty", "-qm", "drift"],
+    );
+    let error = controller
+        .materialize_task_existing_node_modules(
+            &fixture.registry,
+            &task_id,
+            Path::new(""),
+            offline_limits(),
+        )
+        .expect_err("stale HEAD must deny offline copy");
+    assert!(error.to_string().contains("worktree HEAD differs"));
+    assert!(!lease.worktree_path.join("node_modules").exists());
+    let state = StateStore::open(&fixture.repo.state_path).expect("read state");
+    assert!(state
+        .state_records("controller.offline_node_modules")
+        .expect("receipts")
+        .is_empty());
+    controller.cancel_ready_lease(ready).expect("cancel ready");
+}
+
+#[test]
+fn controller_offline_dependencies_detect_destination_and_source_drift_on_restart() {
+    let mut fixture = controller_offline_fixture("controller-offline-drift");
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
+        .expect("ready");
+    let lease = controller
+        .task_worktree_lease(&task_id)
+        .expect("lease")
+        .clone();
+    controller
+        .materialize_task_existing_node_modules(
+            &fixture.registry,
+            &task_id,
+            Path::new(""),
+            offline_limits(),
+        )
+        .expect("copy");
+    controller.cancel_ready_lease(ready).expect("cancel ready");
+    drop(controller);
+    let destination = lease.worktree_path.join("node_modules/pkg/index.js");
+    fs::write(&destination, "changed destination\n").expect("drift destination");
+    let state = StateStore::open(&fixture.repo.state_path).expect("reopen after destination drift");
+    assert!(RecoveryManager::recover(state, &fixture.registry).is_err());
+    fs::write(&destination, "module.exports = 42;\n").expect("restore destination");
+    fs::write(
+        fixture.repo.root.join("node_modules/pkg/index.js"),
+        "changed source\n",
+    )
+    .expect("drift source");
+    let state = StateStore::open(&fixture.repo.state_path).expect("reopen after source drift");
+    assert!(RecoveryManager::recover(state, &fixture.registry).is_err());
+}
+
+#[test]
+fn controller_offline_dependencies_reject_checkpoint_receipt_tamper() {
+    let mut fixture = controller_offline_fixture("controller-offline-receipt-tamper");
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
+        .expect("ready");
+    controller
+        .materialize_task_existing_node_modules(
+            &fixture.registry,
+            &task_id,
+            Path::new(""),
+            offline_limits(),
+        )
+        .expect("copy");
+    controller.cancel_ready_lease(ready).expect("cancel ready");
+    drop(controller);
+    let mut state =
+        StateStore::open(&fixture.repo.state_path).expect("open state for tamper fixture");
+    let record = state
+        .state_records("controller.offline_node_modules")
+        .expect("receipt records")
+        .pop()
+        .expect("receipt");
+    let mut value: Value = serde_json::from_str(&record.value_json).expect("receipt JSON");
+    value["provenance"]["destination_manifest"]["digest"] = json!("sha256:tampered");
+    state
+        .put_state(
+            "controller.offline_node_modules",
+            &record.key,
+            &value.to_string(),
+        )
+        .expect("tamper fixture receipt");
+    drop(state);
+    let state = StateStore::open(&fixture.repo.state_path).expect("reopen tampered state");
+    let error = RecoveryManager::recover(state, &fixture.registry)
+        .err()
+        .expect("tamper must fail closed");
+    assert!(
+        error.to_string().contains("immutable record") || error.to_string().contains("receipt"),
+        "{error}"
+    );
+}
+
+#[test]
+fn controller_offline_dependencies_deny_unsafe_tree_and_never_replay_unresolved_copy() {
+    let mut fixture = controller_offline_fixture("controller-offline-unsafe");
+    let source = fixture.repo.root.join("node_modules/pkg/index.js");
+    fs::remove_file(&source).expect("remove fixture module");
+    std::os::unix::fs::symlink("../../../outside.js", &source).expect("unsafe external link");
+    let (mut controller, task_id) = controller_for(&mut fixture);
+    let ready = controller
+        .derive_ready_lease(
+            &fixture.registry,
+            &task_id,
+            readiness(),
+            &write_tool_manifest(),
+        )
+        .expect("ready");
+    let lease = controller
+        .task_worktree_lease(&task_id)
+        .expect("lease")
+        .clone();
+    let error = controller
+        .materialize_task_existing_node_modules(
+            &fixture.registry,
+            &task_id,
+            Path::new(""),
+            offline_limits(),
+        )
+        .expect_err("unsafe tree denied");
+    assert!(error.to_string().contains("offline dependency"));
+    assert!(!lease.worktree_path.join("node_modules").exists());
+    let state = StateStore::open(&fixture.repo.state_path).expect("read prepared receipt");
+    let records = state
+        .state_records("controller.offline_node_modules")
+        .expect("receipts");
+    assert_eq!(records.len(), 1);
+    let pending: Value =
+        serde_json::from_str(&records[0].value_json).expect("prepared receipt JSON");
+    assert_eq!(pending["state"], "prepared");
+    drop(state);
+    controller.cancel_ready_lease(ready).expect("cancel ready");
+    drop(controller);
+    let state = StateStore::open(&fixture.repo.state_path).expect("reopen interrupted copy");
+    let error = RecoveryManager::recover(state, &fixture.registry)
+        .err()
+        .expect("unresolved copy must deny recovery");
+    assert!(error.to_string().contains("interrupted"));
+    assert!(!lease.worktree_path.join("node_modules").exists());
+}
+
+#[cfg(feature = "recovery-test-hooks")]
+#[test]
+fn controller_offline_dependencies_crash_after_prepared_intent_is_not_replayed() {
+    const CHILD: &str = "SOVEREIGN_OFFLINE_DEPENDENCY_CRASH_CHILD";
+    const META: &str = "SOVEREIGN_OFFLINE_DEPENDENCY_CRASH_META";
+    if std::env::var(CHILD).ok().as_deref() == Some("1") {
+        let mut fixture = controller_offline_fixture("controller-offline-crash-child");
+        let (mut controller, task_id) = controller_for(&mut fixture);
+        let ready = controller
+            .derive_ready_lease(
+                &fixture.registry,
+                &task_id,
+                readiness(),
+                &write_tool_manifest(),
+            )
+            .expect("child ready");
+        let lease = controller
+            .task_worktree_lease(&task_id)
+            .expect("child lease")
+            .clone();
+        controller
+            .cancel_ready_lease(ready)
+            .expect("release MODEL before crash test");
+        fs::write(
+            std::env::var(META).expect("metadata path"),
+            json!({
+                "base": fixture.repo.base,
+                "root": fixture.repo.root,
+                "state": fixture.repo.state_path,
+                "task_id": task_id,
+                "worktree": lease.worktree_path,
+            })
+            .to_string(),
+        )
+        .expect("child metadata");
+        let _ = controller.materialize_task_existing_node_modules(
+            &fixture.registry,
+            &task_id,
+            Path::new(""),
+            offline_limits(),
+        );
+        panic!("child must pause after durable intent");
+    }
+    let token = format!(
+        "{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let harness = std::env::temp_dir().join(format!("sovereign-offline-crash-{token}"));
+    fs::create_dir_all(&harness).expect("harness dir");
+    let marker = harness.join("paused");
+    let metadata = harness.join("metadata.json");
+    let mut child = Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            "controller_offline_dependencies_crash_after_prepared_intent_is_not_replayed",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .env(META, &metadata)
+        .env(
+            "SOVEREIGN_RECOVERY_TEST_PAUSE_AT",
+            "after_offline_node_modules_prepare",
+        )
+        .env("SOVEREIGN_RECOVERY_TEST_MARKER", &marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn crash child");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !marker.exists() && Instant::now() < deadline {
+        if let Some(status) = child.try_wait().expect("poll child") {
+            panic!("crash child exited before durable marker: {status}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("child did not reach prepared checkpoint");
+    }
+    child.kill().expect("kill paused child");
+    child.wait().expect("reap child");
+    let info: Value = serde_json::from_slice(&fs::read(&metadata).expect("child metadata"))
+        .expect("metadata JSON");
+    let root = PathBuf::from(info["root"].as_str().expect("root"));
+    let state_path = PathBuf::from(info["state"].as_str().expect("state"));
+    let worktree = PathBuf::from(info["worktree"].as_str().expect("worktree"));
+    let mut registry = ProjectRegistry::new();
+    registry
+        .register("repo.app", &root)
+        .expect("register recovered repo");
+    assert!(!worktree.join("node_modules").exists());
+    let state = StateStore::open(&state_path).expect("open crashed state");
+    let error = RecoveryManager::recover(state, &registry)
+        .err()
+        .expect("prepared copy blocks recovery");
+    assert!(error.to_string().contains("interrupted"), "{error}");
+    assert!(
+        !worktree.join("node_modules").exists(),
+        "recovery must not copy"
+    );
+    fs::create_dir_all(worktree.join("node_modules/pkg"))
+        .expect("simulate completed but unreceipted copy");
+    fs::write(
+        worktree.join("node_modules/pkg/index.js"),
+        "module.exports = 42;\n",
+    )
+    .expect("simulate uncertain installed tree");
+    let state = StateStore::open(&state_path).expect("reopen uncertain copy");
+    let error = RecoveryManager::recover(state, &registry)
+        .err()
+        .expect("unreceipted tree blocks recovery");
+    assert!(error.to_string().contains("interrupted"), "{error}");
+    fs::remove_dir_all(info["base"].as_str().expect("base")).expect("remove crash fixture");
+    fs::remove_dir_all(harness).expect("remove crash harness");
+}
+
+#[test]
 fn worktree_recovery_revalidates_exact_head_and_common_git_directory() {
     let mut fixture = compiled_worktree_fixture("worktree-recovery");
     let (mut controller, task_id) = controller_for(&mut fixture);
@@ -7582,6 +8758,287 @@ fn managed_loopback_start_rejects_scope_escape_symlink_and_stale_baseline_before
     controller
         .shutdown_browser_session(session)
         .unwrap_or_else(|error| panic!("shutdown managed loopback browser session: {error}"));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn managed_node_launch_uses_controller_pin_dynamic_port_persistence_and_reaps_group() {
+    let node_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("node"))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("Node fixture requires an installed node executable"));
+    let node = PinnedExecutable::from_path(&node_path, "fixture-node")
+        .unwrap_or_else(|error| panic!("pin fixture Node: {error}"));
+    let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python")
+        .unwrap_or_else(|error| panic!("pin fixture Python: {error}"));
+    let node_root = node.path.parent().unwrap().to_path_buf();
+    let python_root = python.path.parent().unwrap().to_path_buf();
+    let command_policy = CommandPolicy::new([python, node.clone()], [python_root, node_root])
+        .unwrap_or_else(|error| panic!("Node fixture command policy: {error}"));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let launch = BrowserManagedAppLaunchV1::NodeManagedServerV1 {
+        working_directory_relative_path: "apps/inventory".to_owned(),
+        entrypoint_relative_path: "server.js".to_owned(),
+        argv: Vec::new(),
+        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag { flag: "--port".to_owned() },
+        readiness: BrowserManagedReadinessV1 { path: "/health".to_owned(), status: 200, body: "ok".to_owned(), timeout_ms: 5_000 },
+        persistence: BrowserManagedPersistenceBindingV1::ArgvFlag { flag: "--db".to_owned(), filename: "inventory.sqlite3".to_owned() },
+        required_generations: 2,
+    };
+    let mut fixture = compiled_managed_loopback_fixture_with_launch("managed-node-runtime", port, launch);
+    let state = StateStore::open(&fixture.repo.state_path).unwrap();
+    let mut controller = Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
+    let mut pressure = green_pressure_snapshot(1_000);
+    pressure.host_free_disk_mib = Some(32_768);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(pressure)));
+    let activation = controller.activate(fixture.compilation.take().unwrap(), &fixture.registry).unwrap();
+    let task_id = &activation.task_ids[0];
+    let browser_manifest = browser_tool_manifest();
+    let browser_config = BrowserAdapterConfig { request_timeout_ms: 5_000, ..BrowserAdapterConfig::default() };
+    let ready = controller.derive_browser_ready_lease(&fixture.registry, task_id, readiness(), &browser_manifest, browser_config.clone()).unwrap();
+    let backend = backend(Vec::new());
+    let chrome = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+    let session = controller.acquire_browser_session_from_ready_lease(ready, &fixture.registry, &browser_manifest, &backend, chrome, browser_config).unwrap();
+    let parts = runtime_parts(&fixture);
+    let isolation = MacSandboxExecBackend::detect().unwrap();
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry, backend: &backend, command_policy: &command_policy,
+        isolation_backend: &isolation, isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts, tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    let unconfigured = controller.start_plan_managed_loopback_app(&session, &runtime, 1).err().unwrap();
+    assert!(unconfigured.to_string().contains("Node executable is not configured"));
+    controller.configure_managed_node_executable(&command_policy, &node.path).unwrap();
+    let mut first = controller.start_plan_managed_loopback_app(&session, &runtime, 1)
+        .unwrap_or_else(|error| panic!("start Node generation one: {error}"));
+    let first_group = first.process_group_id();
+    let db = first.database_path().to_path_buf();
+    assert_eq!(fs::read_to_string(&db).unwrap(), "persisted");
+    controller.stop_managed_loopback_app(&session, &runtime, &mut first).unwrap();
+    assert!(sovereign_tools::process_group_leader_identity(first_group).unwrap().is_none());
+    assert_process_group_absent(first_group);
+    let mut second = controller.start_plan_managed_loopback_app(&session, &runtime, 2)
+        .unwrap_or_else(|error| panic!("start Node generation two: {error}"));
+    assert_eq!(second.database_path(), db);
+    assert_eq!(fs::read_to_string(&db).unwrap(), "persisted");
+    let second_group = second.process_group_id();
+    controller.stop_managed_loopback_app(&session, &runtime, &mut second).unwrap();
+    assert!(sovereign_tools::process_group_leader_identity(second_group).unwrap().is_none());
+    assert_process_group_absent(second_group);
+    controller.shutdown_browser_session(session).unwrap();
+}
+
+#[test]
+fn managed_node_postgres_broker_launches_two_generations_and_closes_each_endpoint() {
+    let Ok(database_oid) = std::env::var("SOVEREIGN_TEST_LIVE_POSTGRES_OID") else { return; };
+    let database_oid: u32 = database_oid.parse().unwrap();
+    assert!(std::net::TcpStream::connect(("127.0.0.1", 5432)).is_ok(),
+        "live PostgreSQL TCP must be reachable outside the managed-app sandbox for this denial proof");
+    let node_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("node"))
+        .find(|path| path.is_file()).unwrap();
+    let node = PinnedExecutable::from_path(&node_path, "fixture-node").unwrap();
+    let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python").unwrap();
+    let node_root = node.path.parent().unwrap().to_path_buf();
+    let python_root = python.path.parent().unwrap().to_path_buf();
+    let command_policy = CommandPolicy::new([python, node.clone()], [python_root, node_root]).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let launch = BrowserManagedAppLaunchV1::NodeManagedServerV1 {
+        working_directory_relative_path: "apps/inventory".to_owned(),
+        entrypoint_relative_path: "server.js".to_owned(),
+        argv: Vec::new(),
+        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag { flag: "--port".to_owned() },
+        readiness: BrowserManagedReadinessV1 { path: "/health".to_owned(), status: 200, body: "ok".to_owned(), timeout_ms: 5_000 },
+        persistence: BrowserManagedPersistenceBindingV1::PostgresBrokerV1 { flag: "--database-url".to_owned() },
+        required_generations: 2,
+    };
+    let mut fixture = compiled_managed_loopback_fixture_with_launch("managed-postgres-runtime", port, launch);
+    let state = StateStore::open(&fixture.repo.state_path).unwrap();
+    let mut controller = Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
+    let mut pressure = green_pressure_snapshot(1_000);
+    pressure.host_free_disk_mib = Some(32_768);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(pressure)));
+    let activation = controller.activate(fixture.compilation.take().unwrap(), &fixture.registry).unwrap();
+    let task_id = &activation.task_ids[0];
+    let browser_manifest = browser_tool_manifest();
+    let browser_config = BrowserAdapterConfig { request_timeout_ms: 5_000, ..BrowserAdapterConfig::default() };
+    let ready = controller.derive_browser_ready_lease(&fixture.registry, task_id, readiness(), &browser_manifest, browser_config.clone()).unwrap();
+    let backend = backend(Vec::new());
+    let chrome = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+    let session = controller.acquire_browser_session_from_ready_lease(ready, &fixture.registry, &browser_manifest, &backend, chrome, browser_config).unwrap();
+    let parts = runtime_parts(&fixture);
+    let isolation = MacSandboxExecBackend::detect().unwrap();
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry, backend: &backend, command_policy: &command_policy,
+        isolation_backend: &isolation, isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts, tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    controller.configure_managed_node_executable(&command_policy, &node.path).unwrap();
+    controller.configure_managed_postgres_backend(Path::new("/tmp/.s.PGSQL.5432"), database_oid).unwrap();
+    let mut groups = BTreeSet::new();
+    let mut broker_ports = Vec::new();
+    for generation in 1..=2 {
+        let request_id = match controller.start_plan_managed_loopback_app(&session, &runtime, generation) {
+            Err(sovereign_controller::ControllerError::AwaitingApproval { request_id, .. }) => request_id,
+            Ok(_) => panic!("PostgreSQL generation {generation} started without network-write approval"),
+            Err(error) => panic!("request PostgreSQL generation {generation} approval: {error}"),
+        };
+        let approved = controller.respond_to_approval(
+            &request_id,
+            sovereign_controller::ApprovalDecisionV1::Approve,
+            "test:postgres-operator",
+        ).unwrap_or_else(|error| panic!("approve PostgreSQL generation {generation}: {error}"));
+        assert_eq!(approved.permission_class, "network_write");
+        let mut app = controller.start_plan_managed_loopback_app(&session, &runtime, generation)
+            .unwrap_or_else(|error| panic!("start approved PostgreSQL generation {generation}: {error}"));
+        let broker_port = app.postgres_broker_port().unwrap();
+        broker_ports.push(broker_port);
+        assert_eq!(app.database_path(), Path::new("postgresql:sovereign_app"));
+        let group = app.process_group_id();
+        assert!(groups.insert(group), "managed PostgreSQL restart reused a process group");
+        controller.stop_managed_loopback_app(&session, &runtime, &mut app).unwrap();
+        assert_process_group_absent(group);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", broker_port)).is_err());
+    }
+    controller.shutdown_browser_session(session).unwrap();
+    let grants = controller.state().action_records().unwrap().into_iter()
+        .filter(|record| record.action_id.starts_with("managed-postgres-broker."))
+        .map(|record| {
+            assert_eq!(record.state, "committed");
+            assert!(record.result_digest.is_some());
+            (record.action_id, record.payload_digest, record.result_digest)
+        }).collect::<Vec<_>>();
+    assert_eq!(grants.len(), 2, "each generation needs one distinct durable network grant");
+    drop(controller);
+    let state = StateStore::open(&fixture.repo.state_path).unwrap();
+    let (recovered, recovery) = RecoveryManager::recover_with_permission_context(
+        state, &fixture.registry, PermissionContext::m7_local_browser_execution(),
+    ).unwrap_or_else(|error| panic!("recover stopped PostgreSQL generations: {error}"));
+    assert!(recovery.unknown_action_ids.is_empty());
+    for (action_id, payload_digest, result_digest) in grants {
+        let record = recovered.state().action_record(&action_id).unwrap().unwrap();
+        assert_eq!(record.state, "committed");
+        assert_eq!(record.payload_digest, payload_digest);
+        assert_eq!(record.result_digest, result_digest);
+        assert_eq!(recovered.state().journal().unwrap().iter().filter(|event|
+            event.entity_id == action_id && event.event_kind == "dispatched").count(), 1,
+            "recovery replayed the generation-bound broker action");
+    }
+    for port in broker_ports {
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    }
+    for group in groups {
+        assert_process_group_absent(group);
+    }
+}
+
+#[test]
+fn managed_postgres_abrupt_handle_loss_recovery_reaps_generation_without_replay() {
+    let Ok(database_oid) = std::env::var("SOVEREIGN_TEST_LIVE_POSTGRES_OID") else { return; };
+    let database_oid: u32 = database_oid.parse().unwrap();
+    let node_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .map(|directory| directory.join("node"))
+        .find(|path| path.is_file()).unwrap();
+    let node = PinnedExecutable::from_path(&node_path, "fixture-node").unwrap();
+    let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python").unwrap();
+    let command_policy = CommandPolicy::new(
+        [python.clone(), node.clone()],
+        [python.path.parent().unwrap().to_path_buf(), node.path.parent().unwrap().to_path_buf()],
+    ).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let launch = BrowserManagedAppLaunchV1::NodeManagedServerV1 {
+        working_directory_relative_path: "apps/inventory".to_owned(),
+        entrypoint_relative_path: "server.js".to_owned(),
+        argv: Vec::new(),
+        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag { flag: "--port".to_owned() },
+        readiness: BrowserManagedReadinessV1 { path: "/health".to_owned(), status: 200, body: "ok".to_owned(), timeout_ms: 5_000 },
+        persistence: BrowserManagedPersistenceBindingV1::PostgresBrokerV1 { flag: "--database-url".to_owned() },
+        required_generations: 2,
+    };
+    let mut fixture = compiled_managed_loopback_fixture_with_launch("managed-postgres-recovery", port, launch);
+    let state = StateStore::open(&fixture.repo.state_path).unwrap();
+    let mut controller = Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
+    let mut pressure = green_pressure_snapshot(1_000);
+    pressure.host_free_disk_mib = Some(32_768);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(pressure)));
+    let activation = controller.activate(fixture.compilation.take().unwrap(), &fixture.registry).unwrap();
+    let browser_manifest = browser_tool_manifest();
+    let browser_config = BrowserAdapterConfig { request_timeout_ms: 5_000, ..BrowserAdapterConfig::default() };
+    let ready = controller.derive_browser_ready_lease(&fixture.registry, &activation.task_ids[0], readiness(), &browser_manifest, browser_config.clone()).unwrap();
+    let backend = backend(Vec::new());
+    let chrome = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+    let session = controller.acquire_browser_session_from_ready_lease(ready, &fixture.registry, &browser_manifest, &backend, chrome, browser_config).unwrap();
+    let parts = runtime_parts(&fixture);
+    let isolation = MacSandboxExecBackend::detect().unwrap();
+    let runtime = ExecutionRuntime {
+        registry: &fixture.registry, backend: &backend, command_policy: &command_policy,
+        isolation_backend: &isolation, isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts, tool_manifest: &parts.manifest,
+        python_executable: Path::new("/usr/bin/python3"),
+    };
+    controller.configure_managed_node_executable(&command_policy, &node.path).unwrap();
+    controller.configure_managed_postgres_backend(Path::new("/tmp/.s.PGSQL.5432"), database_oid).unwrap();
+    let request_id = match controller.start_plan_managed_loopback_app(&session, &runtime, 1) {
+        Err(sovereign_controller::ControllerError::AwaitingApproval { request_id, .. }) => request_id,
+        Ok(_) => panic!("managed PostgreSQL broker started without approval"),
+        Err(error) => panic!("request managed PostgreSQL approval: {error}"),
+    };
+    controller.respond_to_approval(&request_id, sovereign_controller::ApprovalDecisionV1::Approve, "test:postgres-operator").unwrap();
+    let app = controller.start_plan_managed_loopback_app(&session, &runtime, 1).unwrap();
+    let broker_port = app.postgres_broker_port().unwrap();
+    let group = app.process_group_id();
+    let broker_grant = controller.state().action_records().unwrap().into_iter()
+        .find(|record| record.action_id.starts_with("managed-postgres-broker."))
+        .unwrap();
+    assert_eq!(broker_grant.state, "committed");
+    let start_action = controller.state().action_records().unwrap().into_iter()
+        .find(|record| record.action_id.starts_with("managed-loopback-start."))
+        .unwrap();
+    assert_eq!(start_action.state, "committed");
+    drop(app); // Simulates losing the ephemeral owner before a durable stopped transition.
+    assert_process_group_absent(group);
+    assert!(std::net::TcpStream::connect(("127.0.0.1", broker_port)).is_err());
+    drop(session);
+    drop(controller);
+    let state = StateStore::open(&fixture.repo.state_path).unwrap();
+    let (recovered, summary) = RecoveryManager::recover_with_permission_context(
+        state, &fixture.registry, PermissionContext::m7_local_browser_execution(),
+    ).unwrap_or_else(|error| panic!("recover lost managed PostgreSQL owner: {error}"));
+    let recovered_grant = recovered.state().action_record(&broker_grant.action_id).unwrap().unwrap();
+    assert!(summary.execution_epoch_after > broker_grant.execution_epoch);
+    assert_eq!(recovered_grant.state, "committed");
+    assert_eq!(recovered_grant.payload_digest, broker_grant.payload_digest);
+    assert_eq!(recovered_grant.result_digest, broker_grant.result_digest);
+    assert_eq!(recovered.state().journal().unwrap().iter().filter(|event|
+        event.entity_id == broker_grant.action_id && event.event_kind == "dispatched").count(), 1,
+        "recovery replayed the approved PostgreSQL grant");
+    let recovered_start = recovered.state().action_record(&start_action.action_id).unwrap().unwrap();
+    assert_eq!(recovered_start.state, "committed");
+    assert_eq!(recovered_start.payload_digest, start_action.payload_digest);
+    assert_eq!(recovered_start.result_digest, start_action.result_digest);
+    assert_eq!(recovered.state().journal().unwrap().iter().filter(|event|
+        event.entity_id == start_action.action_id && event.event_kind == "dispatched").count(), 1,
+        "recovery replayed the managed process start");
+    assert!(summary.unresolved_process_lease_ids.is_empty());
+    assert_process_group_absent(group);
+    assert!(std::net::TcpStream::connect(("127.0.0.1", broker_port)).is_err());
+}
+
+fn assert_process_group_absent(group: u32) {
+    let output = Command::new("/bin/ps").args(["-A", "-o", "pgid="]).output()
+        .unwrap_or_else(|error| panic!("inspect process groups: {error}"));
+    assert!(output.status.success(), "inspect process groups failed");
+    let listing = String::from_utf8(output.stdout).unwrap();
+    assert!(!listing.lines().any(|line| line.trim() == group.to_string()),
+        "managed process group {group} retained a process or child");
 }
 
 #[test]

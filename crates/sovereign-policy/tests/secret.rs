@@ -475,6 +475,8 @@ fn secret_macos_isolation_proves_security_process_and_securityd_lookup_denial() 
         repository_root: repo.clone(),
         user_home_root: home,
         extra_protected_read_roots: Vec::new(),
+        rust_toolchain: None,
+        build_scratch_root: None,
         network_offline: true,
         allow_repository_write: false,
         require_full_filesystem_read_jail: false,

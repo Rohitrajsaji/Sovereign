@@ -593,6 +593,8 @@ pub struct LoopbackServerIsolationRequestV1 {
     pub data_root: PathBuf,
     pub user_home_root: PathBuf,
     pub extra_protected_read_roots: Vec<PathBuf>,
+    /// Exact Controller-owned `PostgreSQL` broker port. Never the `PostgreSQL` server port.
+    pub postgres_broker_port: Option<u16>,
     pub now_ms: i64,
 }
 
@@ -607,6 +609,13 @@ impl LoopbackServerIsolationRequestV1 {
         if self.task_loopback_grant.scheme != "http" {
             return Err(BrowserPolicyError::Denied(
                 "managed loopback server v1 requires exact http authority".to_owned(),
+            ));
+        }
+        if let Some(port) = self.postgres_broker_port
+            && (port == 0 || port == self.task_loopback_grant.port)
+        {
+            return Err(BrowserPolicyError::Denied(
+                "managed PostgreSQL broker needs a distinct exact loopback port".to_owned(),
             ));
         }
         validate_existing_directory(&self.repository_root)?;
@@ -667,6 +676,7 @@ impl LoopbackServerIsolationRequestV1 {
         digest_field(&mut hasher, &grant.host);
         hasher.update(grant.port.to_be_bytes());
         hasher.update(grant.expires_at_ms.to_be_bytes());
+        hasher.update(self.postgres_broker_port.unwrap_or(0).to_be_bytes());
         digest_field(&mut hasher, &repository_root.display().to_string());
         digest_field(&mut hasher, &data_root.display().to_string());
         digest_field(&mut hasher, &user_home_root.display().to_string());
@@ -710,8 +720,8 @@ impl MacLoopbackServerSandboxExecBackend {
     /// Builds the exact server Seatbelt profile. Protected user-home reads are denied then reopened
     /// only for the exact repository and Controller data roots; extra protected roots remain denied.
     /// Writes are denied globally then reopened only for the exact Controller data root. Network is
-    /// denied globally then reopened only for binding/listening on the exact canonical loopback port;
-    /// no outbound exception exists.
+    /// denied globally then reopened for the granted app listener and, when explicitly supplied,
+    /// outbound access to one exact Controller-owned PostgreSQL broker port.
     ///
     /// # Errors
     /// Returns a denial for malformed/stale authority or unsafe roots.
@@ -739,6 +749,15 @@ impl MacLoopbackServerSandboxExecBackend {
         .map_err(|_| {
             BrowserPolicyError::Denied("failed to build loopback server inbound profile".to_owned())
         })?;
+        if let Some(port) = request.postgres_broker_port {
+            write!(
+                &mut profile,
+                "(allow network-outbound (remote ip \"localhost:{port}\"))"
+            )
+            .map_err(|_| {
+                BrowserPolicyError::Denied("failed to build exact PostgreSQL broker profile".to_owned())
+            })?;
+        }
         write!(
             &mut profile,
             "(deny file-read* (subpath {}))(allow file-read* (subpath {}))(allow file-read* (subpath {}))",
@@ -761,6 +780,28 @@ impl MacLoopbackServerSandboxExecBackend {
                     "failed to build loopback server protected-read profile".to_owned(),
                 )
             })?;
+        }
+        // Node resolves its entrypoint with realpath(3), which needs lstat on each parent.
+        // Permit metadata on the exact repository/data ancestors only; contents elsewhere in
+        // the protected home remain unreadable.
+        let mut metadata_ancestors = BTreeSet::new();
+        for root in [&repository_root, &data_root] {
+            for ancestor in root.ancestors().skip(1) {
+                if !ancestor.starts_with(&user_home_root) {
+                    break;
+                }
+                metadata_ancestors.insert(ancestor.to_path_buf());
+            }
+        }
+        for ancestor in metadata_ancestors {
+            write!(
+                &mut profile,
+                "(allow file-read-metadata (literal {}))",
+                seatbelt_string(&ancestor)
+            )
+            .map_err(|_| BrowserPolicyError::Denied(
+                "failed to build loopback server ancestor metadata profile".to_owned(),
+            ))?;
         }
         profile.push_str("(deny file-write* (subpath \"/\"))");
         profile.push_str("(allow file-write* (literal \"/dev/null\"))");
@@ -851,6 +892,7 @@ impl MacLoopbackServerSandboxExecBackend {
             data_root: data_root.clone(),
             user_home_root: root.canonicalize()?,
             extra_protected_read_roots: vec![protected_root],
+            postgres_broker_port: None,
             now_ms: 0,
         };
         let profile = Self::build_profile(&request)?;

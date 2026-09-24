@@ -195,6 +195,33 @@ pub struct StateRecordUpdate<'a> {
     pub value_json: &'a str,
 }
 
+/// One compare-and-swap current-state mutation committed atomically with related journal events.
+///
+/// `expected_version = None` means the record must not exist and `value_json` must be present,
+/// creating version 1. `expected_version = Some(version)` requires that exact positive durable
+/// version; `value_json = Some(..)` advances it by one and `value_json = None` deletes the record.
+#[derive(Debug, Clone, Copy)]
+pub struct StateRecordCasMutation<'a> {
+    pub namespace: &'a str,
+    pub key: &'a str,
+    pub expected_version: Option<i64>,
+    pub value_json: Option<&'a str>,
+}
+
+/// One compare-only current-state expectation checked inside a compound CAS transaction.
+///
+/// The record must exist at exactly `expected_version`. Callers may additionally bind the exact
+/// persisted JSON bytes, their `sha256:` digest, or both. Asserted records are read-only guards and
+/// therefore cannot also appear in the transaction's mutation set.
+#[derive(Debug, Clone, Copy)]
+pub struct StateRecordCasAssertion<'a> {
+    pub namespace: &'a str,
+    pub key: &'a str,
+    pub expected_version: i64,
+    pub expected_value_json: Option<&'a str>,
+    pub expected_value_digest: Option<&'a str>,
+}
+
 /// Canonical metadata for one published content-addressed artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtifactMetadata {
@@ -641,6 +668,275 @@ impl StateStore {
             }
             Ok(sequences)
         })
+    }
+
+    /// Atomically applies a set of exact-version current-state mutations and appends the correlated
+    /// immutable events in the same transaction. Every mutation is validated against the durable
+    /// version set before any write is applied, so stale or conflicting writers fail closed without
+    /// partially advancing related state-machine rows.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Integrity`] for duplicate mutation keys, invalid expected versions,
+    /// an attempted delete of a missing row, an attempted insert over an existing row, or any stale
+    /// durable version. Other failures are returned as ordinary [`StateError`] values.
+    pub fn compare_and_apply_state_records_with_events(
+        &mut self,
+        mutations: &[StateRecordCasMutation<'_>],
+        events: &[NewJournalEvent<'_>],
+    ) -> Result<Vec<i64>, StateError> {
+        self.compare_and_apply_state_records_with_events_guarded(None, &[], mutations, events)
+    }
+
+    /// Atomically checks an optional exact journal tail and compare-only state-record assertions,
+    /// then applies exact-version current-state mutations and appends correlated immutable events.
+    /// All guards and mutations execute in one `SQLite` transaction, so any stale guard or CAS
+    /// failure leaves both current state and the journal unchanged.
+    ///
+    /// `expected_journal_tail = Some(sequence)` requires the authoritative journal tail to equal
+    /// that exact non-negative sequence. Each [`StateRecordCasAssertion`] requires an existing
+    /// record at its exact positive version and can additionally bind its exact value, digest, or
+    /// both. Asserted records are compare-only and must be disjoint from `mutations`.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Integrity`] for an invalid/stale journal guard, invalid/duplicate/stale
+    /// compare-only assertion, overlap between an assertion and mutation, or any ordinary compound
+    /// CAS integrity failure. Other failures are returned as ordinary [`StateError`] values.
+    pub fn compare_and_apply_state_records_with_events_guarded(
+        &mut self,
+        expected_journal_tail: Option<i64>,
+        assertions: &[StateRecordCasAssertion<'_>],
+        mutations: &[StateRecordCasMutation<'_>],
+        events: &[NewJournalEvent<'_>],
+    ) -> Result<Vec<i64>, StateError> {
+        if expected_journal_tail.is_some_and(|sequence| sequence < 0) {
+            return Err(StateError::Integrity(
+                "state CAS journal-tail assertion must be non-negative".to_owned(),
+            ));
+        }
+
+        let mut asserted = BTreeMap::new();
+        for assertion in assertions {
+            if assertion.expected_version <= 0 {
+                return Err(StateError::Integrity(format!(
+                    "state CAS assertion requires a positive expected version for {}/{}",
+                    assertion.namespace, assertion.key
+                )));
+            }
+            if asserted
+                .insert((assertion.namespace, assertion.key), ())
+                .is_some()
+            {
+                return Err(StateError::Integrity(format!(
+                    "duplicate state CAS assertion for {}/{}",
+                    assertion.namespace, assertion.key
+                )));
+            }
+        }
+
+        let mut unique = BTreeMap::new();
+        for mutation in mutations {
+            if mutation
+                .expected_version
+                .is_some_and(|version| version <= 0)
+            {
+                return Err(StateError::Integrity(format!(
+                    "state CAS requires a positive expected version for {}/{}",
+                    mutation.namespace, mutation.key
+                )));
+            }
+            if mutation.expected_version.is_none() && mutation.value_json.is_none() {
+                return Err(StateError::Integrity(format!(
+                    "state CAS cannot delete absent {}/{}",
+                    mutation.namespace, mutation.key
+                )));
+            }
+            if unique
+                .insert((mutation.namespace, mutation.key), ())
+                .is_some()
+            {
+                return Err(StateError::Integrity(format!(
+                    "duplicate state CAS mutation for {}/{}",
+                    mutation.namespace, mutation.key
+                )));
+            }
+            if asserted.contains_key(&(mutation.namespace, mutation.key)) {
+                return Err(StateError::Integrity(format!(
+                    "state CAS assertion cannot also mutate {}/{}",
+                    mutation.namespace, mutation.key
+                )));
+            }
+        }
+
+        let now = UnixMillis::now()?.as_millis();
+        self.transaction(|tx| {
+            if let Some(expected_sequence) = expected_journal_tail {
+                let actual_sequence: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM event_journal",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if actual_sequence != expected_sequence {
+                    return Err(StateError::Integrity(format!(
+                        "stale state CAS journal tail: expected {expected_sequence}, actual {actual_sequence}"
+                    )));
+                }
+            }
+
+            for assertion in assertions {
+                let current: Option<(i64, String)> = tx
+                    .query_row(
+                        "SELECT version, value_json FROM state_records WHERE namespace=?1 AND record_key=?2",
+                        (assertion.namespace, assertion.key),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let Some((actual_version, actual_value_json)) = current else {
+                    return Err(StateError::Integrity(format!(
+                        "stale state CAS assertion for {}/{}: expected version {}, record missing",
+                        assertion.namespace, assertion.key, assertion.expected_version
+                    )));
+                };
+                if actual_version != assertion.expected_version {
+                    return Err(StateError::Integrity(format!(
+                        "stale state CAS assertion for {}/{}: expected version {}, actual {actual_version}",
+                        assertion.namespace, assertion.key, assertion.expected_version
+                    )));
+                }
+                if assertion
+                    .expected_value_json
+                    .is_some_and(|expected| expected != actual_value_json.as_str())
+                {
+                    return Err(StateError::Integrity(format!(
+                        "stale state CAS assertion value for {}/{}",
+                        assertion.namespace, assertion.key
+                    )));
+                }
+                if let Some(expected_digest) = assertion.expected_value_digest {
+                    let mut hasher = Sha256::new();
+                    hasher.update(actual_value_json.as_bytes());
+                    let actual_digest = format!("sha256:{:x}", hasher.finalize());
+                    if actual_digest != expected_digest {
+                        return Err(StateError::Integrity(format!(
+                            "stale state CAS assertion digest for {}/{}",
+                            assertion.namespace, assertion.key
+                        )));
+                    }
+                }
+            }
+
+            for mutation in mutations {
+                let current_version: Option<i64> = tx
+                    .query_row(
+                        "SELECT version FROM state_records WHERE namespace=?1 AND record_key=?2",
+                        (mutation.namespace, mutation.key),
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if current_version != mutation.expected_version {
+                    return Err(StateError::Integrity(format!(
+                        "stale state CAS for {}/{}: expected {:?}, actual {:?}",
+                        mutation.namespace,
+                        mutation.key,
+                        mutation.expected_version,
+                        current_version
+                    )));
+                }
+            }
+
+            for mutation in mutations {
+                match (mutation.expected_version, mutation.value_json) {
+                    (None, Some(value_json)) => {
+                        tx.execute(
+                            "INSERT INTO state_records(namespace, record_key, value_json, version, updated_at_ms) \
+                             VALUES (?1, ?2, ?3, 1, ?4)",
+                            (mutation.namespace, mutation.key, value_json, now),
+                        )?;
+                    }
+                    (Some(expected_version), Some(value_json)) => {
+                        let updated = tx.execute(
+                            "UPDATE state_records SET value_json=?3, version=version + 1, updated_at_ms=?4 \
+                             WHERE namespace=?1 AND record_key=?2 AND version=?5",
+                            (
+                                mutation.namespace,
+                                mutation.key,
+                                value_json,
+                                now,
+                                expected_version,
+                            ),
+                        )?;
+                        if updated != 1 {
+                            return Err(StateError::Integrity(format!(
+                                "state CAS lost concurrent update for {}/{} at version {expected_version}",
+                                mutation.namespace, mutation.key
+                            )));
+                        }
+                    }
+                    (Some(expected_version), None) => {
+                        let deleted = tx.execute(
+                            "DELETE FROM state_records WHERE namespace=?1 AND record_key=?2 AND version=?3",
+                            (mutation.namespace, mutation.key, expected_version),
+                        )?;
+                        if deleted != 1 {
+                            return Err(StateError::Integrity(format!(
+                                "state CAS lost concurrent delete for {}/{} at version {expected_version}",
+                                mutation.namespace, mutation.key
+                            )));
+                        }
+                    }
+                    (None, None) => unreachable!("invalid state CAS mutation rejected above"),
+                }
+            }
+
+            let mut sequences = Vec::with_capacity(events.len());
+            for event in events {
+                tx.execute(
+                    "INSERT INTO event_journal(\
+                        event_id, entity_type, entity_id, event_kind, payload_json, occurred_at_ms\
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (
+                        event.event_id,
+                        event.entity_type,
+                        event.entity_id,
+                        event.event_kind,
+                        event.payload_json,
+                        now,
+                    ),
+                )?;
+                sequences.push(tx.last_insert_rowid());
+            }
+            Ok(sequences)
+        })
+    }
+
+    /// Atomically replaces one existing current-state record only when its durable version still
+    /// matches `expected_version`, and appends the correlated immutable event in the same
+    /// transaction. This is the generic compare-and-swap primitive for Controller-owned state
+    /// machines that must reject stale concurrent transitions.
+    ///
+    /// # Errors
+    /// Returns [`StateError::Integrity`] when the record is missing, `expected_version` is not
+    /// positive, or another writer has already advanced the record version. Other failures are
+    /// returned as ordinary [`StateError`] values.
+    pub fn compare_and_put_state_record_with_event(
+        &mut self,
+        namespace: &str,
+        key: &str,
+        expected_version: i64,
+        value_json: &str,
+        event: NewJournalEvent<'_>,
+    ) -> Result<i64, StateError> {
+        self.compare_and_apply_state_records_with_events(
+            &[StateRecordCasMutation {
+                namespace,
+                key,
+                expected_version: Some(expected_version),
+                value_json: Some(value_json),
+            }],
+            &[event],
+        )?
+        .into_iter()
+        .next()
+        .ok_or_else(|| StateError::Integrity("state CAS event sequence missing".to_owned()))
     }
 
     /// Returns all events in authoritative sequence order.
@@ -2099,6 +2395,391 @@ mod tests {
         drop(StateStore::open(temp.db()).unwrap_or_else(|error| panic!("open 1: {error}")));
         let store = StateStore::open(temp.db()).unwrap_or_else(|error| panic!("open 2: {error}"));
         assert_eq!(store.schema_version().unwrap_or(-1), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn state_record_cas_updates_with_event_and_rejects_stale_writer() {
+        let temp = TestDir::new("state-cas");
+        let mut store =
+            StateStore::open(temp.db()).unwrap_or_else(|error| panic!("open state CAS: {error}"));
+        store
+            .put_state("fixture", "goal-1", "{\"status\":\"queued\"}")
+            .unwrap_or_else(|error| panic!("seed state CAS: {error}"));
+
+        let sequence = store
+            .compare_and_put_state_record_with_event(
+                "fixture",
+                "goal-1",
+                1,
+                "{\"status\":\"selected\"}",
+                NewJournalEvent {
+                    event_id: "event-state-cas-1",
+                    entity_type: "controller",
+                    entity_id: "goal-1",
+                    event_kind: "goal_selected",
+                    payload_json: "{\"status\":\"selected\"}",
+                },
+            )
+            .unwrap_or_else(|error| panic!("advance state CAS: {error}"));
+        assert!(sequence > 0);
+        let record = store
+            .state_records("fixture")
+            .unwrap_or_else(|error| panic!("read state CAS: {error}"))
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("state CAS record missing"));
+        assert_eq!(record.version, 2);
+        assert_eq!(record.value_json, "{\"status\":\"selected\"}");
+        let before_stale_events = store
+            .journal()
+            .unwrap_or_else(|error| panic!("read state CAS journal: {error}"))
+            .len();
+
+        let stale = store.compare_and_put_state_record_with_event(
+            "fixture",
+            "goal-1",
+            1,
+            "{\"status\":\"succeeded\"}",
+            NewJournalEvent {
+                event_id: "event-state-cas-stale",
+                entity_type: "controller",
+                entity_id: "goal-1",
+                event_kind: "goal_succeeded",
+                payload_json: "{\"status\":\"succeeded\"}",
+            },
+        );
+        assert!(matches!(stale, Err(StateError::Integrity(_))));
+        assert_eq!(
+            store
+                .journal()
+                .unwrap_or_else(|error| panic!("read stale CAS journal: {error}"))
+                .len(),
+            before_stale_events
+        );
+        assert_eq!(
+            store
+                .get_state("fixture", "goal-1")
+                .unwrap_or_else(|error| panic!("read stale CAS state: {error}"))
+                .as_deref(),
+            Some("{\"status\":\"selected\"}")
+        );
+    }
+
+    #[test]
+    fn compound_state_cas_is_atomic_for_insert_update_and_delete() {
+        let temp = TestDir::new("state-cas-compound");
+        let mut store = StateStore::open(temp.db())
+            .unwrap_or_else(|error| panic!("open compound state CAS: {error}"));
+        store
+            .put_state("fixture", "intent", "{\"status\":\"queued\"}")
+            .unwrap_or_else(|error| panic!("seed compound state CAS: {error}"));
+
+        let sequences = store
+            .compare_and_apply_state_records_with_events(
+                &[
+                    StateRecordCasMutation {
+                        namespace: "fixture",
+                        key: "intent",
+                        expected_version: Some(1),
+                        value_json: Some("{\"status\":\"claimed\"}"),
+                    },
+                    StateRecordCasMutation {
+                        namespace: "fixture",
+                        key: "claim",
+                        expected_version: None,
+                        value_json: Some("{\"status\":\"claimed\"}"),
+                    },
+                ],
+                &[NewJournalEvent {
+                    event_id: "event-state-cas-compound-1",
+                    entity_type: "controller",
+                    entity_id: "intent",
+                    event_kind: "goal_claimed",
+                    payload_json: "{}",
+                }],
+            )
+            .unwrap_or_else(|error| panic!("compound state CAS: {error}"));
+        assert_eq!(sequences.len(), 1);
+
+        let intent = store
+            .state_records("fixture")
+            .unwrap_or_else(|error| panic!("read compound state CAS: {error}"))
+            .into_iter()
+            .find(|record| record.key == "intent")
+            .unwrap_or_else(|| panic!("compound intent missing"));
+        let claim = store
+            .state_records("fixture")
+            .unwrap_or_else(|error| panic!("read compound claim: {error}"))
+            .into_iter()
+            .find(|record| record.key == "claim")
+            .unwrap_or_else(|| panic!("compound claim missing"));
+        assert_eq!(intent.version, 2);
+        assert_eq!(claim.version, 1);
+
+        let before_stale_events = store
+            .journal()
+            .unwrap_or_else(|error| panic!("read compound journal: {error}"))
+            .len();
+        let stale = store.compare_and_apply_state_records_with_events(
+            &[
+                StateRecordCasMutation {
+                    namespace: "fixture",
+                    key: "intent",
+                    expected_version: Some(1),
+                    value_json: Some("{\"status\":\"completed\"}"),
+                },
+                StateRecordCasMutation {
+                    namespace: "fixture",
+                    key: "claim",
+                    expected_version: Some(1),
+                    value_json: None,
+                },
+            ],
+            &[NewJournalEvent {
+                event_id: "event-state-cas-compound-stale",
+                entity_type: "controller",
+                entity_id: "intent",
+                event_kind: "goal_completed",
+                payload_json: "{}",
+            }],
+        );
+        assert!(matches!(stale, Err(StateError::Integrity(_))));
+        assert!(
+            store
+                .get_state("fixture", "claim")
+                .unwrap_or_else(|error| panic!("read claim after stale CAS: {error}"))
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .journal()
+                .unwrap_or_else(|error| panic!("read journal after stale CAS: {error}"))
+                .len(),
+            before_stale_events
+        );
+
+        store
+            .compare_and_apply_state_records_with_events(
+                &[
+                    StateRecordCasMutation {
+                        namespace: "fixture",
+                        key: "intent",
+                        expected_version: Some(2),
+                        value_json: Some("{\"status\":\"completed\"}"),
+                    },
+                    StateRecordCasMutation {
+                        namespace: "fixture",
+                        key: "claim",
+                        expected_version: Some(1),
+                        value_json: None,
+                    },
+                ],
+                &[NewJournalEvent {
+                    event_id: "event-state-cas-compound-2",
+                    entity_type: "controller",
+                    entity_id: "intent",
+                    event_kind: "goal_completed",
+                    payload_json: "{}",
+                }],
+            )
+            .unwrap_or_else(|error| panic!("finish compound state CAS: {error}"));
+        assert_eq!(
+            store
+                .get_state("fixture", "intent")
+                .unwrap_or_else(|error| panic!("read completed intent: {error}"))
+                .as_deref(),
+            Some("{\"status\":\"completed\"}")
+        );
+        assert!(
+            store
+                .get_state("fixture", "claim")
+                .unwrap_or_else(|error| panic!("read deleted claim: {error}"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn guarded_compound_state_cas_rejects_stale_journal_tail_without_mutation() {
+        let temp = TestDir::new("state-cas-journal-tail");
+        let mut store = StateStore::open(temp.db())
+            .unwrap_or_else(|error| panic!("open guarded state CAS: {error}"));
+        store
+            .put_state("fixture", "intent", "{\"status\":\"queued\"}")
+            .unwrap_or_else(|error| panic!("seed guarded state CAS: {error}"));
+        store
+            .append_event(NewJournalEvent {
+                event_id: "event-state-cas-existing",
+                entity_type: "controller",
+                entity_id: "intent",
+                event_kind: "existing",
+                payload_json: "{}",
+            })
+            .unwrap_or_else(|error| panic!("seed guarded journal: {error}"));
+        let before_state = store
+            .state_records("fixture")
+            .unwrap_or_else(|error| panic!("read state before stale journal guard: {error}"));
+        let before_journal = store
+            .journal()
+            .unwrap_or_else(|error| panic!("read journal before stale guard: {error}"));
+
+        let stale = store.compare_and_apply_state_records_with_events_guarded(
+            Some(0),
+            &[],
+            &[StateRecordCasMutation {
+                namespace: "fixture",
+                key: "intent",
+                expected_version: Some(1),
+                value_json: Some("{\"status\":\"claimed\"}"),
+            }],
+            &[NewJournalEvent {
+                event_id: "event-state-cas-stale-tail",
+                entity_type: "controller",
+                entity_id: "intent",
+                event_kind: "goal_claimed",
+                payload_json: "{}",
+            }],
+        );
+        assert!(matches!(stale, Err(StateError::Integrity(_))));
+        assert_eq!(
+            store
+                .state_records("fixture")
+                .unwrap_or_else(|error| panic!("read state after stale journal guard: {error}")),
+            before_state
+        );
+        assert_eq!(
+            store
+                .journal()
+                .unwrap_or_else(|error| panic!("read journal after stale journal guard: {error}")),
+            before_journal
+        );
+    }
+
+    #[test]
+    fn guarded_compound_state_cas_assertions_are_compare_only_and_fail_atomically() {
+        let temp = TestDir::new("state-cas-assertion");
+        let mut store = StateStore::open(temp.db())
+            .unwrap_or_else(|error| panic!("open assertion state CAS: {error}"));
+        let guard_value = "{\"authority\":\"ready\"}";
+        store
+            .put_state("fixture", "guard", guard_value)
+            .unwrap_or_else(|error| panic!("seed assertion guard: {error}"));
+        store
+            .put_state("fixture", "target", "{\"status\":\"queued\"}")
+            .unwrap_or_else(|error| panic!("seed assertion target: {error}"));
+        let before_state = store
+            .state_records("fixture")
+            .unwrap_or_else(|error| panic!("read state before stale assertion: {error}"));
+        let before_journal = store
+            .journal()
+            .unwrap_or_else(|error| panic!("read journal before stale assertion: {error}"));
+        let mutation = StateRecordCasMutation {
+            namespace: "fixture",
+            key: "target",
+            expected_version: Some(1),
+            value_json: Some("{\"status\":\"claimed\"}"),
+        };
+        let event = NewJournalEvent {
+            event_id: "event-state-cas-assertion",
+            entity_type: "controller",
+            entity_id: "target",
+            event_kind: "goal_claimed",
+            payload_json: "{}",
+        };
+
+        let stale_digest = store.compare_and_apply_state_records_with_events_guarded(
+            Some(0),
+            &[StateRecordCasAssertion {
+                namespace: "fixture",
+                key: "guard",
+                expected_version: 1,
+                expected_value_json: Some(guard_value),
+                expected_value_digest: Some(
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                ),
+            }],
+            &[mutation],
+            &[event],
+        );
+        assert!(matches!(stale_digest, Err(StateError::Integrity(_))));
+        assert_eq!(
+            store
+                .state_records("fixture")
+                .unwrap_or_else(|error| panic!("read state after stale digest: {error}")),
+            before_state
+        );
+        assert_eq!(
+            store
+                .journal()
+                .unwrap_or_else(|error| panic!("read journal after stale digest: {error}")),
+            before_journal
+        );
+
+        let stale_value = store.compare_and_apply_state_records_with_events_guarded(
+            Some(0),
+            &[StateRecordCasAssertion {
+                namespace: "fixture",
+                key: "guard",
+                expected_version: 1,
+                expected_value_json: Some("{\"authority\":\"stale\"}"),
+                expected_value_digest: None,
+            }],
+            &[mutation],
+            &[event],
+        );
+        assert!(matches!(stale_value, Err(StateError::Integrity(_))));
+        assert_eq!(
+            store
+                .state_records("fixture")
+                .unwrap_or_else(|error| panic!("read state after stale value: {error}")),
+            before_state
+        );
+        assert_eq!(
+            store
+                .journal()
+                .unwrap_or_else(|error| panic!("read journal after stale value: {error}")),
+            before_journal
+        );
+
+        let mut hasher = Sha256::new();
+        hasher.update(guard_value.as_bytes());
+        let guard_digest = format!("sha256:{:x}", hasher.finalize());
+        store
+            .compare_and_apply_state_records_with_events_guarded(
+                Some(0),
+                &[StateRecordCasAssertion {
+                    namespace: "fixture",
+                    key: "guard",
+                    expected_version: 1,
+                    expected_value_json: Some(guard_value),
+                    expected_value_digest: Some(&guard_digest),
+                }],
+                &[mutation],
+                &[event],
+            )
+            .unwrap_or_else(|error| panic!("apply guarded state CAS: {error}"));
+        let guard = store
+            .state_records("fixture")
+            .unwrap_or_else(|error| panic!("read compare-only guard: {error}"))
+            .into_iter()
+            .find(|record| record.key == "guard")
+            .unwrap_or_else(|| panic!("compare-only guard missing"));
+        assert_eq!(guard.version, 1);
+        assert_eq!(guard.value_json, guard_value);
+        let target = store
+            .state_records("fixture")
+            .unwrap_or_else(|error| panic!("read guarded target: {error}"))
+            .into_iter()
+            .find(|record| record.key == "target")
+            .unwrap_or_else(|| panic!("guarded target missing"));
+        assert_eq!(target.version, 2);
+        assert_eq!(target.value_json, "{\"status\":\"claimed\"}");
+        assert_eq!(
+            store
+                .journal()
+                .unwrap_or_else(|error| panic!("read guarded journal: {error}"))
+                .len(),
+            1
+        );
     }
 
     #[test]

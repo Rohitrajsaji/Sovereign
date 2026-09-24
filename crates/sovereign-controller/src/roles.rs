@@ -10,7 +10,8 @@ use sovereign_policy::{Capability, CapabilitySet};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const ROLE_PROFILE_SCHEMA_VERSION: u32 = 1;
-pub const ROLE_PROFILE_VERSION: &str = "1.2.0";
+pub const ROLE_PROFILE_VERSION: &str = "1.3.0";
+const PREVIOUS_ROLE_PROFILE_VERSION: &str = "1.2.0";
 const PRE_BROWSER_ROLE_PROFILE_VERSION: &str = "1.1.0";
 const LEGACY_ROLE_PROFILE_VERSION: &str = "1.0.0";
 pub const ROLE_OUTPUT_SCHEMA_VERSION: u32 = 1;
@@ -213,6 +214,7 @@ pub struct RoleOutputV1 {
 #[derive(Debug, Clone)]
 pub struct RoleRegistry {
     profiles: BTreeMap<RoleId, RoleProfile>,
+    previous_profiles: BTreeMap<RoleId, RoleProfile>,
     pre_browser_profiles: BTreeMap<RoleId, RoleProfile>,
     legacy_profiles: BTreeMap<RoleId, RoleProfile>,
 }
@@ -226,7 +228,7 @@ impl Default for RoleRegistry {
 impl RoleRegistry {
     #[must_use]
     pub fn canonical() -> Self {
-        let profiles = [
+        let previous_profiles: BTreeMap<RoleId, RoleProfile> = [
             explorer_profile(true),
             planner_profile(),
             implementer_profile(true, true),
@@ -238,6 +240,12 @@ impl RoleRegistry {
         .into_iter()
         .map(|profile| (profile.role, profile))
         .collect();
+        let mut profiles = previous_profiles.clone();
+        profiles
+            .get_mut(&RoleId::Implementer)
+            .unwrap_or_else(|| unreachable!("canonical role registry is complete"))
+            .allowed_tool_classes_ceiling
+            .insert(Capability::Read);
         let pre_browser_profiles = [
             explorer_profile(false),
             planner_profile(),
@@ -264,6 +272,7 @@ impl RoleRegistry {
         .collect();
         Self {
             profiles,
+            previous_profiles,
             pre_browser_profiles,
             legacy_profiles,
         }
@@ -304,6 +313,10 @@ impl RoleRegistry {
         })?;
         let profile = match version {
             ROLE_PROFILE_VERSION => self.profile(role),
+            PREVIOUS_ROLE_PROFILE_VERSION => self
+                .previous_profiles
+                .get(&role)
+                .unwrap_or_else(|| unreachable!("previous role registry is complete")),
             PRE_BROWSER_ROLE_PROFILE_VERSION => self
                 .pre_browser_profiles
                 .get(&role)
@@ -1123,6 +1136,30 @@ mod tests {
                 .is_err()
         );
         assert!(registry.resolve_pin(&pin.id, "0.9.0", &pin.digest).is_err());
+
+        let implementer_v13 = registry.profile(RoleId::Implementer);
+        assert!(
+            implementer_v13
+                .capability_ceiling()
+                .contains(Capability::Read)
+        );
+        let implementer_v12 = registry
+            .resolve_pin(
+                RoleId::Implementer.plan_ir_id(),
+                PREVIOUS_ROLE_PROFILE_VERSION,
+                &registry
+                    .previous_profiles
+                    .get(&RoleId::Implementer)
+                    .unwrap_or_else(|| unreachable!("previous implementer profile exists"))
+                    .digest()
+                    .unwrap_or_else(|error| panic!("previous implementer digest: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("resolve previous implementer pin: {error}"));
+        assert!(
+            !implementer_v12
+                .capability_ceiling()
+                .contains(Capability::Read)
+        );
 
         let pre_browser = implementer_profile(true, false);
         let pre_browser_digest = pre_browser

@@ -376,6 +376,169 @@
         "download_root": { "type": ["string", "null"] }
       }
     },
+    "browserManagedAppLaunch": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["runtime", "server_relative_path", "database_filename", "required_generations"],
+          "properties": {
+            "runtime": { "const": "python_managed_server_v1" },
+            "server_relative_path": { "$ref": "#/$defs/relativeSelector" },
+            "database_filename": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[^/\\\\]+$" },
+            "required_generations": { "type": "integer", "minimum": 1, "maximum": 8 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["runtime", "working_directory_relative_path", "entrypoint_relative_path", "argv", "dynamic_port", "readiness", "persistence", "required_generations"],
+          "properties": {
+            "runtime": { "const": "node_managed_server_v1" },
+            "working_directory_relative_path": { "$ref": "#/$defs/relativeSelector" },
+            "entrypoint_relative_path": { "$ref": "#/$defs/relativeSelector" },
+            "argv": { "type": "array", "maxItems": 24, "items": { "type": "string", "minLength": 1, "maxLength": 256 } },
+            "dynamic_port": { "$ref": "#/$defs/browserManagedArgBinding" },
+            "readiness": { "$ref": "#/$defs/browserManagedReadiness" },
+            "persistence": { "$ref": "#/$defs/browserManagedPersistenceBinding" },
+            "required_generations": { "type": "integer", "minimum": 1, "maximum": 8 }
+          }
+        }
+      ]
+    },
+    "browserManagedArgBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "flag"],
+      "properties": { "kind": { "const": "argv_flag" }, "flag": { "type": "string", "pattern": "^--[a-z-]{1,30}$" } }
+    },
+    "browserManagedReadiness": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "status", "body", "timeout_ms"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^/[^?#\\\\]*$" },
+        "status": { "const": 200 },
+        "body": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "timeout_ms": { "type": "integer", "minimum": 100, "maximum": 5000 }
+      }
+    },
+    "browserManagedPersistenceBinding": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "flag", "filename"],
+          "properties": {
+            "kind": { "const": "argv_flag" },
+            "flag": { "type": "string", "pattern": "^--[a-z-]{1,30}$" },
+            "filename": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[^/\\\\]+$" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["kind", "flag"],
+          "properties": {
+            "kind": { "const": "postgres_broker_v1" },
+            "flag": { "type": "string", "pattern": "^--[a-z-]{1,30}$" }
+          }
+        }
+      ]
+    },
+    "browserLoopbackTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scheme", "host", "port"],
+      "properties": {
+        "scheme": { "const": "http" },
+        "host": { "const": "127.0.0.1" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "browserAcceptanceAction": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "path"],
+          "properties": {
+            "kind": { "const": "navigate" },
+            "path": { "type": "string", "minLength": 1, "maxLength": 2048 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "selector"],
+          "properties": {
+            "kind": { "const": "submit_form" },
+            "selector": { "type": "string", "minLength": 1, "maxLength": 512 },
+            "fields": {
+              "type": "array",
+              "maxItems": 16,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["selector", "value"],
+                "properties": {
+                  "selector": { "type": "string", "minLength": 1, "maxLength": 512 },
+                  "value": { "type": "string", "maxLength": 256 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "capture_synopsis" }
+          }
+        }
+      ]
+    },
+    "browserAcceptanceExpectation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["semantic", "required_contains", "forbidden_contains"],
+      "properties": {
+        "semantic": { "enum": ["read", "create", "update", "delete", "invalid_validation", "restart_persistence", "observation"] },
+        "required_contains": { "type": "array", "maxItems": 16, "items": { "type": "string", "minLength": 1, "maxLength": 512 } },
+        "forbidden_contains": { "type": "array", "maxItems": 16, "items": { "type": "string", "minLength": 1, "maxLength": 512 } }
+      }
+    },
+    "browserAcceptanceStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["step_id", "generation", "action", "expectation"],
+      "properties": {
+        "step_id": { "$ref": "#/$defs/id" },
+        "generation": { "type": "integer", "minimum": 1, "maximum": 8 },
+        "action": { "$ref": "#/$defs/browserAcceptanceAction" },
+        "expectation": { "$ref": "#/$defs/browserAcceptanceExpectation" }
+      }
+    },
+    "browserEvidenceBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt_digest", "action_commit_sequence", "managed_generation", "acceptance_criterion_ids"],
+      "properties": {
+        "receipt_digest": { "const": true },
+        "action_commit_sequence": { "const": true },
+        "managed_generation": { "const": true },
+        "acceptance_criterion_ids": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/id" } }
+      }
+    },
+    "browserAcceptanceContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "launch", "loopback", "steps", "evidence_binding"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "launch": { "$ref": "#/$defs/browserManagedAppLaunch" },
+        "loopback": { "$ref": "#/$defs/browserLoopbackTarget" },
+        "steps": { "type": "array", "minItems": 1, "maxItems": 128, "items": { "$ref": "#/$defs/browserAcceptanceStep" } },
+        "evidence_binding": { "$ref": "#/$defs/browserEvidenceBinding" }
+      }
+    },
     "taskExternalIntelligencePolicy": {
       "type": "object",
       "additionalProperties": false,
@@ -621,6 +784,7 @@
           "description": "Requested task capability ceiling only. Effective runtime authority is the intersection of Controller/global policy, project policy, this request, role/tool ceilings, and any persisted user approval/grant."
         },
         "action_policy": { "$ref": "#/$defs/taskActionPolicy" },
+        "browser_acceptance": { "$ref": "#/$defs/browserAcceptanceContract" },
         "implementation_contract": { "$ref": "#/$defs/implementationContract" },
         "constraints": { "type": "array", "items": { "type": "string", "minLength": 1 } },
         "expected_artifacts": {

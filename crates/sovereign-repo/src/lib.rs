@@ -19,7 +19,8 @@ pub use structural::{
 };
 pub use worktree::{
     ChangeSet, ChangeSetCompositionInput, ChangeSetCompositionProvenance, ComposeChangeSetsOutcome,
-    CompositionConflictEvidence, UntrackedFileDelta, WorktreeBaseline, WorktreeFileContent,
+    CompositionConflictEvidence, OfflineDependencyLimits, OfflineDependencyManifest,
+    OfflineNodeModulesProvenance, UntrackedFileDelta, WorktreeBaseline, WorktreeFileContent,
     WorktreeLease,
 };
 
@@ -74,6 +75,7 @@ pub enum RepoError {
     },
     UnsafeGitConfiguration(String),
     InvalidWorktreeLease(String),
+    InvalidOfflineDependency(String),
     Serialization(serde_json::Error),
 }
 
@@ -139,6 +141,9 @@ impl Display for RepoError {
             }
             Self::InvalidWorktreeLease(message) => {
                 write!(f, "invalid controller worktree lease: {message}")
+            }
+            Self::InvalidOfflineDependency(message) => {
+                write!(f, "invalid offline dependency materialization: {message}")
             }
             Self::Serialization(error) => {
                 write!(f, "repository manifest serialization error: {error}")

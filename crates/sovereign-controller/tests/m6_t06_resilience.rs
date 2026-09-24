@@ -608,6 +608,8 @@ fn runtime_parts_for(repository_root: &Path, base: &Path) -> RuntimeParts {
             repository_root: repository_root.to_path_buf(),
             user_home_root: std::env::var_os("HOME").map_or_else(|| panic!("HOME"), PathBuf::from),
             extra_protected_read_roots: Vec::new(),
+            rust_toolchain: None,
+            build_scratch_root: None,
             network_offline: true,
             allow_repository_write: true,
             require_full_filesystem_read_jail: false,

@@ -138,6 +138,14 @@ impl Fixture {
     fn marker(&self) -> PathBuf {
         self.base.join("crash.marker")
     }
+
+    fn stdout_log(&self) -> PathBuf {
+        self.base.join("crash-child.stdout.log")
+    }
+
+    fn stderr_log(&self) -> PathBuf {
+        self.base.join("crash-child.stderr.log")
+    }
 }
 
 impl Drop for Fixture {
@@ -284,7 +292,7 @@ fn fake_backend(prepared: &Prepared, with_execution: bool) -> DeterministicFakeB
             "title": "Rename Settings submit label",
             "objective": "Change the rendered Settings submit label from Save to Apply without altering submit behavior.",
             "rationale": "Exact current source identifies one bounded edit.",
-            "files": ["src/settings/SettingsForm.tsx", "src/settings/SettingsForm.test.tsx"],
+            "files": ["src/settings/SettingsForm.tsx"],
             "symbols": ["SettingsForm"],
             "evidence_queries": [],
             "expected_change": "SettingsForm renders Apply instead of Save."
@@ -403,7 +411,7 @@ fn compile_and_activate_with_policy(
     let mut budget = ModelCallBudget::new(1, 1_000);
     let compilation = compiler
         .compile(&input, &mut budget)
-        .unwrap_or_else(|error| panic!("compile T08 goal: {error}"));
+        .unwrap_or_else(|error| panic!("compile T08 goal: {error:?} ({error})"));
     let state = StateStore::open(base.join("state.sqlite3"))
         .unwrap_or_else(|error| panic!("state: {error}"));
     let mut controller = Controller::new(state);
@@ -882,6 +890,8 @@ fn runtime_parts(base: &Path, root: &Path) -> RuntimeParts {
             repository_root: root.to_path_buf(),
             user_home_root: home,
             extra_protected_read_roots: Vec::new(),
+            rust_toolchain: None,
+            build_scratch_root: None,
             network_offline: true,
             allow_repository_write: true,
             require_full_filesystem_read_jail: false,
@@ -1082,8 +1092,14 @@ fn spawn_child(fixture: &Fixture, case: &str, pause_at: Option<&str>) -> Child {
         .env(CHILD_ROOT, &fixture.root)
         .env(CHILD_MARKER, fixture.marker())
         .env("RUST_BACKTRACE", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::from(
+            fs::File::create(fixture.stdout_log())
+                .unwrap_or_else(|error| panic!("create crash child stdout log: {error}")),
+        ))
+        .stderr(Stdio::from(
+            fs::File::create(fixture.stderr_log())
+                .unwrap_or_else(|error| panic!("create crash child stderr log: {error}")),
+        ));
     if let Some(point) = pause_at {
         command
             .env("SOVEREIGN_RECOVERY_TEST_PAUSE_AT", point)
@@ -1103,15 +1119,49 @@ fn kill_child(child: &mut Child) {
         .unwrap_or_else(|error| panic!("wait killed child: {error}"));
 }
 
-fn wait_for_marker(path: &Path) {
+fn child_diagnostics(fixture: &Fixture, child: &mut Child) -> String {
+    const MAX_LOG_BYTES: usize = 16 * 1024;
+    let status = child
+        .try_wait()
+        .unwrap_or_else(|error| panic!("inspect crash child status: {error}"))
+        .map_or_else(|| "still running".to_owned(), |status| status.to_string());
+    let read_tail = |path: PathBuf| {
+        let Ok(bytes) = fs::read(path) else {
+            return "<log unavailable>".to_owned();
+        };
+        let start = bytes.len().saturating_sub(MAX_LOG_BYTES);
+        String::from_utf8_lossy(&bytes[start..]).into_owned()
+    };
+    format!(
+        "child status: {status}\nchild stdout (last {MAX_LOG_BYTES} bytes):\n{}\nchild stderr (last {MAX_LOG_BYTES} bytes):\n{}",
+        read_tail(fixture.stdout_log()),
+        read_tail(fixture.stderr_log())
+    )
+}
+
+fn wait_for_marker(path: &Path, fixture: &Fixture, child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if path.exists() {
             return;
         }
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("inspect crash child before marker: {error}"))
+        {
+            panic!(
+                "crash child exited before marker {}: {status}\n{}",
+                path.display(),
+                child_diagnostics(fixture, child)
+            );
+        }
         thread::sleep(Duration::from_millis(10));
     }
-    panic!("timed out waiting for crash marker {}", path.display());
+    panic!(
+        "timed out waiting for crash marker {}\n{}",
+        path.display(),
+        child_diagnostics(fixture, child)
+    );
 }
 
 fn wait_for_source_contains(root: &Path, needle: &str) {
@@ -1127,7 +1177,12 @@ fn wait_for_source_contains(root: &Path, needle: &str) {
     panic!("timed out waiting for source to contain {needle:?}");
 }
 
-fn wait_for_action_state(path: &Path, expected: &str) -> String {
+fn wait_for_action_state(
+    path: &Path,
+    expected: &str,
+    fixture: &Fixture,
+    child: &mut Child,
+) -> String {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         if let Ok(state) = StateStore::open(path)
@@ -1136,9 +1191,21 @@ fn wait_for_action_state(path: &Path, expected: &str) -> String {
         {
             return record.action_id.clone();
         }
+        if let Some(status) = child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("inspect crash child before action state: {error}"))
+        {
+            panic!(
+                "crash child exited before action state {expected}: {status}\n{}",
+                child_diagnostics(fixture, child)
+            );
+        }
         thread::sleep(Duration::from_millis(10));
     }
-    panic!("timed out waiting for action state {expected}");
+    panic!(
+        "timed out waiting for action state {expected}\n{}",
+        child_diagnostics(fixture, child)
+    );
 }
 
 fn wait_for_active_process_lease(path: &Path) -> (u32, String) {
@@ -1200,7 +1267,15 @@ fn first_task_id(state: &StateStore) -> String {
         .first()
         .map_or_else(
             || panic!("task record missing"),
-            |record| record.key.clone(),
+            |record| {
+                let value: Value = serde_json::from_str(&record.value_json)
+                    .unwrap_or_else(|error| panic!("task runtime json: {error}"));
+                value
+                    .pointer("/task/task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("task runtime lacks logical task id"))
+                    .to_owned()
+            },
         )
 }
 
@@ -1258,8 +1333,9 @@ fn normal_runtime<'a>(
 fn kill_before_mutation_resumes_persisted_intent_without_model_replay() {
     let fixture = Fixture::create("before-mutation");
     let mut child = spawn_child(&fixture, "before_mutation", None);
-    wait_for_marker(&fixture.marker());
-    let _old_action = wait_for_action_state(&fixture.state_path(), "authorized");
+    wait_for_marker(&fixture.marker(), &fixture, &mut child);
+    let _old_action =
+        wait_for_action_state(&fixture.state_path(), "authorized", &fixture, &mut child);
     kill_child(&mut child);
     assert!(source(&fixture.root).contains("Save"));
 
@@ -1287,11 +1363,133 @@ fn kill_before_mutation_resumes_persisted_intent_without_model_replay() {
 }
 
 #[test]
+fn kill_after_atomic_initial_activation_commit_bootstraps_first_checkpoint() {
+    let fixture = Fixture::create("initial-activation-bootstrap");
+    let mut child = spawn_child(
+        &fixture,
+        "initial_activation_bootstrap",
+        Some("after_initial_plan_activation_commit"),
+    );
+    wait_for_marker(&fixture.marker(), &fixture, &mut child);
+
+    let pre_crash = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("open initial activation state: {error}"));
+    assert!(
+        pre_crash
+            .get_state("controller.plan", "active")
+            .unwrap_or_else(|error| panic!("read initial active plan: {error}"))
+            .is_some(),
+        "atomic initial activation publication must be durable before the crash hook"
+    );
+    assert!(
+        pre_crash
+            .latest_checkpoint_integrity()
+            .unwrap_or_else(|error| panic!("read pre-crash checkpoint: {error}"))
+            .is_none(),
+        "crash hook must fire before the first activation checkpoint"
+    );
+    assert!(
+        pre_crash
+            .action_records()
+            .unwrap_or_else(|error| panic!("read pre-crash actions: {error}"))
+            .is_empty(),
+        "pristine initial activation must not publish action authority"
+    );
+    drop(pre_crash);
+    kill_child(&mut child);
+
+    let (controller, summary, _registry) = recover(&fixture);
+    assert!(!summary.mutation_blocked);
+    assert!(summary.unknown_action_ids.is_empty());
+    assert!(summary.pending_recovery_action_ids.is_empty());
+    let task_id = first_task_id(controller.state());
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Planned));
+    assert_eq!(controller.task_model_calls_used(&task_id), Some(0));
+    let first_checkpoint = controller
+        .state()
+        .latest_checkpoint_integrity()
+        .unwrap_or_else(|error| panic!("read bootstrapped checkpoint: {error}"))
+        .unwrap_or_else(|| panic!("initial activation recovery did not seal a checkpoint"));
+    let recovered_plan_digest = summary.plan_digest.clone();
+    drop(controller);
+
+    let (controller, second_summary, _registry) = recover(&fixture);
+    assert_eq!(second_summary.plan_digest, recovered_plan_digest);
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Planned));
+    assert_eq!(controller.task_model_calls_used(&task_id), Some(0));
+    let second_checkpoint = controller
+        .state()
+        .latest_checkpoint_integrity()
+        .unwrap_or_else(|error| panic!("read second recovery checkpoint: {error}"))
+        .unwrap_or_else(|| panic!("second recovery lost initial activation checkpoint"));
+    assert!(second_checkpoint.generation >= first_checkpoint.generation);
+}
+
+#[test]
+fn initial_activation_bootstrap_rejects_precheckpoint_side_effect_authority() {
+    let fixture = Fixture::create("initial-activation-side-effect");
+    let mut child = spawn_child(
+        &fixture,
+        "initial_activation_side_effect",
+        Some("after_initial_plan_activation_commit"),
+    );
+    wait_for_marker(&fixture.marker(), &fixture, &mut child);
+    kill_child(&mut child);
+
+    let mut tampered = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("open initial activation for tamper: {error}"));
+    let task_key = tampered
+        .state_records("controller.task")
+        .unwrap_or_else(|error| panic!("read initial task record: {error}"))
+        .first()
+        .unwrap_or_else(|| panic!("initial task record missing"))
+        .key
+        .clone();
+    tampered
+        .put_state(
+            "controller.failure_record",
+            &task_key,
+            &json!({"tampered": true}).to_string(),
+        )
+        .unwrap_or_else(|error| panic!("inject precheckpoint side-effect authority: {error}"));
+    assert!(
+        tampered
+            .latest_checkpoint_integrity()
+            .unwrap_or_else(|error| panic!("read checkpoint before failed bootstrap: {error}"))
+            .is_none()
+    );
+    drop(tampered);
+
+    let registry = registry_for(&fixture.root);
+    let state = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("reopen tampered initial activation: {error}"));
+    let error = RecoveryManager::recover(state, &registry)
+        .err()
+        .unwrap_or_else(|| panic!("bootstrap accepted precheckpoint side-effect authority"));
+    assert!(
+        error
+            .to_string()
+            .contains("side-effect authority before first checkpoint"),
+        "unexpected bootstrap rejection: {error}"
+    );
+    let after = StateStore::open(fixture.state_path())
+        .unwrap_or_else(|error| panic!("reopen failed-bootstrap state: {error}"));
+    assert!(
+        after
+            .latest_checkpoint_integrity()
+            .unwrap_or_else(|error| panic!("read checkpoint after failed bootstrap: {error}"))
+            .is_none(),
+        "failed bootstrap must not publish a checkpoint"
+    );
+}
+
+#[test]
 fn tampered_persisted_intent_is_rejected_before_recovered_mutation() {
     let fixture = Fixture::create("tampered-intent");
     let mut child = spawn_child(&fixture, "before_mutation", None);
-    wait_for_marker(&fixture.marker());
-    let action_id = wait_for_action_state(&fixture.state_path(), "authorized");
+    wait_for_marker(&fixture.marker(), &fixture, &mut child);
+    let action_id =
+        wait_for_action_state(&fixture.state_path(), "authorized", &fixture, &mut child);
     kill_child(&mut child);
 
     let (mut controller, summary, registry) = recover(&fixture);
@@ -1345,8 +1543,9 @@ fn tampered_persisted_intent_is_rejected_before_recovered_mutation() {
 fn assert_verification_only_recovery(pause_at: &str, label: &str) {
     let fixture = Fixture::create(label);
     let mut child = spawn_child(&fixture, "normal", Some(pause_at));
-    wait_for_marker(&fixture.marker());
-    let action_id = wait_for_action_state(&fixture.state_path(), "committed");
+    wait_for_marker(&fixture.marker(), &fixture, &mut child);
+    let action_id =
+        wait_for_action_state(&fixture.state_path(), "committed", &fixture, &mut child);
     kill_child(&mut child);
     assert!(source(&fixture.root).contains("Apply"));
     let before = StateStore::open(fixture.state_path())
@@ -1393,7 +1592,8 @@ fn kill_during_verification_recovers_by_deterministic_verification_only() {
 fn kill_after_dispatch_before_observed_blocks_ambiguous_effect_without_replay() {
     let fixture = Fixture::create("dispatch-unknown");
     let mut child = spawn_child(&fixture, "dispatch_ambiguous", None);
-    let action_id = wait_for_action_state(&fixture.state_path(), "dispatched");
+    let action_id =
+        wait_for_action_state(&fixture.state_path(), "dispatched", &fixture, &mut child);
     let _lease = wait_for_active_process_lease(&fixture.state_path());
     wait_for_source_contains(&fixture.root, "ambiguous crash residue");
     kill_child(&mut child);
@@ -1414,7 +1614,8 @@ fn kill_after_dispatch_before_observed_blocks_ambiguous_effect_without_replay() 
 fn orphan_process_group_is_reaped_before_recovery_continues() {
     let fixture = Fixture::create("orphan-reap");
     let mut child = spawn_child(&fixture, "orphan_sleep", None);
-    let _action_id = wait_for_action_state(&fixture.state_path(), "dispatched");
+    let _action_id =
+        wait_for_action_state(&fixture.state_path(), "dispatched", &fixture, &mut child);
     let (pgid, identity) = wait_for_active_process_lease(&fixture.state_path());
     assert_eq!(
         process_group_leader_identity(pgid)
@@ -1449,8 +1650,9 @@ fn kill_after_spawn_before_identity_lease_stays_recovery_blocked() {
         "pending_spawn",
         Some("after_process_spawn_before_identity_lease"),
     );
-    wait_for_marker(&fixture.marker());
-    let action_id = wait_for_action_state(&fixture.state_path(), "dispatched");
+    wait_for_marker(&fixture.marker(), &fixture, &mut child);
+    let action_id =
+        wait_for_action_state(&fixture.state_path(), "dispatched", &fixture, &mut child);
     let pending_lease_id = wait_for_pending_process_lease(&fixture.state_path());
     kill_child(&mut child);
 
@@ -1701,8 +1903,9 @@ fn unjournaled_task_state_drift_is_rejected_during_recovery() {
 fn recovery_normalized_attempt_state_survives_second_restart() {
     let fixture = Fixture::create("recovery-second-restart");
     let mut child = spawn_child(&fixture, "before_mutation", None);
-    wait_for_marker(&fixture.marker());
-    let action_id = wait_for_action_state(&fixture.state_path(), "authorized");
+    wait_for_marker(&fixture.marker(), &fixture, &mut child);
+    let action_id =
+        wait_for_action_state(&fixture.state_path(), "authorized", &fixture, &mut child);
     kill_child(&mut child);
 
     let (controller, first, _registry) = recover(&fixture);
@@ -2184,8 +2387,9 @@ fn pending_spawn_build_heavy_blocks_before_recovery_epoch_advance() {
         "build_pending_spawn",
         Some("after_process_spawn_before_identity_lease"),
     );
-    wait_for_marker(&fixture.marker());
-    let _action_id = wait_for_action_state(&fixture.state_path(), "dispatched");
+    wait_for_marker(&fixture.marker(), &fixture, &mut child);
+    let _action_id =
+        wait_for_action_state(&fixture.state_path(), "dispatched", &fixture, &mut child);
     let pending_lease_id = wait_for_pending_process_lease(&fixture.state_path());
     let state = StateStore::open(fixture.state_path())
         .unwrap_or_else(|error| panic!("state before pending BUILD_HEAVY crash: {error}"));
@@ -2230,7 +2434,8 @@ fn pending_spawn_build_heavy_blocks_before_recovery_epoch_advance() {
 fn active_build_heavy_process_is_reaped_then_resource_lease_released_before_epoch_advance() {
     let fixture = Fixture::create("resource-build-heavy-active-reap");
     let mut child = spawn_child(&fixture, "build_orphan_sleep", None);
-    let _action_id = wait_for_action_state(&fixture.state_path(), "dispatched");
+    let _action_id =
+        wait_for_action_state(&fixture.state_path(), "dispatched", &fixture, &mut child);
     let (pgid, identity) = wait_for_active_process_lease(&fixture.state_path());
     assert_eq!(
         process_group_leader_identity(pgid)

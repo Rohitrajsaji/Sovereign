@@ -699,6 +699,78 @@ fn compiler_m3_emits_guarded_cross_revision_freshness_for_machine_acceptance_and
 }
 
 #[test]
+fn compiler_m3_rejects_multi_file_mutation_and_repairs_to_one_mutable_path_per_task() {
+    let mut invalid = json!({
+        "tasks": [task("multi", "repo.app", "src/api.rs", &[])]
+    });
+    invalid["tasks"][0]["create_files"] = json!(["src/generated.rs"]);
+    let corrected = json!({
+        "tasks": [task("single", "repo.app", "src/api.rs", &[])]
+    });
+    let backend = RecordingBackend::new(vec![
+        response(invalid.to_string()),
+        response(corrected.to_string()),
+    ]);
+    let validator = validator();
+    let input = compilation_input();
+    let mut budget = ModelCallBudget::new(2, 2_000);
+    let result = compiler(&backend, &validator)
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile after multi-file repair: {error}"));
+
+    assert_eq!(backend.calls.load(Ordering::Relaxed), 2);
+    let requests = lock(&backend.requests);
+    assert!(
+        requests[1].messages.iter().any(|message| {
+            message
+                .content
+                .contains("split multi-file changes into explicit dependent tasks")
+        }),
+        "repair request did not preserve the deterministic one-mutation-per-task rejection"
+    );
+    let tasks = result.plan().as_value()["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("compiled tasks"));
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["scope"]["files"], json!(["src/api.rs"]));
+    assert_eq!(tasks[0]["scope"]["allow_create"], json!([]));
+}
+
+#[test]
+fn compiler_m3_preserves_multi_file_read_only_scope_without_repo_write_authority() {
+    let mut proposed = task("inspect", "repo.app", "src/api.rs", &[]);
+    proposed["files"] = json!(["src/api.rs", "src/worker.rs"]);
+    let backend = RecordingBackend::new(vec![response(json!({"tasks": [proposed]}).to_string())]);
+    let validator = validator();
+    let mut input = compilation_input();
+    input.policy["capability_ceiling"] = json!(["read", "process_exec"]);
+    input.context_packet.items.push(repository_source(
+        "ev.app.worker",
+        "repo.app",
+        "src/worker.rs",
+        '9',
+        "pub fn worker() {}",
+    ));
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let result = compiler(&backend, &validator)
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile multi-file read-only task: {error}"));
+    let compiled = &result.plan().as_value()["tasks"][0];
+
+    assert_eq!(
+        compiled["scope"]["files"],
+        json!(["src/api.rs", "src/worker.rs"])
+    );
+    assert_eq!(compiled["scope"]["allow_create"], json!([]));
+    assert_eq!(compiled["permissions"], json!(["read"]));
+    assert!(
+        compiled["action_policy"]["write_roots"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+    );
+}
+
+#[test]
 fn compiler_m3_depth_and_supplied_human_plan_are_persisted_verbatim_and_digest_bound() {
     let backend = RecordingBackend::new(vec![response(multi_module_proposal())]);
     let validator = validator();

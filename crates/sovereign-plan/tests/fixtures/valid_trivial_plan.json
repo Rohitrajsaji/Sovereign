@@ -223,8 +223,7 @@
           "repo.app"
         ],
         "files": [
-          "src/settings/SettingsForm.tsx",
-          "src/settings/SettingsForm.test.tsx"
+          "src/settings/SettingsForm.tsx"
         ],
         "symbols": [
           "SettingsForm"

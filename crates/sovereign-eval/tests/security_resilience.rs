@@ -506,6 +506,8 @@ fn cancellation_reaps_the_exact_owned_process_group_and_cannot_report_success() 
         repository_root: repo.clone(),
         user_home_root: home,
         extra_protected_read_roots: Vec::new(),
+        rust_toolchain: None,
+        build_scratch_root: None,
         network_offline: true,
         allow_repository_write: true,
         require_full_filesystem_read_jail: false,

@@ -383,6 +383,8 @@ fn controller_accepts_false_completion(
         repository_root: repository.root.clone(),
         user_home_root: home,
         extra_protected_read_roots: Vec::new(),
+        rust_toolchain: None,
+        build_scratch_root: None,
         network_offline: true,
         allow_repository_write: true,
         require_full_filesystem_read_jail: false,

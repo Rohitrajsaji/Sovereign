@@ -6,6 +6,8 @@
 //! from already-validated Plan IR, binds browser actions to the canonical `ActionJournal` authority
 //! surface, and owns the only localhost gateway Chrome may reach under Seatbelt.
 
+#[cfg(unix)]
+use super::postgres_broker::{ControllerPostgresBroker, PostgresBrokerConfig};
 use super::{
     ActionJournal, ActionState, ArtifactStore, AttemptStartBinding, AttemptState, Controller,
     ControllerError, ExecutionRuntime, FailureRecordInput, NetworkChargePersistence, PlanValidity,
@@ -27,6 +29,11 @@ use sovereign_context::{
     ContextLevel, EvidenceItem, EvidenceKind, ExpansionHandle, PacketSection, TrustClass,
 };
 use sovereign_model::{ModelBackend, ModelResidencyProof};
+use sovereign_plan::{
+    BROWSER_ACCEPTANCE_CONTRACT_SCHEMA_VERSION, BrowserAcceptanceActionV1,
+    BrowserAcceptanceContractV1, BrowserAcceptanceSemanticV1, BrowserManagedAppLaunchV1,
+    BrowserManagedArgBindingV1, BrowserManagedPersistenceBindingV1, BrowserManagedReadinessV1,
+};
 use sovereign_policy::browser::{
     BROWSER_DOWNLOAD_POLICY_SCHEMA_VERSION, BROWSER_LOOPBACK_CAPABILITY_SCHEMA_VERSION,
     BrowserDownloadMode, BrowserDownloadPolicyV1, BrowserDownloadRetentionPolicyV1,
@@ -52,8 +59,8 @@ use sovereign_tools::{
         BrowserAdapterConfig, BrowserDocumentRequestDecision, BrowserDocumentRequestKind,
         BrowserDocumentRequestObservation, BrowserDownloadPolicy,
         BrowserDownloadTerminalObservation, BrowserDownloadTerminalState, BrowserError,
-        BrowserFormInspectionReceipt, BrowserLaunchOptions, BrowserLease, BrowserProfileRoot,
-        BrowserProxyAuthBinding, BrowserSensitivePageReason, BrowserSpawnState,
+        BrowserFormFieldValues, BrowserFormInspectionReceipt, BrowserLaunchOptions, BrowserLease,
+        BrowserProfileRoot, BrowserProxyAuthBinding, BrowserSensitivePageReason, BrowserSpawnState,
         BrowserStateSynopsis, DownloadReceipt, PreparedBrowserLaunch,
     },
     process_group_leader_identity,
@@ -90,13 +97,27 @@ const BROWSER_SEMANTIC_CONTRACT_NAMESPACE: &str = "controller.browser_semantic_c
 const BROWSER_SEMANTIC_CONTRACT_SCHEMA_VERSION: u32 = 1;
 const BROWSER_SEMANTIC_PROOF_NAMESPACE: &str = "controller.browser_semantic_proof";
 const BROWSER_SEMANTIC_PROOF_SCHEMA_VERSION: u32 = 1;
-const LOCAL_INVENTORY_BROWSER_SYMBOL: &str = "inventory-browser-proof";
-const LOCAL_INVENTORY_BROWSER_PROFILE: &str = "local_full_stack_v1.inventory_browser.v1";
 const MANAGED_LOOPBACK_MAX_LIFETIME_MS: u64 = 30_000;
 const MANAGED_LOOPBACK_START_OUTPUT_BYTES: u64 = 64 * 1024;
 const MANAGED_LOOPBACK_START_DISK_BYTES: u64 = 1024 * 1024;
 const MANAGED_LOOPBACK_SUBPROCESS_LIMIT: u32 = 0;
 const MANAGED_LOOPBACK_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+enum ManagedLoopbackLaunch<'a> {
+    Python {
+        server_relative_path: &'a Path,
+        database_filename: &'a str,
+    },
+    Node {
+        executable: &'a Path,
+        working_directory_relative_path: &'a Path,
+        entrypoint_relative_path: &'a Path,
+        argv: &'a [String],
+        dynamic_port: &'a BrowserManagedArgBindingV1,
+        readiness: &'a BrowserManagedReadinessV1,
+        persistence: &'a BrowserManagedPersistenceBindingV1,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserResourceActivity {
@@ -196,6 +217,7 @@ pub struct ControllerBrowserSession {
     resource_lease: ResourceLeaseV1,
     browser_lease: BrowserLease,
     permission_decision: PermissionDecision,
+    tool_manifest: ToolManifest,
     authority: BrowserTaskAuthorityV1,
     profile_authority: BrowserProfileAuthority,
     loopback_capability: BrowserLoopbackCapabilityV1,
@@ -228,6 +250,10 @@ struct ManagedLoopbackAppBindingV1 {
     repository_root: String,
     data_root: String,
     database_path: String,
+    #[serde(default)]
+    postgres_broker_port: Option<u16>,
+    #[serde(default)]
+    postgres_database_oid: Option<u32>,
     start_action_id: String,
     start_result_digest: String,
     process_group_id: u32,
@@ -241,6 +267,16 @@ struct ManagedLoopbackAppBindingV1 {
 pub struct ControllerManagedLoopbackApp {
     binding: ManagedLoopbackAppBindingV1,
     process: ManagedProcess,
+    #[cfg(unix)]
+    postgres_broker: Option<ControllerPostgresBroker>,
+}
+
+/// One exact Plan-IR-derived browser action with its managed-app generation boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControllerBrowserPlannedAction {
+    pub generation: u32,
+    pub semantic: BrowserAcceptanceSemanticV1,
+    pub action: BrowserAction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,13 +284,16 @@ struct BrowserSemanticStepV1 {
     action_id: String,
     action_kind: String,
     action_digest: String,
+    generation: u32,
+    semantic: BrowserAcceptanceSemanticV1,
     required_synopsis_contains: Vec<String>,
+    forbidden_synopsis_contains: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct BrowserSemanticContractV1 {
     schema_version: u32,
-    profile: String,
+    plan_contract_digest: String,
     plan_id: String,
     plan_revision: u32,
     task_id: String,
@@ -274,8 +313,12 @@ struct BrowserSemanticObservedStepV1 {
     action_id: String,
     action_kind: String,
     action_digest: String,
+    generation: u32,
+    semantic: BrowserAcceptanceSemanticV1,
+    committed_sequence: i64,
     receipt_digest: String,
     matched_synopsis_predicates: Vec<String>,
+    verified_absent_synopsis_predicates: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +356,11 @@ impl ControllerManagedLoopbackApp {
     #[must_use]
     pub fn database_path(&self) -> &Path {
         Path::new(&self.binding.database_path)
+    }
+
+    #[must_use]
+    pub const fn postgres_broker_port(&self) -> Option<u16> {
+        self.binding.postgres_broker_port
     }
 
     #[must_use]
@@ -2290,6 +2338,7 @@ impl Controller {
     fn activate_prepared_browser_session(
         &mut self,
         prepared: PreparedBrowserSession,
+        tool_manifest: &ToolManifest,
     ) -> Result<ControllerBrowserSession, ControllerError> {
         let PreparedBrowserSession {
             scope,
@@ -2344,6 +2393,7 @@ impl Controller {
             resource_lease,
             browser_lease,
             permission_decision: scope.permission_decision,
+            tool_manifest: tool_manifest.clone(),
             authority: scope.authority,
             profile_authority,
             loopback_capability,
@@ -2562,7 +2612,7 @@ impl Controller {
                 return Err(error);
             }
         };
-        self.activate_prepared_browser_session(prepared)
+        self.activate_prepared_browser_session(prepared, tool_manifest)
     }
 
     /// Revalidates one browser-only ready lease before creating any durable attempt, then starts the
@@ -2609,7 +2659,7 @@ impl Controller {
                 return Err(error);
             }
         };
-        self.activate_prepared_browser_session(prepared)
+        self.activate_prepared_browser_session(prepared, browser_tool_manifest)
     }
 
     fn validate_browser_session_for_action(
@@ -3275,6 +3325,25 @@ impl Controller {
                 Self::authorize_browser_url_scope(session, &inspection.resolved_action_url)?;
                 Ok(Some(inspection))
             }
+            BrowserAction::SubmitFormWithValues {
+                selector, fields, ..
+            } => {
+                let browser_lease = session.browser_lease.clone();
+                let inspection = session
+                    .adapter
+                    .as_mut()
+                    .ok_or_else(|| {
+                        ControllerError::NotReady(
+                            "browser adapter is unavailable for form inspection".to_owned(),
+                        )
+                    })?
+                    .inspect_form_values_until(&browser_lease, selector, fields, deadline)
+                    .map_err(browser_pre_dispatch_error)?;
+                Self::authorize_browser_url_scope(session, &inspection.current_page_url)?;
+                Self::authorize_browser_method(session, &inspection.normalized_method)?;
+                Self::authorize_browser_url_scope(session, &inspection.resolved_action_url)?;
+                Ok(Some(inspection))
+            }
         }
     }
 
@@ -3288,7 +3357,7 @@ impl Controller {
             BrowserAction::Navigate { .. } => {
                 required.insert(browser_read_capability(permission_decision)?);
             }
-            BrowserAction::SubmitForm { .. } => {
+            BrowserAction::SubmitForm { .. } | BrowserAction::SubmitFormWithValues { .. } => {
                 let method = &approved_form
                     .ok_or_else(|| {
                         ControllerError::InvalidPlan(
@@ -4143,13 +4212,122 @@ impl Controller {
         server_relative_path: &Path,
         database_filename: &str,
     ) -> Result<ControllerManagedLoopbackApp, ControllerError> {
+        self.start_managed_loopback_app_inner(
+            session,
+            runtime,
+            generation,
+            ManagedLoopbackLaunch::Python {
+                server_relative_path,
+                database_filename,
+            },
+        )
+    }
+
+    /// Configures the Controller-owned, digest-pinned Node executable for typed managed launches.
+    /// The Plan may choose the Node runtime but cannot select or replace this executable.
+    /// Reconfigure after recovery, before the first Node launch.
+    pub fn configure_managed_node_executable(
+        &mut self,
+        command_policy: &sovereign_policy::CommandPolicy,
+        executable: &Path,
+    ) -> Result<(), ControllerError> {
+        let pinned = command_policy.pinned_executable(executable)?;
+        self.managed_node_executable = Some(pinned.path.clone());
+        Ok(())
+    }
+
+    /// Pins the Controller's local PostgreSQL socket and dedicated `sovereign_app` database OID.
+    /// The Plan cannot supply or override either value. Reconfigure after Controller recovery.
+    #[cfg(unix)]
+    pub fn configure_managed_postgres_backend(
+        &mut self,
+        backend_socket: &Path,
+        database_oid: u32,
+    ) -> Result<(), ControllerError> {
+        if !backend_socket.is_absolute() || database_oid == 0 {
+            return Err(ControllerError::NotReady(
+                "managed PostgreSQL needs an absolute socket and nonzero database OID".to_owned(),
+            ));
+        }
+        let metadata = fs::symlink_metadata(backend_socket)?;
+        if !std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type()) {
+            return Err(ControllerError::NotReady(
+                "managed PostgreSQL endpoint is not a Unix socket".to_owned(),
+            ));
+        }
+        self.managed_postgres_backend = Some(PostgresBrokerConfig {
+            backend_socket: backend_socket.to_path_buf(),
+            database_oid,
+        });
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    #[cfg(unix)]
+    fn commit_managed_postgres_network_grant(
+        &mut self,
+        action: &AuthorizedBrowserAction,
+        manifest: &ToolManifest,
+        decision: &PermissionDecision,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), ControllerError> {
+        self.prepare_action_for_dispatch(action, manifest, decision)?;
+        let receipt = serde_json::to_vec(&serde_json::json!({
+            "schema": "controller.postgres_broker_network_grant.v1",
+            "action_id": action.action_id,
+            "destination_digest": action.destination_digest,
+            "execution_identity_digest": action.isolation_policy_digest,
+            "outcome": "authority_recorded_no_network_dispatched",
+        }))?;
+        let mut journal = ActionJournal::new(&mut self.state);
+        journal.transition(action, ActionState::Authorized, ActionState::Dispatched)?;
+        journal.observe_with_receipt(action, artifacts, &receipt)?;
+        journal.commit_with_bound_result(action, ActionState::Observed)?;
+        Ok(())
+    }
+
+    fn start_managed_loopback_app_inner<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        session: &ControllerBrowserSession,
+        runtime: &ExecutionRuntime<'_, I>,
+        generation: u32,
+        launch: ManagedLoopbackLaunch<'_>,
+    ) -> Result<ControllerManagedLoopbackApp, ControllerError> {
         self.require_execution_not_paused()?;
         if generation == 0 {
             return Err(ControllerError::NotReady(
                 "managed loopback generation must be positive".to_owned(),
             ));
         }
-        validate_managed_relative_file(server_relative_path, "server")?;
+        let database_filename = match &launch {
+            ManagedLoopbackLaunch::Python {
+                server_relative_path,
+                database_filename,
+            } => {
+                validate_managed_relative_file(server_relative_path, "server")?;
+                *database_filename
+            }
+            ManagedLoopbackLaunch::Node {
+                working_directory_relative_path,
+                entrypoint_relative_path,
+                persistence,
+                ..
+            } => {
+                if *working_directory_relative_path != Path::new(".") {
+                    validate_managed_relative_file(
+                        working_directory_relative_path,
+                        "working directory",
+                    )?;
+                }
+                validate_managed_relative_file(entrypoint_relative_path, "entrypoint")?;
+                match persistence {
+                    BrowserManagedPersistenceBindingV1::ArgvFlag { filename, .. } => {
+                        filename.as_str()
+                    }
+                    BrowserManagedPersistenceBindingV1::PostgresBrokerV1 { .. } => "sovereign_app",
+                }
+            }
+        };
         validate_managed_database_filename(database_filename)?;
         let current_epoch = self.state.current_execution_epoch()?;
         let active = self.active_ref()?;
@@ -4200,6 +4378,24 @@ impl Controller {
                 "managed loopback app requires process_exec capability".to_owned(),
             )));
         }
+        let postgres_permission_decision = if matches!(
+            &launch,
+            ManagedLoopbackLaunch::Node {
+                persistence: BrowserManagedPersistenceBindingV1::PostgresBrokerV1 { .. },
+                ..
+            }
+        ) {
+            let decision =
+                self.validate_browser_session_for_action(session, &session.tool_manifest)?;
+            if !decision.effective.contains(Capability::NetworkWrite) {
+                return Err(ControllerError::Policy(PolicyError::Denied(
+                    "managed PostgreSQL broker requires network_write capability".to_owned(),
+                )));
+            }
+            Some(decision)
+        } else {
+            None
+        };
 
         let repository_root = self.task_execution_root(&session.task_id)?.canonicalize()?;
         let runtime_repository_root = runtime
@@ -4217,13 +4413,45 @@ impl Controller {
                     .to_owned(),
             )));
         }
-        let server_path = repository_root.join(server_relative_path);
+        let working_directory = match &launch {
+            ManagedLoopbackLaunch::Python { .. } => repository_root.clone(),
+            ManagedLoopbackLaunch::Node {
+                working_directory_relative_path,
+                ..
+            } => {
+                let directory = repository_root
+                    .join(working_directory_relative_path)
+                    .canonicalize()
+                    .map_err(|_| {
+                        ControllerError::NotReady(
+                            "managed Node working directory does not exist".to_owned(),
+                        )
+                    })?;
+                if !directory.starts_with(&repository_root) || !directory.is_dir() {
+                    return Err(ControllerError::NotReady(
+                        "managed Node working directory escaped the canonical repository"
+                            .to_owned(),
+                    ));
+                }
+                directory
+            }
+        };
+        let server_path = match &launch {
+            ManagedLoopbackLaunch::Python {
+                server_relative_path,
+                ..
+            } => repository_root.join(server_relative_path),
+            ManagedLoopbackLaunch::Node {
+                entrypoint_relative_path,
+                ..
+            } => working_directory.join(entrypoint_relative_path),
+        };
         let canonical_server_path = server_path.canonicalize().map_err(|_| {
             ControllerError::NotReady(
                 "managed loopback server path is not an existing regular file".to_owned(),
             )
         })?;
-        if !canonical_server_path.starts_with(&repository_root)
+        if !canonical_server_path.starts_with(&working_directory)
             || !canonical_server_path.is_file()
             || canonical_server_path.parent().is_none()
         {
@@ -4255,6 +4483,31 @@ impl Controller {
         fs::set_permissions(&data_root, fs::Permissions::from_mode(0o700))?;
         let data_root = data_root.canonicalize()?;
         let database_path = data_root.join(database_filename);
+        #[cfg(unix)]
+        let mut postgres_broker = if matches!(
+            &launch,
+            ManagedLoopbackLaunch::Node {
+                persistence: BrowserManagedPersistenceBindingV1::PostgresBrokerV1 { .. },
+                ..
+            }
+        ) {
+            let config = self.managed_postgres_backend.clone().ok_or_else(|| {
+                ControllerError::NotReady(
+                    "Controller-owned PostgreSQL backend is not configured".to_owned(),
+                )
+            })?;
+            Some(ControllerPostgresBroker::prepare(config).map_err(|error| {
+                ControllerError::NotReady(format!(
+                    "Controller-owned PostgreSQL broker refused to prepare: {error}"
+                ))
+            })?)
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let postgres_broker_port: Option<u16> = None;
+        #[cfg(unix)]
+        let postgres_broker_port = postgres_broker.as_ref().map(ControllerPostgresBroker::port);
         let isolation = LoopbackServerIsolationRequestV1 {
             task_loopback_grant: grant.clone(),
             repository_root: repository_root.clone(),
@@ -4264,6 +4517,7 @@ impl Controller {
                 .isolation_request
                 .extra_protected_read_roots
                 .clone(),
+            postgres_broker_port,
             now_ms: unix_millis()?,
         };
         let isolation_policy_digest = isolation
@@ -4271,21 +4525,68 @@ impl Controller {
             .map_err(|error| managed_loopback_policy_error(&error))?;
         let server_backend = MacLoopbackServerSandboxExecBackend::detect()
             .map_err(|error| managed_loopback_policy_error(&error))?;
-        let python = runtime
-            .command_policy
-            .pinned_executable(runtime.python_executable)?;
-        let args = vec![
-            "-B".to_owned(),
-            canonical_server_path.display().to_string(),
-            "--host".to_owned(),
-            "127.0.0.1".to_owned(),
-            "--port".to_owned(),
-            grant.port.to_string(),
-            "--db".to_owned(),
-            database_path.display().to_string(),
-        ];
+        let (pinned, args, readiness) = match &launch {
+            ManagedLoopbackLaunch::Python { .. } => (
+                runtime
+                    .command_policy
+                    .pinned_executable(runtime.python_executable)?,
+                vec![
+                    "-B".to_owned(),
+                    canonical_server_path.display().to_string(),
+                    "--host".to_owned(),
+                    "127.0.0.1".to_owned(),
+                    "--port".to_owned(),
+                    grant.port.to_string(),
+                    "--db".to_owned(),
+                    database_path.display().to_string(),
+                ],
+                None,
+            ),
+            ManagedLoopbackLaunch::Node {
+                executable,
+                argv,
+                dynamic_port,
+                readiness,
+                persistence,
+                ..
+            } => {
+                let BrowserManagedArgBindingV1::ArgvFlag { flag: port_flag } = dynamic_port;
+                let (data_flag, data_value) = match persistence {
+                    BrowserManagedPersistenceBindingV1::ArgvFlag { flag, .. } => {
+                        (flag, database_path.display().to_string())
+                    }
+                    BrowserManagedPersistenceBindingV1::PostgresBrokerV1 { flag } => {
+                        let broker_port = postgres_broker_port.ok_or_else(|| {
+                            ControllerError::NotReady(
+                                "PostgreSQL broker is unavailable for managed app".to_owned(),
+                            )
+                        })?;
+                        (
+                            flag,
+                            format!(
+                                "postgresql://sovereign_app_runtime@127.0.0.1:{broker_port}/sovereign_app"
+                            ),
+                        )
+                    }
+                };
+                let mut args = Vec::with_capacity(argv.len() + 5);
+                args.push(canonical_server_path.display().to_string());
+                args.extend(argv.iter().cloned());
+                args.extend([
+                    port_flag.clone(),
+                    grant.port.to_string(),
+                    data_flag.clone(),
+                    data_value,
+                ]);
+                (
+                    runtime.command_policy.pinned_executable(executable)?,
+                    args,
+                    Some(*readiness),
+                )
+            }
+        };
         let isolated = server_backend
-            .isolate(&python.path, &args, &isolation)
+            .isolate(&pinned.path, &args, &isolation)
             .map_err(|error| managed_loopback_policy_error(&error))?;
         let managed_deadline_base = Instant::now();
         let managed_now_ms = unix_millis()?;
@@ -4310,9 +4611,9 @@ impl Controller {
                 )
             })?;
         let command = CommandSpec {
-            executable: python.path.clone(),
+            executable: pinned.path.clone(),
             args,
-            working_directory: repository_root.clone(),
+            working_directory,
             environment: BTreeMap::new(),
             mode: CommandMode::Direct,
             declared_risk: CommandRisk::RepositoryMutation,
@@ -4341,10 +4642,125 @@ impl Controller {
                 .saturating_add(60_000),
         )?;
         let grant_digest = digest_json(&serde_json::to_value(&grant)?)?;
+        #[cfg(unix)]
+        let destination_digest = if let Some(broker_port) = postgres_broker_port {
+            let config = self.managed_postgres_backend.as_ref().ok_or_else(|| {
+                ControllerError::NotReady("PostgreSQL backend configuration disappeared".to_owned())
+            })?;
+            digest_json(&serde_json::json!({
+                "loopback_grant_digest": grant_digest,
+                "postgres_broker_port": broker_port,
+                "postgres_database": "sovereign_app",
+                "postgres_role": "sovereign_app_runtime",
+                "postgres_database_oid": config.database_oid,
+                "postgres_backend_socket": config.backend_socket,
+            }))?
+        } else {
+            grant_digest.clone()
+        };
+        #[cfg(not(unix))]
+        let destination_digest = grant_digest.clone();
         let repository_id = active
             .single_task_repository(&session.task_id)?
             .repository_id
             .clone();
+        let active_policy_digest = active.policy_digest.clone();
+        #[cfg(unix)]
+        if let Some(broker) = postgres_broker.as_ref() {
+            let browser_decision = postgres_permission_decision.as_ref().ok_or_else(|| {
+                ControllerError::NotReady(
+                    "PostgreSQL broker lost browser network authority".to_owned(),
+                )
+            })?;
+            let config = self.managed_postgres_backend.as_ref().ok_or_else(|| {
+                ControllerError::NotReady("PostgreSQL backend configuration disappeared".to_owned())
+            })?;
+            let (socket_device, socket_inode, socket_owner) = broker.backend_identity();
+            let broker_destination_digest = digest_json(&serde_json::json!({
+                "schema": "controller.postgres_broker_destination.v1",
+                "database": "sovereign_app",
+                "role": "sovereign_app_runtime",
+                "database_oid": config.database_oid,
+                "socket": config.backend_socket,
+                "socket_device": socket_device,
+                "socket_inode": socket_inode,
+                "socket_owner": socket_owner,
+                "task_loopback_grant_digest": grant_digest,
+                "generation": generation,
+            }))?;
+            let broker_isolation_digest = digest_json(&serde_json::json!({
+                "schema": "controller.postgres_broker_execution.v1",
+                "destination_digest": broker_destination_digest,
+                "executable_digest": pinned.sha256,
+                "entrypoint": canonical_server_path,
+                "repository_root": repository_root,
+            }))?;
+            let broker_action_id =
+                format!("managed-postgres-broker.{}", &generation_binding[7..27]);
+            let broker_expires_at_ms =
+                self.approval_bound_action_expiry(&broker_action_id, expires_at_ms)?;
+            let network_action = AuthorizedBrowserAction {
+                action_id: broker_action_id.clone(),
+                plan_id: session.plan_id.clone(),
+                plan_revision: session.plan_revision,
+                task_id: session.task_id.clone(),
+                attempt_id: session.attempt_id.clone(),
+                tool_id: session.tool_manifest.tool_id.clone(),
+                tool_version: session.tool_manifest.version.clone(),
+                tool_digest: session.tool_manifest.content_digest.clone(),
+                repository_id: repository_id.clone(),
+                destination_digest: Some(broker_destination_digest.clone()),
+                execution_epoch: session.execution_epoch,
+                policy_digest: active_policy_digest.clone(),
+                permission_decision_digest: browser_decision.digest(),
+                isolation_policy_digest: broker_isolation_digest.clone(),
+                nonce: format!("nonce.{broker_action_id}"),
+                expires_at_ms: broker_expires_at_ms,
+                browser_action_digest: broker_isolation_digest,
+                required_capabilities: BTreeSet::from([
+                    Capability::BrowserInteractive,
+                    Capability::NetworkWrite,
+                ]),
+                permission_class: Capability::NetworkWrite,
+                approval_required: self.approval_required_for_task_permission(
+                    &session.task_id,
+                    Capability::NetworkWrite,
+                )?,
+                reconciliation_mode: ReconciliationMode::UnsafeSideEffect,
+                declared_risk: CommandRisk::RepositoryMutation,
+                action_deadline_ms: MANAGED_LOOPBACK_MAX_LIFETIME_MS,
+                output_bytes: 1024,
+            };
+            if let Some(record) = self.state.action_record(&broker_action_id)? {
+                if record.state == ActionState::Committed.as_str() {
+                    network_action.validate(unix_millis()?)?;
+                    network_action.verify_permission_decision(browser_decision)?;
+                    if record.payload_digest != network_action.payload_digest()
+                        || record.policy_digest != network_action.policy_digest
+                        || record.execution_epoch != network_action.execution_epoch
+                        || record.result_digest.is_none()
+                    {
+                        return Err(ControllerError::NotReady(
+                            "committed PostgreSQL broker authority drifted".to_owned(),
+                        ));
+                    }
+                } else {
+                    self.commit_managed_postgres_network_grant(
+                        &network_action,
+                        &session.tool_manifest,
+                        browser_decision,
+                        runtime.artifacts,
+                    )?;
+                }
+            } else {
+                self.commit_managed_postgres_network_grant(
+                    &network_action,
+                    &session.tool_manifest,
+                    browser_decision,
+                    runtime.artifacts,
+                )?;
+            }
+        }
         let authorized = AuthorizedAction {
             action_id: action_id.clone(),
             plan_id: session.plan_id.clone(),
@@ -4354,12 +4770,12 @@ impl Controller {
             tool_id: runtime.tool_manifest.tool_id.clone(),
             tool_version: runtime.tool_manifest.version.clone(),
             tool_digest: runtime.tool_manifest.content_digest.clone(),
-            executable_digest: python.sha256.clone(),
+            executable_digest: pinned.sha256.clone(),
             repository_id,
-            destination_digest: Some(grant_digest.clone()),
+            destination_digest: Some(destination_digest),
             permission_class: Capability::ProcessExec,
             execution_epoch: session.execution_epoch,
-            policy_digest: active.policy_digest.clone(),
+            policy_digest: active_policy_digest,
             permission_decision_digest: permission_decision.digest(),
             isolation_policy_digest: isolation_policy_digest.clone(),
             nonce: format!("nonce.{action_id}"),
@@ -4384,7 +4800,26 @@ impl Controller {
                 managed_deadline,
             )?
         };
-        let ready = wait_for_managed_loopback_health(&mut process, grant.port);
+        #[cfg(unix)]
+        let broker_ready = if let Some(broker) = &mut postgres_broker {
+            broker
+                .activate_for_process(
+                    process.process_group_id(),
+                    process.leader_identity().to_owned(),
+                    managed_deadline,
+                )
+                .map_err(|error| {
+                    ControllerError::NotReady(format!(
+                        "dispatched PostgreSQL broker activation failed: {error}"
+                    ))
+                })
+        } else {
+            Ok(())
+        };
+        #[cfg(not(unix))]
+        let broker_ready: Result<(), ControllerError> = Ok(());
+        let ready = broker_ready
+            .and_then(|()| wait_for_managed_loopback_health(&mut process, grant.port, readiness));
         if let Err(error) = ready {
             let cleanup = {
                 let mut journal = ActionJournal::new(&mut self.state);
@@ -4411,6 +4846,16 @@ impl Controller {
                 &mut process,
             )?
         };
+        #[cfg(unix)]
+        let postgres_database_oid = if postgres_broker_port.is_some() {
+            self.managed_postgres_backend
+                .as_ref()
+                .map(|config| config.database_oid)
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let postgres_database_oid = None;
         let binding = ManagedLoopbackAppBindingV1 {
             schema_version: MANAGED_LOOPBACK_APP_SCHEMA_VERSION,
             app_id: format!("managed-loopback.{}", &generation_binding[7..27]),
@@ -4426,7 +4871,13 @@ impl Controller {
             port: grant.port,
             repository_root: repository_root.display().to_string(),
             data_root: data_root.display().to_string(),
-            database_path: database_path.display().to_string(),
+            database_path: if postgres_broker_port.is_some() {
+                "postgresql:sovereign_app".to_owned()
+            } else {
+                database_path.display().to_string()
+            },
+            postgres_broker_port,
+            postgres_database_oid,
             start_action_id: action_id.clone(),
             start_result_digest,
             process_group_id,
@@ -4444,7 +4895,102 @@ impl Controller {
             &serde_json::to_value(&binding)?,
         )?;
         self.checkpoint_now()?;
-        Ok(ControllerManagedLoopbackApp { binding, process })
+        Ok(ControllerManagedLoopbackApp {
+            binding,
+            process,
+            #[cfg(unix)]
+            postgres_broker,
+        })
+    }
+
+    /// Starts one managed application generation using only the typed browser acceptance launch
+    /// contract already persisted in the active Plan IR. Callers select the generation number but
+    /// cannot substitute a server path, database filename, runtime ABI, host, or port.
+    ///
+    /// # Errors
+    /// Returns fail-closed for missing/stale Plan browser acceptance, unsupported runtime ABI,
+    /// generation overflow, loopback-grant drift, or any error from the governed managed-app path.
+    pub fn start_plan_managed_loopback_app<I: sovereign_policy::ExecutionIsolationBackend>(
+        &mut self,
+        session: &ControllerBrowserSession,
+        runtime: &ExecutionRuntime<'_, I>,
+        generation: u32,
+    ) -> Result<ControllerManagedLoopbackApp, ControllerError> {
+        let contract = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&session.task_id).ok_or_else(|| {
+                ControllerError::NotReady("browser launch task disappeared".to_owned())
+            })?;
+            browser_acceptance_contract(&task.task)?.ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "browser launch requires a typed Plan IR browser_acceptance contract"
+                        .to_owned(),
+                )
+            })?
+        };
+        if generation == 0 || generation > contract.launch.required_generations() {
+            return Err(ControllerError::InvalidPlan(format!(
+                "browser launch generation {generation} exceeds Plan IR required_generations {}",
+                contract.launch.required_generations()
+            )));
+        }
+        let grant = session
+            .task_loopback_grants
+            .iter()
+            .find(|grant| grant.resource_lease_id == session.resource_lease.lease_id)
+            .ok_or_else(|| {
+                ControllerError::NotReady(
+                    "browser launch lost exact task-loopback grant".to_owned(),
+                )
+            })?;
+        if grant.port != contract.loopback.port {
+            return Err(ControllerError::InvalidPlan(
+                "browser launch Plan IR loopback port differs from exact Controller grant"
+                    .to_owned(),
+            ));
+        }
+        match &contract.launch {
+            BrowserManagedAppLaunchV1::PythonManagedServerV1 {
+                server_relative_path,
+                database_filename,
+                ..
+            } => self.start_managed_loopback_app(
+                session,
+                runtime,
+                generation,
+                Path::new(server_relative_path),
+                database_filename,
+            ),
+            BrowserManagedAppLaunchV1::NodeManagedServerV1 {
+                working_directory_relative_path,
+                entrypoint_relative_path,
+                argv,
+                dynamic_port,
+                readiness,
+                persistence,
+                ..
+            } => {
+                let executable = self.managed_node_executable.clone().ok_or_else(|| {
+                    ControllerError::NotReady(
+                        "Controller-owned Node executable is not configured".to_owned(),
+                    )
+                })?;
+                self.start_managed_loopback_app_inner(
+                    session,
+                    runtime,
+                    generation,
+                    ManagedLoopbackLaunch::Node {
+                        executable: &executable,
+                        working_directory_relative_path: Path::new(working_directory_relative_path),
+                        entrypoint_relative_path: Path::new(entrypoint_relative_path),
+                        argv,
+                        dynamic_port,
+                        readiness,
+                        persistence,
+                    },
+                )
+            }
+        }
     }
 
     /// Stops one exact Controller-owned loopback generation and proves physical group absence before
@@ -4476,6 +5022,14 @@ impl Controller {
         {
             let mut journal = ActionJournal::new(&mut self.state);
             runner.stop_managed(&mut journal, &mut app.process)?;
+        }
+        #[cfg(unix)]
+        if let Some(broker) = &mut app.postgres_broker {
+            broker.stop().map_err(|error| {
+                ControllerError::NotReady(format!(
+                    "managed PostgreSQL broker cleanup failed: {error}"
+                ))
+            })?;
         }
         "stopped".clone_into(&mut app.binding.state);
         self.state.put_state(
@@ -4566,23 +5120,29 @@ impl Controller {
         )
     }
 
-    /// Binds the selected local inventory profile's exact browser semantics to one live browser
-    /// task/attempt/session. Callers do not supply action expectations: the Controller derives the
-    /// canonical profile contract from the selected task and exact loopback grant.
+    /// Binds the active task's typed Plan IR browser acceptance semantics to one live browser
+    /// task/attempt/session. Callers do not supply action expectations: the Controller derives every
+    /// launch/action/restart expectation from the already-validated task contract and exact loopback
+    /// grant.
     ///
     /// # Errors
-    /// Fails closed when the task is not the selected inventory browser proof, session authority is
-    /// stale, or an existing durable semantic contract differs from the canonical contract.
-    pub fn bind_local_inventory_browser_semantics(
+    /// Fails closed when the task lacks browser acceptance, session authority is stale, Plan IR
+    /// loopback authority differs from the exact grant, or a durable semantic contract drifts.
+    pub fn bind_plan_browser_semantics(
         &mut self,
         session: &ControllerBrowserSession,
     ) -> Result<String, ControllerError> {
         let active = self.active_ref()?;
         let task = active.tasks.get(&session.task_id).ok_or_else(|| {
-            ControllerError::NotReady("inventory semantic task disappeared".to_owned())
+            ControllerError::NotReady("browser semantic task disappeared".to_owned())
         })?;
         let attempt = active.attempts.get(&session.attempt_id).ok_or_else(|| {
-            ControllerError::NotReady("inventory semantic attempt disappeared".to_owned())
+            ControllerError::NotReady("browser semantic attempt disappeared".to_owned())
+        })?;
+        let plan_contract = browser_acceptance_contract(&task.task)?.ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "browser semantic binding requires typed Plan IR browser_acceptance".to_owned(),
+            )
         })?;
         if active.plan_id != session.plan_id
             || active.revision != session.plan_revision
@@ -4590,17 +5150,16 @@ impl Controller {
             || attempt.task_id != session.task_id
             || attempt.state != AttemptState::Executing
             || task.state != TaskState::Running
-            || !browser_task_has_inventory_symbol(&task.task)?
         {
             return Err(ControllerError::NotReady(
-                "local inventory semantic binding requires the exact Running/Executing selected browser task"
+                "browser semantic binding requires the exact Running/Executing Plan task"
                     .to_owned(),
             ));
         }
         let current_epoch = self.state.current_execution_epoch()?;
         if current_epoch != session.execution_epoch {
             return Err(ControllerError::NotReady(
-                "local inventory semantic binding execution epoch is stale".to_owned(),
+                "browser semantic binding execution epoch is stale".to_owned(),
             ));
         }
         let grant = session
@@ -4609,12 +5168,19 @@ impl Controller {
             .find(|grant| grant.resource_lease_id == session.resource_lease.lease_id)
             .ok_or_else(|| {
                 ControllerError::NotReady(
-                    "local inventory semantic binding lost exact task-loopback grant".to_owned(),
+                    "browser semantic binding lost exact task-loopback grant".to_owned(),
                 )
             })?;
+        if grant.port != plan_contract.loopback.port {
+            return Err(ControllerError::InvalidPlan(
+                "browser semantic Plan IR loopback port differs from exact Controller grant"
+                    .to_owned(),
+            ));
+        }
+        let plan_contract_digest = digest_json(&serde_json::to_value(&plan_contract)?)?;
         let mut contract = BrowserSemanticContractV1 {
             schema_version: BROWSER_SEMANTIC_CONTRACT_SCHEMA_VERSION,
-            profile: LOCAL_INVENTORY_BROWSER_PROFILE.to_owned(),
+            plan_contract_digest,
             plan_id: session.plan_id.clone(),
             plan_revision: session.plan_revision,
             task_id: session.task_id.clone(),
@@ -4624,8 +5190,8 @@ impl Controller {
             browser_lease_id: session.browser_lease.lease_id.clone(),
             browser_binding_digest: session.browser_lease.binding_digest(),
             loopback_port: grant.port,
-            steps: local_inventory_semantic_steps(grant.port),
-            required_managed_generations: 2,
+            steps: plan_browser_semantic_steps(&plan_contract)?,
+            required_managed_generations: plan_contract.launch.required_generations(),
             contract_digest: String::new(),
         };
         contract.contract_digest = browser_semantic_contract_digest(&contract)?;
@@ -4637,7 +5203,7 @@ impl Controller {
             let durable: BrowserSemanticContractV1 = serde_json::from_str(&existing)?;
             if durable != contract {
                 return Err(ControllerError::NotReady(
-                    "durable browser semantic contract differs from canonical inventory contract"
+                    "durable browser semantic contract differs from typed Plan IR contract"
                         .to_owned(),
                 ));
             }
@@ -4657,7 +5223,68 @@ impl Controller {
         Ok(contract.contract_digest)
     }
 
-    fn inventory_semantic_contract_for_session(
+    /// Returns the exact ordered browser actions and generation boundaries encoded in the active
+    /// Plan IR browser acceptance contract. The returned actions are already bound to the exact
+    /// Controller loopback grant; callers do not construct URLs, selectors, payload digests, or
+    /// restart boundaries themselves.
+    ///
+    /// # Errors
+    /// Returns fail-closed for stale session/task authority, missing typed acceptance, or loopback
+    /// port drift.
+    pub fn plan_browser_actions_for_session(
+        &self,
+        session: &ControllerBrowserSession,
+    ) -> Result<Vec<ControllerBrowserPlannedAction>, ControllerError> {
+        let active = self.active_ref()?;
+        let task = active.tasks.get(&session.task_id).ok_or_else(|| {
+            ControllerError::NotReady("browser action-plan task disappeared".to_owned())
+        })?;
+        let attempt = active.attempts.get(&session.attempt_id).ok_or_else(|| {
+            ControllerError::NotReady("browser action-plan attempt disappeared".to_owned())
+        })?;
+        if active.plan_id != session.plan_id
+            || active.revision != session.plan_revision
+            || task.task_contract_digest != session.task_contract_digest
+            || task.state != TaskState::Running
+            || attempt.task_id != session.task_id
+            || attempt.state != AttemptState::Executing
+        {
+            return Err(ControllerError::NotReady(
+                "browser action plan requires exact Running/Executing session authority".to_owned(),
+            ));
+        }
+        let contract = browser_acceptance_contract(&task.task)?.ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "browser action plan requires typed Plan IR browser_acceptance".to_owned(),
+            )
+        })?;
+        let grant = session
+            .task_loopback_grants
+            .iter()
+            .find(|grant| grant.resource_lease_id == session.resource_lease.lease_id)
+            .ok_or_else(|| {
+                ControllerError::NotReady("browser action plan lost task-loopback grant".to_owned())
+            })?;
+        if grant.port != contract.loopback.port {
+            return Err(ControllerError::InvalidPlan(
+                "browser action Plan IR loopback port differs from exact Controller grant"
+                    .to_owned(),
+            ));
+        }
+        plan_browser_actions_from_contract(&contract)
+    }
+
+    /// Backward-compatible method name retained for callers compiled against the earlier focused
+    /// proof API. It now delegates exclusively to typed Plan IR semantics and performs no symbol,
+    /// title, application-name, or selector heuristic.
+    pub fn bind_local_inventory_browser_semantics(
+        &mut self,
+        session: &ControllerBrowserSession,
+    ) -> Result<String, ControllerError> {
+        self.bind_plan_browser_semantics(session)
+    }
+
+    fn plan_semantic_contract_for_session(
         &self,
         session: &ControllerBrowserSession,
     ) -> Result<Option<BrowserSemanticContractV1>, ControllerError> {
@@ -4665,21 +5292,21 @@ impl Controller {
         let task = active.tasks.get(&session.task_id).ok_or_else(|| {
             ControllerError::NotReady("browser semantic task disappeared".to_owned())
         })?;
-        if !browser_task_has_inventory_symbol(&task.task)? {
+        let Some(plan_contract) = browser_acceptance_contract(&task.task)? else {
             return Ok(None);
-        }
+        };
         let raw = self
             .state
             .get_state(BROWSER_SEMANTIC_CONTRACT_NAMESPACE, &session.attempt_id)?
             .ok_or_else(|| {
                 ControllerError::NotReady(
-                    "selected inventory browser task has no durable Controller semantic contract"
-                        .to_owned(),
+                    "typed browser task has no durable Controller semantic contract".to_owned(),
                 )
             })?;
         let contract: BrowserSemanticContractV1 = serde_json::from_str(&raw)?;
+        let plan_contract_digest = digest_json(&serde_json::to_value(&plan_contract)?)?;
         if contract.schema_version != BROWSER_SEMANTIC_CONTRACT_SCHEMA_VERSION
-            || contract.profile != LOCAL_INVENTORY_BROWSER_PROFILE
+            || contract.plan_contract_digest != plan_contract_digest
             || contract.plan_id != session.plan_id
             || contract.plan_revision != session.plan_revision
             || contract.task_id != session.task_id
@@ -4691,7 +5318,7 @@ impl Controller {
             || contract.contract_digest != browser_semantic_contract_digest(&contract)?
         {
             return Err(ControllerError::InvalidPlan(
-                "durable inventory browser semantic contract is malformed or stale".to_owned(),
+                "durable Plan-driven browser semantic contract is malformed or stale".to_owned(),
             ));
         }
         Ok(Some(contract))
@@ -4806,21 +5433,22 @@ impl Controller {
         })
     }
 
-    fn verify_and_persist_inventory_semantic_proof(
+    fn verify_and_persist_plan_semantic_proof(
         &mut self,
         session: &ControllerBrowserSession,
         receipts: &[BrowserActionReceipt],
         evidence_ids: &[String],
     ) -> Result<(), ControllerError> {
-        let Some(contract) = self.inventory_semantic_contract_for_session(session)? else {
+        let Some(contract) = self.plan_semantic_contract_for_session(session)? else {
             return Ok(());
         };
         if receipts.len() != contract.steps.len() || evidence_ids.len() != contract.steps.len() {
             return Err(ControllerError::NotReady(format!(
-                "inventory semantic proof requires exactly {} ordered receipts",
+                "Plan-driven browser semantic proof requires exactly {} ordered receipts",
                 contract.steps.len()
             )));
         }
+        let managed_generations = self.managed_generations_for_semantic_contract(&contract)?;
         let mut observed_steps = Vec::with_capacity(receipts.len());
         for ((receipt, expected), receipt_digest) in receipts
             .iter()
@@ -4832,37 +5460,84 @@ impl Controller {
                 || receipt.action_digest != expected.action_digest
             {
                 return Err(ControllerError::NotReady(format!(
-                    "inventory browser semantic action mismatch at {}",
+                    "Plan-driven browser semantic action mismatch at {}",
                     expected.action_id
                 )));
             }
+            let action = self
+                .state
+                .action_record(&expected.action_id)?
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!(
+                        "browser semantic proof lost action {}",
+                        expected.action_id
+                    ))
+                })?;
+            let generation = managed_generations
+                .iter()
+                .find(|generation| generation.generation == expected.generation)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!(
+                        "browser semantic step {} references missing managed generation {}",
+                        expected.action_id, expected.generation
+                    ))
+                })?;
+            if action.state != ActionState::Committed.as_str()
+                || action.execution_epoch != contract.execution_epoch
+                || action.result_digest.as_deref() != Some(receipt_digest.as_str())
+            {
+                return Err(ControllerError::NotReady(format!(
+                    "browser semantic action {} is not exact committed evidence",
+                    expected.action_id
+                )));
+            }
+            validate_browser_action_generation_sequence(
+                action.last_event_sequence,
+                generation,
+                &expected.action_id,
+            )?;
             let mut matched = Vec::new();
-            if !expected.required_synopsis_contains.is_empty() {
+            let mut verified_absent = Vec::new();
+            if !expected.required_synopsis_contains.is_empty()
+                || !expected.forbidden_synopsis_contains.is_empty()
+            {
                 let synopsis = receipt.synopsis.as_ref().ok_or_else(|| {
                     ControllerError::NotReady(format!(
-                        "inventory semantic synopsis {} is missing",
+                        "browser semantic synopsis {} is missing",
                         expected.action_id
                     ))
                 })?;
                 for predicate in &expected.required_synopsis_contains {
                     if !synopsis.text.contains(predicate) {
                         return Err(ControllerError::NotReady(format!(
-                            "inventory semantic synopsis {} lacks required predicate {predicate:?}",
+                            "browser semantic synopsis {} lacks required predicate {predicate:?}",
                             expected.action_id
                         )));
                     }
                     matched.push(predicate.clone());
+                }
+                for predicate in &expected.forbidden_synopsis_contains {
+                    if synopsis.text.contains(predicate) {
+                        return Err(ControllerError::NotReady(format!(
+                            "browser semantic synopsis {} contains forbidden predicate {predicate:?}",
+                            expected.action_id
+                        )));
+                    }
+                    verified_absent.push(predicate.clone());
                 }
             }
             observed_steps.push(BrowserSemanticObservedStepV1 {
                 action_id: receipt.action_id.clone(),
                 action_kind: receipt.action_kind.clone(),
                 action_digest: receipt.action_digest.clone(),
+                generation: expected.generation,
+                semantic: expected.semantic,
+                committed_sequence: action.last_event_sequence,
                 receipt_digest: receipt_digest.clone(),
                 matched_synopsis_predicates: matched,
+                verified_absent_synopsis_predicates: verified_absent,
             });
         }
-        let managed_generations = self.managed_generations_for_semantic_contract(&contract)?;
         let mut proof = BrowserSemanticProofV1 {
             schema_version: BROWSER_SEMANTIC_PROOF_SCHEMA_VERSION,
             contract_digest: contract.contract_digest.clone(),
@@ -4909,7 +5584,7 @@ impl Controller {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn validate_durable_inventory_semantic_proof(
+    fn validate_durable_plan_semantic_proof(
         &self,
         artifacts: &ArtifactStore,
         attempt_id: &str,
@@ -4918,6 +5593,18 @@ impl Controller {
         task_id: &str,
         task_contract_digest: &str,
     ) -> Result<BrowserSemanticProofV1, ControllerError> {
+        let plan_contract = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(task_id).ok_or_else(|| {
+                ControllerError::NotReady("browser verification resume task disappeared".to_owned())
+            })?;
+            browser_acceptance_contract(&task.task)?.ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "browser verification resume task lost typed Plan IR acceptance".to_owned(),
+                )
+            })?
+        };
+        let plan_contract_digest = digest_json(&serde_json::to_value(&plan_contract)?)?;
         let raw_contract = self
             .state
             .get_state(BROWSER_SEMANTIC_CONTRACT_NAMESPACE, attempt_id)?
@@ -4928,7 +5615,7 @@ impl Controller {
             })?;
         let contract: BrowserSemanticContractV1 = serde_json::from_str(&raw_contract)?;
         if contract.schema_version != BROWSER_SEMANTIC_CONTRACT_SCHEMA_VERSION
-            || contract.profile != LOCAL_INVENTORY_BROWSER_PROFILE
+            || contract.plan_contract_digest != plan_contract_digest
             || contract.plan_id != plan_id
             || contract.plan_revision != plan_revision
             || contract.task_id != task_id
@@ -4967,6 +5654,13 @@ impl Controller {
                 "browser verification resume semantic proof is malformed or stale".to_owned(),
             ));
         }
+        let current_generations = self.managed_generations_for_semantic_contract(&contract)?;
+        if current_generations != proof.managed_generations {
+            return Err(ControllerError::NotReady(
+                "browser verification managed restart proof drifted after semantic binding"
+                    .to_owned(),
+            ));
+        }
 
         for (((expected, observed), evidence_id), index) in contract
             .steps
@@ -4978,8 +5672,12 @@ impl Controller {
             if observed.action_id != expected.action_id
                 || observed.action_kind != expected.action_kind
                 || observed.action_digest != expected.action_digest
+                || observed.generation != expected.generation
+                || observed.semantic != expected.semantic
                 || observed.receipt_digest != *evidence_id
                 || observed.matched_synopsis_predicates != expected.required_synopsis_contains
+                || observed.verified_absent_synopsis_predicates
+                    != expected.forbidden_synopsis_contains
             {
                 return Err(ControllerError::InvalidPlan(format!(
                     "browser verification resume semantic step {index} drifted from canonical contract"
@@ -4994,15 +5692,30 @@ impl Controller {
                         expected.action_id
                     ))
                 })?;
+            let generation = current_generations
+                .iter()
+                .find(|generation| generation.generation == expected.generation)
+                .ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!(
+                        "browser verification resume lost managed generation {}",
+                        expected.generation
+                    ))
+                })?;
             if action.state != ActionState::Committed.as_str()
                 || action.execution_epoch != proof.execution_epoch
                 || action.result_digest.as_deref() != Some(evidence_id.as_str())
+                || action.last_event_sequence != observed.committed_sequence
             {
                 return Err(ControllerError::NotReady(format!(
                     "browser verification resume action {} is no longer exact committed evidence",
                     expected.action_id
                 )));
             }
+            validate_browser_action_generation_sequence(
+                observed.committed_sequence,
+                generation,
+                &expected.action_id,
+            )?;
             let metadata = self.state.artifact_metadata(evidence_id)?.ok_or_else(|| {
                 ControllerError::InvalidPlan(format!(
                     "browser verification resume lost receipt artifact {evidence_id}"
@@ -5031,7 +5744,9 @@ impl Controller {
                     expected.action_id
                 )));
             }
-            if !expected.required_synopsis_contains.is_empty() {
+            if !expected.required_synopsis_contains.is_empty()
+                || !expected.forbidden_synopsis_contains.is_empty()
+            {
                 let text = required_str(&receipt_json, "/synopsis/text")?;
                 if expected
                     .required_synopsis_contains
@@ -5043,14 +5758,17 @@ impl Controller {
                         expected.action_id
                     )));
                 }
+                if expected
+                    .forbidden_synopsis_contains
+                    .iter()
+                    .any(|predicate| text.contains(predicate))
+                {
+                    return Err(ControllerError::NotReady(format!(
+                        "browser verification durable synopsis {} contains a forbidden semantic predicate",
+                        expected.action_id
+                    )));
+                }
             }
-        }
-        let current_generations = self.managed_generations_for_semantic_contract(&contract)?;
-        if current_generations != proof.managed_generations {
-            return Err(ControllerError::NotReady(
-                "browser verification managed restart proof drifted after semantic binding"
-                    .to_owned(),
-            ));
         }
         Ok(proof)
     }
@@ -5065,6 +5783,13 @@ impl Controller {
                 "browser verification requires at least one committed browser receipt".to_owned(),
             ));
         }
+        let typed_plan_acceptance = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&session.task_id).ok_or_else(|| {
+                ControllerError::NotReady("browser verification task disappeared".to_owned())
+            })?;
+            browser_task_has_plan_acceptance(&task.task)?
+        };
         let mut action_kinds = BTreeSet::new();
         let mut evidence_ids = Vec::with_capacity(receipts.len());
         for receipt in receipts {
@@ -5094,9 +5819,10 @@ impl Controller {
             action_kinds.insert(receipt.action_kind.as_str());
             evidence_ids.push(receipt_digest);
         }
-        if !["navigate", "submit_form", "capture_synopsis"]
-            .iter()
-            .all(|kind| action_kinds.contains(kind))
+        if !typed_plan_acceptance
+            && !["navigate", "submit_form", "capture_synopsis"]
+                .iter()
+                .all(|kind| action_kinds.contains(kind))
         {
             return Err(ControllerError::NotReady(
                 "browser verification requires committed navigate, submit_form, and capture_synopsis evidence"
@@ -5124,17 +5850,17 @@ impl Controller {
         runtime: &ExecutionRuntime<'_, I>,
         receipts: &[BrowserActionReceipt],
     ) -> Result<VerificationResultV1, ControllerError> {
-        let inventory_profile = {
+        let plan_acceptance = {
             let active = self.active_ref()?;
             let task = active.tasks.get(&session.task_id).ok_or_else(|| {
                 ControllerError::NotReady("browser verification task disappeared".to_owned())
             })?;
-            browser_task_has_inventory_symbol(&task.task)?
+            browser_task_has_plan_acceptance(&task.task)?
         };
-        if inventory_profile {
+        if plan_acceptance {
             let task_id = session.task_id.clone();
-            self.prepare_local_inventory_browser_verification(session, receipts)?;
-            return self.resume_local_inventory_browser_verification(runtime, &task_id);
+            self.prepare_plan_browser_verification(session, receipts)?;
+            return self.resume_plan_browser_verification(runtime, &task_id);
         }
         let _residency = self.live_browser_residency_for_session(&session)?;
         let browser_evidence_ids = self.verify_browser_receipts_for_session(&session, receipts)?;
@@ -5154,26 +5880,22 @@ impl Controller {
         )
     }
 
-    /// Records complete selected-profile semantic proof, moves the exact browser task/attempt into
+    /// Records complete Plan-driven semantic proof, moves the exact browser task/attempt into
     /// `Verifying`, checkpoints, and physically shuts down Chrome. No deterministic verification is
     /// run here. A fresh Controller process can continue with
-    /// [`Self::resume_local_inventory_browser_verification`] using only durable state/CAS.
+    /// [`Self::resume_plan_browser_verification`] using only durable state/CAS.
     ///
     /// # Errors
     /// Fails closed before task completion for semantic/receipt drift, incomplete managed restart
     /// proof, stale authority, or browser shutdown ambiguity.
-    pub fn prepare_local_inventory_browser_verification(
+    pub fn prepare_plan_browser_verification(
         &mut self,
         session: ControllerBrowserSession,
         receipts: &[BrowserActionReceipt],
     ) -> Result<(), ControllerError> {
         let _residency = self.live_browser_residency_for_session(&session)?;
         let browser_evidence_ids = self.verify_browser_receipts_for_session(&session, receipts)?;
-        self.verify_and_persist_inventory_semantic_proof(
-            &session,
-            receipts,
-            &browser_evidence_ids,
-        )?;
+        self.verify_and_persist_plan_semantic_proof(&session, receipts, &browser_evidence_ids)?;
         let task_id = session.task_id.clone();
         let attempt_id = session.attempt_id.clone();
         self.transition_attempt(&attempt_id, AttemptState::Verifying, "attempt_verifying")?;
@@ -5193,6 +5915,15 @@ impl Controller {
         Ok(())
     }
 
+    /// Backward-compatible focused-proof method name. This delegates to typed Plan IR semantics.
+    pub fn prepare_local_inventory_browser_verification(
+        &mut self,
+        session: ControllerBrowserSession,
+        receipts: &[BrowserActionReceipt],
+    ) -> Result<(), ControllerError> {
+        self.prepare_plan_browser_verification(session, receipts)
+    }
+
     /// Resumes selected-profile browser completion from durable Controller state after Chrome has
     /// already been proven absent. No browser action is dispatched and no committed POST can be
     /// replayed by this path.
@@ -5201,9 +5932,7 @@ impl Controller {
     /// Fails closed unless a unique exact Verifying attempt has a valid semantic contract/proof,
     /// every bound receipt still exists and verifies from CAS, all browser actions remain committed,
     /// both managed generations remain stopped, and durable browser residency is `Absent`.
-    pub fn resume_local_inventory_browser_verification<
-        I: sovereign_policy::ExecutionIsolationBackend,
-    >(
+    pub fn resume_plan_browser_verification<I: sovereign_policy::ExecutionIsolationBackend>(
         &mut self,
         runtime: &ExecutionRuntime<'_, I>,
         task_id: &str,
@@ -5220,10 +5949,10 @@ impl Controller {
             let task = active.tasks.get(task_id).ok_or_else(|| {
                 ControllerError::NotReady("browser resume task disappeared".to_owned())
             })?;
-            if task.state != TaskState::Verifying || !browser_task_has_inventory_symbol(&task.task)?
+            if task.state != TaskState::Verifying || !browser_task_has_plan_acceptance(&task.task)?
             {
                 return Err(ControllerError::NotReady(
-                    "browser resume requires the selected inventory task in Verifying state"
+                    "browser resume requires a typed Plan acceptance task in Verifying state"
                         .to_owned(),
                 ));
             }
@@ -5248,7 +5977,7 @@ impl Controller {
                 self.state.current_execution_epoch()?,
             )
         };
-        let proof = self.validate_durable_inventory_semantic_proof(
+        let proof = self.validate_durable_plan_semantic_proof(
             runtime.artifacts,
             &attempt_id,
             &plan_id,
@@ -5290,6 +6019,17 @@ impl Controller {
         )
     }
 
+    /// Backward-compatible focused-proof method name. This delegates to typed Plan IR semantics.
+    pub fn resume_local_inventory_browser_verification<
+        I: sovereign_policy::ExecutionIsolationBackend,
+    >(
+        &mut self,
+        runtime: &ExecutionRuntime<'_, I>,
+        task_id: &str,
+    ) -> Result<VerificationResultV1, ControllerError> {
+        self.resume_plan_browser_verification(runtime, task_id)
+    }
+
     fn finish_browser_task_verification<I: sovereign_policy::ExecutionIsolationBackend>(
         &mut self,
         runtime: &ExecutionRuntime<'_, I>,
@@ -5316,7 +6056,14 @@ impl Controller {
         }
         let command_results =
             self.run_required_command_verification(runtime, &task_id, &attempt_id)?;
-        if command_results.is_empty() {
+        let has_typed_browser_acceptance = {
+            let active = self.active_ref()?;
+            let task = active.tasks.get(&task_id).ok_or_else(|| {
+                ControllerError::NotReady("browser verification task disappeared".to_owned())
+            })?;
+            browser_task_has_plan_acceptance(&task.task)?
+        };
+        if command_results.is_empty() && !has_typed_browser_acceptance {
             return Err(ControllerError::InvalidPlan(
                 "browser verification task has no required deterministic command verification"
                     .to_owned(),
@@ -5488,93 +6235,147 @@ fn managed_generation_event_bounds(
     Ok((ready_sequence, stopped_sequence))
 }
 
-fn browser_task_has_inventory_symbol(task: &Value) -> Result<bool, ControllerError> {
-    Ok(required_array(task, "/scope/symbols")?
-        .iter()
-        .any(|value| value.as_str() == Some(LOCAL_INVENTORY_BROWSER_SYMBOL)))
+fn validate_browser_action_generation_sequence(
+    committed_sequence: i64,
+    generation: &BrowserSemanticManagedGenerationV1,
+    action_id: &str,
+) -> Result<(), ControllerError> {
+    if committed_sequence <= generation.ready_sequence
+        || committed_sequence >= generation.stopped_sequence
+    {
+        return Err(ControllerError::NotReady(format!(
+            "browser semantic action {action_id} committed outside managed generation {}",
+            generation.generation
+        )));
+    }
+    Ok(())
 }
 
-fn semantic_step(action: &BrowserAction, predicates: &[&str]) -> BrowserSemanticStepV1 {
+fn browser_acceptance_contract(
+    task: &Value,
+) -> Result<Option<BrowserAcceptanceContractV1>, ControllerError> {
+    let Some(raw) = task.get("browser_acceptance") else {
+        return Ok(None);
+    };
+    let contract: BrowserAcceptanceContractV1 = serde_json::from_value(raw.clone())?;
+    if contract.schema_version != BROWSER_ACCEPTANCE_CONTRACT_SCHEMA_VERSION {
+        return Err(ControllerError::InvalidPlan(
+            "browser acceptance contract schema version is unsupported".to_owned(),
+        ));
+    }
+    contract
+        .validate()
+        .map_err(|error| ControllerError::InvalidPlan(error.to_string()))?;
+    Ok(Some(contract))
+}
+
+fn browser_task_has_plan_acceptance(task: &Value) -> Result<bool, ControllerError> {
+    Ok(browser_acceptance_contract(task)?.is_some())
+}
+
+fn semantic_step(
+    action: &BrowserAction,
+    generation: u32,
+    semantic: BrowserAcceptanceSemanticV1,
+    required: &[String],
+    forbidden: &[String],
+) -> BrowserSemanticStepV1 {
     BrowserSemanticStepV1 {
         action_id: action.action_id().to_owned(),
         action_kind: action.kind_name().to_owned(),
         action_digest: action.digest(),
-        required_synopsis_contains: predicates.iter().map(|value| (*value).to_owned()).collect(),
+        generation,
+        semantic,
+        required_synopsis_contains: required.to_vec(),
+        forbidden_synopsis_contains: forbidden.to_vec(),
     }
 }
 
-fn semantic_submit(action_id: &str, selector: &str) -> BrowserAction {
+fn semantic_submit(
+    action_id: &str,
+    selector: &str,
+    fields: &[sovereign_plan::BrowserAcceptanceFieldValueV1],
+) -> Result<BrowserAction, ControllerError> {
+    if !fields.is_empty() {
+        let field_values = fields
+            .iter()
+            .map(|field| (field.selector.clone(), field.value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if field_values.len() != fields.len() {
+            return Err(ControllerError::InvalidPlan(
+                "browser form values contain duplicate field selectors".to_owned(),
+            ));
+        }
+        let field_values = BrowserFormFieldValues::new(field_values).map_err(|_| {
+            ControllerError::InvalidPlan(
+                "browser form values failed bounded nonsensitive field validation".to_owned(),
+            )
+        })?;
+        return Ok(BrowserAction::SubmitFormWithValues {
+            action_id: action_id.to_owned(),
+            selector: selector.to_owned(),
+            fields: field_values,
+        });
+    }
     let payload_digest = format!(
         "sha256:{:x}",
         Sha256::digest(format!("{action_id}\0{selector}").as_bytes())
     );
-    BrowserAction::SubmitForm {
+    Ok(BrowserAction::SubmitForm {
         action_id: action_id.to_owned(),
         selector: selector.to_owned(),
         payload_digest,
-    }
+    })
 }
 
-fn semantic_navigate(action_id: &str, url: &str) -> BrowserSemanticStepV1 {
-    semantic_step(
-        &BrowserAction::Navigate {
-            action_id: action_id.to_owned(),
-            url: url.to_owned(),
-        },
-        &[],
-    )
+fn plan_browser_actions_from_contract(
+    contract: &BrowserAcceptanceContractV1,
+) -> Result<Vec<ControllerBrowserPlannedAction>, ControllerError> {
+    let origin = format!(
+        "{}://{}:{}",
+        contract.loopback.scheme, contract.loopback.host, contract.loopback.port
+    );
+    contract
+        .steps
+        .iter()
+        .map(|step| {
+            let action = match &step.action {
+                BrowserAcceptanceActionV1::Navigate { path } => BrowserAction::Navigate {
+                    action_id: step.step_id.clone(),
+                    url: format!("{origin}{path}"),
+                },
+                BrowserAcceptanceActionV1::SubmitForm { selector, fields } => {
+                    semantic_submit(&step.step_id, selector, fields)?
+                }
+                BrowserAcceptanceActionV1::CaptureSynopsis => BrowserAction::CaptureSynopsis {
+                    action_id: step.step_id.clone(),
+                },
+            };
+            Ok(ControllerBrowserPlannedAction {
+                generation: step.generation,
+                semantic: step.expectation.semantic,
+                action,
+            })
+        })
+        .collect()
 }
 
-fn semantic_synopsis(action_id: &str, predicates: &[&str]) -> BrowserSemanticStepV1 {
-    semantic_step(
-        &BrowserAction::CaptureSynopsis {
-            action_id: action_id.to_owned(),
-        },
-        predicates,
-    )
-}
-
-fn semantic_submit_step(action_id: &str, selector: &str) -> BrowserSemanticStepV1 {
-    semantic_step(&semantic_submit(action_id, selector), &[])
-}
-
-fn local_inventory_semantic_steps(port: u16) -> Vec<BrowserSemanticStepV1> {
-    let origin = format!("http://127.0.0.1:{port}/");
-    let view = format!("{origin}view");
-    let search = format!("{origin}view?q=Widget%20Pro");
-    vec![
-        semantic_navigate("open-empty-inventory", &view),
-        semantic_synopsis("empty-synopsis", &["No inventory items"]),
-        semantic_navigate("open-invalid-create-form", &origin),
-        semantic_submit_step("reject-invalid-create", "form#invalid-create"),
-        semantic_synopsis(
-            "invalid-synopsis",
-            &["Validation error: name_required", "No inventory items"],
-        ),
-        semantic_navigate("return-after-invalid", &origin),
-        semantic_submit_step("create-widget", "form#create-widget"),
-        semantic_navigate("observe-created-widget", &view),
-        semantic_synopsis("created-synopsis", &["Widget", "quantity=3"]),
-        semantic_navigate("open-created-widget-form", &origin),
-        semantic_submit_step("edit-widget", "form#edit-1"),
-        semantic_navigate("observe-edited-widget", &view),
-        semantic_synopsis("edited-synopsis", &["Widget Pro", "quantity=5"]),
-        semantic_navigate("search-widget", &search),
-        semantic_synopsis(
-            "search-synopsis",
-            &["Search query: Widget Pro", "Widget Pro"],
-        ),
-        semantic_navigate("open-delete-widget-form", &origin),
-        semantic_submit_step("delete-widget", "form#delete-1"),
-        semantic_navigate("observe-deleted-widget", &view),
-        semantic_synopsis("deleted-synopsis", &["No inventory items"]),
-        semantic_navigate("open-persistent-create-form", &origin),
-        semantic_submit_step("create-persistent-widget", "form#create-widget"),
-        semantic_navigate("observe-persistent-seed", &view),
-        semantic_synopsis("persistent-seed", &["Widget"]),
-        semantic_navigate("open-after-app-restart", &view),
-        semantic_synopsis("restart-persistence-synopsis", &["Widget", "quantity=3"]),
-    ]
+fn plan_browser_semantic_steps(
+    contract: &BrowserAcceptanceContractV1,
+) -> Result<Vec<BrowserSemanticStepV1>, ControllerError> {
+    Ok(plan_browser_actions_from_contract(contract)?
+        .into_iter()
+        .zip(contract.steps.iter())
+        .map(|(planned, step)| {
+            semantic_step(
+                &planned.action,
+                planned.generation,
+                planned.semantic,
+                &step.expectation.required_contains,
+                &step.expectation.forbidden_contains,
+            )
+        })
+        .collect::<Vec<_>>())
 }
 
 fn browser_semantic_contract_digest(
@@ -5582,7 +6383,7 @@ fn browser_semantic_contract_digest(
 ) -> Result<String, ControllerError> {
     Ok(digest_json(&serde_json::json!({
         "schema_version": contract.schema_version,
-        "profile": contract.profile,
+        "plan_contract_digest": contract.plan_contract_digest,
         "plan_id": contract.plan_id,
         "plan_revision": contract.plan_revision,
         "task_id": contract.task_id,
@@ -5654,27 +6455,48 @@ fn validate_managed_database_filename(filename: &str) -> Result<(), ControllerEr
 fn wait_for_managed_loopback_health(
     process: &mut ManagedProcess,
     port: u16,
+    readiness: Option<&BrowserManagedReadinessV1>,
 ) -> Result<(), ControllerError> {
-    let deadline = Instant::now() + MANAGED_LOOPBACK_READY_TIMEOUT;
+    let timeout = readiness.map_or(MANAGED_LOOPBACK_READY_TIMEOUT, |rule| {
+        Duration::from_millis(u64::from(rule.timeout_ms))
+    });
+    let deadline = Instant::now() + timeout;
     let address = SocketAddr::from(([127, 0, 0, 1], port));
+    let path = readiness.map_or("/health", |rule| rule.path.as_str());
+    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     while Instant::now() < deadline {
         process.verify_live()?;
         if let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
             stream.set_read_timeout(Some(Duration::from_millis(200)))?;
             stream.set_write_timeout(Some(Duration::from_millis(200)))?;
-            stream.write_all(
-                b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-            )?;
-            let mut response = [0_u8; 1024];
-            if let Ok(read) = stream.read(&mut response)
-                && read > 0
-            {
-                let response = String::from_utf8_lossy(&response[..read]);
-                if (response.starts_with("HTTP/1.0 200 ") || response.starts_with("HTTP/1.1 200 "))
-                    && response.contains("\r\n\r\nok")
-                {
-                    return Ok(());
+            stream.write_all(request.as_bytes())?;
+            let mut response = Vec::with_capacity(1024);
+            let mut chunk = [0_u8; 256];
+            while response.len() < 1024 && Instant::now() < deadline {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => response.extend_from_slice(&chunk[..read]),
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::TimedOut
+                            || error.kind() == std::io::ErrorKind::WouldBlock =>
+                    {
+                        break;
+                    }
+                    Err(error) => return Err(ControllerError::Io(error)),
                 }
+            }
+            let response = String::from_utf8_lossy(&response);
+            if (response.starts_with("HTTP/1.0 200 ") || response.starts_with("HTTP/1.1 200 "))
+                && response
+                    .split_once("\r\n\r\n")
+                    .is_some_and(|(_, received)| {
+                        readiness.map_or_else(
+                            || received.starts_with("ok"),
+                            |rule| received.contains(&rule.body),
+                        )
+                    })
+            {
+                return Ok(());
             }
         }
         thread::sleep(Duration::from_millis(20));
@@ -5901,7 +6723,9 @@ fn browser_action_reservation_bounds(
         {
             browser_action_retained_receipt_bound(session, action)?
         }
-        BrowserAction::SubmitForm { .. } => browser_action_retained_receipt_bound(session, action)?,
+        BrowserAction::SubmitForm { .. } | BrowserAction::SubmitFormWithValues { .. } => {
+            browser_action_retained_receipt_bound(session, action)?
+        }
         BrowserAction::Navigate { .. } => {
             u64::try_from(session.adapter_config.max_cdp_frame_bytes).unwrap_or(u64::MAX)
         }
@@ -5923,7 +6747,7 @@ fn browser_action_retained_receipt_bound(
 ) -> Result<u64, ControllerError> {
     let requested_url = match action {
         BrowserAction::Navigate { url, .. } => Some(url.clone()),
-        BrowserAction::SubmitForm { .. } => None,
+        BrowserAction::SubmitForm { .. } | BrowserAction::SubmitFormWithValues { .. } => None,
         BrowserAction::CaptureSynopsis { .. } | BrowserAction::CaptureScreenshot { .. } => {
             return Err(ControllerError::InvalidPlan(
                 "retained browser receipt bound is valid only for navigation-capable actions"
@@ -5968,7 +6792,7 @@ fn browser_action_binding_digest(
     match action {
         BrowserAction::Navigate { url, .. } => Ok(Some(browser_destination_digest(url))),
         BrowserAction::CaptureSynopsis { .. } | BrowserAction::CaptureScreenshot { .. } => Ok(None),
-        BrowserAction::SubmitForm { .. } => Ok(Some(
+        BrowserAction::SubmitForm { .. } | BrowserAction::SubmitFormWithValues { .. } => Ok(Some(
             approved_form
                 .ok_or_else(|| {
                     ControllerError::InvalidPlan(
@@ -7241,6 +8065,217 @@ fn current_unix_millis() -> Result<i64, ToolError> {
 }
 
 #[cfg(test)]
+mod plan_browser_acceptance_tests {
+    use super::{
+        BrowserAcceptanceSemanticV1, BrowserSemanticManagedGenerationV1, ControllerError,
+        plan_browser_actions_from_contract, plan_browser_semantic_steps,
+        validate_browser_action_generation_sequence,
+    };
+    use sovereign_plan::{
+        BrowserAcceptanceActionV1, BrowserAcceptanceExpectationV1, BrowserAcceptanceFieldValueV1,
+        BrowserAcceptanceStepV1, BrowserAcceptanceTemplateV1, BrowserManagedAppLaunchV1,
+    };
+    use sovereign_tools::browser::BrowserAction;
+    use sovereign_tools::browser::BrowserFormFieldValues;
+    use std::collections::BTreeMap;
+
+    fn contract() -> sovereign_plan::BrowserAcceptanceContractV1 {
+        BrowserAcceptanceTemplateV1 {
+            launch: BrowserManagedAppLaunchV1::PythonManagedServerV1 {
+                server_relative_path: "apps/demo/server.py".to_owned(),
+                database_filename: "demo.sqlite3".to_owned(),
+                required_generations: 2,
+            },
+            steps: vec![
+                BrowserAcceptanceStepV1 {
+                    step_id: "browser.read".to_owned(),
+                    generation: 1,
+                    action: BrowserAcceptanceActionV1::Navigate {
+                        path: "/people?active=1".to_owned(),
+                    },
+                    expectation: BrowserAcceptanceExpectationV1 {
+                        semantic: BrowserAcceptanceSemanticV1::Read,
+                        required_contains: Vec::new(),
+                        forbidden_contains: Vec::new(),
+                    },
+                },
+                BrowserAcceptanceStepV1 {
+                    step_id: "browser.create".to_owned(),
+                    generation: 1,
+                    action: BrowserAcceptanceActionV1::SubmitForm {
+                        selector: "form#create-person".to_owned(),
+                        fields: Vec::new(),
+                    },
+                    expectation: BrowserAcceptanceExpectationV1 {
+                        semantic: BrowserAcceptanceSemanticV1::Create,
+                        required_contains: Vec::new(),
+                        forbidden_contains: Vec::new(),
+                    },
+                },
+                BrowserAcceptanceStepV1 {
+                    step_id: "browser.update".to_owned(),
+                    generation: 1,
+                    action: BrowserAcceptanceActionV1::SubmitForm {
+                        selector: "form#edit-person".to_owned(),
+                        fields: Vec::new(),
+                    },
+                    expectation: BrowserAcceptanceExpectationV1 {
+                        semantic: BrowserAcceptanceSemanticV1::Update,
+                        required_contains: Vec::new(),
+                        forbidden_contains: Vec::new(),
+                    },
+                },
+                BrowserAcceptanceStepV1 {
+                    step_id: "browser.delete".to_owned(),
+                    generation: 1,
+                    action: BrowserAcceptanceActionV1::SubmitForm {
+                        selector: "form#delete-person".to_owned(),
+                        fields: Vec::new(),
+                    },
+                    expectation: BrowserAcceptanceExpectationV1 {
+                        semantic: BrowserAcceptanceSemanticV1::Delete,
+                        required_contains: Vec::new(),
+                        forbidden_contains: Vec::new(),
+                    },
+                },
+                BrowserAcceptanceStepV1 {
+                    step_id: "browser.invalid".to_owned(),
+                    generation: 1,
+                    action: BrowserAcceptanceActionV1::CaptureSynopsis,
+                    expectation: BrowserAcceptanceExpectationV1 {
+                        semantic: BrowserAcceptanceSemanticV1::InvalidValidation,
+                        required_contains: vec!["Name is required".to_owned()],
+                        forbidden_contains: vec!["Created person".to_owned()],
+                    },
+                },
+                BrowserAcceptanceStepV1 {
+                    step_id: "browser.restart".to_owned(),
+                    generation: 2,
+                    action: BrowserAcceptanceActionV1::CaptureSynopsis,
+                    expectation: BrowserAcceptanceExpectationV1 {
+                        semantic: BrowserAcceptanceSemanticV1::RestartPersistence,
+                        required_contains: vec!["Alice".to_owned()],
+                        forbidden_contains: Vec::new(),
+                    },
+                },
+            ],
+        }
+        .bind_loopback(41_731, vec!["AC.people-browser".to_owned()])
+        .unwrap_or_else(|error| panic!("bind test browser contract: {error}"))
+    }
+
+    #[test]
+    fn plan_browser_actions_are_generic_typed_and_exact_loopback_bound() {
+        let contract = contract();
+        let actions = plan_browser_actions_from_contract(&contract)
+            .unwrap_or_else(|error| panic!("map Plan browser actions: {error}"));
+        assert_eq!(actions.len(), 6);
+        assert!(matches!(
+            &actions[0].action,
+            BrowserAction::Navigate { action_id, url }
+                if action_id == "browser.read"
+                    && url == "http://127.0.0.1:41731/people?active=1"
+        ));
+        assert_eq!(actions[1].semantic, BrowserAcceptanceSemanticV1::Create);
+        assert_eq!(actions[2].semantic, BrowserAcceptanceSemanticV1::Update);
+        assert_eq!(actions[3].semantic, BrowserAcceptanceSemanticV1::Delete);
+        assert_eq!(actions[5].generation, 2);
+        let semantic = plan_browser_semantic_steps(&contract)
+            .unwrap_or_else(|error| panic!("map Plan browser semantic steps: {error}"));
+        assert_eq!(semantic[4].required_synopsis_contains, ["Name is required"]);
+        assert_eq!(semantic[4].forbidden_synopsis_contains, ["Created person"]);
+        assert_eq!(
+            semantic[5].semantic,
+            BrowserAcceptanceSemanticV1::RestartPersistence
+        );
+    }
+
+    #[test]
+    fn typed_form_values_bind_employee_and_invalid_values_without_persisting_them() {
+        let mut contract = contract();
+        let chosen_value = "Avery Chen";
+        let invalid_value = "not-a-valid-employee";
+        contract.steps[1].action = BrowserAcceptanceActionV1::SubmitForm {
+            selector: "form#create-person".to_owned(),
+            fields: vec![BrowserAcceptanceFieldValueV1 {
+                selector: "input[name='employee']".to_owned(),
+                value: chosen_value.to_owned(),
+            }],
+        };
+        contract.steps[4].action = BrowserAcceptanceActionV1::SubmitForm {
+            selector: "form#create-person".to_owned(),
+            fields: vec![BrowserAcceptanceFieldValueV1 {
+                selector: "input[name='employee']".to_owned(),
+                value: invalid_value.to_owned(),
+            }],
+        };
+        contract.steps[4].expectation.required_contains.clear();
+        contract.steps[4].expectation.forbidden_contains.clear();
+        contract.steps[4].expectation.semantic = BrowserAcceptanceSemanticV1::InvalidValidation;
+        contract
+            .validate()
+            .unwrap_or_else(|error| panic!("validate value-bearing contract: {error}"));
+
+        let actions = plan_browser_actions_from_contract(&contract)
+            .unwrap_or_else(|error| panic!("map value-bearing browser actions: {error}"));
+        let BrowserAction::SubmitFormWithValues { fields, .. } = &actions[1].action else {
+            panic!("chosen employee value was not mapped to a value-bearing submit action");
+        };
+        let chosen = BrowserFormFieldValues::new(BTreeMap::from([(
+            "input[name='employee']".to_owned(),
+            chosen_value.to_owned(),
+        )]))
+        .unwrap_or_else(|error| panic!("construct expected chosen value digest: {error}"));
+        assert_eq!(fields.digest(), chosen.digest());
+        let BrowserAction::SubmitFormWithValues { fields, .. } = &actions[4].action else {
+            panic!("invalid validation value was not mapped to a value-bearing submit action");
+        };
+        let invalid = BrowserFormFieldValues::new(BTreeMap::from([(
+            "input[name='employee']".to_owned(),
+            invalid_value.to_owned(),
+        )]))
+        .unwrap_or_else(|error| panic!("construct expected invalid value digest: {error}"));
+        assert_eq!(fields.digest(), invalid.digest());
+
+        let semantic = plan_browser_semantic_steps(&contract)
+            .unwrap_or_else(|error| panic!("map semantic steps: {error}"));
+        let semantic_json = serde_json::to_string(&semantic)
+            .unwrap_or_else(|error| panic!("serialize semantic steps: {error}"));
+        assert!(!semantic_json.contains(chosen_value));
+        assert!(!semantic_json.contains(invalid_value));
+        assert!(!format!("{:?}", actions[1].action).contains(chosen_value));
+        assert!(!format!("{:?}", actions[4].action).contains(invalid_value));
+    }
+
+    #[test]
+    fn browser_action_commit_must_be_strictly_inside_its_managed_generation() {
+        let generation = BrowserSemanticManagedGenerationV1 {
+            app_id: "app.1".to_owned(),
+            generation: 2,
+            start_action_id: "start.2".to_owned(),
+            start_result_digest: "sha256:start".to_owned(),
+            process_group_id: 123,
+            leader_identity: "leader".to_owned(),
+            database_path: "/private/demo.sqlite3".to_owned(),
+            ready_sequence: 100,
+            stopped_sequence: 200,
+        };
+        assert!(
+            validate_browser_action_generation_sequence(101, &generation, "browser.ok").is_ok()
+        );
+        assert!(
+            validate_browser_action_generation_sequence(199, &generation, "browser.ok").is_ok()
+        );
+        for sequence in [99, 100, 200, 201] {
+            assert!(matches!(
+                validate_browser_action_generation_sequence(sequence, &generation, "browser.bad"),
+                Err(ControllerError::NotReady(_))
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
 mod browser_download_terminal_tests {
     use super::{
         AuthorizedBrowserAction, BROWSER_DOWNLOAD_RECORD_NAMESPACE,
@@ -7255,8 +8290,9 @@ mod browser_download_terminal_tests {
     };
     use crate::{
         ActivePlan, ActiveRepositoryState, AttemptRuntime, AttemptState, PlanValidity,
-        ResourceResidencyStateV1, ResourceResidencyV1, TaskRuntime, TaskState,
-        valid_plan_ir_fixture, valid_task_fixture,
+        ResourceResidencyStateV1, ResourceResidencyV1, TaskRuntime, TaskState, digest_json,
+        load_latest_recoverable_manifest, reconcile_recovery_actions, valid_plan_ir_fixture,
+        valid_task_fixture,
     };
     use serde_json::json;
     use sovereign_context::{ContextLevel, EvidenceKind, PacketSection, TrustClass};
@@ -7277,12 +8313,13 @@ mod browser_download_terminal_tests {
         ResourceLeaseV1, ResourcePressureSnapshotV1, TaskResourceBudgetV1, ThermalPressure,
         TrustLevel, TrustSource,
     };
-    use sovereign_repo::{ChangeClassSnapshot, RepositorySnapshot};
+    use sovereign_repo::{ChangeClassSnapshot, ProjectRegistry, RepositorySnapshot};
     use sovereign_state::{ActionTransition, NewActionRecord, StateStore};
     use sovereign_tools::browser::{
         BrowserAction, BrowserActionEffect, BrowserDownloadTerminalObservation,
-        BrowserDownloadTerminalState, BrowserLease, BrowserSensitivePageReason,
-        BrowserSensitivePageSignal, BrowserStateSynopsis, DownloadReceipt,
+        BrowserDownloadTerminalState, BrowserFormFieldValues, BrowserLease,
+        BrowserSensitivePageReason, BrowserSensitivePageSignal, BrowserStateSynopsis,
+        DownloadReceipt,
     };
     use sovereign_tools::{ActionState, ReconciliationMode, ToolError};
     use std::collections::{BTreeMap, BTreeSet};
@@ -7690,6 +8727,33 @@ mod browser_download_terminal_tests {
             .plan_document["policy"]["resources"] = fixture_resource_policy(&budget);
     }
 
+    fn bind_manual_fixture_checkpoint(controller: &mut Controller) {
+        let active = controller
+            .active
+            .as_mut()
+            .unwrap_or_else(|| panic!("fixture active plan disappeared"));
+        let plan_digest = digest_json(&active.plan_document)
+            .unwrap_or_else(|error| panic!("digest fixture plan: {error}"));
+        active.plan_digest.clone_from(&plan_digest);
+        active.compiler_plan_digest = plan_digest;
+        for runtime in active.tasks.values_mut() {
+            runtime.task_contract_digest = digest_json(&runtime.task)
+                .unwrap_or_else(|error| panic!("digest fixture task: {error}"));
+        }
+        for attempt in active.attempts.values_mut() {
+            attempt.task_contract_digest = active
+                .tasks
+                .get(&attempt.task_id)
+                .unwrap_or_else(|| panic!("fixture attempt task disappeared"))
+                .task_contract_digest
+                .clone();
+        }
+        for repository in active.repositories.values_mut() {
+            repository.baseline_diff_digest =
+                super::sha256_prefixed(repository.baseline_diff_content.as_bytes());
+        }
+    }
+
     fn seed_running_attempt(controller: &mut Controller) {
         controller
             .active
@@ -7794,6 +8858,18 @@ mod browser_download_terminal_tests {
             resource_lease,
             browser_lease,
             permission_decision,
+            tool_manifest: sovereign_tools::ToolManifest {
+                tool_id: "browser.test".to_owned(),
+                version: "1".to_owned(),
+                content_digest: format!("sha256:{:064x}", 3),
+                permission_ceiling: BTreeSet::from([
+                    Capability::BrowserInteractive,
+                    Capability::NetworkRead,
+                ]),
+                declared_risk_floor: CommandRisk::ReadOnly,
+                reconciliation_policy: sovereign_policy::ReconciliationPolicy::proof_required_local(
+                ),
+            },
             authority: BrowserTaskAuthorityV1 {
                 schema_version: super::BROWSER_AUTHORITY_SCHEMA_VERSION,
                 allowed_domains: BTreeSet::new(),
@@ -8647,99 +9723,140 @@ mod browser_download_terminal_tests {
     }
 
     #[test]
-    fn dispatched_submit_form_unknown_sink_blocks_replay_and_never_marks_browser_idle() {
+    fn dispatched_submit_form_recovery_after_restart_blocks_replay() {
         let mut fixture = durable_fixture(
             autonomy_budget(1_000, 0, 1_048_576, 0),
             autonomy_budget(1_000, 0, 1_048_576, 0),
         );
         seed_checkpoint_resource_policy(&mut fixture.controller);
         seed_running_attempt(&mut fixture.controller);
+        bind_manual_fixture_checkpoint(&mut fixture.controller);
+        fixture
+            .controller
+            .checkpoint_now()
+            .unwrap_or_else(|error| panic!("write valid pre-dispatch checkpoint: {error}"));
+        let checkpoint = fixture
+            .controller
+            .state
+            .latest_valid_checkpoint_integrity()
+            .unwrap_or_else(|error| panic!("read valid pre-dispatch checkpoint: {error}"))
+            .unwrap_or_else(|| panic!("fixture checkpoint was not recorded"));
+        let (_, manifest) =
+            load_latest_recoverable_manifest(&fixture.controller.state, &checkpoint)
+                .unwrap_or_else(|error| {
+                    panic!("verify pre-dispatch checkpoint CAS manifest: {error}")
+                });
         let lease = admit_browser_lease_for_unknown_test(&mut fixture.controller);
-        let download_root = fixture.root.join("downloads");
-        fs::create_dir_all(&download_root)
-            .unwrap_or_else(|error| panic!("create submit-form fixture root: {error}"));
-        let mut session = download_session(&download_root, 500);
-        session.resource_lease = lease.clone();
-        session.browser_lease.lease_id = lease.lease_id.clone();
-        session.browser_lease.task_id = "task.browser".to_owned();
-        session.browser_lease.attempt_id = "attempt.browser".to_owned();
         let execution_epoch = fixture
             .controller
             .state
             .current_execution_epoch()
             .unwrap_or_else(|error| panic!("read submit-form test epoch: {error}"));
-        session.execution_epoch = execution_epoch;
-        session.browser_lease.execution_epoch = execution_epoch;
 
-        let submit = BrowserAction::SubmitForm {
+        let fields = BrowserFormFieldValues::new(BTreeMap::from([(
+            "input[name=employee]".to_owned(),
+            "employee-42".to_owned(),
+        )]))
+        .unwrap_or_else(|error| panic!("build uncertain employee form values: {error}"));
+        let submit = BrowserAction::SubmitFormWithValues {
             action_id: "browser.submit.unknown.test".to_owned(),
             selector: "form#checkout".to_owned(),
-            payload_digest: format!("sha256:{:064x}", 7),
+            fields,
         };
-        let mut authorized = authorized_synopsis_action(execution_epoch);
-        authorized.action_id = submit.action_id().to_owned();
-        authorized.browser_action_digest = submit.digest();
-        authorized.reconciliation_mode = ReconciliationMode::ConsequentialExternal;
-        let payload_digest = authorized.payload_digest();
+        assert_eq!(submit.kind_name(), "submit_form");
+        assert!(submit.effect().is_side_effectful());
+        let payload_digest = submit.digest();
+        let policy_digest = format!("sha256:{:064x}", 7);
         fixture
             .controller
             .state
             .insert_action_record(NewActionRecord {
-                action_id: &authorized.action_id,
+                action_id: submit.action_id(),
                 state: ActionState::Dispatched.as_str(),
                 payload_digest: &payload_digest,
-                policy_digest: &authorized.policy_digest,
+                policy_digest: &policy_digest,
                 execution_epoch,
                 event_id: "browser-submit-dispatched",
                 event_kind: ActionState::Dispatched.as_str(),
                 payload_json: "{}",
             })
             .unwrap_or_else(|error| panic!("seed dispatched SubmitForm: {error}"));
-
-        fixture
-            .controller
-            .mark_dispatched_browser_unknown(&session, &authorized)
-            .unwrap_or_else(|error| panic!("mark dispatched SubmitForm unknown: {error}"));
-        let action = fixture
-            .controller
-            .state
-            .action_record(&authorized.action_id)
-            .unwrap_or_else(|error| panic!("read unknown SubmitForm: {error}"))
-            .unwrap_or_else(|| panic!("unknown SubmitForm action disappeared"));
-        assert_eq!(action.state, ActionState::Unknown.as_str());
-        let active = fixture
-            .controller
-            .active
-            .as_ref()
-            .unwrap_or_else(|| panic!("active plan disappeared after unknown"));
         assert_eq!(
-            active
-                .attempts
-                .get("attempt.browser")
-                .map(|attempt| attempt.state),
-            Some(AttemptState::Interrupted)
-        );
-        assert_eq!(
-            active.tasks.get("task.browser").map(|task| task.state),
-            Some(TaskState::ReconcilingUnknown)
-        );
-        let resource = fixture
-            .controller
-            .resources
-            .active_lease(&lease.lease_id)
-            .unwrap_or_else(|| panic!("unknown SubmitForm lost live browser lease"));
-        assert_eq!(resource.state, LeaseStateV1::Active);
-        assert_eq!(resource.idle_since_ms, None);
-        assert!(
             fixture
                 .controller
-                .state
-                .journal_after(0)
-                .unwrap_or_else(|error| panic!("read unknown replay-block event: {error}"))
-                .iter()
-                .any(|event| event.event_kind == "unknown_action_blocks_replay"
-                    && event.entity_id == authorized.action_id)
+                .resources
+                .active_lease(&lease.lease_id)
+                .map(|resource| resource.state),
+            Some(LeaseStateV1::Active),
+            "the pre-crash browser lease remains active while the form action is dispatched"
         );
+
+        // Model process loss after the POST may have reached its destination: reopen the durable
+        // database and run the same action-reconciliation phase used by RecoveryManager.
+        let state_path = fixture.controller.state.path().to_path_buf();
+        let placeholder_state = StateStore::open(fixture.root.join("placeholder-state.sqlite"))
+            .unwrap_or_else(|error| panic!("open placeholder state for fixture drop: {error}"));
+        drop(std::mem::replace(
+            &mut fixture.controller.state,
+            placeholder_state,
+        ));
+        let mut recovered_state = StateStore::open(&state_path)
+            .unwrap_or_else(|error| panic!("reopen state after uncertain form POST: {error}"));
+        let registry = ProjectRegistry::new();
+        let unknown = reconcile_recovery_actions(
+            &mut recovered_state,
+            &registry,
+            &BTreeSet::new(),
+            &manifest,
+            &BTreeMap::new(),
+        )
+        .unwrap_or_else(|error| panic!("reconcile uncertain form POST after restart: {error}"));
+        assert_eq!(unknown, vec![submit.action_id().to_owned()]);
+        let action = recovered_state
+            .action_record(submit.action_id())
+            .unwrap_or_else(|error| panic!("read recovered form action: {error}"))
+            .unwrap_or_else(|| panic!("recovered form action disappeared"));
+        assert_eq!(action.state, ActionState::Unknown.as_str());
+        let action_events = recovered_state
+            .journal()
+            .unwrap_or_else(|error| panic!("read recovered form action events: {error}"))
+            .into_iter()
+            .filter(|event| event.entity_type == "action" && event.entity_id == submit.action_id())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            action_events
+                .iter()
+                .filter(|event| event.event_kind == "dispatched")
+                .count(),
+            1,
+            "recovery must not dispatch the form again"
+        );
+        assert_eq!(
+            action_events
+                .iter()
+                .filter(|event| event.event_kind == "unknown")
+                .count(),
+            1,
+            "the uncertain external effect is fenced exactly once"
+        );
+
+        // A second recovery pass must leave the external action fenced without another dispatch.
+        let unknown_again = reconcile_recovery_actions(
+            &mut recovered_state,
+            &registry,
+            &BTreeSet::new(),
+            &manifest,
+            &BTreeMap::new(),
+        )
+        .unwrap_or_else(|error| panic!("repeat form action recovery: {error}"));
+        assert_eq!(unknown_again, vec![submit.action_id().to_owned()]);
+        let repeated_events = recovered_state
+            .journal()
+            .unwrap_or_else(|error| panic!("read repeated recovery events: {error}"))
+            .into_iter()
+            .filter(|event| event.entity_type == "action" && event.entity_id == submit.action_id())
+            .collect::<Vec<_>>();
+        assert_eq!(repeated_events, action_events);
     }
 
     #[test]

@@ -87,6 +87,123 @@ fn task_loopback_scope(grant: &TaskLoopbackGrantV1) -> TaskLoopbackScope<'_> {
 
 #[cfg(target_os = "macos")]
 #[test]
+fn managed_app_default_denies_local_database_and_other_outbound() {
+    let root = TestDir::new("managed-local-database-denial");
+    let repository_root = root.0.join("repo");
+    let data_root = root.0.join("data");
+    fs::create_dir(&repository_root).unwrap();
+    fs::create_dir(&data_root).unwrap();
+    let local_database = TcpListener::bind("127.0.0.1:0").unwrap();
+    let database_socket_path = PathBuf::from(format!(
+        "/tmp/sov-pg-{}-{}.sock",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    ));
+    let _database_socket = std::os::unix::net::UnixListener::bind(&database_socket_path).unwrap();
+    let neighboring_service = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut grant = task_loopback_grant();
+    grant.port = app_listener.local_addr().unwrap().port();
+    grant.expires_at_ms = i64::MAX;
+    let request = LoopbackServerIsolationRequestV1 {
+        task_loopback_grant: grant,
+        repository_root,
+        data_root,
+        user_home_root: root.0.clone(),
+        extra_protected_read_roots: Vec::new(),
+        postgres_broker_port: None,
+        now_ms: 100,
+    };
+    let profile = MacLoopbackServerSandboxExecBackend::build_profile(&request).unwrap();
+    let sandbox = Path::new("/usr/bin/sandbox-exec");
+    let connect = |host: &str, port: u16| {
+        Command::new(sandbox)
+            .args(["-p", &profile, "/usr/bin/python3", "-B", "-c"])
+            .arg("import socket,sys; s=socket.socket(); s.settimeout(0.2); s.connect((sys.argv[1],int(sys.argv[2]))); s.close()")
+            .arg(host)
+            .arg(port.to_string())
+            .env_clear()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(!connect("127.0.0.1", local_database.local_addr().unwrap().port()),
+        "default managed-app Seatbelt unexpectedly reached a local database endpoint");
+    assert!(!connect("127.0.0.1", neighboring_service.local_addr().unwrap().port()));
+    assert!(!connect("8.8.8.8", 53));
+    let unix_status = Command::new(sandbox)
+        .args(["-p", &profile, "/usr/bin/python3", "-B", "-c"])
+        .arg("import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(0.2); s.connect(sys.argv[1]); s.close()")
+        .arg(&database_socket_path)
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!unix_status.success(), "default managed-app Seatbelt reached a local database socket");
+    fs::remove_file(&database_socket_path).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn managed_app_postgres_broker_grant_reaches_only_exact_controller_port() {
+    let root = TestDir::new("managed-postgres-broker");
+    let repository_root = root.0.join("repo");
+    let data_root = root.0.join("data");
+    fs::create_dir(&repository_root).unwrap();
+    fs::create_dir(&data_root).unwrap();
+    let broker = TcpListener::bind("127.0.0.1:0").unwrap();
+    let neighbor = TcpListener::bind("127.0.0.1:0").unwrap();
+    let app_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let direct_socket_path = PathBuf::from(format!("/tmp/sov-pg-deny-{}-{}.sock",
+        std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    let _direct_socket = std::os::unix::net::UnixListener::bind(&direct_socket_path).unwrap();
+    let mut grant = task_loopback_grant();
+    grant.port = app_listener.local_addr().unwrap().port();
+    grant.expires_at_ms = i64::MAX;
+    let request = LoopbackServerIsolationRequestV1 {
+        task_loopback_grant: grant,
+        repository_root,
+        data_root,
+        user_home_root: root.0.clone(),
+        extra_protected_read_roots: Vec::new(),
+        postgres_broker_port: Some(broker.local_addr().unwrap().port()),
+        now_ms: 100,
+    };
+    let profile = MacLoopbackServerSandboxExecBackend::build_profile(&request).unwrap();
+    let connect = |port: u16| {
+        Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "/usr/bin/python3", "-B", "-c"])
+            .arg("import socket,sys; s=socket.socket(); s.settimeout(0.2); s.connect(('127.0.0.1',int(sys.argv[1]))); s.close()")
+            .arg(port.to_string())
+            .env_clear()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(connect(broker.local_addr().unwrap().port()));
+    assert!(!connect(neighbor.local_addr().unwrap().port()));
+    assert!(!connect(5432));
+    let outside = Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", &profile, "/usr/bin/python3", "-B", "-c"])
+        .arg("import socket; s=socket.socket(); s.settimeout(0.2); s.connect(('8.8.8.8',53))")
+        .env_clear().stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+    assert!(!outside.success());
+    let direct_socket = Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", &profile, "/usr/bin/python3", "-B", "-c"])
+        .arg("import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(0.2); s.connect(sys.argv[1])")
+        .arg(&direct_socket_path)
+        .env_clear().stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+    assert!(!direct_socket.success());
+    fs::remove_file(&direct_socket_path).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn loopback_server_seatbelt_profile_is_exact_and_self_tested() {
     let root = TestDir::new("loopback-server-seatbelt");
     let repository_root = root.0.join("repo");
@@ -119,6 +236,7 @@ fn loopback_server_seatbelt_profile_is_exact_and_self_tested() {
         data_root: data_root.clone(),
         user_home_root: root.0.clone(),
         extra_protected_read_roots: vec![protected_root.clone()],
+        postgres_broker_port: None,
         now_ms: 100,
     };
     let profile = MacLoopbackServerSandboxExecBackend::build_profile(&request)

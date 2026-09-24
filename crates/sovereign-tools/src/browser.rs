@@ -35,6 +35,9 @@ const CDP_INITIALIZATION_TIMEOUT_MS: u64 = 15_000;
 const MAX_SELECTOR_BYTES: usize = 4 * 1024;
 const MAX_CONTENT_TYPE_BYTES: usize = 512;
 const MAX_FORM_STRUCTURE_BYTES: usize = 64 * 1024;
+const MAX_FORM_FIELD_VALUE_COUNT: usize = 16;
+const MAX_FORM_FIELD_SELECTOR_BYTES: usize = 512;
+const MAX_FORM_FIELD_VALUE_BYTES: usize = 256;
 const MAX_CALLER_CHROME_ARGS: usize = 128;
 const MAX_CALLER_CHROME_ARG_BYTES: usize = 64 * 1024;
 const MAX_PROXY_AUTH_FIELD_BYTES: usize = 4 * 1024;
@@ -528,6 +531,88 @@ pub enum BrowserAction {
         selector: String,
         payload_digest: String,
     },
+    /// One bounded, nonsensitive set of literal field values for a form submit. Values are never
+    /// included in inspection or action receipts; only their canonical digest is bound.
+    SubmitFormWithValues {
+        action_id: String,
+        selector: String,
+        fields: BrowserFormFieldValues,
+    },
+}
+
+/// Validated, canonical form selector/value pairs. Its debug representation deliberately omits
+/// both selectors and values so accidental diagnostics cannot disclose submitted data.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BrowserFormFieldValues(BTreeMap<String, String>);
+
+impl std::fmt::Debug for BrowserFormFieldValues {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BrowserFormFieldValues")
+            .field("field_count", &self.0.len())
+            .field("values", &"<redacted>")
+            .finish()
+    }
+}
+
+impl BrowserFormFieldValues {
+    /// Builds a bounded set of exact CSS-selector/literal-value pairs.
+    ///
+    /// # Errors
+    /// Returns a generic error if a selector/value is malformed, sensitive-looking, or over the
+    /// fixed item/count bounds. Error text never includes caller-supplied field content.
+    pub fn new(fields: BTreeMap<String, String>) -> Result<Self, BrowserError> {
+        if fields.is_empty() || fields.len() > MAX_FORM_FIELD_VALUE_COUNT {
+            return Err(BrowserError::ResourceLimit(
+                "form field-value count is outside the supported bound".to_owned(),
+            ));
+        }
+        for (selector, value) in &fields {
+            let selector_lower = selector.to_ascii_lowercase();
+            if selector.trim().is_empty()
+                || selector.len() > MAX_FORM_FIELD_SELECTOR_BYTES
+                || selector.chars().any(char::is_control)
+                || [
+                    "password",
+                    "passwd",
+                    "token",
+                    "secret",
+                    "credential",
+                    "authorization",
+                    "cookie",
+                    "session",
+                    "api-key",
+                    "api_key",
+                    "otp",
+                    "one-time-code",
+                ]
+                .iter()
+                .any(|sensitive| selector_lower.contains(sensitive))
+            {
+                return Err(BrowserError::InvalidRequest(
+                    "form field selector is malformed or sensitive".to_owned(),
+                ));
+            }
+            if value.len() > MAX_FORM_FIELD_VALUE_BYTES || value.chars().any(char::is_control) {
+                return Err(BrowserError::ResourceLimit(
+                    "form field value is outside the supported bound".to_owned(),
+                ));
+            }
+        }
+        Ok(Self(fields))
+    }
+
+    /// Domain-separated digest of sorted selector/value pairs. Raw values are not returned.
+    #[must_use]
+    pub fn digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        digest_field(&mut hasher, "sovereign.browser_form_field_values.v1");
+        for (selector, value) in &self.0 {
+            digest_field(&mut hasher, selector);
+            digest_field(&mut hasher, value);
+        }
+        format!("sha256:{:x}", hasher.finalize())
+    }
 }
 
 impl BrowserAction {
@@ -537,7 +622,8 @@ impl BrowserAction {
             Self::Navigate { action_id, .. }
             | Self::CaptureSynopsis { action_id }
             | Self::CaptureScreenshot { action_id }
-            | Self::SubmitForm { action_id, .. } => action_id,
+            | Self::SubmitForm { action_id, .. }
+            | Self::SubmitFormWithValues { action_id, .. } => action_id,
         }
     }
 
@@ -548,7 +634,9 @@ impl BrowserAction {
             Self::CaptureSynopsis { .. } | Self::CaptureScreenshot { .. } => {
                 BrowserActionEffect::Observation
             }
-            Self::SubmitForm { .. } => BrowserActionEffect::ConsequentialFormSubmit,
+            Self::SubmitForm { .. } | Self::SubmitFormWithValues { .. } => {
+                BrowserActionEffect::ConsequentialFormSubmit
+            }
         }
     }
 
@@ -558,7 +646,7 @@ impl BrowserAction {
             Self::Navigate { .. } => "navigate",
             Self::CaptureSynopsis { .. } => "capture_synopsis",
             Self::CaptureScreenshot { .. } => "capture_screenshot",
-            Self::SubmitForm { .. } => "submit_form",
+            Self::SubmitForm { .. } | Self::SubmitFormWithValues { .. } => "submit_form",
         }
     }
 
@@ -595,6 +683,17 @@ impl BrowserAction {
                 validate_sha256_digest(payload_digest, "form payload digest")?;
                 Ok(())
             }
+            Self::SubmitFormWithValues {
+                selector, fields, ..
+            } => {
+                validate_selector(selector)?;
+                if fields.0.is_empty() || fields.0.len() > MAX_FORM_FIELD_VALUE_COUNT {
+                    return Err(BrowserError::ResourceLimit(
+                        "form field-value count is outside the supported bound".to_owned(),
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -614,6 +713,12 @@ impl BrowserAction {
             } => {
                 digest_field(&mut hasher, selector);
                 digest_field(&mut hasher, payload_digest);
+            }
+            Self::SubmitFormWithValues {
+                selector, fields, ..
+            } => {
+                digest_field(&mut hasher, selector);
+                digest_field(&mut hasher, &fields.digest());
             }
         }
         format!("sha256:{:x}", hasher.finalize())
@@ -1607,7 +1712,9 @@ impl BrowserAdapter {
             ));
         }
         let (request_id, requested_url, synopsis, screenshot) = match action {
-            BrowserAction::Navigate { .. } | BrowserAction::SubmitForm { .. } => {
+            BrowserAction::Navigate { .. }
+            | BrowserAction::SubmitForm { .. }
+            | BrowserAction::SubmitFormWithValues { .. } => {
                 return Err(BrowserError::InvalidRequest(
                     "navigation-capable actions require dispatch_intercepted_action so every top-level document request can be caller-authorized before continuation"
                         .to_owned(),
@@ -1762,6 +1869,65 @@ impl BrowserAdapter {
         })
     }
 
+    /// Inspects a form and binds a bounded set of non-sensitive editable controls and intended
+    /// values by digest. Neither field values nor form values are returned or retained.
+    ///
+    /// # Errors
+    /// Returns the same errors as [`Self::inspect_form_until`] and fails closed if any requested
+    /// selector does not resolve to one safe, editable control inside the exact form.
+    pub fn inspect_form_values_until(
+        &mut self,
+        lease: &BrowserLease,
+        selector: &str,
+        fields: &BrowserFormFieldValues,
+        deadline: Instant,
+    ) -> Result<BrowserFormInspectionReceipt, BrowserError> {
+        let fields_digest = fields.digest();
+        let mut inspection = self.inspect_form_until(lease, selector, &fields_digest, deadline)?;
+        if inspection.sensitive_inputs_present {
+            return Err(BrowserError::InvalidRequest(
+                "form with sensitive controls cannot accept governed field values".to_owned(),
+            ));
+        }
+        let form_selector_json = serde_json::to_string(selector).map_err(|error| {
+            BrowserError::Protocol(format!("selector serialization failed: {error}"))
+        })?;
+        let field_selectors_json = serde_json::to_string(&fields.0.keys().collect::<Vec<_>>())
+            .map_err(|error| {
+                BrowserError::Protocol(format!("form field selector serialization failed: {error}"))
+            })?;
+        let (_, response) = self.send_cdp_until(
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": form_field_targets_inspection_expression(
+                    &form_selector_json,
+                    &field_selectors_json,
+                ),
+                "returnByValue": true,
+                "awaitPromise": false,
+            }),
+            Some(self.session_id.clone()),
+            deadline,
+        )?;
+        let value = runtime_value(&response, "Runtime.evaluate")?;
+        if value.get("valid").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(BrowserError::InvalidRequest(
+                "form field selector did not resolve to one safe editable control".to_owned(),
+            ));
+        }
+        let target_structure = required_value_string(value, "structure", "form field inspection")?;
+        if target_structure.len() > MAX_FORM_STRUCTURE_BYTES {
+            return Err(BrowserError::ResourceLimit(
+                "form field structure exceeded browser inspection bound".to_owned(),
+            ));
+        }
+        inspection.structural_digest = digest_string(
+            "sovereign.browser_form_complete_structure.v1",
+            &format!("{}\0{}", inspection.structural_digest, target_structure),
+        );
+        Ok(inspection)
+    }
+
     /// Dispatches one navigation-capable action exactly once while top-level `Document` requests
     /// remain paused until [`Self::resolve_document_request`] is called by the Controller.
     ///
@@ -1810,18 +1976,32 @@ impl BrowserAdapter {
             ));
         }
 
-        if let BrowserAction::SubmitForm {
-            selector,
-            payload_digest,
-            ..
-        } = action
-        {
+        if matches!(
+            action,
+            BrowserAction::SubmitForm { .. } | BrowserAction::SubmitFormWithValues { .. }
+        ) {
             let approved = approved_form.ok_or_else(|| {
                 BrowserError::InvalidRequest(
                     "SubmitForm requires an approved form inspection binding".to_owned(),
                 )
             })?;
-            let fresh = self.inspect_form_until(lease, selector, payload_digest, deadline)?;
+            let fresh = match action {
+                BrowserAction::SubmitForm {
+                    selector,
+                    payload_digest,
+                    ..
+                } => self.inspect_form_until(lease, selector, payload_digest, deadline)?,
+                BrowserAction::SubmitFormWithValues {
+                    selector, fields, ..
+                } => self.inspect_form_values_until(lease, selector, fields, deadline)?,
+                BrowserAction::Navigate { .. }
+                | BrowserAction::CaptureSynopsis { .. }
+                | BrowserAction::CaptureScreenshot { .. } => {
+                    return Err(BrowserError::InvalidRequest(
+                        "form inspection binding is valid only for SubmitForm".to_owned(),
+                    ));
+                }
+            };
             if fresh.binding_digest() != approved.binding_digest() {
                 return Err(BrowserError::InvalidRequest(
                     "form inspection binding changed before submit dispatch".to_owned(),
@@ -1849,6 +2029,32 @@ impl BrowserAdapter {
                     "Runtime.evaluate",
                     serde_json::json!({
                         "expression": form_submit_expression(&selector_json),
+                        "returnByValue": true,
+                        "awaitPromise": false,
+                    }),
+                    None,
+                )
+            }
+            BrowserAction::SubmitFormWithValues {
+                selector, fields, ..
+            } => {
+                let selector_json = serde_json::to_string(selector).map_err(|error| {
+                    BrowserError::Protocol(format!("selector serialization failed: {error}"))
+                })?;
+                let fields_json = serde_json::to_string(
+                    &fields
+                        .0
+                        .iter()
+                        .map(|(field_selector, value)| (field_selector, value))
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|error| {
+                    BrowserError::Protocol(format!("form field serialization failed: {error}"))
+                })?;
+                (
+                    "Runtime.evaluate",
+                    serde_json::json!({
+                        "expression": form_submit_values_expression(&selector_json, &fields_json),
                         "returnByValue": true,
                         "awaitPromise": false,
                     }),
@@ -2120,7 +2326,7 @@ impl BrowserAdapter {
                         .unwrap_or(false)
                         || self.main_frame_load_state == MainFrameLoadState::Stopped
                 }
-                BrowserAction::SubmitForm { .. } => {
+                BrowserAction::SubmitForm { .. } | BrowserAction::SubmitFormWithValues { .. } => {
                     // `Idle` is the initial state immediately after dispatch. Treating that state as
                     // completion can commit the form action before Chrome surfaces the resulting
                     // top-level POST/navigation, leaving the next observation to race a paused
@@ -2157,7 +2363,7 @@ impl BrowserAdapter {
                 validate_navigation_response(response)?;
                 navigation_response_is_download(response)?
             }
-            BrowserAction::SubmitForm { .. } => {
+            BrowserAction::SubmitForm { .. } | BrowserAction::SubmitFormWithValues { .. } => {
                 validate_submit_response(response)?;
                 false
             }
@@ -3855,6 +4061,73 @@ fn form_submit_expression(selector_json: &str) -> String {
     )
 }
 
+fn form_field_targets_inspection_expression(form_selector_json: &str, fields_json: &str) -> String {
+    format!(
+        r"(() => {{
+const form = document.querySelector({form_selector_json});
+if (!(form instanceof HTMLFormElement)) return {{valid:false}};
+const selectors = {fields_json};
+const credentialPattern = /(?:pass(?:word|wd)?|token|secret|credential|authorization|cookie|session|api[-_\s]?key|client[-_\s]?secret|access[-_\s]?token|one[-_\s]?time[-_\s]?code)/i;
+const supportedInputTypes = new Set(['', 'text', 'email', 'tel', 'url', 'search', 'number', 'date', 'month', 'week', 'time', 'datetime-local']);
+const seen = new Set();
+const structure = [];
+for (const selector of selectors) {{
+  let matches;
+  try {{ matches = Array.from(form.querySelectorAll(selector)); }} catch {{ return {{valid:false}}; }}
+  if (matches.length !== 1) return {{valid:false}};
+  const control = matches[0];
+  if (seen.has(control) || control.disabled || control.readOnly) return {{valid:false}};
+  seen.add(control);
+  const tag = control.tagName.toLowerCase();
+  const type = String(control.getAttribute('type') || '').toLowerCase();
+  if (!((tag === 'input' && supportedInputTypes.has(type)) || tag === 'textarea' || (tag === 'select' && !control.multiple))) return {{valid:false}};
+  const autocomplete = String(control.getAttribute('autocomplete') || '').toLowerCase();
+  const attributes = [control.getAttribute('name'), control.getAttribute('id'), control.getAttribute('aria-label'), autocomplete].filter(Boolean).join(' ');
+  if (credentialPattern.test(attributes) || credentialPattern.test(autocomplete)) return {{valid:false}};
+  structure.push([tag, type, control.getAttribute('name') || '', control.id || '', autocomplete, control.required ? 'required' : '', control.disabled ? 'disabled' : '', control.readOnly ? 'readonly' : ''].join(':'));
+}}
+return {{valid:true,structure:structure.join('|')}};
+}})()"
+    )
+}
+
+fn form_submit_values_expression(form_selector_json: &str, fields_json: &str) -> String {
+    format!(
+        r"(() => {{
+const form = document.querySelector({form_selector_json});
+if (!(form instanceof HTMLFormElement)) return {{submitted:false,error:'form unavailable'}};
+const fields = {fields_json};
+const credentialPattern = /(?:pass(?:word|wd)?|token|secret|credential|authorization|cookie|session|api[-_\s]?key|client[-_\s]?secret|access[-_\s]?token|one[-_\s]?time[-_\s]?code)/i;
+const supportedInputTypes = new Set(['', 'text', 'email', 'tel', 'url', 'search', 'number', 'date', 'month', 'week', 'time', 'datetime-local']);
+const seen = new Set();
+const targets = [];
+for (const [selector, value] of fields) {{
+  let matches;
+  try {{ matches = Array.from(form.querySelectorAll(selector)); }} catch {{ return {{submitted:false,error:'field unavailable'}}; }}
+  if (matches.length !== 1) return {{submitted:false,error:'field unavailable'}};
+  const control = matches[0];
+  if (seen.has(control) || control.disabled || control.readOnly) return {{submitted:false,error:'field unavailable'}};
+  seen.add(control);
+  const tag = control.tagName.toLowerCase();
+  const type = String(control.getAttribute('type') || '').toLowerCase();
+  if (!((tag === 'input' && supportedInputTypes.has(type)) || tag === 'textarea' || (tag === 'select' && !control.multiple))) return {{submitted:false,error:'field unavailable'}};
+  const autocomplete = String(control.getAttribute('autocomplete') || '').toLowerCase();
+  const attributes = [control.getAttribute('name'), control.getAttribute('id'), control.getAttribute('aria-label'), autocomplete].filter(Boolean).join(' ');
+  if (credentialPattern.test(attributes) || credentialPattern.test(autocomplete)) return {{submitted:false,error:'field unavailable'}};
+  targets.push([control, value]);
+}}
+for (const [control, value] of targets) {{
+  control.value = value;
+  control.dispatchEvent(new Event('input', {{bubbles:true}}));
+  control.dispatchEvent(new Event('change', {{bubbles:true}}));
+  if (control.value !== value) return {{submitted:false,error:'field value rejected'}};
+}}
+if (typeof form.requestSubmit === 'function') form.requestSubmit(); else form.submit();
+return {{submitted:true}};
+}})()"
+    )
+}
+
 fn form_inspection_expression(selector_json: &str) -> String {
     format!(
         r"(() => {{
@@ -4226,12 +4499,12 @@ mod tests {
         AttachedTargetDisposition, BROWSER_SCHEMA_VERSION, BrowserAction, BrowserAdapter,
         BrowserAdapterConfig, BrowserDocumentRequestDecision, BrowserDocumentRequestKind,
         BrowserDownloadPolicy, BrowserDownloadTerminalState, BrowserDownloadTracker, BrowserError,
-        BrowserLease, BrowserProxyAuthBinding, BrowserSensitivePageReason, BrowserSpawnBinding,
-        BrowserSpawnFailure, BrowserSpawnState, BrowserVersion, CdpFrameReader, FetchAuthDecision,
-        FetchPausedRequest, MainFrameLoadState, assess_single_tab_targets,
-        classify_attached_target, classify_fetch_auth_required, classify_fetch_request_paused,
-        navigation_response_is_download, non_top_level_request_method_allowed,
-        request_method_allowed_by_ceiling,
+        BrowserFormFieldValues, BrowserLease, BrowserProxyAuthBinding, BrowserSensitivePageReason,
+        BrowserSpawnBinding, BrowserSpawnFailure, BrowserSpawnState, BrowserVersion,
+        CdpFrameReader, FetchAuthDecision, FetchPausedRequest, MainFrameLoadState,
+        assess_single_tab_targets, classify_attached_target, classify_fetch_auth_required,
+        classify_fetch_request_paused, navigation_response_is_download,
+        non_top_level_request_method_allowed, request_method_allowed_by_ceiling,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -4244,6 +4517,7 @@ mod tests {
 
     const SCRIPTED_SUBMIT_FORM_CDP: &str = r"
 import json
+import os
 import sys
 import threading
 import time
@@ -4300,6 +4574,8 @@ while True:
 
     if method == 'Runtime.evaluate':
         expression = params.get('expression', '')
+        with open(os.environ['SOVEREIGN_TEST_BROWSER_COMMAND_LOG'], 'a', encoding='utf-8') as log:
+            log.write(expression + '\n')
         if 'const controls = Array.from(form.querySelectorAll' in expression:
             if 'form#deadline' in expression:
                 time.sleep(0.15)
@@ -4310,6 +4586,11 @@ while True:
                 'method': 'POST',
                 'structure': 'form|input:text:name::required|count=1',
                 'sensitiveInputsPresent': False,
+            }}})
+        elif 'const selectors = ' in expression and 'structure:structure.join' in expression:
+            reply(request_id, {'result': {'value': {
+                'valid': True,
+                'structure': 'input:text:employee:employee::required:false:false',
             }}})
         elif 'requestSubmit' in expression:
             # The regression-critical order: the synchronous submit result arrives before Chrome
@@ -4396,6 +4677,10 @@ while True:
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .env(
+                "SOVEREIGN_TEST_BROWSER_COMMAND_LOG",
+                root.join("commands.log"),
+            )
             .process_group(0)
             .spawn()
             .unwrap_or_else(|error| panic!("spawn scripted CDP peer failed: {error}"));
@@ -4591,6 +4876,97 @@ while True:
             .unwrap_or_else(|error| panic!("shutdown scripted browser failed: {error}"));
         fs::remove_dir_all(&root)
             .unwrap_or_else(|error| panic!("remove scripted browser root failed: {error}"));
+    }
+
+    #[test]
+    fn submit_form_with_values_binds_and_redacts_employee_inputs() {
+        let mut action_digests = BTreeSet::new();
+        for (action_id, value) in [
+            ("submit-chosen-employee", "employee-42"),
+            ("submit-invalid-employee", "unknown-employee"),
+        ] {
+            let lease = scripted_submit_form_lease(
+                action_id,
+                &format!("attempt-{action_id}"),
+                15,
+                &format!("{action_id}-token"),
+            );
+            let (mut adapter, root) = scripted_submit_form_adapter(&lease);
+            let fields = BrowserFormFieldValues::new(BTreeMap::from([(
+                "input[name=employee]".to_owned(),
+                value.to_owned(),
+            )]))
+            .unwrap_or_else(|error| panic!("validate bounded employee field: {error}"));
+            let action = BrowserAction::SubmitFormWithValues {
+                action_id: action_id.to_owned(),
+                selector: "form#employee".to_owned(),
+                fields: fields.clone(),
+            };
+            assert!(action_digests.insert(action.digest()));
+            assert!(!format!("{action:?}").contains(value));
+
+            let inspection = adapter
+                .inspect_form_values_until(
+                    &lease,
+                    "form#employee",
+                    &fields,
+                    Instant::now() + Duration::from_secs(2),
+                )
+                .unwrap_or_else(|error| panic!("inspect employee form fields: {error}"));
+            assert_eq!(inspection.payload_digest, fields.digest());
+            assert!(!format!("{inspection:?}").contains(value));
+            let _dispatched = adapter
+                .dispatch_intercepted_action(&lease, &action, Some(&inspection))
+                .unwrap_or_else(|error| panic!("dispatch employee form values: {error}"));
+            let post = adapter
+                .next_document_request(&lease, 1_000)
+                .unwrap_or_else(|error| panic!("observe employee form POST: {error}"));
+            assert_eq!(post.method, "POST");
+            adapter
+                .resolve_document_request(&lease, &post, BrowserDocumentRequestDecision::Continue)
+                .unwrap_or_else(|error| panic!("continue employee form POST: {error}"));
+            let redirect = adapter
+                .next_document_request(&lease, 1_000)
+                .unwrap_or_else(|error| panic!("observe employee form redirect: {error}"));
+            adapter
+                .resolve_document_request(
+                    &lease,
+                    &redirect,
+                    BrowserDocumentRequestDecision::Continue,
+                )
+                .unwrap_or_else(|error| panic!("continue employee form redirect: {error}"));
+            let receipt = adapter
+                .finish_dispatched_action(&lease)
+                .unwrap_or_else(|error| panic!("finish employee form submit: {error}"));
+            assert_eq!(receipt.action_digest, action.digest());
+            let receipt_json = String::from_utf8(
+                receipt
+                    .to_bytes()
+                    .unwrap_or_else(|error| panic!("serialize employee form receipt: {error}")),
+            )
+            .unwrap_or_else(|error| panic!("decode employee form receipt: {error}"));
+            assert!(receipt_json.contains(&action.digest()));
+            assert!(!receipt_json.contains(value));
+            let commands = fs::read_to_string(root.join("commands.log"))
+                .unwrap_or_else(|error| panic!("read transient CDP command log: {error}"));
+            assert!(commands.contains(value));
+            assert!(commands.contains("control.value = value"));
+            let debug = format!("{fields:?}");
+            assert!(!debug.contains(value));
+
+            adapter
+                .shutdown()
+                .unwrap_or_else(|error| panic!("shutdown employee browser test: {error}"));
+            fs::remove_dir_all(&root)
+                .unwrap_or_else(|error| panic!("remove employee browser test root: {error}"));
+        }
+
+        let error = BrowserFormFieldValues::new(BTreeMap::from([(
+            "input[name=password]".to_owned(),
+            "never-retain-this".to_owned(),
+        )]))
+        .expect_err("credential-like controls must be refused");
+        assert!(!error.to_string().contains("never-retain-this"));
     }
 
     #[test]

@@ -4,10 +4,12 @@ use super::{
     reject_existing_symlink_components, sha256_prefixed, validate_relative_path,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const WORKTREE_LEASE_SCHEMA_VERSION: u32 = 1;
 const CHANGE_SET_SCHEMA_VERSION: u32 = 2;
 const COMPOSITION_CONFLICT_SCHEMA_VERSION: u32 = 1;
+const OFFLINE_NODE_MODULES_PROVENANCE_SCHEMA_VERSION: u32 = 1;
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Controller-owned detached Git worktree authority for one exact plan/task revision.
@@ -31,6 +34,70 @@ pub struct WorktreeLease {
     pub controller_root: PathBuf,
     pub worktree_path: PathBuf,
     pub base_head: String,
+}
+
+/// Hard ceilings for copying one existing offline dependency tree into a Controller worktree.
+/// `max_entries` counts directories, regular files, and symlinks below the `node_modules` root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineDependencyLimits {
+    pub max_entries: u64,
+    pub max_bytes: u64,
+}
+
+/// Deterministic content/shape digest for one safe `node_modules` tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineDependencyManifest {
+    pub digest: String,
+    pub entry_count: u64,
+    pub directory_count: u64,
+    pub regular_file_count: u64,
+    pub symlink_count: u64,
+    pub total_bytes: u64,
+}
+
+/// Exact repository/worktree facts returned after a successful offline dependency materialization.
+/// The Controller may bind these facts into its own durable authority/evidence; this record grants
+/// no execution or package-install authority by itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfflineNodeModulesProvenance {
+    pub schema_version: u32,
+    pub repository_id: String,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    pub task_id: String,
+    pub task_contract_digest: String,
+    pub worktree_lease_id: String,
+    pub base_head: String,
+    pub project_root: PathBuf,
+    pub source_node_modules: PathBuf,
+    pub destination_node_modules: PathBuf,
+    pub ignore_evidence_digest: String,
+    pub source_manifest: OfflineDependencyManifest,
+    pub destination_manifest: OfflineDependencyManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OfflineDependencyEntryKind {
+    Directory,
+    RegularFile { content_digest: String },
+    Symlink { target: PathBuf },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineDependencyEntry {
+    relative_path: PathBuf,
+    mode: u32,
+    size_bytes: u64,
+    identity: FileIdentity,
+    kind: OfflineDependencyEntryKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfflineDependencyTree {
+    root_mode: u32,
+    root_identity: FileIdentity,
+    entries: Vec<OfflineDependencyEntry>,
+    manifest: OfflineDependencyManifest,
 }
 
 /// Immutable evidence for all repository changes observed in one controller worktree.
@@ -355,6 +422,224 @@ impl ProjectRegistry {
         })
     }
 
+    /// Copies one already-present, Git-ignored and untracked `node_modules` tree from the
+    /// registered primary repository into the exact Controller-owned worktree.
+    ///
+    /// This is a filesystem materialization only: it never invokes a package manager or network
+    /// operation. The source tree is bounded and content-addressed, unsafe filesystem objects are
+    /// rejected, the copy is staged beneath the Controller-owned worktree root, and the final
+    /// directory appears through one same-filesystem atomic rename. Returned provenance is bound to
+    /// the exact worktree lease so a higher layer can persist its own authority/evidence record.
+    ///
+    /// An empty `project_root` denotes the registered repository root. Otherwise every component
+    /// must be a normal repository-relative path component.
+    ///
+    /// # Errors
+    /// Returns a fail-closed repository error for a stale lease, unsafe project/source path,
+    /// tracked or non-ignored dependencies, an existing destination, resource-limit excess,
+    /// external/unsafe symlinks, special files, source drift, or staging/destination mismatch.
+    #[allow(clippy::too_many_lines)]
+    pub fn materialize_existing_node_modules(
+        &self,
+        lease: &WorktreeLease,
+        project_root: &Path,
+        limits: OfflineDependencyLimits,
+    ) -> Result<OfflineNodeModulesProvenance, RepoError> {
+        self.validate_worktree_lease(lease)?;
+        validate_offline_dependency_limits(limits)?;
+        validate_offline_project_root(project_root)?;
+
+        let primary_root = lease.primary_root.canonicalize()?;
+        let worktree_root = lease.worktree_path.canonicalize()?;
+        if primary_root != lease.primary_root || worktree_root != lease.worktree_path {
+            return Err(offline_dependency_error(
+                "repository/worktree root changed identity before dependency materialization",
+            ));
+        }
+        reject_existing_symlink_components(&primary_root, project_root)?;
+        reject_existing_symlink_components(&worktree_root, project_root)?;
+        let primary_project = primary_root.join(project_root);
+        let worktree_project = worktree_root.join(project_root);
+        require_existing_canonical_directory(
+            &primary_project,
+            &primary_root,
+            "primary project root",
+        )?;
+        require_existing_canonical_directory(
+            &worktree_project,
+            &worktree_root,
+            "worktree project root",
+        )?;
+
+        let source = primary_project.join("node_modules");
+        let destination = worktree_project.join("node_modules");
+        require_existing_canonical_directory(&source, &primary_root, "source node_modules")?;
+        require_absent_path(&destination, "destination node_modules")?;
+
+        let source_relative = project_node_modules_relative(project_root);
+        let source_tree = scan_offline_dependency_tree(&source, limits)?;
+        let ignore_evidence_digest = verify_offline_node_modules_git_state(
+            &primary_root,
+            &source_relative,
+            &source_tree.entries,
+        )?;
+
+        let controller_root = lease.controller_root.canonicalize()?;
+        if controller_root != lease.controller_root {
+            return Err(offline_dependency_error(
+                "Controller worktree root changed identity before dependency staging",
+            ));
+        }
+        let destination_parent_identity = directory_identity(&worktree_project)?;
+        if fs::symlink_metadata(&controller_root)?.dev()
+            != fs::symlink_metadata(&worktree_project)?.dev()
+        {
+            return Err(offline_dependency_error(
+                "dependency staging and destination are not on the same filesystem",
+            ));
+        }
+
+        let sequence = ATOMIC_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let staging = controller_root.join(format!(
+            ".sovereign-node-modules-{}-{sequence}",
+            std::process::id()
+        ));
+        require_absent_path(&staging, "dependency staging path")?;
+        fs::create_dir(&staging)?;
+        let staged_result = (|| {
+            copy_offline_dependency_tree(&source, &staging, &source_tree)?;
+            let staged_tree = scan_offline_dependency_tree(&staging, limits)?;
+            if staged_tree.manifest != source_tree.manifest {
+                return Err(offline_dependency_error(
+                    "staged node_modules manifest differs from the verified source manifest",
+                ));
+            }
+
+            let source_revalidated = scan_offline_dependency_tree(&source, limits)?;
+            if source_revalidated.manifest != source_tree.manifest {
+                return Err(offline_dependency_error(
+                    "source node_modules changed while the offline copy was staged",
+                ));
+            }
+            let revalidated_ignore_digest = verify_offline_node_modules_git_state(
+                &primary_root,
+                &source_relative,
+                &source_revalidated.entries,
+            )?;
+            if revalidated_ignore_digest != ignore_evidence_digest {
+                return Err(offline_dependency_error(
+                    "source node_modules Git-ignore evidence changed while staging",
+                ));
+            }
+            require_absent_path(&destination, "destination node_modules")?;
+            if directory_identity(&worktree_project)? != destination_parent_identity {
+                return Err(offline_dependency_error(
+                    "worktree project root changed identity before dependency commit",
+                ));
+            }
+            reject_existing_symlink_components(&worktree_root, project_root)?;
+            fs::rename(&staging, &destination)?;
+            OpenOptions::new()
+                .read(true)
+                .open(&worktree_project)?
+                .sync_all()?;
+            Ok(source_revalidated)
+        })();
+        let source_revalidated = match staged_result {
+            Ok(tree) => tree,
+            Err(error) => {
+                cleanup_owned_staging_path(&staging);
+                return Err(error);
+            }
+        };
+
+        let destination_tree = scan_offline_dependency_tree(&destination, limits)?;
+        if destination_tree.manifest != source_revalidated.manifest {
+            return Err(offline_dependency_error(
+                "atomically installed node_modules manifest differs from its verified source",
+            ));
+        }
+        Ok(OfflineNodeModulesProvenance {
+            schema_version: OFFLINE_NODE_MODULES_PROVENANCE_SCHEMA_VERSION,
+            repository_id: lease.repository_id.clone(),
+            plan_id: lease.plan_id.clone(),
+            plan_revision: lease.plan_revision,
+            task_id: lease.task_id.clone(),
+            task_contract_digest: lease.task_contract_digest.clone(),
+            worktree_lease_id: lease.lease_id.clone(),
+            base_head: lease.base_head.clone(),
+            project_root: project_root.to_path_buf(),
+            source_node_modules: source,
+            destination_node_modules: destination,
+            ignore_evidence_digest,
+            source_manifest: source_revalidated.manifest,
+            destination_manifest: destination_tree.manifest,
+        })
+    }
+
+    /// Rechecks an earlier offline dependency receipt against the exact live lease, source,
+    /// ignored Git state, and destination. This grants no copy or installation authority.
+    ///
+    /// # Errors
+    /// Returns an error when the receipt is misbound or either tree has drifted or become unsafe.
+    pub fn validate_existing_node_modules_provenance(
+        &self,
+        lease: &WorktreeLease,
+        provenance: &OfflineNodeModulesProvenance,
+        limits: OfflineDependencyLimits,
+    ) -> Result<(), RepoError> {
+        self.validate_worktree_lease(lease)?;
+        validate_offline_dependency_limits(limits)?;
+        validate_offline_project_root(&provenance.project_root)?;
+        let primary_root = lease.primary_root.canonicalize()?;
+        let worktree_root = lease.worktree_path.canonicalize()?;
+        if primary_root != lease.primary_root || worktree_root != lease.worktree_path {
+            return Err(offline_dependency_error(
+                "offline dependency roots changed identity",
+            ));
+        }
+        reject_existing_symlink_components(&primary_root, &provenance.project_root)?;
+        reject_existing_symlink_components(&worktree_root, &provenance.project_root)?;
+        let relative = project_node_modules_relative(&provenance.project_root);
+        let source = primary_root.join(&relative);
+        let destination = worktree_root.join(&relative);
+        if provenance.schema_version != OFFLINE_NODE_MODULES_PROVENANCE_SCHEMA_VERSION
+            || provenance.repository_id != lease.repository_id
+            || provenance.plan_id != lease.plan_id
+            || provenance.plan_revision != lease.plan_revision
+            || provenance.task_id != lease.task_id
+            || provenance.task_contract_digest != lease.task_contract_digest
+            || provenance.worktree_lease_id != lease.lease_id
+            || provenance.base_head != lease.base_head
+            || provenance.source_node_modules != source
+            || provenance.destination_node_modules != destination
+            || provenance.source_manifest != provenance.destination_manifest
+        {
+            return Err(offline_dependency_error(
+                "offline dependency receipt is not bound to the exact lease and paths",
+            ));
+        }
+        require_existing_canonical_directory(&source, &primary_root, "source node_modules")?;
+        require_existing_canonical_directory(
+            &destination,
+            &worktree_root,
+            "destination node_modules",
+        )?;
+        let source_tree = scan_offline_dependency_tree(&source, limits)?;
+        let destination_tree = scan_offline_dependency_tree(&destination, limits)?;
+        let ignore_digest =
+            verify_offline_node_modules_git_state(&primary_root, &relative, &source_tree.entries)?;
+        if source_tree.manifest != provenance.source_manifest
+            || destination_tree.manifest != provenance.destination_manifest
+            || ignore_digest != provenance.ignore_evidence_digest
+        {
+            return Err(offline_dependency_error(
+                "offline dependency receipt manifest or Git-ignore evidence drifted",
+            ));
+        }
+        Ok(())
+    }
+
     /// Reads one exact file from a validated controller worktree.
     ///
     /// # Errors
@@ -673,6 +958,655 @@ impl ProjectRegistry {
             ));
         }
         Ok(())
+    }
+}
+
+fn offline_dependency_error(message: impl Into<String>) -> RepoError {
+    RepoError::InvalidOfflineDependency(message.into())
+}
+
+fn validate_offline_dependency_limits(limits: OfflineDependencyLimits) -> Result<(), RepoError> {
+    if limits.max_entries == 0 || limits.max_bytes == 0 {
+        return Err(offline_dependency_error(
+            "offline dependency entry and byte ceilings must both be positive",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_offline_project_root(project_root: &Path) -> Result<(), RepoError> {
+    if project_root.is_absolute()
+        || project_root
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(offline_dependency_error(format!(
+            "project root must be strict repository-relative normal components: {}",
+            project_root.display()
+        )));
+    }
+    if project_root.to_str().is_none() {
+        return Err(offline_dependency_error(
+            "project root must be UTF-8 for hardened Git path binding",
+        ));
+    }
+    Ok(())
+}
+
+fn project_node_modules_relative(project_root: &Path) -> PathBuf {
+    if project_root.as_os_str().is_empty() {
+        PathBuf::from("node_modules")
+    } else {
+        project_root.join("node_modules")
+    }
+}
+
+fn require_existing_canonical_directory(
+    path: &Path,
+    boundary: &Path,
+    label: &str,
+) -> Result<(), RepoError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        offline_dependency_error(format!(
+            "{label} is unavailable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(offline_dependency_error(format!(
+            "{label} must be an existing non-symlink directory: {}",
+            path.display()
+        )));
+    }
+    let canonical = path.canonicalize()?;
+    if canonical != path || !canonical.starts_with(boundary) {
+        return Err(offline_dependency_error(format!(
+            "{label} escaped or changed canonical identity: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn require_absent_path(path: &Path, label: &str) -> Result<(), RepoError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err(offline_dependency_error(format!(
+            "{label} must be absent before materialization: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(RepoError::Io(error)),
+    }
+}
+
+fn verify_offline_node_modules_git_state(
+    repository_root: &Path,
+    node_modules_relative: &Path,
+    entries: &[OfflineDependencyEntry],
+) -> Result<String, RepoError> {
+    let pathspec = node_modules_relative.to_str().ok_or_else(|| {
+        offline_dependency_error("node_modules path must be UTF-8 for hardened Git inspection")
+    })?;
+    let tracked = git_required_dynamic(
+        repository_root,
+        "verify offline node_modules is untracked",
+        &["ls-files", "-z", "--", pathspec],
+    )?;
+    if !tracked.stdout.is_empty() {
+        return Err(offline_dependency_error(
+            "source node_modules contains Git-tracked paths",
+        ));
+    }
+
+    let mut paths = Vec::with_capacity(entries.len().saturating_add(1));
+    paths.push(node_modules_relative.to_path_buf());
+    paths.extend(
+        entries
+            .iter()
+            .map(|entry| node_modules_relative.join(&entry.relative_path)),
+    );
+    let expected = paths
+        .iter()
+        .map(|path| path.as_os_str().as_bytes().to_vec())
+        .collect::<BTreeSet<_>>();
+    let mut input = Vec::new();
+    for path in &paths {
+        input.extend_from_slice(path.as_os_str().as_bytes());
+        input.push(0);
+    }
+    let ignored = git_output_with_input(
+        repository_root,
+        &["check-ignore", "--no-index", "-z", "--stdin"],
+        &input,
+    )?;
+    if !ignored.status.success() && ignored.status.code() != Some(1) {
+        return Err(git_failure(
+            "verify offline node_modules ignore state",
+            &ignored,
+        ));
+    }
+    let ignored_paths = ignored
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect::<BTreeSet<_>>();
+    if ignored_paths != expected {
+        return Err(offline_dependency_error(
+            "source node_modules and every materialized entry must be Git-ignored",
+        ));
+    }
+
+    let verbose = git_output_with_input(
+        repository_root,
+        &["check-ignore", "--no-index", "-v", "-z", "--stdin"],
+        &input,
+    )?;
+    if !verbose.status.success() {
+        if verbose.status.code() == Some(1) {
+            return Err(offline_dependency_error(
+                "source node_modules ignore provenance changed during verification",
+            ));
+        }
+        return Err(git_failure(
+            "capture offline node_modules ignore provenance",
+            &verbose,
+        ));
+    }
+    Ok(sha256_prefixed(&verbose.stdout))
+}
+
+fn scan_offline_dependency_tree(
+    root: &Path,
+    limits: OfflineDependencyLimits,
+) -> Result<OfflineDependencyTree, RepoError> {
+    validate_offline_dependency_limits(limits)?;
+    let root_metadata = fs::symlink_metadata(root)?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(offline_dependency_error(format!(
+            "offline dependency root must be a non-symlink directory: {}",
+            root.display()
+        )));
+    }
+    validate_offline_dependency_mode(root, &root_metadata)?;
+    let canonical_root = root.canonicalize()?;
+    if canonical_root != root {
+        return Err(offline_dependency_error(
+            "offline dependency root changed canonical identity",
+        ));
+    }
+    let root_identity = identity(&root_metadata);
+    let root_mode = root_metadata.permissions().mode() & 0o7777;
+    let root_device = root_metadata.dev();
+    let mut entries = Vec::new();
+    let mut total_bytes = 0_u64;
+    scan_offline_dependency_directory(
+        &canonical_root,
+        Path::new(""),
+        root_device,
+        limits,
+        &mut entries,
+        &mut total_bytes,
+    )?;
+    if directory_identity(root)? != root_identity {
+        return Err(offline_dependency_error(
+            "offline dependency root changed identity during manifest capture",
+        ));
+    }
+    entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    let manifest = offline_dependency_manifest(root_mode, &entries, total_bytes)?;
+    Ok(OfflineDependencyTree {
+        root_mode,
+        root_identity,
+        entries,
+        manifest,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn scan_offline_dependency_directory(
+    root: &Path,
+    relative_directory: &Path,
+    root_device: u64,
+    limits: OfflineDependencyLimits,
+    entries: &mut Vec<OfflineDependencyEntry>,
+    total_bytes: &mut u64,
+) -> Result<(), RepoError> {
+    let directory = root.join(relative_directory);
+    let before_identity = directory_identity(&directory)?;
+    let mut children = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+    children.sort_by_key(std::fs::DirEntry::file_name);
+    if directory_identity(&directory)? != before_identity {
+        return Err(offline_dependency_error(
+            "offline dependency directory changed identity during enumeration",
+        ));
+    }
+    for child in children {
+        let name = child.file_name();
+        if name.as_os_str().as_bytes() == b".git" {
+            return Err(offline_dependency_error(
+                "offline dependency tree cannot contain a .git filesystem entry",
+            ));
+        }
+        let relative_path = relative_directory.join(&name);
+        let path = root.join(&relative_path);
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.dev() != root_device {
+            return Err(offline_dependency_error(format!(
+                "offline dependency entry crosses a filesystem boundary: {}",
+                relative_path.display()
+            )));
+        }
+        validate_offline_dependency_mode(&path, &metadata)?;
+        let next_entries = u64::try_from(entries.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        if next_entries > limits.max_entries {
+            return Err(offline_dependency_error(format!(
+                "offline dependency entry ceiling exceeded: {} > {}",
+                next_entries, limits.max_entries
+            )));
+        }
+        let entry_identity = identity(&metadata);
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            require_existing_canonical_directory(&path, root, "dependency directory")?;
+            entries.push(OfflineDependencyEntry {
+                relative_path: relative_path.clone(),
+                mode: metadata.permissions().mode() & 0o7777,
+                size_bytes: 0,
+                identity: entry_identity,
+                kind: OfflineDependencyEntryKind::Directory,
+            });
+            scan_offline_dependency_directory(
+                root,
+                &relative_path,
+                root_device,
+                limits,
+                entries,
+                total_bytes,
+            )?;
+            if directory_identity(&path)? != entry_identity {
+                return Err(offline_dependency_error(format!(
+                    "offline dependency directory changed identity: {}",
+                    relative_path.display()
+                )));
+            }
+        } else if metadata.is_file() && !metadata.file_type().is_symlink() {
+            let size_bytes = metadata.len();
+            *total_bytes = total_bytes.checked_add(size_bytes).ok_or_else(|| {
+                offline_dependency_error("offline dependency byte count overflowed")
+            })?;
+            if *total_bytes > limits.max_bytes {
+                return Err(offline_dependency_error(format!(
+                    "offline dependency byte ceiling exceeded: {} > {}",
+                    *total_bytes, limits.max_bytes
+                )));
+            }
+            let content_digest = hash_verified_regular_file(&path, entry_identity, size_bytes)?;
+            entries.push(OfflineDependencyEntry {
+                relative_path,
+                mode: metadata.permissions().mode() & 0o7777,
+                size_bytes,
+                identity: entry_identity,
+                kind: OfflineDependencyEntryKind::RegularFile { content_digest },
+            });
+        } else if metadata.file_type().is_symlink() {
+            let target =
+                validated_internal_symlink_target(root, &path, entry_identity, root_device)?;
+            let size_bytes = u64::try_from(target.as_os_str().as_bytes().len()).unwrap_or(u64::MAX);
+            *total_bytes = total_bytes.checked_add(size_bytes).ok_or_else(|| {
+                offline_dependency_error("offline dependency byte count overflowed")
+            })?;
+            if *total_bytes > limits.max_bytes {
+                return Err(offline_dependency_error(format!(
+                    "offline dependency byte ceiling exceeded: {} > {}",
+                    *total_bytes, limits.max_bytes
+                )));
+            }
+            entries.push(OfflineDependencyEntry {
+                relative_path,
+                mode: metadata.permissions().mode() & 0o7777,
+                size_bytes,
+                identity: entry_identity,
+                kind: OfflineDependencyEntryKind::Symlink { target },
+            });
+        } else {
+            return Err(offline_dependency_error(format!(
+                "offline dependency tree contains a special filesystem entry: {}",
+                relative_path.display()
+            )));
+        }
+    }
+    if directory_identity(&directory)? != before_identity {
+        return Err(offline_dependency_error(
+            "offline dependency directory changed identity during traversal",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_offline_dependency_mode(path: &Path, metadata: &fs::Metadata) -> Result<(), RepoError> {
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o7000 != 0 {
+        return Err(offline_dependency_error(format!(
+            "offline dependency entry has unsafe special permission bits: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn hash_verified_regular_file(
+    path: &Path,
+    expected_identity: FileIdentity,
+    expected_size: u64,
+) -> Result<String, RepoError> {
+    let before = fs::symlink_metadata(path)?;
+    if before.file_type().is_symlink()
+        || !before.is_file()
+        || identity(&before) != expected_identity
+        || before.len() != expected_size
+    {
+        return Err(offline_dependency_error(format!(
+            "offline dependency file changed before hashing: {}",
+            path.display()
+        )));
+    }
+    let mut file = File::open(path)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || identity(&opened) != expected_identity || opened.len() != expected_size
+    {
+        return Err(offline_dependency_error(format!(
+            "offline dependency file identity changed at open: {}",
+            path.display()
+        )));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut read_bytes = 0_u64;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        read_bytes = read_bytes
+            .checked_add(u64::try_from(count).unwrap_or(u64::MAX))
+            .ok_or_else(|| offline_dependency_error("offline dependency file size overflowed"))?;
+        hasher.update(&buffer[..count]);
+    }
+    if read_bytes != expected_size || identity(&fs::symlink_metadata(path)?) != expected_identity {
+        return Err(offline_dependency_error(format!(
+            "offline dependency file changed while hashing: {}",
+            path.display()
+        )));
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn validated_internal_symlink_target(
+    root: &Path,
+    path: &Path,
+    expected_identity: FileIdentity,
+    root_device: u64,
+) -> Result<PathBuf, RepoError> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.file_type().is_symlink() || identity(&before) != expected_identity {
+        return Err(offline_dependency_error(format!(
+            "offline dependency symlink changed identity: {}",
+            path.display()
+        )));
+    }
+    let target = fs::read_link(path)?;
+    if target.is_absolute() {
+        return Err(offline_dependency_error(format!(
+            "offline dependency symlink target must be relative: {}",
+            path.display()
+        )));
+    }
+    let lexical_target = resolve_symlink_lexically_within_root(root, path, &target)?;
+    let canonical_target = lexical_target.canonicalize().map_err(|error| {
+        offline_dependency_error(format!(
+            "offline dependency symlink target is missing or unsafe at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if canonical_target == root || !canonical_target.starts_with(root) {
+        return Err(offline_dependency_error(format!(
+            "offline dependency symlink escapes or cycles to its node_modules root: {}",
+            path.display()
+        )));
+    }
+    if fs::metadata(&canonical_target)?.dev() != root_device {
+        return Err(offline_dependency_error(format!(
+            "offline dependency symlink target crosses a filesystem boundary: {}",
+            path.display()
+        )));
+    }
+    let after = fs::symlink_metadata(path)?;
+    if !after.file_type().is_symlink()
+        || identity(&after) != expected_identity
+        || fs::read_link(path)? != target
+    {
+        return Err(offline_dependency_error(format!(
+            "offline dependency symlink changed while validating: {}",
+            path.display()
+        )));
+    }
+    Ok(target)
+}
+
+fn resolve_symlink_lexically_within_root(
+    root: &Path,
+    symlink_path: &Path,
+    target: &Path,
+) -> Result<PathBuf, RepoError> {
+    let parent = symlink_path.parent().ok_or_else(|| {
+        offline_dependency_error("offline dependency symlink has no parent directory")
+    })?;
+    let parent_relative = parent.strip_prefix(root).map_err(|_| {
+        offline_dependency_error("offline dependency symlink parent escaped its root")
+    })?;
+    let mut components = parent_relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for component in target.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(value) => components.push(value.to_os_string()),
+            std::path::Component::ParentDir => {
+                if components.pop().is_none() {
+                    return Err(offline_dependency_error(
+                        "offline dependency symlink lexically escapes node_modules",
+                    ));
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(offline_dependency_error(
+                    "offline dependency symlink target is not relative",
+                ));
+            }
+        }
+    }
+    let mut resolved = root.to_path_buf();
+    for component in components {
+        resolved.push(component);
+    }
+    Ok(resolved)
+}
+
+fn offline_dependency_manifest(
+    root_mode: u32,
+    entries: &[OfflineDependencyEntry],
+    total_bytes: u64,
+) -> Result<OfflineDependencyManifest, RepoError> {
+    let mut hasher = Sha256::new();
+    digest_manifest_field(&mut hasher, b"sovereign.offline_node_modules.v1");
+    hasher.update(root_mode.to_be_bytes());
+    let mut directory_count = 0_u64;
+    let mut regular_file_count = 0_u64;
+    let mut symlink_count = 0_u64;
+    for entry in entries {
+        digest_manifest_field(&mut hasher, entry.relative_path.as_os_str().as_bytes());
+        hasher.update(entry.mode.to_be_bytes());
+        hasher.update(entry.size_bytes.to_be_bytes());
+        match &entry.kind {
+            OfflineDependencyEntryKind::Directory => {
+                digest_manifest_field(&mut hasher, b"directory");
+                directory_count = directory_count.saturating_add(1);
+            }
+            OfflineDependencyEntryKind::RegularFile { content_digest } => {
+                digest_manifest_field(&mut hasher, b"regular_file");
+                digest_manifest_field(&mut hasher, content_digest.as_bytes());
+                regular_file_count = regular_file_count.saturating_add(1);
+            }
+            OfflineDependencyEntryKind::Symlink { target } => {
+                digest_manifest_field(&mut hasher, b"symlink");
+                digest_manifest_field(&mut hasher, target.as_os_str().as_bytes());
+                symlink_count = symlink_count.saturating_add(1);
+            }
+        }
+    }
+    Ok(OfflineDependencyManifest {
+        digest: format!("sha256:{:x}", hasher.finalize()),
+        entry_count: u64::try_from(entries.len()).map_err(|_| {
+            offline_dependency_error("offline dependency entry count cannot fit u64")
+        })?,
+        directory_count,
+        regular_file_count,
+        symlink_count,
+        total_bytes,
+    })
+}
+
+fn digest_manifest_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(value);
+}
+
+fn copy_offline_dependency_tree(
+    source_root: &Path,
+    staging_root: &Path,
+    source_tree: &OfflineDependencyTree,
+) -> Result<(), RepoError> {
+    if directory_identity(source_root)? != source_tree.root_identity {
+        return Err(offline_dependency_error(
+            "source node_modules root changed before staging copy",
+        ));
+    }
+    fs::set_permissions(staging_root, fs::Permissions::from_mode(0o700))?;
+    let root_device = fs::symlink_metadata(source_root)?.dev();
+    for entry in &source_tree.entries {
+        let source = source_root.join(&entry.relative_path);
+        let destination = staging_root.join(&entry.relative_path);
+        match &entry.kind {
+            OfflineDependencyEntryKind::Directory => {
+                let metadata = fs::symlink_metadata(&source)?;
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_dir()
+                    || identity(&metadata) != entry.identity
+                {
+                    return Err(offline_dependency_error(format!(
+                        "source dependency directory changed before copy: {}",
+                        entry.relative_path.display()
+                    )));
+                }
+                fs::create_dir(&destination)?;
+                fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))?;
+            }
+            OfflineDependencyEntryKind::RegularFile { .. } => {
+                copy_verified_regular_file(&source, &destination, entry)?;
+            }
+            OfflineDependencyEntryKind::Symlink { target } => {
+                let current_target = validated_internal_symlink_target(
+                    source_root,
+                    &source,
+                    entry.identity,
+                    root_device,
+                )?;
+                if &current_target != target {
+                    return Err(offline_dependency_error(format!(
+                        "source dependency symlink target changed before copy: {}",
+                        entry.relative_path.display()
+                    )));
+                }
+                symlink(target, &destination)?;
+            }
+        }
+    }
+    for entry in source_tree.entries.iter().rev() {
+        if matches!(entry.kind, OfflineDependencyEntryKind::Directory) {
+            fs::set_permissions(
+                staging_root.join(&entry.relative_path),
+                fs::Permissions::from_mode(entry.mode & 0o777),
+            )?;
+        }
+    }
+    fs::set_permissions(
+        staging_root,
+        fs::Permissions::from_mode(source_tree.root_mode & 0o777),
+    )?;
+    OpenOptions::new()
+        .read(true)
+        .open(staging_root)?
+        .sync_all()?;
+    Ok(())
+}
+
+fn copy_verified_regular_file(
+    source: &Path,
+    destination: &Path,
+    entry: &OfflineDependencyEntry,
+) -> Result<(), RepoError> {
+    let before = fs::symlink_metadata(source)?;
+    if before.file_type().is_symlink()
+        || !before.is_file()
+        || identity(&before) != entry.identity
+        || before.len() != entry.size_bytes
+    {
+        return Err(offline_dependency_error(format!(
+            "source dependency file changed before copy: {}",
+            entry.relative_path.display()
+        )));
+    }
+    let mut input = File::open(source)?;
+    let opened = input.metadata()?;
+    if !opened.is_file() || identity(&opened) != entry.identity || opened.len() != entry.size_bytes
+    {
+        return Err(offline_dependency_error(format!(
+            "source dependency file identity changed at copy open: {}",
+            entry.relative_path.display()
+        )));
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let copied = std::io::copy(&mut input, &mut output)?;
+    if copied != entry.size_bytes || identity(&fs::symlink_metadata(source)?) != entry.identity {
+        return Err(offline_dependency_error(format!(
+            "source dependency file changed during copy: {}",
+            entry.relative_path.display()
+        )));
+    }
+    output.set_permissions(fs::Permissions::from_mode(entry.mode & 0o777))?;
+    output.sync_all()?;
+    Ok(())
+}
+
+fn cleanup_owned_staging_path(path: &Path) {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            let _ = fs::remove_file(path);
+        }
+        Ok(_) => {
+            let _ = fs::remove_dir_all(path);
+        }
+        Err(_) => {}
     }
 }
 

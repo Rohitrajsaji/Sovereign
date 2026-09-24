@@ -5,10 +5,10 @@
 
 use super::{
     APPROVAL_REQUEST_NAMESPACE, APPROVAL_REQUEST_SCHEMA_VERSION, ApprovalDecisionV1,
-    ApprovalRequestStatusV1, ApprovalRequestV1, AttemptState, Controller, ControllerError,
-    ControllerStatusView, ExecutionControlV1, GoalIntentV1, RECOVERY_PROCESS_LEASE_SCHEMA_VERSION,
-    RecoveryManager, RecoveryProcessLease, RollbackStatusV1, TaskState, WorktreeLifecycle,
-    decode_persisted_repository_baseline_set, decode_verification_records,
+    ApprovalRequestStatusV1, ApprovalRequestV1, AttemptState, BrowserAcceptanceTemplateV1,
+    Controller, ControllerError, ControllerStatusView, ExecutionControlV1, GoalIntentV1,
+    RECOVERY_PROCESS_LEASE_SCHEMA_VERSION, RecoveryManager, RecoveryProcessLease, RollbackStatusV1,
+    TaskState, WorktreeLifecycle, decode_persisted_repository_baseline_set,
     process_lease_is_terminal, rollback_records, unix_millis,
     validate_durable_action_lifecycle_states,
 };
@@ -84,7 +84,9 @@ impl Controller {
     pub fn reopen_local(state: StateStore) -> Result<Self, ControllerError> {
         validate_durable_action_lifecycle_states(&state)?;
         if state.get_state("controller.plan", "active")?.is_none() {
-            return Ok(Self::new(state));
+            let controller = Self::new(state);
+            controller.validate_no_active_plan_history()?;
+            return Ok(controller);
         }
 
         state.recovery_integrity_check()?;
@@ -109,7 +111,15 @@ impl Controller {
         for (repository_id, baseline) in baseline_set.repositories {
             registry.register(repository_id, &baseline.snapshot.root)?;
         }
-        let (controller, _) = RecoveryManager::recover(state, &registry)?;
+        let browser_grant =
+            super::goal_runner::durable_browser_grant_for_plan(&state, &plan_document)?;
+        let permission_context = if browser_grant.is_some() {
+            super::PermissionContext::for_durable_goal_browser_grant()
+        } else {
+            super::PermissionContext::m1_local_autonomous()
+        };
+        let (controller, _) =
+            RecoveryManager::recover_with_permission_context(state, &registry, permission_context)?;
         Ok(controller)
     }
 }
@@ -184,6 +194,20 @@ impl LocalControl {
         self.controller.submit_goal_intent(goal)
     }
 
+    /// Submits a goal with an explicit durable browser grant and typed acceptance contract.
+    ///
+    /// # Errors
+    /// Returns the Controller validation or persistence error.
+    pub fn submit_goal_with_browser_grant(
+        &mut self,
+        goal: &str,
+        acceptance: BrowserAcceptanceTemplateV1,
+    ) -> Result<GoalIntentV1, ControllerError> {
+        self.ensure_mutation_authority()?;
+        self.controller
+            .submit_goal_intent_with_browser_grant(goal, acceptance)
+    }
+
     /// Delegates pause to the Controller-owned durable transition.
     ///
     /// # Errors
@@ -251,6 +275,12 @@ fn durable_active_read(
             "durable canonical plan document digest does not match active plan".to_owned(),
         ));
     }
+    let legacy_rev1_authority = super::trusted_active_legacy_rev1_authority(
+        &controller.state,
+        &plan_id,
+        revision,
+        plan_digest,
+    )?;
     let policy_digest = super::digest_json(
         plan_document
             .get("policy")
@@ -264,12 +294,29 @@ fn durable_active_read(
     let mut tasks = BTreeMap::new();
     for (task_id, plan_task) in &plan_task_map {
         let key = super::revision_scoped_key(&plan_id, revision, task_id);
-        let raw = controller
-            .state
-            .get_state("controller.task", &key)?
+        let raw = if let Some(raw) = controller.state.get_state("controller.task", &key)? {
+            raw
+        } else if let Some(expected) = legacy_rev1_authority
+            .as_ref()
+            .and_then(|authority| authority.task_records.get(task_id))
+        {
+            super::read_runtime_record_with_legacy_rev1(
+                &controller.state,
+                "controller.task",
+                &plan_id,
+                revision,
+                task_id,
+                expected,
+                true,
+            )?
             .ok_or_else(|| {
                 ControllerError::InvalidPlan(format!("durable active task {task_id} is missing"))
-            })?;
+            })?
+        } else {
+            return Err(ControllerError::InvalidPlan(format!(
+                "durable active task {task_id} is missing"
+            )));
+        };
         let runtime: super::TaskRuntime = serde_json::from_str(&raw)?;
         if runtime.task_contract_digest != super::digest_json(plan_task)?
             || runtime.task != **plan_task
@@ -280,24 +327,48 @@ fn durable_active_read(
         }
         tasks.insert(task_id.clone(), runtime);
     }
-    let attempts = controller
-        .state
-        .state_records("controller.attempt")?
-        .into_iter()
-        .filter_map(|record| {
-            super::logical_key_for_revision(&record.key, &plan_id, revision)
-                .map(|attempt_id| (attempt_id, record.value_json))
-        })
-        .map(|(attempt_id, raw)| {
+    let mut attempts = BTreeMap::new();
+    for record in controller.state.state_records("controller.attempt")? {
+        let Some(attempt_id) = super::logical_key_for_revision(&record.key, &plan_id, revision)
+        else {
+            continue;
+        };
+        let attempt: super::AttemptRuntime = serde_json::from_str(&record.value_json)?;
+        if !tasks.contains_key(&attempt.task_id) {
+            return Err(ControllerError::InvalidPlan(format!(
+                "active attempt {attempt_id} belongs to a superseded task"
+            )));
+        }
+        attempts.insert(attempt_id, attempt);
+    }
+    if let Some(authority) = legacy_rev1_authority.as_ref() {
+        for (attempt_id, expected) in &authority.attempt_records {
+            if attempts.contains_key(attempt_id) {
+                continue;
+            }
+            let raw = super::read_runtime_record_with_legacy_rev1(
+                &controller.state,
+                "controller.attempt",
+                &plan_id,
+                revision,
+                attempt_id,
+                expected,
+                true,
+            )?
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(format!(
+                    "durable active attempt {attempt_id} is missing"
+                ))
+            })?;
             let attempt: super::AttemptRuntime = serde_json::from_str(&raw)?;
             if !tasks.contains_key(&attempt.task_id) {
                 return Err(ControllerError::InvalidPlan(format!(
                     "active attempt {attempt_id} belongs to a superseded task"
                 )));
             }
-            Ok((attempt_id, attempt))
-        })
-        .collect::<Result<BTreeMap<_, _>, ControllerError>>()?;
+            attempts.insert(attempt_id.clone(), attempt);
+        }
+    }
     let baseline_raw = controller
         .state
         .get_state("controller.repository_baseline", "active")?
@@ -334,10 +405,15 @@ fn current_verifications(
     controller: &Controller,
     active: Option<&DurableActiveRead>,
 ) -> Result<Vec<Value>, ControllerError> {
-    let records = decode_verification_records(&controller.state)?;
     let Some(active) = active else {
         return Ok(Vec::new());
     };
+    let records = super::decode_verification_records_for_scope(
+        &controller.state,
+        &active.plan_id,
+        active.revision,
+        &active.plan_digest,
+    )?;
     let mut verifications = Vec::new();
     for verification in records {
         if verification.plan_id == active.plan_id

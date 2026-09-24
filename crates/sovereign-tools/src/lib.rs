@@ -4,6 +4,15 @@
 //! Controller-created authority to exist durably before an operating-system process starts.
 
 pub mod browser;
+mod catalog;
+
+pub use catalog::{
+    CANONICAL_BROWSER_TOOL_ID, CANONICAL_PATCH_TOOL_ID, CANONICAL_PROCESS_TOOL_ID,
+    CANONICAL_READ_TOOL_ID,
+    CANONICAL_TOOL_VERSION, canonical_browser_tool_manifest, canonical_patch_tool_manifest,
+    canonical_patch_tool_schema, canonical_process_tool_manifest, canonical_read_tool_manifest,
+    canonical_read_tool_schema,
+};
 
 use sha2::{Digest, Sha256};
 use sovereign_evidence::{ArtifactStore, EvidenceError, Redactor};
@@ -2699,6 +2708,17 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             &action.individually_authorized_environment,
         )?;
         environment.insert("PATH".to_owned(), self.command_policy.approved_path());
+        if let Some(toolchain) = &isolation_request.rust_toolchain {
+            environment.insert(
+                "RUSTC".to_owned(),
+                toolchain.rustc_path().display().to_string(),
+            );
+        }
+        if let Some(scratch) = &isolation_request.build_scratch_root {
+            let scratch = scratch.canonicalize()?;
+            environment.insert("CARGO_TARGET_DIR".to_owned(), scratch.display().to_string());
+            environment.insert("TMPDIR".to_owned(), scratch.display().to_string());
+        }
         let isolated = self.isolation.isolate(&action.command, isolation_request)?;
         let baseline_disk = directory_size(&action.command.working_directory)?;
         Ok(PreparedExecution {
@@ -2772,12 +2792,12 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             );
         }
 
-        if limited.is_some() && action.command.subprocess_limit > 0 {
+        if let Some(limit) = limited.filter(|_| action.command.subprocess_limit > 0) {
             journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
-            return Err(ToolError::RecoveryBlocked(
-                "forced cleanup cannot prove absence of descendants that may have escaped the process group"
-                    .to_owned(),
-            ));
+            return Err(ToolError::RecoveryBlocked(format!(
+                "forced cleanup after {} limit cannot prove absence of descendants that may have escaped the process group",
+                resource_limit_name(limit),
+            )));
         }
 
         let stdout =

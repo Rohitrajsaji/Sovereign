@@ -6,11 +6,22 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
 serde_json.workspace = true
+sovereign-context = { path = "../../crates/sovereign-context" }
 sovereign-controller = { path = "../../crates/sovereign-controller" }
+sovereign-evidence = { path = "../../crates/sovereign-evidence" }
 sovereign-eval = { path = "../../crates/sovereign-eval" }
+sovereign-model = { path = "../../crates/sovereign-model" }
+sovereign-plan = { path = "../../crates/sovereign-plan" }
+sovereign-policy = { path = "../../crates/sovereign-policy" }
+sovereign-repo = { path = "../../crates/sovereign-repo" }
 sovereign-state = { path = "../../crates/sovereign-state" }
+sovereign-tools = { path = "../../crates/sovereign-tools" }
 sovereign-types = { path = "../../crates/sovereign-types" }
+
+[dev-dependencies]
+sha2.workspace = true
 
 [lints]
 workspace = true

@@ -9,6 +9,8 @@ use sovereign_model::{
     ModelUsage,
 };
 use sovereign_plan::{
+    BrowserAcceptanceActionV1, BrowserAcceptanceExpectationV1, BrowserAcceptanceSemanticV1,
+    BrowserAcceptanceStepV1, BrowserAcceptanceTemplateV1, BrowserManagedAppLaunchV1,
     PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationError, PlanCompilationInput,
     PlanCompilationRepository, PlanCompilationResult, PlanCompiler, PlanValidator,
     ValidationEnvironment,
@@ -196,6 +198,50 @@ fn browser_tool_pin() -> Value {
     })
 }
 
+fn browser_acceptance_template() -> BrowserAcceptanceTemplateV1 {
+    BrowserAcceptanceTemplateV1 {
+        launch: BrowserManagedAppLaunchV1::PythonManagedServerV1 {
+            server_relative_path: "src/browser_app.py".to_owned(),
+            database_filename: "browser.sqlite3".to_owned(),
+            required_generations: 2,
+        },
+        steps: vec![
+            BrowserAcceptanceStepV1 {
+                step_id: "browser.open".to_owned(),
+                generation: 1,
+                action: BrowserAcceptanceActionV1::Navigate {
+                    path: "/records".to_owned(),
+                },
+                expectation: BrowserAcceptanceExpectationV1 {
+                    semantic: BrowserAcceptanceSemanticV1::Read,
+                    required_contains: Vec::new(),
+                    forbidden_contains: Vec::new(),
+                },
+            },
+            BrowserAcceptanceStepV1 {
+                step_id: "browser.invalid".to_owned(),
+                generation: 1,
+                action: BrowserAcceptanceActionV1::CaptureSynopsis,
+                expectation: BrowserAcceptanceExpectationV1 {
+                    semantic: BrowserAcceptanceSemanticV1::InvalidValidation,
+                    required_contains: vec!["Validation error".to_owned()],
+                    forbidden_contains: vec!["Saved successfully".to_owned()],
+                },
+            },
+            BrowserAcceptanceStepV1 {
+                step_id: "browser.restart".to_owned(),
+                generation: 2,
+                action: BrowserAcceptanceActionV1::CaptureSynopsis,
+                expectation: BrowserAcceptanceExpectationV1 {
+                    semantic: BrowserAcceptanceSemanticV1::RestartPersistence,
+                    required_contains: vec!["persisted record".to_owned()],
+                    forbidden_contains: Vec::new(),
+                },
+            },
+        ],
+    }
+}
+
 fn enable_loopback_browser(input: &mut PlanCompilationInput) {
     input.policy["capability_ceiling"]
         .as_array_mut()
@@ -232,7 +278,7 @@ fn one_task_proposal() -> String {
             "title": "Rename Settings submit label",
             "objective": "Change Save to Apply in the exact SettingsForm source.",
             "rationale": "The bounded source and focused test identify the requested component.",
-            "files": ["src/settings/SettingsForm.tsx", "src/settings/SettingsForm.test.tsx"],
+            "files": ["src/settings/SettingsForm.tsx"],
             "symbols": ["SettingsForm"],
             "evidence_queries": [],
             "expected_change": "A Controller-owned patch changes only the label."
@@ -852,6 +898,127 @@ fn controller_loopback_browser_binding_is_validator_clean_and_narrows_authority(
     assert_eq!(bindings[0].source_plan_digest(), source_plan_digest);
     assert_eq!(bindings[0].target_task_id(), target_task_id);
     assert!(bindings[0].binding_digest().starts_with("sha256:"));
+}
+
+#[test]
+fn typed_browser_acceptance_template_binds_exact_loopback_and_restart_evidence() {
+    let template = browser_acceptance_template();
+    template
+        .validate()
+        .unwrap_or_else(|error| panic!("typed browser acceptance template: {error}"));
+    let contract = template
+        .bind_loopback(LOOPBACK_BROWSER_PORT, vec!["AC.browser-primary".to_owned()])
+        .unwrap_or_else(|error| panic!("bind typed browser acceptance: {error}"));
+
+    assert_eq!(contract.loopback.scheme, "http");
+    assert_eq!(contract.loopback.host, "127.0.0.1");
+    assert_eq!(contract.loopback.port, LOOPBACK_BROWSER_PORT);
+    assert!(contract.evidence_binding.receipt_digest);
+    assert!(contract.evidence_binding.action_commit_sequence);
+    assert!(contract.evidence_binding.managed_generation);
+    assert_eq!(contract.launch.required_generations(), 2);
+    assert!(contract.steps.iter().any(|step| {
+        step.expectation.semantic == BrowserAcceptanceSemanticV1::InvalidValidation
+            && step
+                .expectation
+                .required_contains
+                .contains(&"Validation error".to_owned())
+            && step
+                .expectation
+                .forbidden_contains
+                .contains(&"Saved successfully".to_owned())
+    }));
+    assert!(contract.steps.iter().any(|step| {
+        step.generation == 2
+            && step.expectation.semantic == BrowserAcceptanceSemanticV1::RestartPersistence
+    }));
+}
+
+#[test]
+fn goal_granted_browser_acceptance_updates_completion_evidence_types() {
+    let backend = RecordingBackend::new(vec![response(unknown_path_proposal())]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let mut input = compilation_input();
+    enable_loopback_browser(&mut input);
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let source = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile browser goal: {error}"));
+    let bound = source
+        .bind_goal_granted_loopback_browser_acceptance(
+            &validator,
+            &browser_tool_pin(),
+            LOOPBACK_BROWSER_PORT,
+            LOOPBACK_BROWSER_MAX_NETWORK_BYTES,
+            &format!("sha256:{}", "9".repeat(64)),
+            &browser_acceptance_template(),
+        )
+        .unwrap_or_else(|error| panic!("bind granted browser acceptance: {error}"));
+
+    let task = &bound.plan().as_value()["tasks"][0];
+    assert_eq!(
+        task["acceptance_criteria"][0]["evidence_type"],
+        json!("artifact_result")
+    );
+    assert_eq!(
+        task["verification"]["required_evidence_types"],
+        json!(["artifact_result"])
+    );
+    assert_eq!(
+        bound.plan().as_value()["completion_gate"]["checks"][0]["required_evidence_types"],
+        json!(["artifact_result"])
+    );
+    assert_eq!(
+        bound.plan().as_value()["requirements"][0]["evidence_expectations"],
+        json!(["artifact_result"])
+    );
+    assert!(validator.is_valid(bound.plan()));
+}
+
+#[test]
+fn typed_browser_acceptance_requires_restart_persistence_and_preauthorized_process_exec() {
+    let mut no_restart = browser_acceptance_template();
+    no_restart.steps.retain(|step| step.generation == 1);
+    no_restart.steps.push(BrowserAcceptanceStepV1 {
+        step_id: "browser.generation-two".to_owned(),
+        generation: 2,
+        action: BrowserAcceptanceActionV1::CaptureSynopsis,
+        expectation: BrowserAcceptanceExpectationV1 {
+            semantic: BrowserAcceptanceSemanticV1::Observation,
+            required_contains: vec!["second generation".to_owned()],
+            forbidden_contains: Vec::new(),
+        },
+    });
+    assert!(
+        no_restart
+            .validate()
+            .err()
+            .is_some_and(|error| error.to_string().contains("restart_persistence"))
+    );
+
+    let source = compile_loopback_browser_source(|_| {});
+    let validator = validator();
+    let target_task_id = source.plan().as_value()["tasks"][1]["task_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("browser target task id"));
+    let error = source
+        .bind_controller_loopback_browser_acceptance(
+            &validator,
+            target_task_id,
+            &browser_tool_pin(),
+            LOOPBACK_BROWSER_PORT,
+            LOOPBACK_BROWSER_MAX_NETWORK_BYTES,
+            &browser_acceptance_template(),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("browser acceptance unexpectedly gained process_exec"));
+    assert!(
+        error
+            .to_string()
+            .contains("preauthorized process_exec authority"),
+        "unexpected browser acceptance rejection: {error}"
+    );
 }
 
 #[test]
