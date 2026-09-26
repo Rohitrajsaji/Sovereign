@@ -71,6 +71,12 @@ pub(crate) enum ControlApiRequest {
         goal_id: String,
         principal: String,
     },
+    UndoGoal {
+        goal_id: String,
+    },
+    ApplyGoal {
+        goal_id: String,
+    },
     ListEvents {
         after: i64,
         limit: usize,

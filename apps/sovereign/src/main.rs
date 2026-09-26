@@ -8,6 +8,7 @@ mod execution;
 #[cfg(any(test, feature = "e2e-fixtures"))]
 mod fixture_backend;
 mod goal_views;
+mod landing_service;
 mod launch_agent;
 mod launch_code;
 mod model_assets;
@@ -289,7 +290,12 @@ fn run_serve(args: &[String], state_path: &Path) -> Result<String, String> {
     );
     let (actor, actor_handle) = actor::ControllerActorHandle::spawn_with(
         actor_state,
-        actor::ActorOptions { execute, git_root },
+        actor::ActorOptions {
+            execute,
+            git_root,
+            managed: active.as_ref().is_some_and(|record| record.managed),
+            lands_results: active.is_some(),
+        },
     )?;
     let actor_for_server = actor.clone();
     let server_config = control_api::ServerConfig {
@@ -478,6 +484,7 @@ fn handle_control_request(
             let views = goal_views::goal_views(
                 &model,
                 &[],
+                None,
                 &goal_views::ServiceFacts {
                     status: &status,
                     working: false,
@@ -494,8 +501,11 @@ fn handle_control_request(
         ControlApiRequest::GetGoalActivity { .. } => {
             Err("goal activity is served by the local service".to_owned())
         }
-        ControlApiRequest::CreateProject { .. } | ControlApiRequest::OpenFolder { .. } => {
-            Err("project setup is served by the local service".to_owned())
+        ControlApiRequest::CreateProject { .. }
+        | ControlApiRequest::OpenFolder { .. }
+        | ControlApiRequest::UndoGoal { .. }
+        | ControlApiRequest::ApplyGoal { .. } => {
+            Err("projects and results are served by the local service".to_owned())
         }
         ControlApiRequest::ListEvents { after, limit } => {
             let store = StateStore::open(

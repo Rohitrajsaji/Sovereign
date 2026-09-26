@@ -8,6 +8,7 @@
 //! Task titles come from the compiled plan and are untrusted text; clients render them as text.
 
 use crate::execution::ServiceStatusV1;
+use crate::landing_service::{LandingRecordV1, LandingStatusV1, LandingsV1};
 use crate::service_state::PendingCommandV1;
 use serde::Serialize;
 use serde_json::Value;
@@ -31,7 +32,7 @@ pub struct GoalStepV1 {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct GoalProgressV1 {
     /// `received`, `queued`, `waiting`, `planning`, `building`, `checking`, `waiting_for_you`,
-    /// `stopping`, `done`, `failed`, or `cancelled`.
+    /// `stopping`, `applying`, `done`, `not_applied`, `undone`, `failed`, or `cancelled`.
     pub phase: String,
     pub headline: String,
     pub sentence: String,
@@ -53,6 +54,8 @@ pub struct GoalViewV1 {
     pub steps: Vec<GoalStepV1>,
     pub outcome: Option<GoalOutcomeV1>,
     pub queue_position: Option<u32>,
+    /// Where a finished request's result stands in the project folder.
+    pub landing: Option<LandingRecordV1>,
 }
 
 /// One activity line for a request, in plain words.
@@ -87,7 +90,10 @@ fn progress(
         steps_done,
         steps_total,
         percent,
-        terminal: matches!(phase, "done" | "failed" | "cancelled"),
+        terminal: matches!(
+            phase,
+            "done" | "not_applied" | "undone" | "failed" | "cancelled"
+        ),
     }
 }
 
@@ -286,6 +292,65 @@ fn queued_progress(position: u32, head_is_next: bool, facts: &ServiceFacts<'_>) 
     progress("queued", "Starting", "Starting soon.", (0, 0), 0)
 }
 
+/// How a finished request reads once its result is (or is not) in the project folder.
+/// `landings` is `None` for a project whose results Sovereign does not apply itself.
+fn completed_progress(
+    landings: Option<&LandingsV1>,
+    record: Option<&LandingRecordV1>,
+) -> GoalProgressV1 {
+    let Some(record) = record else {
+        return if landings.is_some() {
+            progress(
+                "applying",
+                "Finishing",
+                "Checked. Putting the changes in your project.",
+                (0, 0),
+                98,
+            )
+        } else {
+            progress("done", "Done", "Finished and checked.", (0, 0), 100)
+        };
+    };
+    match record.status {
+        LandingStatusV1::Landed => progress(
+            "done",
+            "Done",
+            "Finished, checked, and saved in your project.",
+            (0, 0),
+            100,
+        ),
+        LandingStatusV1::NothingToLand => progress(
+            "done",
+            "Done",
+            "Finished and checked. Nothing in your project needed to change.",
+            (0, 0),
+            100,
+        ),
+        LandingStatusV1::PredatesLanding => {
+            progress("done", "Done", "Finished and checked.", (0, 0), 100)
+        }
+        LandingStatusV1::Undone => progress(
+            "undone",
+            "Undone",
+            "Undone. Your project is back to how it was before this request.",
+            (0, 0),
+            100,
+        ),
+        LandingStatusV1::BlockedByLocalChanges
+        | LandingStatusV1::Conflict
+        | LandingStatusV1::Failed => progress(
+            "not_applied",
+            "Not applied yet",
+            record
+                .detail
+                .clone()
+                .unwrap_or_else(|| "The result could not be applied to your project.".to_owned()),
+            (0, 0),
+            100,
+        ),
+    }
+}
+
 /// Builds every request view: durable goals in submission order, then submissions still waiting
 /// for the current step to finish.
 #[must_use]
@@ -296,6 +361,7 @@ fn queued_progress(position: u32, head_is_next: bool, facts: &ServiceFacts<'_>) 
 pub fn goal_views(
     model: &LocalControlReadModelV1,
     outcomes: &[GoalOutcomeV1],
+    landings: Option<&LandingsV1>,
     facts: &ServiceFacts<'_>,
 ) -> Vec<GoalViewV1> {
     let active_goal_id = model
@@ -332,17 +398,11 @@ pub fn goal_views(
         let is_active = active_goal_id.as_deref() == Some(intent.goal_id.as_str());
         let mut queue_position = None;
         let mut steps = Vec::new();
+        let landing = landings
+            .and_then(|landings| landings.record(&intent.goal_id))
+            .cloned();
         let mut view_progress = match intent.status.as_str() {
-            "completed" => progress(
-                "done",
-                "Done",
-                "Finished and checked.",
-                (
-                    u32::try_from(active_steps.len()).unwrap_or(0),
-                    u32::try_from(active_steps.len()).unwrap_or(0),
-                ),
-                100,
-            ),
+            "completed" => completed_progress(landings, landing.as_ref()),
             "failed" => progress(
                 "failed",
                 "Didn't finish",
@@ -410,6 +470,7 @@ pub fn goal_views(
             steps,
             outcome,
             queue_position,
+            landing,
         });
     }
     for command in facts
@@ -433,6 +494,7 @@ pub fn goal_views(
             steps: Vec::new(),
             outcome: None,
             queue_position: None,
+            landing: None,
         });
     }
     views
@@ -555,6 +617,43 @@ mod tests {
         assert_eq!(view.percent, 41);
         assert_eq!(view.sentence, "Step 2 of 4: Add styles");
         assert!(!view.terminal);
+    }
+
+    #[test]
+    fn finished_request_reads_by_where_its_result_stands() {
+        let record = |status: LandingStatusV1| LandingRecordV1 {
+            goal_id: "goal-1".to_owned(),
+            status,
+            commit: None,
+            undo_commit: None,
+            changed_paths: Vec::new(),
+            detail: Some("Your folder has unsaved changes.".to_owned()),
+            technical_detail: None,
+            updated_at_ms: 1,
+        };
+        let landings = LandingsV1 {
+            schema_version: 1,
+            records: Vec::new(),
+        };
+        assert_eq!(completed_progress(None, None).phase, "done");
+        let applying = completed_progress(Some(&landings), None);
+        assert_eq!(applying.phase, "applying");
+        assert!(!applying.terminal);
+        let landed = record(LandingStatusV1::Landed);
+        assert_eq!(
+            completed_progress(Some(&landings), Some(&landed)).phase,
+            "done"
+        );
+        let blocked = record(LandingStatusV1::BlockedByLocalChanges);
+        let view = completed_progress(Some(&landings), Some(&blocked));
+        assert_eq!(view.phase, "not_applied");
+        assert_eq!(view.sentence, "Your folder has unsaved changes.");
+        assert!(view.terminal);
+        let undone = record(LandingStatusV1::Undone);
+        assert_eq!(
+            completed_progress(Some(&landings), Some(&undone)).phase,
+            "undone"
+        );
     }
 
     #[test]

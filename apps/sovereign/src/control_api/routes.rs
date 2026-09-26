@@ -258,6 +258,27 @@ pub(crate) fn parse_control_request(
                 principal,
             })
         }
+        ("POST", path)
+            if path.starts_with("/v2/goals/")
+                && (path.ends_with("/undo") || path.ends_with("/apply")) =>
+        {
+            let (goal_id, undo) = match path.strip_prefix("/v2/goals/") {
+                Some(rest) if rest.ends_with("/undo") => (rest.strip_suffix("/undo"), true),
+                Some(rest) => (rest.strip_suffix("/apply"), false),
+                None => (None, false),
+            };
+            let goal_id = goal_id
+                .filter(|goal_id| !goal_id.is_empty() && !goal_id.contains('/'))
+                .ok_or_else(|| ApiError::new(ApiStatus::BadRequest, "invalid goal path"))?
+                .to_owned();
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &[])?;
+            Ok(if undo {
+                ControlApiRequest::UndoGoal { goal_id }
+            } else {
+                ControlApiRequest::ApplyGoal { goal_id }
+            })
+        }
         ("POST", "/v2/setup/model/download") => {
             let value = parse_optional_json_object(body)?;
             require_only_fields(&value, &["confirmation"])?;

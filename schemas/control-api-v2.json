@@ -649,6 +649,70 @@
         }
       }
     },
+    "LandingRecord": {
+      "type": "object",
+      "required": [
+        "goal_id",
+        "status",
+        "commit",
+        "undo_commit",
+        "changed_paths",
+        "detail",
+        "technical_detail",
+        "updated_at_ms"
+      ],
+      "properties": {
+        "goal_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "predates_landing",
+            "landed",
+            "nothing_to_land",
+            "blocked_by_local_changes",
+            "conflict",
+            "undone",
+            "failed"
+          ]
+        },
+        "commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "undo_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "changed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "technical_detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at_ms": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
     "GoalView": {
       "type": "object",
       "required": [
@@ -699,6 +763,16 @@
           "type": [
             "integer",
             "null"
+          ]
+        },
+        "landing": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LandingRecord"
+            },
+            {
+              "type": "null"
+            }
           ]
         }
       }

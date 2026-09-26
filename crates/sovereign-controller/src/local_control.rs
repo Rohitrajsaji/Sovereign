@@ -239,6 +239,18 @@ impl LocalControl {
         self.controller.cancel_goal_intent(goal_id, principal)
     }
 
+    /// A completed goal's verified change sets in dependency order, for landing in the project
+    /// folder. `None` unless the goal completed.
+    ///
+    /// # Errors
+    /// Returns a state or decoding error, or a fail-closed error for a misbound plan.
+    pub fn completed_goal_work(
+        &self,
+        goal_id: &str,
+    ) -> Result<Option<super::CompletedGoalWorkV1>, ControllerError> {
+        super::completed_goal_work(self.controller.state(), goal_id)
+    }
+
     /// The active goal and a handle that interrupts its in-flight work. The handle carries no
     /// authority: it only sets the cancellation bit the Controller already polls.
     #[must_use]

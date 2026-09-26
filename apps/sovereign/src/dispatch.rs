@@ -6,7 +6,7 @@
 
 use crate::actor::{ControllerActorHandle, Reply};
 use crate::control_api::ControlApiRequest;
-use crate::{app_data, doctor, goal_views, model_assets, projections, projects};
+use crate::{app_data, doctor, goal_views, landing_service, model_assets, projections, projects};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sovereign_controller::ApprovalDecisionV1;
@@ -36,9 +36,15 @@ fn current_goal_views(
     let outcomes = sovereign_controller::goal_outcomes(&store).map_err(|e| e.to_string())?;
     let status = actor.service_status();
     let pending = actor.pending_commands();
+    // Unreadable landing records only hide landing detail; the requests still show.
+    let landings = actor
+        .state_path()
+        .parent()
+        .and_then(|dir| landing_service::load_landings(dir).ok().flatten());
     Ok(goal_views::goal_views(
         &model,
         &outcomes,
+        landings.as_ref(),
         &goal_views::ServiceFacts {
             status: &status,
             working: actor.working(),
@@ -57,6 +63,7 @@ fn switch_to_project(
     let _ = actor.switch_project(
         PathBuf::from(&record.state_path),
         Some(PathBuf::from(&record.root)),
+        record.managed,
     )?;
     Ok(json!({
         "cancelled": false,
@@ -129,6 +136,14 @@ pub(crate) fn handle_actor_request(
         ControlApiRequest::CancelGoal { goal_id, principal } => reply_json(
             actor.cancel_goal(goal_id, principal)?,
             "Stopping. The current work was interrupted and the request will show as cancelled in a moment.",
+        ),
+        ControlApiRequest::UndoGoal { goal_id } => reply_json(
+            actor.undo_goal(goal_id)?,
+            "Sovereign will undo this as soon as the current step finishes.",
+        ),
+        ControlApiRequest::ApplyGoal { goal_id } => reply_json(
+            actor.apply_goal(goal_id)?,
+            "Sovereign will apply this as soon as the current step finishes.",
         ),
         ControlApiRequest::RespondToApproval {
             request_id,
@@ -208,6 +223,7 @@ pub(crate) fn handle_actor_request(
                 let _ = actor.switch_project(
                     PathBuf::from(&record.state_path),
                     Some(PathBuf::from(&record.root)),
+                    record.managed,
                 )?;
             }
             serde_json::to_value(projects).map_err(|e| e.to_string())
@@ -243,6 +259,7 @@ pub(crate) fn handle_actor_request(
             let _ = actor.switch_project(
                 PathBuf::from(&target.state_path),
                 Some(PathBuf::from(&target.root)),
+                target.managed,
             )?;
             projects.active_project_id = Some(project_id);
             data.save_projects(&projects).map_err(|e| e.to_string())?;

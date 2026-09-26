@@ -255,6 +255,8 @@ mod tests {
             ActorOptions {
                 execute: true,
                 git_root: Some(root.clone()),
+                managed: false,
+                lands_results: false,
             },
         )
         .unwrap_or_else(|error| panic!("{error}"));
@@ -327,6 +329,8 @@ mod tests {
             ActorOptions {
                 execute: true,
                 git_root: Some(root.clone()),
+                managed: false,
+                lands_results: false,
             },
         )
         .unwrap_or_else(|error| panic!("{error}"));

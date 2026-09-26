@@ -173,6 +173,17 @@ export type GoalOutcome = {
   recorded_at_ms: number;
 };
 
+export type LandingRecord = {
+  goal_id: string;
+  status: "predates_landing" | "landed" | "nothing_to_land" | "blocked_by_local_changes" | "conflict" | "undone" | "failed";
+  commit: string | null;
+  undo_commit: string | null;
+  changed_paths: Array<string>;
+  detail: string | null;
+  technical_detail: string | null;
+  updated_at_ms: number;
+};
+
 export type GoalView = {
   schema_version: number;
   goal_id: string;
@@ -183,6 +194,7 @@ export type GoalView = {
   steps: Array<GoalStep>;
   outcome?: GoalOutcome | null;
   queue_position?: number | null;
+  landing?: LandingRecord | null;
 };
 
 export type GoalActivity = {

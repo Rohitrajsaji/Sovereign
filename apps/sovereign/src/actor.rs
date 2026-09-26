@@ -21,6 +21,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::execution::{ExecutionService, ServiceStatusV1};
+use crate::landing_service::{self, LandingRecordV1, ProjectWorkspace};
 use crate::run_lock::RunLock;
 use crate::service_state::{PendingCommandV1, ServiceShared, with_step_context};
 use sovereign_repo::ProjectRegistry;
@@ -35,6 +36,8 @@ const COMPOSITION_ERROR_LIMIT: u32 = 3;
 const STATE_READY_POLLS: u32 = 40;
 const STATE_BUSY_RETRIES: u32 = 5;
 const STATE_RETRY_DELAY: Duration = Duration::from_millis(50);
+const NO_LANDING_WORKSPACE: &str =
+    "This project's folder is not managed by Sovereign's results, so there is nothing to change.";
 
 /// Result of a command sent to the actor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +92,18 @@ pub enum ActorCommand {
         ticket: u64,
         state_path: PathBuf,
         git_root: Option<PathBuf>,
+        managed: bool,
         reply: Sender<Result<(), String>>,
+    },
+    UndoGoal {
+        ticket: u64,
+        goal_id: String,
+        reply: Sender<Result<LandingRecordV1, String>>,
+    },
+    ApplyGoal {
+        ticket: u64,
+        goal_id: String,
+        reply: Sender<Result<LandingRecordV1, String>>,
     },
     Shutdown {
         reply: Sender<Result<(), String>>,
@@ -100,6 +114,11 @@ pub enum ActorCommand {
 pub struct ActorOptions {
     pub execute: bool,
     pub git_root: Option<PathBuf>,
+    /// Sovereign keeps the folder's history itself (a project it created or first versioned).
+    pub managed: bool,
+    /// The folder is a registered project, so completed requests are applied to it. The
+    /// developer fallback (`serve` inside an unregistered repository) never applies results.
+    pub lands_results: bool,
 }
 
 #[derive(Clone)]
@@ -310,6 +329,7 @@ impl ControllerActorHandle {
         &self,
         state_path: PathBuf,
         git_root: Option<PathBuf>,
+        managed: bool,
     ) -> Result<Reply<()>, String> {
         let ticket = self.shared.enqueue("switch_project", None, None);
         let (reply, rx) = mpsc::channel();
@@ -319,6 +339,47 @@ impl ControllerActorHandle {
                 ticket,
                 state_path,
                 git_root,
+                managed,
+                reply,
+            },
+            &rx,
+        )
+    }
+
+    /// Undoes a request's result in the project folder with a new commit that reverses it.
+    ///
+    /// # Errors
+    /// Returns an error if the actor is gone or the result cannot be undone.
+    pub fn undo_goal(&self, goal_id: String) -> Result<Reply<LandingRecordV1>, String> {
+        let ticket = self
+            .shared
+            .enqueue("undo_goal", Some(goal_id.clone()), None);
+        let (reply, rx) = mpsc::channel();
+        self.send_tracked(
+            ticket,
+            ActorCommand::UndoGoal {
+                ticket,
+                goal_id,
+                reply,
+            },
+            &rx,
+        )
+    }
+
+    /// Tries again to apply a request's kept result to the project folder.
+    ///
+    /// # Errors
+    /// Returns an error if the actor is gone or there is nothing to apply.
+    pub fn apply_goal(&self, goal_id: String) -> Result<Reply<LandingRecordV1>, String> {
+        let ticket = self
+            .shared
+            .enqueue("apply_goal", Some(goal_id.clone()), None);
+        let (reply, rx) = mpsc::channel();
+        self.send_tracked(
+            ticket,
+            ActorCommand::ApplyGoal {
+                ticket,
+                goal_id,
                 reply,
             },
             &rx,
@@ -440,6 +501,113 @@ fn bind_workspace(
     }
 }
 
+/// Completed requests, oldest first, as (goal id, the person's words).
+fn completed_goals(model: &LocalControlReadModelV1) -> Vec<(String, String)> {
+    let mut goals = model
+        .status
+        .goal_intents
+        .iter()
+        .filter(|goal| goal.status == "completed")
+        .map(|goal| {
+            (
+                goal.submitted_at_ms,
+                goal.goal_id.clone(),
+                goal.natural_language_goal.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    goals.sort();
+    goals
+        .into_iter()
+        .map(|(_, goal_id, words)| (goal_id, words))
+        .collect()
+}
+
+/// The folder the bound project's results land in, when Sovereign lands them. Landing records
+/// start only once the current completions are known, so earlier work is never applied.
+fn bind_landing(
+    state: Option<&ActorState>,
+    git_root: Option<&Path>,
+    managed: bool,
+    state_path: &Path,
+) -> Option<ProjectWorkspace> {
+    let workspace = ProjectWorkspace::new(git_root?, managed, state_path)?;
+    let model = state?.control.as_ref()?.read_model().ok()?;
+    let completed = completed_goals(&model)
+        .into_iter()
+        .map(|(goal_id, _)| goal_id)
+        .collect::<Vec<_>>();
+    match landing_service::ensure_landings(&workspace, &completed) {
+        Ok(_) => Some(workspace),
+        Err(error) => {
+            eprintln!("sovereign: landing records unavailable: {error}");
+            None
+        }
+    }
+}
+
+/// Before a request is planned, saves the person's own edits in a managed project so the plan
+/// builds on them. Nothing happens while a plan is active: its worktrees are bound to HEAD.
+fn prepare_folder_for_planning(control: &LocalControl, workspace: &ProjectWorkspace) {
+    if !workspace.managed {
+        return;
+    }
+    let Ok(model) = control.read_model() else {
+        return;
+    };
+    let waiting = model
+        .status
+        .goal_intents
+        .iter()
+        .any(|goal| goal.status == "queued_for_plan_compilation");
+    let busy = model.status.active_plan.is_some()
+        || model
+            .status
+            .goal_intents
+            .iter()
+            .any(|goal| goal.status == "claimed_for_plan_compilation");
+    if waiting && !busy {
+        landing_service::save_your_edits(workspace);
+    }
+}
+
+/// Applies every completed request's verified work to the folder once its plan is finalized.
+fn land_finished_goals(control: &LocalControl, workspace: &ProjectWorkspace) {
+    let Ok(model) = control.read_model() else {
+        return;
+    };
+    if model.status.active_plan.is_some() {
+        return;
+    }
+    let completed = completed_goals(&model);
+    if completed.is_empty() {
+        return;
+    }
+    if let Err(error) = landing_service::land_completed_goals(workspace, &completed, |goal_id| {
+        control
+            .completed_goal_work(goal_id)
+            .map_err(|error| error.to_string())
+    }) {
+        eprintln!("sovereign: could not record a landed result: {error}");
+    }
+}
+
+/// The person's words for a goal, used as the history message for its result.
+fn goal_words(control: &LocalControl, goal_id: &str) -> String {
+    control
+        .read_model()
+        .ok()
+        .and_then(|model| {
+            model
+                .status
+                .goal_intents
+                .into_iter()
+                .find(|goal| goal.goal_id == goal_id)
+                .map(|goal| goal.natural_language_goal)
+        })
+        .unwrap_or_else(|| "Sovereign change".to_owned())
+}
+
 /// Errors that come from the environment (model files, memory probe) rather than from the
 /// queued goal. They never fail the goal: fixing setup lets it run.
 fn is_environment_error(error: &str) -> bool {
@@ -494,12 +662,16 @@ fn run_step(
     service: &mut ExecutionService,
     state: &mut ActorState,
     registry: &ProjectRegistry,
+    workspace: Option<&ProjectWorkspace>,
     shared: &Arc<ServiceShared>,
     errors: &mut CompositionErrors,
 ) {
     let Some(control) = state.control.as_mut() else {
         return;
     };
+    if let Some(workspace) = workspace {
+        prepare_folder_for_planning(control, workspace);
+    }
     if let Some((goal_id, handle)) = control.active_goal_interrupt() {
         shared.set_goal_interrupt(goal_id, handle);
     }
@@ -539,6 +711,9 @@ fn run_step(
             }
         }
     }
+    if let Some(workspace) = workspace {
+        land_finished_goals(control, workspace);
+    }
     shared.publish_status(service.status().clone());
 }
 
@@ -571,6 +746,17 @@ fn run_actor_loop(
             None
         }
     };
+    let mut workspace = options
+        .lands_results
+        .then(|| {
+            bind_landing(
+                actor_state.as_ref(),
+                options.git_root.as_deref(),
+                options.managed,
+                &initial_state,
+            )
+        })
+        .flatten();
     let mut errors = CompositionErrors::default();
 
     loop {
@@ -585,7 +771,14 @@ fn run_actor_loop(
                 Err(RecvTimeoutError::Timeout) => {
                     if let (Some(service), Some(state)) = (execution.as_mut(), actor_state.as_mut())
                     {
-                        run_step(service, state, &registry, shared, &mut errors);
+                        run_step(
+                            service,
+                            state,
+                            &registry,
+                            workspace.as_ref(),
+                            shared,
+                            &mut errors,
+                        );
                     }
                     None
                 }
@@ -608,6 +801,7 @@ fn run_actor_loop(
                 ticket,
                 state_path,
                 git_root,
+                managed,
                 reply,
             } => {
                 let res = match &mut actor_state {
@@ -628,6 +822,12 @@ fn run_actor_loop(
                         &mut execution,
                         &mut registry,
                         git_root.as_deref(),
+                        &state_path,
+                    );
+                    workspace = bind_landing(
+                        actor_state.as_ref(),
+                        git_root.as_deref(),
+                        managed,
                         &state_path,
                     );
                     errors.clear();
@@ -682,6 +882,65 @@ fn run_actor_loop(
                         .cancel_goal(&goal_id, &principal)
                         .map_err(|e| e.to_string())
                 });
+                shared.complete(ticket);
+                let _ = reply.send(res);
+            }
+            ActorCommand::UndoGoal {
+                ticket,
+                goal_id,
+                reply,
+            } => {
+                let res = match (workspace.as_ref(), actor_state.as_ref()) {
+                    (
+                        Some(workspace),
+                        Some(ActorState {
+                            control: Some(control),
+                            ..
+                        }),
+                    ) => landing_service::undo_goal(
+                        workspace,
+                        &goal_id,
+                        &goal_words(control, &goal_id),
+                    ),
+                    _ => Err(NO_LANDING_WORKSPACE.to_owned()),
+                };
+                shared.complete(ticket);
+                let _ = reply.send(res);
+            }
+            ActorCommand::ApplyGoal {
+                ticket,
+                goal_id,
+                reply,
+            } => {
+                let res = match (workspace.as_ref(), actor_state.as_ref()) {
+                    (
+                        Some(workspace),
+                        Some(ActorState {
+                            control: Some(control),
+                            ..
+                        }),
+                    ) => {
+                        if control
+                            .read_model()
+                            .is_ok_and(|model| model.status.active_plan.is_some())
+                        {
+                            Err("Sovereign is working on another request. Try again when it finishes."
+                                .to_owned())
+                        } else {
+                            landing_service::apply_goal(
+                                workspace,
+                                &goal_id,
+                                &goal_words(control, &goal_id),
+                                |goal_id| {
+                                    control
+                                        .completed_goal_work(goal_id)
+                                        .map_err(|error| error.to_string())
+                                },
+                            )
+                        }
+                    }
+                    _ => Err(NO_LANDING_WORKSPACE.to_owned()),
+                };
                 shared.complete(ticket);
                 let _ = reply.send(res);
             }
@@ -820,6 +1079,8 @@ mod tests {
             ActorOptions {
                 execute: true,
                 git_root: None,
+                managed: false,
+                lands_results: false,
             },
         )
         .unwrap_or_else(|error| panic!("spawn: {error}"));
@@ -828,7 +1089,7 @@ mod tests {
         assert_eq!(before.last_outcome, "none");
 
         actor
-            .switch_project(state_path.clone(), Some(repo))
+            .switch_project(state_path.clone(), Some(repo), false)
             .unwrap_or_else(|error| panic!("switch: {error}"));
         thread::sleep(Duration::from_millis(1_500));
         let after = actor.service_status();

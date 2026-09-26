@@ -22,6 +22,8 @@ mod execution;
 mod fixture_backend;
 #[path = "goal_views.rs"]
 mod goal_views;
+#[path = "landing_service.rs"]
+mod landing_service;
 #[path = "launch_agent.rs"]
 mod launch_agent;
 #[path = "launch_code.rs"]
@@ -100,6 +102,8 @@ fn run() -> Result<(), String> {
         ActorOptions {
             execute: true,
             git_root: Some(repo),
+            managed: false,
+            lands_results: false,
         },
     )?;
     let listener = bind_loopback(SocketAddr::from(([127, 0, 0, 1], 0)))?;

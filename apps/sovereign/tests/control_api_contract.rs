@@ -222,6 +222,19 @@ fn control_api_v2_live_serve_matches_frozen_schema() {
     assert_eq!(listed["projects"].as_array().map(Vec::len), Some(2));
     assert_eq!(listed["active_project_id"], opened["project"]["project_id"]);
 
+    // Undo and Apply exist and explain, in words, why there is nothing to do yet.
+    for action in ["undo", "apply"] {
+        let (status, refused) = post(&format!("/v2/goals/{goal_id}/{action}"), &json!({}));
+        assert!(
+            status != 200 && status != 404,
+            "{action}: {status} {refused}"
+        );
+        assert!(
+            load_validator("ErrorResponse").is_valid(&refused),
+            "{action}: {refused}"
+        );
+    }
+
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_dir_all(&home);

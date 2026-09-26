@@ -35565,6 +35565,14 @@ mod tests {
             .unwrap_or_else(|| panic!("a completed goal exposes its work"));
         assert_eq!(work.plan_id, plan_id);
         assert_eq!(work.plan_revision, plan_revision);
+        // Landing runs after the plan is finalized, so the work must outlive finalization.
+        controller
+            .finalize_completed_active_plan()
+            .unwrap_or_else(|error| panic!("finalize plan: {error}"));
+        let finalized = super::completed_goal_work(&controller.state, &goal_id)
+            .unwrap_or_else(|error| panic!("work after finalization: {error}"))
+            .unwrap_or_else(|| panic!("a finalized goal still exposes its work"));
+        assert_eq!(finalized, work);
         assert!(
             super::completed_goal_work(&controller.state, "goal-unknown")
                 .unwrap_or_else(|error| panic!("unknown goal: {error}"))
