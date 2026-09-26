@@ -49,6 +49,9 @@ const MAX_ADDITIONAL_REPOSITORIES: usize = 8;
 const MAX_SOURCE_CANDIDATES: usize = 16;
 const MAX_SOURCE_CANDIDATE_BYTES: usize = 16 * 1024;
 const MAX_SOURCE_CANDIDATE_TOTAL_BYTES: usize = 48 * 1024;
+/// Most bytes of project files shown to the model when a project has no explicit configuration.
+/// Sized so the chosen files fit the compile packet's direct-evidence budget whole.
+const AUTOMATIC_SOURCE_TOTAL_BYTES: u64 = 12 * 1024;
 const PROJECT_CONFIGURATION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +118,70 @@ fn load_project_configuration() -> Result<ProjectConfigurationV1, String> {
         ));
     }
     Ok(config)
+}
+
+/// How useful a project file is to show the model, lower first. `None` never shows it: hidden
+/// paths, lockfiles, and types a person's app is not edited through.
+fn automatic_source_rank(relative: &Path) -> Option<u8> {
+    if relative
+        .components()
+        .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
+    {
+        return None;
+    }
+    let name = relative.file_name()?.to_str()?;
+    if name == "SOVEREIGN.md" {
+        return Some(0);
+    }
+    if matches!(
+        name,
+        "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml" | "Cargo.lock"
+    ) {
+        return None;
+    }
+    match relative.extension()?.to_str()? {
+        "html" | "htm" => Some(1),
+        "js" | "mjs" | "jsx" | "ts" | "tsx" => Some(2),
+        "css" => Some(3),
+        "py" | "rs" | "go" | "rb" | "swift" => Some(4),
+        "json" | "toml" | "yaml" | "yml" => Some(5),
+        "md" | "txt" => Some(6),
+        _ => None,
+    }
+}
+
+/// Exact project files for a project without explicit configuration: the most useful text
+/// files first, within `AUTOMATIC_SOURCE_TOTAL_BYTES`. Chosen from the current repository
+/// listing, never from goal prose or model output.
+fn automatic_source_candidates(root: &Path) -> Vec<ConfiguredSourceCandidateV1> {
+    let Ok(files) = sovereign_repo::project_text_files(root, AUTOMATIC_SOURCE_TOTAL_BYTES) else {
+        return Vec::new();
+    };
+    let mut ranked = files
+        .into_iter()
+        .filter_map(|relative| {
+            let rank = automatic_source_rank(&relative)?;
+            let size = std::fs::metadata(root.join(&relative)).ok()?.len();
+            Some((rank, relative.components().count(), relative, size))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort();
+    let mut total = 0_u64;
+    let mut selected = Vec::new();
+    for (_, _, relative_path, size) in ranked {
+        if selected.len() == MAX_SOURCE_CANDIDATES {
+            break;
+        }
+        if total.saturating_add(size) > AUTOMATIC_SOURCE_TOTAL_BYTES {
+            continue;
+        }
+        total = total.saturating_add(size);
+        selected.push(ConfiguredSourceCandidateV1 {
+            repository_id: REPOSITORY_ID.to_owned(),
+            relative_path,
+        });
+    }
+    selected
 }
 
 fn parse_options(args: &[String]) -> Result<RunOptions, String> {
@@ -359,12 +426,35 @@ fn compilation_input(
                 .map_err(|error| error.to_string())?,
         );
     }
+    // A project without explicit configuration (every consumer project) still shows the model
+    // its files, so a request can change them. Unreadable automatic files are skipped.
+    let automatic = project_config.source_candidates.is_empty()
+        && project_config.additional_repositories.is_empty();
+    let automatic_candidates = if automatic {
+        snapshots
+            .get(REPOSITORY_ID)
+            .map(|snapshot| automatic_source_candidates(&snapshot.root))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let (source_candidates, routing_reason) = if automatic {
+        (
+            &automatic_candidates,
+            "project file chosen by the Controller from the current repository",
+        )
+    } else {
+        (
+            &project_config.source_candidates,
+            "explicit versioned project configuration",
+        )
+    };
     let mut candidate_keys = BTreeSet::new();
     let mut candidate_bytes = 0usize;
-    let mut candidates = Vec::with_capacity(project_config.source_candidates.len());
+    let mut candidates = Vec::with_capacity(source_candidates.len());
     let mut repository_languages = BTreeMap::<String, BTreeSet<String>>::new();
     let retriever = ExactRetriever::new(registry);
-    for candidate in &project_config.source_candidates {
+    for candidate in source_candidates {
         if !registered_ids.contains(&candidate.repository_id)
             || !candidate_keys.insert((
                 candidate.repository_id.clone(),
@@ -375,9 +465,14 @@ fn compilation_input(
                 "source candidate repository is unregistered or candidate is duplicated".to_owned(),
             );
         }
-        let exact = retriever
-            .read_path(&candidate.repository_id, &candidate.relative_path, None)
-            .map_err(|error| format!("read configured exact source candidate: {error}"))?;
+        let exact =
+            match retriever.read_path(&candidate.repository_id, &candidate.relative_path, None) {
+                Ok(exact) => exact,
+                Err(_) if automatic => continue,
+                Err(error) => {
+                    return Err(format!("read configured exact source candidate: {error}"));
+                }
+            };
         let size = usize::try_from(exact.byte_len).unwrap_or(usize::MAX);
         candidate_bytes = candidate_bytes
             .checked_add(size)
@@ -393,6 +488,8 @@ fn compilation_input(
             Some("rs") => "rust",
             Some("js" | "mjs" | "jsx") => "javascript",
             Some("ts" | "tsx") => "typescript",
+            Some("html" | "htm") => "html",
+            Some("css") => "css",
             Some("py") => "python",
             Some("md") => "markdown",
             Some("json") => "json",
@@ -404,10 +501,7 @@ fn compilation_input(
             .entry(candidate.repository_id.clone())
             .or_default()
             .insert(language.to_owned());
-        candidates.push(EvidenceItem::from_exact_file(
-            &exact,
-            "explicit versioned project configuration",
-        ));
+        candidates.push(EvidenceItem::from_exact_file(&exact, routing_reason));
     }
     for (repository_id, initial) in &snapshots {
         let current = registry
@@ -1528,6 +1622,58 @@ http.createServer((request, response) => {
             }),
             "production compilation must receive the exact configured source candidate"
         );
+        fs::remove_dir_all(root).expect("cleanup source evidence fixture");
+        fs::remove_dir_all(state.parent().expect("state directory"))
+            .expect("cleanup state fixture");
+    }
+
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
+    fn unconfigured_project_shows_the_model_its_useful_files_within_the_bound() {
+        let root = fixture();
+        commit_fixture_file(&root, "SOVEREIGN.md", "# Conventions\n");
+        commit_fixture_file(&root, "index.html", "<title>App</title>\n");
+        commit_fixture_file(&root, "app.js", "console.log(1);\n");
+        commit_fixture_file(&root, "package-lock.json", "{}\n");
+        commit_fixture_file(&root, ".config/hidden.js", "hidden\n");
+        commit_fixture_file(&root, "logo.png", "not really an image\n");
+        commit_fixture_file(&root, "big.js", &"x".repeat(13 * 1024));
+        let candidates = automatic_source_candidates(&root);
+        let paths = candidates
+            .iter()
+            .map(|candidate| candidate.relative_path.display().to_string())
+            .collect::<Vec<_>>();
+        assert!(paths.starts_with(&["SOVEREIGN.md".to_owned(), "index.html".to_owned()]));
+        assert!(paths.contains(&"app.js".to_owned()));
+        for skipped in [
+            "package-lock.json",
+            ".config/hidden.js",
+            "logo.png",
+            "big.js",
+        ] {
+            assert!(!paths.contains(&skipped.to_owned()), "{skipped} was shown");
+        }
+
+        let state = external_fixture_state(&root);
+        let controller = queued_compilation(&state, "Make the page say hello");
+        let mut registry = ProjectRegistry::new();
+        registry
+            .register(REPOSITORY_ID, &root)
+            .expect("register exact primary repository");
+        let input = compilation_input(&controller, &registry, &ProjectConfigurationV1::default())
+            .expect("construct compilation input")
+            .expect("queued goal input");
+        assert!(
+            input.context_packet.items.iter().any(|item| {
+                item.locator.as_deref() == Some("path:index.html")
+                    && item.text == "<title>App</title>\n"
+            }),
+            "an unconfigured project must show the model its current files"
+        );
+        assert!(input.m3.is_none());
         fs::remove_dir_all(root).expect("cleanup source evidence fixture");
         fs::remove_dir_all(state.parent().expect("state directory"))
             .expect("cleanup state fixture");
