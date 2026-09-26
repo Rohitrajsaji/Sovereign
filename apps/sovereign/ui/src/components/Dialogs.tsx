@@ -240,8 +240,8 @@ export function HelpDialog({ open, onOpenChange }: { open: boolean; onOpenChange
         <section>
           <h3>Sovereign isn't responding</h3>
           <p className="muted">
-            Open Terminal and type <span className="mono">sovereign</span>. That restarts it and opens
-            this page again.
+            Open Sovereign from Spotlight or Launchpad, or type <span className="mono">sovereign</span>{" "}
+            in Terminal. That restarts it and opens this page again.
           </p>
         </section>
       </div>

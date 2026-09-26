@@ -28,16 +28,30 @@ Each milestone ends with: Rust fmt, clippy, and tests; the UI gate; Playwright a
 
 ### Status (2026-09-26)
 
-- **M1 done in the backend.** Its UI item (7) moves into M5, because the new UI replaces those screens.
-- **M2 done.**
-  - `POST /v2/projects/create` and `POST /v2/projects/open` (path or folder picker), the starter scaffold, and invisible Git.
-  - Landing after the plan is finalized, with `landings-v1.json` beside the project state.
-  - "Your edits" checkpoints in managed projects only.
-  - `POST /v2/goals/{id}/undo` and `/apply`.
-- **Findings that change later work.**
-  - Without `SOVEREIGN_PROJECT_CONFIG`, compiles saw no files and could not plan any change. The runner now shows the model up to 12 KiB of the project's own files. That fits the 8K compile packet, but a project whose main file outgrows 12 KiB will need a bigger context tier (M3).
-  - Consumer compiles use the minimal compiler path. Its only acceptance check is the scoped-diff evaluator. The starter's `tests/test_site.py` is not yet run as acceptance, so a Controller-authored check command belongs in M6.
-  - Task worktrees are pinned to HEAD. So the folder is only changed when no plan is active: before planning and after finalization.
+M1 through M5 are built and pushed. M6 is done up to the owner's run on a Mac.
+
+- **M1.** Nothing hangs or lies. Its UI item moved into M5.
+- **M2.** Projects, invisible Git, landing, Undo, Apply, and the scaffold.
+- **M3.** A pinned catalog (Qwen3-4B Q4_K_M at a fixed Hugging Face revision; the llama.cpp b10516 runner), resumable checksum-checked downloads, and the Command Line Tools check.
+- **M4.** `install.sh`, `self-install`, `update`, `uninstall`, the `~/Applications/Sovereign.app` launcher, the release workflow, and `install-from-source.sh`.
+- **M5.** The new UI: onboarding, conversation, the preview/files/details panel, settings, and help.
+- **M6.**
+  - The Playwright journey (9 tests) passes against the fixture server in Chromium.
+  - Vitest and axe cover every card state.
+  - The user guide, troubleshooting, and `docs/acceptance-v2.md` are written.
+
+**Deviation.** The preview frame uses `allow-scripts allow-same-origin allow-forms allow-modals` rather than omitting `allow-same-origin`.
+
+- Without it, previewed apps cannot use `localStorage`, which the starter tells the model to use.
+- It is safe because the preview is served from `localhost`, a different site from the app on `127.0.0.1`. The session cookie never reaches it, and the frame cannot touch the app.
+
+**Findings that change later work.**
+
+- Without `SOVEREIGN_PROJECT_CONFIG`, compiles saw no files. The runner now shows the model up to 12 KiB of the project's own files, which fits the 8K compile packet. A project whose main file outgrows that needs a bigger context tier.
+- Consumer compiles use the minimal compiler path. Its only acceptance check is the scoped-diff evaluator, so the starter's `tests/test_site.py` is not yet run. A Controller-authored check command is the next quality step.
+- Task worktrees are pinned to HEAD, so the folder only changes when no plan is active: before planning and after finalization.
+- Each open page's event stream used to hold one of four HTTP workers, stalling buttons for 15 to 30 s with a few tabs open. The stream also tailed the wrong database for registered projects. Both are fixed.
+- The fixture model cannot produce file changes, so Undo and Apply are proven by Rust tests with real Git, not by Playwright.
 
 ### M1. Nothing hangs, nothing lies (CX2-T01 to T05)
 

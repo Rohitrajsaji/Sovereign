@@ -18,7 +18,7 @@ Open Terminal and paste:
 curl -fsSL https://raw.githubusercontent.com/Rohitrajsaji/Sovereign/main/install.sh | sh
 ```
 
-Sovereign opens in your browser. The first time, it checks your Mac, installs Apple's free Command Line Tools if they are missing, and downloads the local model. After that, open it any time by typing `sovereign` in Terminal.
+Sovereign opens in your browser. The first time, it checks your Mac, installs Apple's free Command Line Tools if they are missing, and downloads the local model. After that, open it from Spotlight or Launchpad like any app, or type `sovereign` in Terminal.
 
 The installer puts everything under `~/.sovereign` and needs no administrator password. It checks every download against its published checksum.
 

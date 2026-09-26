@@ -40,7 +40,8 @@ function Offline({ error, onRetry }: { error: unknown; onRetry: () => void }) {
       <BrandMark className="brand-mark" />
       <h1>{expired ? "This page needs a fresh link" : "Sovereign isn't running"}</h1>
       <p className="muted">
-        Open Terminal and type <code>sovereign</code>. It starts Sovereign and opens this page again.
+        Open Sovereign from Spotlight or Launchpad, or type <code>sovereign</code> in Terminal. It
+        starts Sovereign and opens this page again.
       </p>
       <div>
         <Button onClick={onRetry}>Try again</Button>

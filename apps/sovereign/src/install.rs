@@ -7,7 +7,8 @@
 //! Layout, all under the person's home directory and never inside a project:
 //! - `~/.sovereign/versions/<version>/` holds `bin/sovereign`, `libexec/llama/`, and `VERSION`;
 //! - `~/.sovereign/current` points at the version in use, switched with an atomic rename;
-//! - `~/.local/bin/sovereign` points at `~/.sovereign/current/bin/sovereign`.
+//! - `~/.local/bin/sovereign` points at `~/.sovereign/current/bin/sovereign`;
+//! - `~/Applications/Sovereign.app` opens Sovereign from Spotlight, Launchpad, or the Dock.
 //!
 //! Updates download the release tarball and its `SHA256SUMS` over HTTPS with `/usr/bin/curl`,
 //! refuse a tarball whose checksum does not match, and hand over to the new version's own
@@ -71,6 +72,55 @@ impl InstallLayout {
     fn current_binary(&self) -> PathBuf {
         self.current().join("bin").join("sovereign")
     }
+
+    fn app_bundle(&self) -> PathBuf {
+        self.home.join("Applications").join("Sovereign.app")
+    }
+}
+
+const LAUNCHER_EXECUTABLE: &str = "sovereign-launcher";
+
+fn launcher_info_plist(version: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Sovereign</string>
+  <key>CFBundleDisplayName</key><string>Sovereign</string>
+  <key>CFBundleIdentifier</key><string>dev.sovereign.launcher</string>
+  <key>CFBundleExecutable</key><string>{LAUNCHER_EXECUTABLE}</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>{version}</string>
+  <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+"#
+    )
+}
+
+/// Writes `~/Applications/Sovereign.app`, which opens Sovereign with a fresh one-time link, so
+/// nobody needs Terminal after installing. It is made on this Mac, so Gatekeeper never
+/// quarantines it.
+fn write_app_launcher(layout: &InstallLayout, version: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let contents = layout.app_bundle().join("Contents");
+    let macos = contents.join("MacOS");
+    fs::create_dir_all(&macos).map_err(|error| error.to_string())?;
+    fs::write(contents.join("Info.plist"), launcher_info_plist(version))
+        .map_err(|error| error.to_string())?;
+    let launcher = macos.join(LAUNCHER_EXECUTABLE);
+    fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\n# Opens Sovereign in the browser with a fresh one-time link.\nexec \"{}\" app\n",
+            layout.current_binary().display()
+        ),
+    )
+    .map_err(|error| error.to_string())?;
+    fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))
+        .map_err(|error| error.to_string())
 }
 
 fn valid_version(version: &str) -> bool {
@@ -187,6 +237,14 @@ pub fn self_install(layout: &InstallLayout, data: &AppData) -> Result<String, St
         |text| text.trim().to_owned(),
     );
     let mut lines = vec![format!("Sovereign {version} is installed."), service];
+    match write_app_launcher(layout, &version) {
+        Ok(()) => lines.push(
+            "Open Sovereign any time from Spotlight or Launchpad, or type `sovereign`.".to_owned(),
+        ),
+        Err(error) => lines.push(format!(
+            "Could not add Sovereign to ~/Applications ({error}). Type `sovereign` to open it."
+        )),
+    }
     if let Some(hint) = path_hint(layout) {
         lines.push(hint);
     }
@@ -372,6 +430,9 @@ pub fn uninstall(layout: &InstallLayout, args: &[String]) -> Result<String, Stri
     if layout.root().exists() {
         fs::remove_dir_all(layout.root()).map_err(|error| error.to_string())?;
     }
+    if layout.app_bundle().exists() {
+        fs::remove_dir_all(layout.app_bundle()).map_err(|error| error.to_string())?;
+    }
     lines.push("Removed the Sovereign app and its background service.".to_owned());
     let data_root = AppData::open_default()
         .ok()
@@ -429,6 +490,24 @@ mod tests {
             listed_checksum(&format!("xyz  {RELEASE_ASSET}"), RELEASE_ASSET),
             None
         );
+    }
+
+    #[test]
+    fn the_app_launcher_opens_the_current_version() {
+        let home = temp_home("launcher");
+        let layout = InstallLayout { home: home.clone() };
+        write_app_launcher(&layout, "0.2.0").unwrap_or_else(|error| panic!("{error}"));
+        let contents = layout.app_bundle().join("Contents");
+        let plist = fs::read_to_string(contents.join("Info.plist")).unwrap_or_default();
+        assert!(plist.contains("<string>sovereign-launcher</string>"));
+        assert!(plist.contains("<string>0.2.0</string>"));
+        let script = fs::read_to_string(contents.join("MacOS").join(LAUNCHER_EXECUTABLE))
+            .unwrap_or_default();
+        assert!(
+            script.contains(".sovereign/current/bin/sovereign\" app"),
+            "{script}"
+        );
+        let _ = fs::remove_dir_all(home);
     }
 
     #[test]

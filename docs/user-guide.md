@@ -1,58 +1,102 @@
 # Sovereign user guide
 
-Install the local binary, then operate from the loopback UI.
+Sovereign builds small apps on your Mac from requests written in plain words. The AI runs on your Mac, so what you type and make stays there.
 
 ## Install
 
+You need a Mac with Apple silicon (M1 or later), 8 GB of memory, and about 23 GB of free disk space.
+
+Open Terminal and paste:
+
 ```sh
-cargo install --path apps/sovereign
+curl -fsSL https://raw.githubusercontent.com/Rohitrajsaji/Sovereign/main/install.sh | sh
 ```
 
-You need `/usr/bin/git`, `/usr/bin/python3`, and `/usr/bin/sandbox-exec` on macOS. The local model is Qwen3-4B-Q4_K_M plus `llama-server`. Point Settings at those files, or set `SOVEREIGN_MODEL_RUNTIME` and `SOVEREIGN_MODEL_PATH`.
+Sovereign opens in your browser. From then on, open it from Spotlight or Launchpad like any app (it lives in your Applications folder), or type `sovereign` in Terminal. It keeps running in the background, so a closed browser tab doesn't stop work in progress.
 
 ## First run
 
+Setup has three steps:
+
+1. **Welcome.** What Sovereign does.
+2. **Getting ready.** Sovereign checks your Mac.
+   - If Apple's Command Line Tools are missing, choose **Install**. Follow Apple's installer, then choose **Check again**. Sovereign uses them to keep your project's history and to run checks.
+   - Choose **Download** for the AI model (about 2.5 GB, once). You can pause and resume. If the connection drops, it continues where it stopped.
+3. **Your first project.** Either:
+   - start a new one: Sovereign makes a folder under **Sovereign Projects** in your home folder; or
+   - choose a folder you already have.
+
+You can choose **Set up later** and look around first. Requests wait until setup is finished.
+
+## Making something
+
+Type what you want in the box at the bottom and press Enter. Start small and add to it:
+
+- "A to-do list that remembers my tasks"
+- "Make the add button bigger and green"
+- "Add a total at the bottom"
+
+Each request gets a card that shows where it is: **Planning → Building → Checking → Done**. The card shows the current step, a progress bar, and a sentence about what's happening. One request runs at a time; new ones wait their turn.
+
+When a request is done, its card lists the files that changed.
+
+- **Open preview** shows your app on the right.
+- **Undo** takes the change back.
+
+Every change, including your own edits between requests, is saved in the project's history. Undo never loses anything else.
+
+## The panel on the right
+
+- **Preview** shows your app as it is in the project folder. It reloads when a change lands. **Open in new tab** opens it on its own. The preview runs separately from Sovereign and can't reach it.
+- **Files** lists the project's files. Choose one to read it.
+- **Details** shows what happened for a request, step by step, plus technical facts for anyone who wants them.
+
+## When Sovereign needs you
+
+- **Needs your answer.** Sovereign asks before anything outside your project, such as downloading a package or using the internet. Read what it wants to do, then choose **Allow** or **Don't allow**. Nothing happens until you choose, and every request is asked separately.
+- **Not applied yet.** The result is finished, but your folder has unsaved changes to the same files. Save or set aside those changes, then choose **Apply**. The result is kept until you do.
+- **Didn't finish.** Choose **Try again**, or ask differently or in smaller steps.
+- **Stop / Cancel.** Stops a request after you confirm. Nothing in your project changes.
+
+## Troubleshooting
+
+**"Sovereign isn't running" or "This page needs a fresh link."** Open Sovereign from Spotlight or Launchpad, or type `sovereign` in Terminal. That restarts it if needed and opens a fresh page.
+
+**"Waiting for memory."** The AI model needs several gigabytes of free memory. Close apps you aren't using; Sovereign tries again on its own. After a few runs it measures its real memory use, and the requirement often drops.
+
+**"Having trouble."** Sovereign hit a problem and keeps retrying. The card says why in plain words, and Details shows the exact message.
+- "The AI model isn't set up yet": open **Settings → Set up** and finish the download.
+- "Safety sandbox isn't available": Sovereign needs macOS on Apple silicon.
+
+**Apple's Command Line Tools won't install.** Open **System Settings → General → Software Update** and install any updates. Then run `xcode-select --install` in Terminal, and choose **Check again** in Sovereign.
+
+**The model download keeps failing.** Check your internet connection and choose **Try again**. It continues where it stopped. Sovereign only accepts the file if it matches its published checksum, so a damaged download is thrown away rather than used.
+
+**A request keeps failing.** A 4-billion-parameter model on a laptop is good at small, clear requests. Split a big idea into several smaller ones, or describe the result you want to see.
+
+## Settings
+
+- **Local AI model:** whether the model is ready, and **Set up** to finish or check it.
+- **Work:** **Pause work** stops Sovereign from starting anything new; **Resume work** continues.
+- **Notifications:** hear when a request finishes or needs you while the tab is in the background.
+- **Advanced:**
+  - diagnostics for every check;
+  - your own model files (a `llama-server` program and a `.gguf` model);
+  - the name recorded with your approvals.
+
+## Update or remove
+
 ```sh
-sovereign app
+sovereign update      # installs the newest release
+sovereign uninstall   # removes Sovereign; your project folders stay
 ```
 
-That starts `sovereign serve --execute` through a LaunchAgent if needed and opens the UI with a one-time link that expires after a minute. Run `sovereign app` again whenever you need a new one. Or run `sovereign serve --execute 127.0.0.1:7777` yourself and open the printed URL.
+`sovereign uninstall` asks before deleting downloaded models and Sovereign's records of your projects. It never deletes your project folders.
 
-Complete onboarding: doctor checks, choose existing model files, paste a git repository path.
+## For developers
 
-## Goals
+Sovereign's projects are ordinary Git repositories. A folder that already has Git history is used as it is. Sovereign never commits your own work in it, and it asks you to save or set aside changes before applying a result.
 
-Type a bounded engineering goal. Sovereign queues it. The Controller compiles and executes. Verification, not the model, marks work complete.
-
-Pause and resume from Home. Cancel from the goal page. Cancel does not roll back git work. A dispatched action without a receipt is `unknown`.
-
-## Waiting for memory
-
-On an 8 GB Mac the model needs several gigabytes free. If Home says Sovereign is waiting for memory, it shows how much the model needs and how much is free. Close other apps. Sovereign retries on its own. After a few successful runs Sovereign measures the model's real memory use, and the requirement can drop.
-
-Turn on desktop notifications in Settings to hear about approvals, recovery, and finished goals while the tab is in the background.
-
-## Approvals
-
-Publication, spending, secret use, and destructive external actions still need an explicit Approve or Deny. There is no bulk approve.
-
-## Recovery
-
-If mutation is blocked, open Recovery. Unknown actions are not replayed. Conflicted worktrees are yours to fix. Sovereign will not reset your repository.
-
-## First-run checklist
-
-With model files already on disk, a first-time operator should be able to:
-
-1. Finish onboarding in under 10 minutes.
-2. Submit a goal and understand every status without reading logs.
-3. Approve or deny one action and see exactly what will run.
-4. Recover the same goal after a forced process restart, with no replay of an unknown action.
-
-## Uninstall
-
-```sh
-sovereign service uninstall
-```
-
-Then remove `~/Library/Application Support/Sovereign/` if you want local settings gone.
+- To build from source, see the README.
+- For how it works, see [docs/wiki](wiki/README.md).
+- The command-line interface is in `sovereign help`.
