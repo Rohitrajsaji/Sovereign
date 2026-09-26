@@ -1,109 +1,92 @@
-/* Callers: src/styles.css. API: semantic tokens, light/dark via data-theme, reduced motion.
-   Schema: none. Contrast target is at least 4.5:1 for text.
-   User instruction: Continue from the current tree and finish the remaining consumer-product gaps you identified. Tokens with semantic roles, light and dark schemes. */
+/* Callers: src/styles.css. API: design tokens, light and dark following the system.
+   Schema: none. Every text/background pair used for words meets WCAG AA (4.5:1). */
 
 :root {
   color-scheme: light;
-  --surface: #eef2f5;
-  --raised: #fbfcfd;
-  --inset: #e4eaef;
-  --border: #c3ced8;
-  --text: #12202b;
-  --muted: #4a5b68;
-  --accent: #1d567f;
-  --accent-text: #f7fbff;
-  --success: #1a6840;
-  --warning: #845400;
-  --danger: #9b1c2c;
-  --info: #155e75;
-  --focus: #0b3d66;
-  --steel: #5b6d7a;
-  --space-1: 4px;
-  --space-2: 8px;
-  --space-3: 12px;
-  --space-4: 16px;
-  --space-6: 24px;
-  --space-8: 32px;
-  --radius: 10px;
-  --shadow: 0 10px 28px rgba(18, 32, 43, 0.08);
-  --font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --bg: #ffffff;
+  --bg-sidebar: #f5f5f7;
+  --bg-subtle: #f5f5f7;
+  --bg-hover: rgba(0, 0, 0, 0.045);
+  --bg-active: rgba(0, 0, 0, 0.08);
+  --bg-accent-soft: #e8f1fd;
+  --border: #e5e5ea;
+  --border-strong: #d1d1d6;
+  --text: #1d1d1f;
+  --text-2: #5c5c62;
+  --text-3: #636366;
+  --accent: #0064d2;
+  --accent-fill: #0064d2;
+  --accent-fill-hover: #0057b8;
+  --on-accent: #ffffff;
+  --success: #1f7a3d;
+  --success-soft: #e7f4ec;
+  --warning: #9a5b00;
+  --warning-soft: #fdf3e2;
+  --danger: #c4262e;
+  --danger-soft: #fcebec;
+  --focus: #0064d2;
+  --overlay: rgba(0, 0, 0, 0.32);
+  --shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.14), 0 2px 6px rgba(0, 0, 0, 0.06);
+
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   --fs-12: 12px;
+  --fs-13: 13px;
   --fs-14: 14px;
-  --fs-16: 16px;
-  --fs-20: 20px;
-  --fs-24: 24px;
-  --fs-32: 32px;
-  --dur-1: 120ms;
-  --dur-2: 180ms;
-  --dur-3: 240ms;
-}
+  --fs-15: 15px;
+  --fs-17: 17px;
+  --fs-22: 22px;
+  --fs-28: 28px;
 
-[data-theme="light"] {
-  color-scheme: light;
-}
+  --s-1: 4px;
+  --s-2: 8px;
+  --s-3: 12px;
+  --s-4: 16px;
+  --s-5: 20px;
+  --s-6: 24px;
+  --s-8: 32px;
+  --s-10: 40px;
+  --s-12: 48px;
 
-[data-theme="dark"] {
-  color-scheme: dark;
-  --surface: #0e1419;
-  --raised: #162029;
-  --inset: #10181f;
-  --border: #31404c;
-  --text: #e8eef3;
-  --muted: #a8b6c0;
-  --accent: #8ec0e6;
-  --accent-text: #102033;
-  --success: #7dcea0;
-  --warning: #f0c36a;
-  --danger: #f0a0a8;
-  --info: #7dd3fc;
-  --focus: #9fd0f5;
-  --steel: #8ea0ad;
-  --shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
+  --radius: 8px;
+  --radius-lg: 12px;
+  --control-h: 32px;
+  --sidebar-w: 248px;
+  --dur: 140ms;
 }
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
+  :root {
     color-scheme: dark;
-    --surface: #0e1419;
-    --raised: #162029;
-    --inset: #10181f;
-    --border: #31404c;
-    --text: #e8eef3;
-    --muted: #a8b6c0;
-    --accent: #8ec0e6;
-    --accent-text: #102033;
-    --success: #7dcea0;
-    --warning: #f0c36a;
-    --danger: #f0a0a8;
-    --info: #7dd3fc;
-    --focus: #9fd0f5;
-    --steel: #8ea0ad;
-    --shadow: 0 12px 32px rgba(0, 0, 0, 0.38);
+    --bg: #1c1c1e;
+    --bg-sidebar: #161618;
+    --bg-subtle: #242426;
+    --bg-hover: rgba(255, 255, 255, 0.06);
+    --bg-active: rgba(255, 255, 255, 0.1);
+    --bg-accent-soft: #16263d;
+    --border: #2f2f32;
+    --border-strong: #3d3d40;
+    --text: #f5f5f7;
+    --text-2: #aeaeb2;
+    --text-3: #98989d;
+    --accent: #4c9aff;
+    --accent-fill: #0a6cff;
+    --accent-fill-hover: #2a7fff;
+    --on-accent: #ffffff;
+    --success: #5ccb7d;
+    --success-soft: #16291d;
+    --warning: #f0b04a;
+    --warning-soft: #2e2413;
+    --danger: #ff6b6b;
+    --danger-soft: #331a1b;
+    --focus: #4c9aff;
+    --overlay: rgba(0, 0, 0, 0.55);
+    --shadow-pop: 0 16px 40px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.3);
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
   :root {
-    --dur-1: 0ms;
-    --dur-2: 0ms;
-    --dur-3: 0ms;
+    --dur: 0ms;
   }
 }
-
-* { box-sizing: border-box; }
-html, body, #root { min-height: 100%; }
-body {
-  margin: 0;
-  font-family: var(--font);
-  font-size: var(--fs-16);
-  line-height: 1.45;
-  background: var(--surface);
-  color: var(--text);
-}
-a { color: var(--accent); }
-:focus-visible {
-  outline: 3px solid var(--focus);
-  outline-offset: 2px;
-}
-button, input, textarea, select { font: inherit; }

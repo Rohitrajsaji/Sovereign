@@ -1,33 +1,55 @@
-// Callers: SPA screens via TanStack Query.
-// API: typed /v2 queries and mutations. SSE invalidates the read model.
-// Schema: schemas/control-api-v2.json.
-// User instruction: Continue from the current tree and finish the remaining consumer-product gaps you identified. All data comes from TanStack Query plus SSE invalidation.
+// Callers: the app shell, onboarding, conversation, side panel, and settings.
+// API: typed /v2 queries and mutations. The event stream refreshes what changes with work.
+// Schema: schemas/control-api-v2.json (types in ./generated).
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { api, connectEvents, setCsrfToken } from "./client";
 import type {
+  DeveloperToolsInstallResponse,
   DoctorResponse,
-  GoalDetail,
+  DownloadResponse,
+  GoalActivityResponse,
   GoalIntent,
+  GoalView,
   OverviewResponse,
+  PreviewResponse,
+  ProjectFileContent,
+  ProjectFilesResponse,
+  ProjectOpenResponse,
   ProjectsResponse,
-  RecoveryExplanation,
+  QueuedCommandResponse,
+  LandingRecord,
   SessionResponse,
   SettingsV1,
+  SetupStatus,
 } from "./generated";
 
 export const keys = {
   session: ["session"] as const,
+  setup: ["setup"] as const,
   overview: ["overview"] as const,
   doctor: ["doctor"] as const,
   projects: ["projects"] as const,
   goals: ["goals"] as const,
-  goal: (id: string) => ["goal", id] as const,
-  events: ["events"] as const,
-  recovery: ["recovery"] as const,
+  activity: (id: string) => ["activity", id] as const,
+  preview: ["preview"] as const,
+  files: ["files"] as const,
+  file: (path: string) => ["file", path] as const,
   settings: ["settings"] as const,
 };
+
+/** A command the service accepted but will apply after the current step. */
+export function isQueued(value: unknown): value is QueuedCommandResponse {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "applied" in value &&
+    (value as QueuedCommandResponse).applied === false
+  );
+}
+
+const WORKING_POLL_MS = 1500;
 
 export function useSession() {
   return useQuery({
@@ -41,19 +63,69 @@ export function useSession() {
   });
 }
 
+export function useSetup(enabled: boolean) {
+  return useQuery({
+    queryKey: keys.setup,
+    queryFn: () => api<SetupStatus>("/v2/setup"),
+    enabled,
+    refetchInterval: (query) => {
+      const phase = query.state.data?.download.phase;
+      return phase && ["checking", "downloading_runtime", "downloading_model", "verifying"].includes(phase)
+        ? 1000
+        : false;
+    },
+  });
+}
+
+function anyGoalRunning(goals: GoalView[] | undefined): boolean {
+  return (goals ?? []).some((goal) => !goal.progress.terminal);
+}
+
+/**
+ * True while a chosen project waits for the current step to finish. Until then the service still
+ * reads the previous project, so its requests, preview, and files are not this project's.
+ */
+export function isSwitchingProject(overview: OverviewResponse | undefined): boolean {
+  return (overview?.pending_commands ?? []).some((command) => command.kind === "switch_project");
+}
+
 export function useOverview(enabled: boolean) {
   return useQuery({
     queryKey: keys.overview,
     queryFn: () => api<OverviewResponse>("/v2/overview"),
     enabled,
+    refetchInterval: (query) =>
+      query.state.data?.working || isSwitchingProject(query.state.data) ? WORKING_POLL_MS : false,
   });
 }
 
-export function useDoctor(enabled: boolean) {
+/** Reloads everything once a project switch that had to wait is applied. */
+export function useProjectSwitchRefresh(switching: boolean) {
+  const client = useQueryClient();
+  const previous = useRef(switching);
+  useEffect(() => {
+    if (previous.current && !switching) {
+      void client.invalidateQueries();
+    }
+    previous.current = switching;
+  }, [client, switching]);
+}
+
+export function useGoals(enabled: boolean) {
   return useQuery({
-    queryKey: keys.doctor,
-    queryFn: () => api<DoctorResponse>("/v2/doctor"),
+    queryKey: keys.goals,
+    queryFn: () => api<GoalView[]>("/v2/goals"),
     enabled,
+    // Progress inside a long step (a model call) produces no events, so poll while working.
+    refetchInterval: (query) => (anyGoalRunning(query.state.data) ? WORKING_POLL_MS : false),
+  });
+}
+
+export function useGoalActivity(goalId: string | undefined) {
+  return useQuery({
+    queryKey: keys.activity(goalId ?? ""),
+    queryFn: () => api<GoalActivityResponse>(`/v2/goals/${encodeURIComponent(goalId ?? "")}/activity`),
+    enabled: Boolean(goalId) && !goalId?.startsWith("pending-"),
   });
 }
 
@@ -65,43 +137,34 @@ export function useProjects(enabled: boolean) {
   });
 }
 
-export function useGoals(enabled: boolean) {
+export function usePreview(enabled: boolean) {
   return useQuery({
-    queryKey: keys.goals,
-    queryFn: () => api<GoalIntent[]>("/v2/goals"),
+    queryKey: keys.preview,
+    queryFn: () => api<PreviewResponse>("/v2/preview"),
     enabled,
   });
 }
 
-export function useGoal(id: string | undefined) {
+export function useFiles(enabled: boolean) {
   return useQuery({
-    queryKey: keys.goal(id ?? ""),
-    queryFn: () => api<GoalDetail>(`/v2/goals/${id}`),
-    enabled: Boolean(id),
-  });
-}
-
-export function useEvents(enabled: boolean) {
-  return useQuery({
-    queryKey: keys.events,
-    queryFn: () =>
-      api<
-        Array<{
-          sequence: number;
-          event_id: string;
-          summary: string;
-          event_kind: string;
-          occurred_at_ms: number;
-        }>
-      >("/v2/events"),
+    queryKey: keys.files,
+    queryFn: () => api<ProjectFilesResponse>("/v2/files"),
     enabled,
   });
 }
 
-export function useRecovery(enabled: boolean) {
+export function useFileContent(path: string | undefined) {
   return useQuery({
-    queryKey: keys.recovery,
-    queryFn: () => api<{ explanation: RecoveryExplanation }>("/v2/recovery"),
+    queryKey: keys.file(path ?? ""),
+    queryFn: () => api<ProjectFileContent>(`/v2/files/content?path=${encodeURIComponent(path ?? "")}`),
+    enabled: Boolean(path),
+  });
+}
+
+export function useDoctor(enabled: boolean) {
+  return useQuery({
+    queryKey: keys.doctor,
+    queryFn: () => api<DoctorResponse>("/v2/doctor"),
     enabled,
   });
 }
@@ -114,84 +177,167 @@ export function useSettings(enabled: boolean) {
   });
 }
 
-export function useInvalidateOnEvents(ready: boolean) {
+/** Refreshes work-related views whenever the Controller records an event. */
+export function useLiveUpdates(ready: boolean) {
   const client = useQueryClient();
   useEffect(() => {
     if (!ready) {
       return;
     }
     return connectEvents(() => {
-      void client.invalidateQueries();
+      void client.invalidateQueries({ queryKey: keys.goals });
+      void client.invalidateQueries({ queryKey: keys.overview });
+      void client.invalidateQueries({ queryKey: ["activity"] });
     });
   }, [client, ready]);
 }
 
-export function useSubmitGoal() {
+function useRefreshWork() {
   const client = useQueryClient();
+  return () => {
+    void client.invalidateQueries({ queryKey: keys.goals });
+    void client.invalidateQueries({ queryKey: keys.overview });
+  };
+}
+
+export function useSubmitGoal() {
+  const refresh = useRefreshWork();
   return useMutation({
     mutationFn: (goal: string) =>
-      api<GoalIntent>("/v2/goals", { method: "POST", body: JSON.stringify({ goal }) }),
-    onSuccess: () => void client.invalidateQueries({ queryKey: keys.goals }),
-  });
-}
-
-export function usePause() {
-  const client = useQueryClient();
-  return useMutation({
-    mutationFn: () => api("/v2/control/pause", { method: "POST", body: JSON.stringify({}) }),
-    onSuccess: () => void client.invalidateQueries({ queryKey: keys.overview }),
-  });
-}
-
-export function useResume() {
-  const client = useQueryClient();
-  return useMutation({
-    mutationFn: () => api("/v2/control/resume", { method: "POST", body: "{}" }),
-    onSuccess: () => void client.invalidateQueries({ queryKey: keys.overview }),
+      api<GoalIntent | QueuedCommandResponse>("/v2/goals", {
+        method: "POST",
+        body: JSON.stringify({ goal }),
+      }),
+    onSuccess: refresh,
   });
 }
 
 export function useCancelGoal() {
-  const client = useQueryClient();
+  const refresh = useRefreshWork();
   return useMutation({
-    mutationFn: (goalId: string) => api(`/v2/goals/${goalId}/cancel`, { method: "POST", body: "{}" }),
-    onSuccess: () => void client.invalidateQueries({ queryKey: keys.goals }),
+    mutationFn: (goalId: string) =>
+      api<GoalIntent | QueuedCommandResponse>(`/v2/goals/${encodeURIComponent(goalId)}/cancel`, {
+        method: "POST",
+        body: "{}",
+      }),
+    onSuccess: refresh,
   });
+}
+
+function useLandingAction(action: "undo" | "apply") {
+  const client = useQueryClient();
+  const refresh = useRefreshWork();
+  return useMutation({
+    mutationFn: (goalId: string) =>
+      api<LandingRecord | QueuedCommandResponse>(`/v2/goals/${encodeURIComponent(goalId)}/${action}`, {
+        method: "POST",
+        body: "{}",
+      }),
+    onSuccess: () => {
+      refresh();
+      void client.invalidateQueries({ queryKey: keys.files });
+      void client.invalidateQueries({ queryKey: ["file"] });
+    },
+  });
+}
+
+export function useUndoGoal() {
+  return useLandingAction("undo");
+}
+
+export function useApplyGoal() {
+  return useLandingAction("apply");
 }
 
 export function useRespondApproval() {
-  const client = useQueryClient();
+  const refresh = useRefreshWork();
   return useMutation({
     mutationFn: (body: { request_id: string; decision: "approve" | "deny"; principal: string }) =>
       api("/v2/approvals/respond", { method: "POST", body: JSON.stringify(body) }),
-    onSuccess: () => void client.invalidateQueries({ queryKey: keys.overview }),
+    onSuccess: refresh,
   });
 }
 
-export function useAddProject() {
+function useProjectChange() {
   const client = useQueryClient();
+  return () => {
+    // Everything shown belongs to the active project.
+    void client.invalidateQueries();
+  };
+}
+
+export function useCreateProject() {
+  const changed = useProjectChange();
   return useMutation({
-    mutationFn: (body: { root: string; display_name: string }) =>
-      api<ProjectsResponse>("/v2/projects", { method: "POST", body: JSON.stringify(body) }),
-    onSuccess: () => void client.invalidateQueries({ queryKey: keys.projects }),
+    mutationFn: (name: string) =>
+      api<ProjectOpenResponse>("/v2/projects/create", { method: "POST", body: JSON.stringify({ name }) }),
+    onSuccess: changed,
+  });
+}
+
+export function useOpenFolder() {
+  const changed = useProjectChange();
+  return useMutation({
+    mutationFn: (root?: string) =>
+      api<ProjectOpenResponse>("/v2/projects/open", {
+        method: "POST",
+        body: JSON.stringify(root ? { root } : {}),
+      }),
+    onSuccess: changed,
   });
 }
 
 export function useActivateProject() {
-  const client = useQueryClient();
+  const changed = useProjectChange();
   return useMutation({
     mutationFn: (projectId: string) =>
-      api(`/v2/projects/${projectId}/activate`, { method: "POST", body: "{}" }),
-    onSuccess: () => void client.invalidateQueries({ queryKey: keys.projects }),
+      api<ProjectsResponse>(`/v2/projects/${encodeURIComponent(projectId)}/activate`, {
+        method: "POST",
+        body: "{}",
+      }),
+    onSuccess: changed,
   });
 }
 
-export function useVerifyModel() {
+export function useStartDownload() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: (body: { runtime_path: string; model_path: string }) =>
-      api("/v2/setup/model/verify", { method: "POST", body: JSON.stringify(body) }),
-    onSuccess: () => void client.invalidateQueries({ queryKey: keys.settings }),
+    mutationFn: () => api<DownloadResponse>("/v2/setup/model/download", { method: "POST", body: "{}" }),
+    onSuccess: () => void client.invalidateQueries({ queryKey: keys.setup }),
+  });
+}
+
+export function useCancelDownload() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: () => api<DownloadResponse>("/v2/setup/model/cancel", { method: "POST", body: "{}" }),
+    onSuccess: () => void client.invalidateQueries({ queryKey: keys.setup }),
+  });
+}
+
+export function useInstallDeveloperTools() {
+  return useMutation({
+    mutationFn: () =>
+      api<DeveloperToolsInstallResponse>("/v2/setup/developer-tools/install", {
+        method: "POST",
+        body: "{}",
+      }),
+  });
+}
+
+export function usePause() {
+  const refresh = useRefreshWork();
+  return useMutation({
+    mutationFn: () => api("/v2/control/pause", { method: "POST", body: "{}" }),
+    onSuccess: refresh,
+  });
+}
+
+export function useResume() {
+  const refresh = useRefreshWork();
+  return useMutation({
+    mutationFn: () => api("/v2/control/resume", { method: "POST", body: "{}" }),
+    onSuccess: refresh,
   });
 }
 
@@ -201,5 +347,20 @@ export function useSaveSettings() {
     mutationFn: (body: Partial<SettingsV1>) =>
       api<SettingsV1>("/v2/settings", { method: "POST", body: JSON.stringify(body) }),
     onSuccess: () => void client.invalidateQueries({ queryKey: keys.settings }),
+  });
+}
+
+export function useVerifyModel() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { runtime_path: string; model_path: string }) =>
+      api<{ ok: boolean; detail: string }>("/v2/setup/model/verify", {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: keys.settings });
+      void client.invalidateQueries({ queryKey: keys.setup });
+    },
   });
 }

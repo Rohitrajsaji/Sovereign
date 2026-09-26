@@ -25,6 +25,23 @@ const GOAL_STATUS_CLAIMED: &str = "claimed_for_plan_compilation";
 const GOAL_STATUS_ACTIVE: &str = "active_plan";
 const GOAL_STATUS_COMPLETED: &str = "completed";
 const GOAL_STATUS_CANCELLED: &str = "cancelled_before_dispatch";
+/// Terminal: the goal could not be planned or a step failed for good.
+const GOAL_STATUS_FAILED: &str = "failed";
+/// Terminal: the user cancelled the goal after its plan was activated.
+const GOAL_STATUS_CANCELLED_ACTIVE: &str = "cancelled";
+
+pub(crate) const GOAL_OUTCOME_NAMESPACE: &str = "controller.goal_outcome";
+const GOAL_OUTCOME_SCHEMA_VERSION: u32 = 1;
+const PLAN_ABANDONMENT_NAMESPACE: &str = "controller.plan_abandonment";
+const PLAN_ABANDONMENT_SCHEMA_VERSION: u32 = 1;
+const MAX_GOAL_OUTCOME_DETAIL_BYTES: usize = 2_048;
+
+/// Reason codes recorded in [`GoalOutcomeV1::reason_code`].
+pub const GOAL_REASON_COMPILATION_FAILED: &str = "compilation_failed";
+pub const GOAL_REASON_COMPILATION_BUDGET_EXHAUSTED: &str = "compilation_budget_exhausted";
+pub const GOAL_REASON_TASK_FAILED: &str = "task_failed";
+pub const GOAL_REASON_CANCELLED_BY_USER: &str = "cancelled_by_user";
+pub const GOAL_REASON_COMPOSITION_ERROR: &str = "composition_error";
 
 /// Revalidates the active goal's durable browser grant against its canonical Plan and
 /// compilation evidence. A missing grant is returned only when the active Plan has no browser
@@ -196,6 +213,230 @@ pub enum GoalIntentClaimStatusV1 {
     Active,
     Completed,
     Released,
+    Failed,
+    Cancelled,
+}
+
+/// How a goal ended without completing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalOutcomeKindV1 {
+    Failed,
+    Cancelled,
+}
+
+/// Why a goal ended without completing. `detail` is bounded and may carry untrusted text
+/// (for example a compiler error); clients render it as text only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoalOutcomeV1 {
+    pub schema_version: u32,
+    pub goal_id: String,
+    pub kind: GoalOutcomeKindV1,
+    pub reason_code: String,
+    pub detail: String,
+    pub plan_id: Option<String>,
+    pub plan_revision: Option<u32>,
+    pub recorded_at_ms: i64,
+}
+
+/// Retirement record for an active plan whose goal ended as failed or cancelled. It plays the
+/// role [`PlanFinalizationV1`] plays for completed plans, without a completion record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanAbandonmentV1 {
+    pub schema_version: u32,
+    pub plan_id: String,
+    pub goal_id: String,
+    pub plan_revision: u32,
+    pub plan_digest: String,
+    pub kind: GoalOutcomeKindV1,
+    pub reason_code: String,
+    pub goal_intent_version: i64,
+    pub goal_intent_digest: String,
+    pub goal_claim_version: i64,
+    pub goal_claim_digest: String,
+    pub checkpoint_generation: i64,
+    pub checkpoint_action_sequence: i64,
+    pub checkpoint_hash: String,
+    pub abandoned_at_ms: i64,
+}
+
+/// Reads every recorded goal outcome, oldest first by the millisecond it was recorded. Outcomes
+/// recorded in the same millisecond are in goal id order.
+///
+/// # Errors
+/// Returns a state or decoding error.
+pub fn goal_outcomes(state: &StateStore) -> Result<Vec<GoalOutcomeV1>, ControllerError> {
+    let mut outcomes = state
+        .state_records(GOAL_OUTCOME_NAMESPACE)?
+        .into_iter()
+        .map(|record| {
+            let outcome: GoalOutcomeV1 = serde_json::from_str(&record.value_json)?;
+            validate_goal_outcome(&record.key, &outcome)?;
+            Ok(outcome)
+        })
+        .collect::<Result<Vec<_>, ControllerError>>()?;
+    outcomes.sort_by_key(|outcome| outcome.recorded_at_ms);
+    Ok(outcomes)
+}
+
+/// A completed goal's verified work, ready to land in the project folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedGoalWorkV1 {
+    pub goal_id: String,
+    pub natural_language_goal: String,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    /// Each succeeded task's own change set, upstream tasks first.
+    pub change_sets: Vec<sovereign_repo::ChangeSet>,
+}
+
+/// Returns the verified change sets of a goal the Controller recorded as completed, in dependency
+/// order. Returns `None` for any goal that is not completed with a completion record, so only
+/// verified work can ever be landed.
+///
+/// # Errors
+/// Returns a state or decoding error, or a fail-closed error for a misbound plan or a task graph
+/// with a cycle.
+pub fn completed_goal_work(
+    state: &StateStore,
+    goal_id: &str,
+) -> Result<Option<CompletedGoalWorkV1>, ControllerError> {
+    let Some(intent_row) = state
+        .state_records(GOAL_INTENT_NAMESPACE)?
+        .into_iter()
+        .find(|record| record.key == goal_id)
+    else {
+        return Ok(None);
+    };
+    let intent = decode_versioned_goal_intent(&intent_row)?;
+    if intent.status != GOAL_STATUS_COMPLETED {
+        return Ok(None);
+    }
+    let Some(claim_row) = state
+        .state_records(GOAL_INTENT_CLAIM_NAMESPACE)?
+        .into_iter()
+        .find(|record| record.key == goal_id)
+    else {
+        return Ok(None);
+    };
+    let claim = decode_versioned_goal_claim(&claim_row)?;
+    if claim.status != GoalIntentClaimStatusV1::Completed {
+        return Ok(None);
+    }
+    if state
+        .get_state(
+            "controller.completion_record",
+            &completion_record_key(&claim.plan_id, claim.plan_revision),
+        )?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let mut tasks = BTreeMap::<String, (Vec<String>, Option<sovereign_repo::ChangeSet>)>::new();
+    for record in state.state_records("controller.task")? {
+        if !super::key_belongs_to_revision(&record.key, &claim.plan_id, claim.plan_revision) {
+            continue;
+        }
+        let runtime: Value = serde_json::from_str(&record.value_json)?;
+        if runtime.get("state").and_then(Value::as_str) != Some("succeeded") {
+            return Err(ControllerError::InvalidPlan(format!(
+                "completed goal {goal_id} has a task that did not succeed"
+            )));
+        }
+        let task_id = required_str(&runtime, "/task/task_id")?.to_owned();
+        let dependencies = runtime
+            .pointer("/task/dependencies")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let change_set = match runtime.get("change_set") {
+            Some(value) if !value.is_null() => {
+                let change_set: sovereign_repo::ChangeSet = serde_json::from_value(value.clone())?;
+                if change_set.plan_id != claim.plan_id
+                    || change_set.plan_revision != claim.plan_revision
+                    || change_set.task_id != task_id
+                {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "task {task_id} change set is bound to another plan or task"
+                    )));
+                }
+                Some(change_set)
+            }
+            _ => None,
+        };
+        tasks.insert(task_id, (dependencies, change_set));
+    }
+    // Upstream tasks first; ties broken by task id for a stable order.
+    let mut ordered = Vec::with_capacity(tasks.len());
+    let mut placed = std::collections::BTreeSet::<String>::new();
+    while placed.len() < tasks.len() {
+        let ready = tasks
+            .iter()
+            .find(|(task_id, (dependencies, _))| {
+                !placed.contains(*task_id)
+                    && dependencies.iter().all(|dependency| {
+                        placed.contains(dependency) || !tasks.contains_key(dependency)
+                    })
+            })
+            .map(|(task_id, _)| task_id.clone());
+        let Some(task_id) = ready else {
+            return Err(ControllerError::InvalidPlan(format!(
+                "completed goal {goal_id} task graph has a cycle"
+            )));
+        };
+        if let Some((_, Some(change_set))) = tasks.get(&task_id) {
+            ordered.push(change_set.clone());
+        }
+        placed.insert(task_id);
+    }
+    Ok(Some(CompletedGoalWorkV1 {
+        goal_id: goal_id.to_owned(),
+        natural_language_goal: intent.natural_language_goal,
+        plan_id: claim.plan_id,
+        plan_revision: claim.plan_revision,
+        change_sets: ordered,
+    }))
+}
+
+fn validate_goal_outcome(record_key: &str, outcome: &GoalOutcomeV1) -> Result<(), ControllerError> {
+    if outcome.schema_version != GOAL_OUTCOME_SCHEMA_VERSION
+        || outcome.goal_id != record_key
+        || outcome.goal_id.trim().is_empty()
+        || outcome.reason_code.trim().is_empty()
+        || outcome.detail.len() > MAX_GOAL_OUTCOME_DETAIL_BYTES
+        || outcome.recorded_at_ms <= 0
+        || outcome.plan_id.is_some() != outcome.plan_revision.is_some()
+    {
+        return Err(ControllerError::InvalidPlan(format!(
+            "malformed durable goal outcome {record_key}"
+        )));
+    }
+    Ok(())
+}
+
+/// Truncates untrusted detail text to the durable bound on a character boundary.
+fn bounded_outcome_detail(detail: &str) -> String {
+    if detail.len() <= MAX_GOAL_OUTCOME_DETAIL_BYTES {
+        return detail.to_owned();
+    }
+    let mut end = MAX_GOAL_OUTCOME_DETAIL_BYTES;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail[..end].to_owned()
+}
+
+/// Statuses a goal can reach from the queue without ever holding a live claim.
+fn is_unclaimed_terminal_status(status: &str) -> bool {
+    matches!(status, GOAL_STATUS_CANCELLED | GOAL_STATUS_FAILED)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -908,21 +1149,34 @@ impl Controller {
             let matching_claim = claim_records
                 .iter()
                 .find(|claim_record| claim_record.key == intent.goal_id);
-            match matching_claim {
-                Some(claim_record) => {
-                    let _ = decode_versioned_goal_claim(claim_record)?;
+            if let Some(claim_record) = matching_claim {
+                let claim = decode_versioned_goal_claim(claim_record)?;
+                if claim.status == GoalIntentClaimStatusV1::Released
+                    && is_unclaimed_terminal_status(&intent.status)
+                {
+                    // A released claim went back to the queue; the terminal transition then
+                    // advanced only the intent.
+                    if intent_record.version != claim_record.version + 2 {
+                        return Err(ControllerError::InvalidPlan(format!(
+                            "terminal goal intent {} and its released claim have conflicting record versions",
+                            intent.goal_id
+                        )));
+                    }
+                } else {
                     validate_goal_lifecycle_record_versions(GoalLifecycleRecordVersions {
                         intent_version: intent_record.version,
                         claim_version: Some(claim_record.version),
                     })?;
                 }
-                None => {
-                    if intent.status != GOAL_STATUS_QUEUED || intent_record.version != 1 {
-                        return Err(ControllerError::InvalidPlan(format!(
-                            "goal intent {} lacks its durable claim at record version {}",
-                            intent.goal_id, intent_record.version
-                        )));
-                    }
+            } else {
+                let queued = intent.status == GOAL_STATUS_QUEUED && intent_record.version == 1;
+                let unclaimed_terminal =
+                    is_unclaimed_terminal_status(&intent.status) && intent_record.version == 2;
+                if !queued && !unclaimed_terminal {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "goal intent {} lacks its durable claim at record version {}",
+                        intent.goal_id, intent_record.version
+                    )));
                 }
             }
         }
@@ -1158,10 +1412,14 @@ impl Controller {
         Ok(completed)
     }
 
-    /// Cancels a queued goal before dispatch, or requests cancellation of non-terminal tasks.
+    /// Cancels a goal. A queued goal ends at once as cancelled. An active goal gets a durable
+    /// goal-level cancellation request that stops in-flight work at its next cancellation check;
+    /// the next production step then ends the goal as cancelled and the queue moves on. Ending
+    /// states are idempotent.
     ///
     /// # Errors
-    /// Fails closed when the goal is missing, claimed for compilation, or bound to another plan.
+    /// Returns `NotReady` while the goal is claimed for compilation (retry after the step), and
+    /// fails closed when the goal is missing or bound to another plan.
     pub fn cancel_goal_intent(
         &mut self,
         goal_id: &str,
@@ -1178,29 +1436,24 @@ impl Controller {
             .state
             .get_state(GOAL_INTENT_NAMESPACE, goal_id)?
             .ok_or_else(|| ControllerError::NotReady(format!("goal {goal_id} is not durable")))?;
-        let mut intent: GoalIntentV1 = serde_json::from_str(&raw)?;
+        let intent: GoalIntentV1 = serde_json::from_str(&raw)?;
         if intent.goal_id != goal_id {
             return Err(ControllerError::InvalidPlan(
                 "goal intent id does not match its record key".to_owned(),
             ));
         }
         match intent.status.as_str() {
-            GOAL_STATUS_CANCELLED | GOAL_STATUS_COMPLETED => Ok(intent),
-            GOAL_STATUS_QUEUED => {
-                GOAL_STATUS_CANCELLED.clone_into(&mut intent.status);
-                let intent_json = serde_json::to_string(&intent)?;
-                self.persist_control_record_with_event(
-                    GOAL_INTENT_NAMESPACE,
-                    goal_id,
-                    &intent_json,
-                    "goal_intent_cancelled",
-                    &json!({"principal": principal, "status": intent.status}),
-                )?;
-                if self.active.is_some() {
-                    self.checkpoint_now()?;
-                }
-                Ok(intent)
-            }
+            GOAL_STATUS_CANCELLED
+            | GOAL_STATUS_COMPLETED
+            | GOAL_STATUS_FAILED
+            | GOAL_STATUS_CANCELLED_ACTIVE => Ok(intent),
+            GOAL_STATUS_QUEUED => self.end_queued_goal(
+                goal_id,
+                GoalOutcomeKindV1::Cancelled,
+                GOAL_REASON_CANCELLED_BY_USER,
+                "Cancelled before it started.",
+                principal,
+            ),
             GOAL_STATUS_ACTIVE => {
                 let active_goal = self
                     .active
@@ -1216,35 +1469,410 @@ impl Controller {
                         "active plan is bound to a different goal".to_owned(),
                     ));
                 }
-                let task_ids = self
-                    .active
-                    .as_ref()
-                    .map(|active| {
-                        active
-                            .tasks
-                            .iter()
-                            .filter(|(_, task)| {
-                                !matches!(
-                                    task.state,
-                                    super::TaskState::Succeeded | super::TaskState::FailedTerminal
-                                )
-                            })
-                            .map(|(id, _)| id.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                for task_id in task_ids {
-                    self.request_task_cancellation(&task_id, principal)?;
-                }
+                self.request_goal_cancellation(&format!("cancelled by {principal}"))?;
                 Ok(intent)
             }
             GOAL_STATUS_CLAIMED => Err(ControllerError::NotReady(
-                "goal is claimed for compilation; cancel after activation or recovery".to_owned(),
+                "goal is claimed for compilation; cancel after the current step".to_owned(),
             )),
             other => Err(ControllerError::InvalidPlan(format!(
                 "goal status {other} cannot be cancelled"
             ))),
         }
+    }
+
+    /// Ends a queued goal as failed, for example when its input cannot be composed. Only the
+    /// queued goal is touched; the queue moves on at the next step.
+    ///
+    /// # Errors
+    /// Returns `NotReady` when the goal is not queued, or a state/validation error.
+    pub fn fail_queued_goal_intent(
+        &mut self,
+        goal_id: &str,
+        reason_code: &str,
+        detail: &str,
+    ) -> Result<GoalIntentV1, ControllerError> {
+        self.end_queued_goal(
+            goal_id,
+            GoalOutcomeKindV1::Failed,
+            reason_code,
+            detail,
+            "sovereign",
+        )
+    }
+
+    /// Moves a goal that holds no live claim from the queue to a terminal status, together with
+    /// its outcome record, in one compare-and-swap transition. A released claim is asserted
+    /// unchanged; the intent alone advances.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one atomic terminal transition validates intent, claim, and outcome together"
+    )]
+    fn end_queued_goal(
+        &mut self,
+        goal_id: &str,
+        kind: GoalOutcomeKindV1,
+        reason_code: &str,
+        detail: &str,
+        principal: &str,
+    ) -> Result<GoalIntentV1, ControllerError> {
+        self.validate_persisted_goal_lifecycle_versions()?;
+        let intent_record = persisted_state_record(&self.state, GOAL_INTENT_NAMESPACE, goal_id)?;
+        let intent = decode_versioned_goal_intent(&intent_record)?;
+        if intent.status != GOAL_STATUS_QUEUED {
+            return Err(ControllerError::NotReady(format!(
+                "goal {goal_id} is not queued"
+            )));
+        }
+        let claim_record = self
+            .state
+            .state_records(GOAL_INTENT_CLAIM_NAMESPACE)?
+            .into_iter()
+            .find(|record| record.key == goal_id);
+        if let Some(record) = claim_record.as_ref() {
+            let claim = decode_versioned_goal_claim(record)?;
+            if claim.status != GoalIntentClaimStatusV1::Released {
+                return Err(ControllerError::InvalidPlan(format!(
+                    "queued goal {goal_id} holds a live claim"
+                )));
+            }
+        }
+        if self
+            .state
+            .get_state(GOAL_OUTCOME_NAMESPACE, goal_id)?
+            .is_some()
+        {
+            return Err(ControllerError::InvalidPlan(format!(
+                "goal {goal_id} already has a recorded outcome"
+            )));
+        }
+        let status = match kind {
+            GoalOutcomeKindV1::Failed => GOAL_STATUS_FAILED,
+            GoalOutcomeKindV1::Cancelled => GOAL_STATUS_CANCELLED,
+        };
+        let ended = with_goal_status(intent, status);
+        validate_goal_intent(goal_id, &ended)?;
+        let outcome = GoalOutcomeV1 {
+            schema_version: GOAL_OUTCOME_SCHEMA_VERSION,
+            goal_id: goal_id.to_owned(),
+            kind,
+            reason_code: reason_code.to_owned(),
+            detail: bounded_outcome_detail(detail),
+            plan_id: None,
+            plan_revision: None,
+            recorded_at_ms: super::unix_millis()?,
+        };
+        validate_goal_outcome(goal_id, &outcome)?;
+        let intent_json = serde_json::to_string(&ended)?;
+        let outcome_json = serde_json::to_string(&outcome)?;
+        let event_kind = match kind {
+            GoalOutcomeKindV1::Failed => "goal_intent_failed",
+            GoalOutcomeKindV1::Cancelled => "goal_intent_cancelled",
+        };
+        let payload_json = json!({
+            "goal_id": goal_id,
+            "status": ended.status,
+            "reason_code": reason_code,
+            "principal": principal,
+            "outcome_digest": sha256_prefixed(outcome_json.as_bytes()),
+        })
+        .to_string();
+        let seed = sha256_prefixed(
+            format!(
+                "{event_kind}\0{goal_id}\0{}\0{payload_json}",
+                self.state.latest_journal_sequence()?
+            )
+            .as_bytes(),
+        );
+        let event_id = format!("controller.{}", &seed[7..27]);
+        let claim_assertion = claim_record.as_ref().map(|record| StateRecordCasAssertion {
+            namespace: GOAL_INTENT_CLAIM_NAMESPACE,
+            key: goal_id,
+            expected_version: record.version,
+            expected_value_json: Some(&record.value_json),
+            expected_value_digest: None,
+        });
+        self.state
+            .compare_and_apply_state_records_with_events_guarded(
+                None,
+                claim_assertion.as_slice(),
+                &[
+                    StateRecordCasMutation {
+                        namespace: GOAL_INTENT_NAMESPACE,
+                        key: goal_id,
+                        expected_version: Some(intent_record.version),
+                        value_json: Some(&intent_json),
+                    },
+                    StateRecordCasMutation {
+                        namespace: GOAL_OUTCOME_NAMESPACE,
+                        key: goal_id,
+                        expected_version: None,
+                        value_json: Some(&outcome_json),
+                    },
+                ],
+                &[NewJournalEvent {
+                    event_id: &event_id,
+                    entity_type: "controller",
+                    entity_id: goal_id,
+                    event_kind,
+                    payload_json: &payload_json,
+                }],
+            )?;
+        if self.active.is_some() {
+            self.checkpoint_now()?;
+        }
+        Ok(ended)
+    }
+
+    /// Ends the active goal as failed or cancelled and retires its plan in one transaction:
+    /// the goal intent and claim move to terminal statuses, the active pointer triad is removed,
+    /// the revision lifecycle becomes `abandoned`, and an abandonment record plus a goal outcome
+    /// are published. Every revision-scoped task, attempt, and evidence record is kept.
+    ///
+    /// # Errors
+    /// Returns `NotReady` while anything is still in flight, and fails closed unless the
+    /// lifecycle, claim, checkpoint, and active pointers all bind the same plan revision.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "plan abandonment validates and commits one atomic retirement transition"
+    )]
+    pub(crate) fn abandon_active_goal(
+        &mut self,
+        kind: GoalOutcomeKindV1,
+        reason_code: &str,
+        detail: &str,
+    ) -> Result<GoalOutcomeV1, ControllerError> {
+        self.reconcile_queued_goal_lifecycle()?;
+        let active = self.canonical_active_goal_binding()?.ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "plan abandonment requires a canonical active plan".to_owned(),
+            )
+        })?;
+        if self.completion_record()?.is_some() {
+            return Err(ControllerError::NotReady(
+                "a completed plan is finalized, not abandoned".to_owned(),
+            ));
+        }
+        self.require_abandonment_recovery_clear()?;
+
+        let intents = self.read_validated_goal_intents()?;
+        let claims = self.read_validated_goal_claims()?;
+        validate_claim_set(&intents, &claims)?;
+        let intent = intent_by_id(&intents, &active.goal_id)?.clone();
+        let claim = claims
+            .iter()
+            .find(|candidate| candidate.goal_id == active.goal_id)
+            .cloned()
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan("active plan lacks its queued-goal claim".to_owned())
+            })?;
+        if intent.status != GOAL_STATUS_ACTIVE || claim.status != GoalIntentClaimStatusV1::Active {
+            return Err(ControllerError::InvalidPlan(
+                "plan abandonment requires exact active intent and claim".to_owned(),
+            ));
+        }
+        validate_claim_binding(&intent, &claim)?;
+        validate_active_claim_binding(&active, &claim)?;
+
+        self.checkpoint_now()?;
+        let checkpoint = self
+            .state
+            .latest_valid_checkpoint_integrity()?
+            .ok_or_else(|| {
+                ControllerError::InvalidPlan(
+                    "plan abandonment lacks a trusted terminal checkpoint".to_owned(),
+                )
+            })?;
+        if checkpoint.action_sequence != self.state.latest_journal_sequence()? {
+            return Err(ControllerError::InvalidPlan(
+                "terminal checkpoint does not cover the latest controller journal sequence"
+                    .to_owned(),
+            ));
+        }
+
+        let plan_record = persisted_state_record(&self.state, "controller.plan", "active")?;
+        let plan_document_record =
+            persisted_state_record(&self.state, "controller.plan_document", "active")?;
+        let baseline_record =
+            persisted_state_record(&self.state, "controller.repository_baseline", "active")?;
+        let lifecycle_key = revision_record_key(&active.plan_id, active.plan_revision);
+        let lifecycle_record = persisted_state_record(
+            &self.state,
+            "controller.plan_revision_lifecycle",
+            &lifecycle_key,
+        )?;
+        validate_active_revision_lifecycle(&lifecycle_record, &active)?;
+        let intent_record =
+            persisted_state_record(&self.state, GOAL_INTENT_NAMESPACE, &intent.goal_id)?;
+        let claim_record =
+            persisted_state_record(&self.state, GOAL_INTENT_CLAIM_NAMESPACE, &claim.goal_id)?;
+        if self
+            .state
+            .get_state(PLAN_ABANDONMENT_NAMESPACE, &lifecycle_key)?
+            .is_some()
+            || self
+                .state
+                .get_state(PLAN_FINALIZATION_NAMESPACE, &lifecycle_key)?
+                .is_some()
+            || self
+                .state
+                .get_state(GOAL_OUTCOME_NAMESPACE, &intent.goal_id)?
+                .is_some()
+        {
+            return Err(ControllerError::InvalidPlan(
+                "plan retirement record already exists while plan is still active".to_owned(),
+            ));
+        }
+
+        let now = super::unix_millis()?;
+        let (intent_status, claim_status) = match kind {
+            GoalOutcomeKindV1::Failed => (GOAL_STATUS_FAILED, GoalIntentClaimStatusV1::Failed),
+            GoalOutcomeKindV1::Cancelled => (
+                GOAL_STATUS_CANCELLED_ACTIVE,
+                GoalIntentClaimStatusV1::Cancelled,
+            ),
+        };
+        let ended_intent = with_goal_status(intent.clone(), intent_status);
+        let mut ended_claim = claim.clone();
+        ended_claim.status = claim_status;
+        ended_claim.updated_at_ms = now.max(claim.updated_at_ms);
+        validate_goal_intent(&ended_intent.goal_id, &ended_intent)?;
+        validate_goal_claim(&ended_claim.goal_id, &ended_claim)?;
+        let intent_json = serde_json::to_string(&ended_intent)?;
+        let claim_json = serde_json::to_string(&ended_claim)?;
+
+        let outcome = GoalOutcomeV1 {
+            schema_version: GOAL_OUTCOME_SCHEMA_VERSION,
+            goal_id: active.goal_id.clone(),
+            kind,
+            reason_code: reason_code.to_owned(),
+            detail: bounded_outcome_detail(detail),
+            plan_id: Some(active.plan_id.clone()),
+            plan_revision: Some(active.plan_revision),
+            recorded_at_ms: now,
+        };
+        validate_goal_outcome(&outcome.goal_id, &outcome)?;
+        let outcome_json = serde_json::to_string(&outcome)?;
+
+        let abandonment = PlanAbandonmentV1 {
+            schema_version: PLAN_ABANDONMENT_SCHEMA_VERSION,
+            plan_id: active.plan_id.clone(),
+            goal_id: active.goal_id.clone(),
+            plan_revision: active.plan_revision,
+            plan_digest: active.plan_digest.clone(),
+            kind,
+            reason_code: reason_code.to_owned(),
+            goal_intent_version: intent_record.version + 1,
+            goal_intent_digest: sha256_prefixed(intent_json.as_bytes()),
+            goal_claim_version: claim_record.version + 1,
+            goal_claim_digest: sha256_prefixed(claim_json.as_bytes()),
+            checkpoint_generation: checkpoint.generation,
+            checkpoint_action_sequence: checkpoint.action_sequence,
+            checkpoint_hash: checkpoint.checkpoint_hash.clone(),
+            abandoned_at_ms: now,
+        };
+        validate_plan_abandonment(&lifecycle_key, &abandonment)?;
+        let abandonment_json = serde_json::to_string(&abandonment)?;
+        let abandonment_digest = digest_json(&serde_json::to_value(&abandonment)?)?;
+        let lifecycle_json = serde_json::to_string(&json!({
+            "plan_id": active.plan_id,
+            "revision": active.plan_revision,
+            "plan_digest": active.plan_digest,
+            "status": "abandoned",
+            "superseded_by_revision": Value::Null,
+            "superseded_by_digest": Value::Null,
+            "abandonment_kind": kind,
+            "abandonment_record_digest": abandonment_digest,
+            "terminal_checkpoint_generation": checkpoint.generation,
+            "terminal_checkpoint_action_sequence": checkpoint.action_sequence,
+            "terminal_checkpoint_hash": checkpoint.checkpoint_hash,
+        }))?;
+        let event_payload = serde_json::to_string(&json!({
+            "plan_id": abandonment.plan_id,
+            "goal_id": abandonment.goal_id,
+            "plan_revision": abandonment.plan_revision,
+            "plan_digest": abandonment.plan_digest,
+            "kind": kind,
+            "reason_code": reason_code,
+            "abandonment_record_digest": abandonment_digest,
+            "terminal_checkpoint_generation": abandonment.checkpoint_generation,
+            "terminal_checkpoint_action_sequence": abandonment.checkpoint_action_sequence,
+            "terminal_checkpoint_hash": abandonment.checkpoint_hash,
+        }))?;
+        let seed = sha256_prefixed(
+            format!(
+                "plan_abandoned\0{}\0{}\0{}",
+                lifecycle_key, checkpoint.action_sequence, event_payload
+            )
+            .as_bytes(),
+        );
+        let event_id = format!("controller.{}", &seed[7..27]);
+        super::recovery_test_hook("before_plan_abandonment_commit");
+        self.state
+            .compare_and_apply_state_records_with_events_guarded(
+                Some(checkpoint.action_sequence),
+                &[],
+                &[
+                    StateRecordCasMutation {
+                        namespace: GOAL_INTENT_NAMESPACE,
+                        key: &intent.goal_id,
+                        expected_version: Some(intent_record.version),
+                        value_json: Some(&intent_json),
+                    },
+                    StateRecordCasMutation {
+                        namespace: GOAL_INTENT_CLAIM_NAMESPACE,
+                        key: &claim.goal_id,
+                        expected_version: Some(claim_record.version),
+                        value_json: Some(&claim_json),
+                    },
+                    StateRecordCasMutation {
+                        namespace: "controller.plan",
+                        key: "active",
+                        expected_version: Some(plan_record.version),
+                        value_json: None,
+                    },
+                    StateRecordCasMutation {
+                        namespace: "controller.plan_document",
+                        key: "active",
+                        expected_version: Some(plan_document_record.version),
+                        value_json: None,
+                    },
+                    StateRecordCasMutation {
+                        namespace: "controller.repository_baseline",
+                        key: "active",
+                        expected_version: Some(baseline_record.version),
+                        value_json: None,
+                    },
+                    StateRecordCasMutation {
+                        namespace: "controller.plan_revision_lifecycle",
+                        key: &lifecycle_key,
+                        expected_version: Some(lifecycle_record.version),
+                        value_json: Some(&lifecycle_json),
+                    },
+                    StateRecordCasMutation {
+                        namespace: PLAN_ABANDONMENT_NAMESPACE,
+                        key: &lifecycle_key,
+                        expected_version: None,
+                        value_json: Some(&abandonment_json),
+                    },
+                    StateRecordCasMutation {
+                        namespace: GOAL_OUTCOME_NAMESPACE,
+                        key: &outcome.goal_id,
+                        expected_version: None,
+                        value_json: Some(&outcome_json),
+                    },
+                ],
+                &[NewJournalEvent {
+                    event_id: &event_id,
+                    entity_type: "controller",
+                    entity_id: &lifecycle_key,
+                    event_kind: "plan_abandoned",
+                    payload_json: &event_payload,
+                }],
+            )?;
+        super::recovery_test_hook("after_plan_abandonment_commit");
+        self.active = None;
+        Ok(outcome)
     }
 }
 
@@ -1311,6 +1939,203 @@ fn validate_plan_finalization(
     Ok(())
 }
 
+fn validate_plan_abandonment(
+    record_key: &str,
+    abandonment: &PlanAbandonmentV1,
+) -> Result<(), ControllerError> {
+    if abandonment.schema_version != PLAN_ABANDONMENT_SCHEMA_VERSION
+        || abandonment.plan_id.trim().is_empty()
+        || abandonment.goal_id.trim().is_empty()
+        || abandonment.plan_revision == 0
+        || record_key != revision_record_key(&abandonment.plan_id, abandonment.plan_revision)
+        || !abandonment.plan_digest.starts_with("sha256:")
+        || abandonment.reason_code.trim().is_empty()
+        || abandonment.goal_intent_version <= 0
+        || !abandonment.goal_intent_digest.starts_with("sha256:")
+        || abandonment.goal_claim_version <= 0
+        || !abandonment.goal_claim_digest.starts_with("sha256:")
+        || abandonment.checkpoint_generation <= 0
+        || abandonment.checkpoint_action_sequence < 0
+        || abandonment.checkpoint_hash.trim().is_empty()
+        || abandonment.abandoned_at_ms <= 0
+    {
+        return Err(ControllerError::InvalidPlan(format!(
+            "malformed plan abandonment {record_key}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates one retired-by-abandonment revision: the abandonment record, its terminal
+/// checkpoint, the exact terminal goal intent and claim it bound, its goal outcome, its revision
+/// lifecycle, and its single publication event.
+#[expect(
+    clippy::too_many_lines,
+    reason = "abandonment history binds record, checkpoint, lifecycle, goal, and event together"
+)]
+fn validate_abandonment_history_record(
+    state: &StateStore,
+    revision: &Value,
+    lifecycle: &Value,
+    abandonment_record: &PersistedStateRecord,
+) -> Result<(), ControllerError> {
+    let abandonment: PlanAbandonmentV1 = serde_json::from_str(&abandonment_record.value_json)?;
+    validate_plan_abandonment(&abandonment_record.key, &abandonment)?;
+    if required_str(revision, "/plan_id")? != abandonment.plan_id
+        || required_u32(revision, "/revision")? != abandonment.plan_revision
+        || required_str(revision, "/plan_digest")? != abandonment.plan_digest
+    {
+        return Err(ControllerError::InvalidPlan(
+            "plan abandonment does not bind its immutable plan revision".to_owned(),
+        ));
+    }
+    let plan_document = revision.get("plan_document").ok_or_else(|| {
+        ControllerError::InvalidPlan("plan revision lacks canonical plan document".to_owned())
+    })?;
+    if required_str(plan_document, "/goal/goal_id")? != abandonment.goal_id
+        || digest_json(plan_document)? != abandonment.plan_digest
+    {
+        return Err(ControllerError::InvalidPlan(
+            "plan abandonment goal/document binding is invalid".to_owned(),
+        ));
+    }
+
+    let checkpoint = state
+        .checkpoint_integrity_by_generation(abandonment.checkpoint_generation)?
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "plan abandonment terminal checkpoint is missing".to_owned(),
+            )
+        })?;
+    if checkpoint.action_sequence != abandonment.checkpoint_action_sequence
+        || checkpoint.checkpoint_hash != abandonment.checkpoint_hash
+    {
+        return Err(ControllerError::InvalidPlan(
+            "plan abandonment terminal checkpoint binding is invalid".to_owned(),
+        ));
+    }
+    let checkpoint_is_trusted =
+        state
+            .latest_valid_checkpoint_ancestry()?
+            .into_iter()
+            .any(|trusted| {
+                trusted.generation == abandonment.checkpoint_generation
+                    && trusted.action_sequence == abandonment.checkpoint_action_sequence
+                    && trusted.checkpoint_hash == abandonment.checkpoint_hash
+            });
+    if !checkpoint_is_trusted {
+        return Err(ControllerError::InvalidPlan(
+            "plan abandonment terminal checkpoint is absent from trusted checkpoint ancestry"
+                .to_owned(),
+        ));
+    }
+
+    let intent_record = persisted_state_record(state, GOAL_INTENT_NAMESPACE, &abandonment.goal_id)?;
+    let claim_record =
+        persisted_state_record(state, GOAL_INTENT_CLAIM_NAMESPACE, &abandonment.goal_id)?;
+    if intent_record.version != abandonment.goal_intent_version
+        || sha256_prefixed(intent_record.value_json.as_bytes()) != abandonment.goal_intent_digest
+        || claim_record.version != abandonment.goal_claim_version
+        || sha256_prefixed(claim_record.value_json.as_bytes()) != abandonment.goal_claim_digest
+    {
+        return Err(ControllerError::InvalidPlan(
+            "plan abandonment queued-goal record binding is stale".to_owned(),
+        ));
+    }
+    let intent = decode_versioned_goal_intent(&intent_record)?;
+    let claim = decode_versioned_goal_claim(&claim_record)?;
+    let (expected_intent_status, expected_claim_status) = match abandonment.kind {
+        GoalOutcomeKindV1::Failed => (GOAL_STATUS_FAILED, GoalIntentClaimStatusV1::Failed),
+        GoalOutcomeKindV1::Cancelled => (
+            GOAL_STATUS_CANCELLED_ACTIVE,
+            GoalIntentClaimStatusV1::Cancelled,
+        ),
+    };
+    if intent.status != expected_intent_status || claim.status != expected_claim_status {
+        return Err(ControllerError::InvalidPlan(
+            "plan abandonment queued-goal lifecycle is not terminal".to_owned(),
+        ));
+    }
+    validate_claim_binding(&intent, &claim)?;
+    let active = ActiveGoalBinding {
+        goal_id: abandonment.goal_id.clone(),
+        goal_statement: required_str(plan_document, "/goal/statement")?.to_owned(),
+        plan_id: abandonment.plan_id.clone(),
+        plan_revision: abandonment.plan_revision,
+        plan_digest: abandonment.plan_digest.clone(),
+    };
+    validate_active_claim_binding(&active, &claim)?;
+
+    let outcome_raw = state
+        .get_state(GOAL_OUTCOME_NAMESPACE, &abandonment.goal_id)?
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan("plan abandonment lacks its goal outcome".to_owned())
+        })?;
+    let outcome: GoalOutcomeV1 = serde_json::from_str(&outcome_raw)?;
+    validate_goal_outcome(&abandonment.goal_id, &outcome)?;
+    if outcome.kind != abandonment.kind
+        || outcome.reason_code != abandonment.reason_code
+        || outcome.plan_id.as_deref() != Some(abandonment.plan_id.as_str())
+        || outcome.plan_revision != Some(abandonment.plan_revision)
+    {
+        return Err(ControllerError::InvalidPlan(
+            "plan abandonment goal outcome binding is invalid".to_owned(),
+        ));
+    }
+
+    let abandonment_digest = digest_json(&serde_json::to_value(&abandonment)?)?;
+    if required_str(lifecycle, "/abandonment_record_digest")? != abandonment_digest
+        || lifecycle
+            .get("terminal_checkpoint_generation")
+            .and_then(Value::as_i64)
+            != Some(abandonment.checkpoint_generation)
+        || lifecycle
+            .get("terminal_checkpoint_action_sequence")
+            .and_then(Value::as_i64)
+            != Some(abandonment.checkpoint_action_sequence)
+        || required_str(lifecycle, "/terminal_checkpoint_hash")? != abandonment.checkpoint_hash
+    {
+        return Err(ControllerError::InvalidPlan(
+            "abandoned lifecycle does not bind the exact plan abandonment record".to_owned(),
+        ));
+    }
+
+    let expected_publication_sequence = abandonment
+        .checkpoint_action_sequence
+        .checked_add(1)
+        .ok_or_else(|| {
+            ControllerError::InvalidPlan(
+                "plan abandonment checkpoint action sequence cannot advance".to_owned(),
+            )
+        })?;
+    let mut matching = 0_usize;
+    for event in state.journal()? {
+        if event.event_kind != "plan_abandoned"
+            || event.entity_type != "controller"
+            || event.entity_id != abandonment_record.key
+        {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&event.payload_json)?;
+        if required_str(&payload, "/abandonment_record_digest")? != abandonment_digest
+            || required_str(&payload, "/goal_id")? != abandonment.goal_id
+            || required_str(&payload, "/plan_digest")? != abandonment.plan_digest
+            || event.sequence != expected_publication_sequence
+        {
+            return Err(ControllerError::InvalidPlan(
+                "plan_abandoned event is misbound".to_owned(),
+            ));
+        }
+        matching = matching.saturating_add(1);
+    }
+    if matching != 1 {
+        return Err(ControllerError::InvalidPlan(format!(
+            "plan abandonment requires exactly one plan_abandoned event, found {matching}"
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn validate_finalized_plan_history(state: &StateStore) -> Result<(), ControllerError> {
     if state.get_state("controller.plan", "active")?.is_some() {
@@ -1333,8 +2158,9 @@ fn validate_finalized_plan_history(state: &StateStore) -> Result<(), ControllerE
     let revisions = state.state_records("controller.plan_revision")?;
     let lifecycles = state.state_records("controller.plan_revision_lifecycle")?;
     let finalizations = state.state_records(PLAN_FINALIZATION_NAMESPACE)?;
+    let abandonments = state.state_records(PLAN_ABANDONMENT_NAMESPACE)?;
     if revisions.is_empty() {
-        if !lifecycles.is_empty() || !finalizations.is_empty() {
+        if !lifecycles.is_empty() || !finalizations.is_empty() || !abandonments.is_empty() {
             return Err(ControllerError::InvalidPlan(
                 "plan lifecycle/finalization history exists without plan revision history"
                     .to_owned(),
@@ -1349,10 +2175,12 @@ fn validate_finalized_plan_history(state: &StateStore) -> Result<(), ControllerE
     }
 
     let mut max_revision_by_plan = BTreeMap::<String, u32>::new();
+    // A plan terminates in exactly one revision, either completed or abandoned.
     let mut completed_revision_by_plan = BTreeMap::<String, u32>::new();
     let mut revision_chain_by_plan =
         BTreeMap::<String, BTreeMap<u32, (String, Value, Value)>>::new();
     let mut completed_count = 0_usize;
+    let mut abandoned_count = 0_usize;
     for revision_record in &revisions {
         let revision: Value = serde_json::from_str(&revision_record.value_json)?;
         let plan_id = required_str(&revision, "/plan_id")?.to_owned();
@@ -1416,12 +2244,46 @@ fn validate_finalized_plan_history(state: &StateStore) -> Result<(), ControllerE
             "superseded" => {
                 if finalizations
                     .iter()
+                    .chain(abandonments.iter())
                     .any(|candidate| candidate.key == expected_key)
                 {
                     return Err(ControllerError::InvalidPlan(
-                        "superseded revision unexpectedly has a finalization record".to_owned(),
+                        "superseded revision unexpectedly has a retirement record".to_owned(),
                     ));
                 }
+            }
+            "abandoned" => {
+                abandoned_count = abandoned_count.saturating_add(1);
+                if completed_revision_by_plan
+                    .insert(plan_id.clone(), plan_revision)
+                    .is_some()
+                {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "plan {plan_id} has multiple terminal revisions"
+                    )));
+                }
+                if finalizations
+                    .iter()
+                    .any(|candidate| candidate.key == expected_key)
+                {
+                    return Err(ControllerError::InvalidPlan(
+                        "abandoned revision unexpectedly has a finalization record".to_owned(),
+                    ));
+                }
+                let abandonment_record = abandonments
+                    .iter()
+                    .find(|candidate| candidate.key == expected_key)
+                    .ok_or_else(|| {
+                        ControllerError::InvalidPlan(format!(
+                            "abandoned revision {expected_key} lacks its abandonment record"
+                        ))
+                    })?;
+                validate_abandonment_history_record(
+                    state,
+                    &revision,
+                    &lifecycle,
+                    abandonment_record,
+                )?;
             }
             "completed" => {
                 completed_count = completed_count.saturating_add(1);
@@ -1466,10 +2328,15 @@ fn validate_finalized_plan_history(state: &StateStore) -> Result<(), ControllerE
             "orphan or duplicate plan finalization records exist".to_owned(),
         ));
     }
+    if abandonments.len() != abandoned_count {
+        return Err(ControllerError::InvalidPlan(
+            "orphan or duplicate plan abandonment records exist".to_owned(),
+        ));
+    }
     for (plan_id, max_revision) in &max_revision_by_plan {
         if completed_revision_by_plan.get(plan_id) != Some(max_revision) {
             return Err(ControllerError::InvalidPlan(format!(
-                "plan {plan_id} does not terminate in exactly its latest completed revision"
+                "plan {plan_id} does not terminate in exactly its latest terminal revision"
             )));
         }
     }
@@ -1561,10 +2428,12 @@ fn validate_finalized_plan_history(state: &StateStore) -> Result<(), ControllerE
                         "plan {plan_id} revision {plan_revision} supersession chain is misbound"
                     )));
                 }
-            } else if required_str(lifecycle, "/status")? != "completed"
-                || !lifecycle
-                    .get("superseded_by_revision")
-                    .is_some_and(Value::is_null)
+            } else if !matches!(
+                required_str(lifecycle, "/status")?,
+                "completed" | "abandoned"
+            ) || !lifecycle
+                .get("superseded_by_revision")
+                .is_some_and(Value::is_null)
                 || !lifecycle
                     .get("superseded_by_digest")
                     .is_some_and(Value::is_null)
@@ -1572,7 +2441,7 @@ fn validate_finalized_plan_history(state: &StateStore) -> Result<(), ControllerE
                 || required_str(lifecycle, "/plan_digest")? != plan_digest
             {
                 return Err(ControllerError::InvalidPlan(format!(
-                    "plan {plan_id} latest revision {plan_revision} is not exactly completed"
+                    "plan {plan_id} latest revision {plan_revision} is not exactly completed or abandoned"
                 )));
             }
         }
@@ -1790,6 +2659,8 @@ fn validate_goal_intent(record_key: &str, intent: &GoalIntentV1) -> Result<(), C
                 | GOAL_STATUS_ACTIVE
                 | GOAL_STATUS_COMPLETED
                 | GOAL_STATUS_CANCELLED
+                | GOAL_STATUS_FAILED
+                | GOAL_STATUS_CANCELLED_ACTIVE
         )
     {
         return Err(ControllerError::InvalidPlan(format!(
@@ -1958,9 +2829,22 @@ fn validate_claim_set(
                     "completed goal claim does not have completed intent status".to_owned(),
                 ));
             }
-            GoalIntentClaimStatusV1::Released if intent.status != GOAL_STATUS_QUEUED => {
+            GoalIntentClaimStatusV1::Released
+                if intent.status != GOAL_STATUS_QUEUED
+                    && !is_unclaimed_terminal_status(&intent.status) =>
+            {
                 return Err(ControllerError::InvalidPlan(
                     "released goal claim does not have queued intent status".to_owned(),
+                ));
+            }
+            GoalIntentClaimStatusV1::Failed if intent.status != GOAL_STATUS_FAILED => {
+                return Err(ControllerError::InvalidPlan(
+                    "failed goal claim does not have failed intent status".to_owned(),
+                ));
+            }
+            GoalIntentClaimStatusV1::Cancelled if intent.status != GOAL_STATUS_CANCELLED_ACTIVE => {
+                return Err(ControllerError::InvalidPlan(
+                    "cancelled goal claim does not have cancelled intent status".to_owned(),
                 ));
             }
             _ => {}
@@ -1969,7 +2853,10 @@ fn validate_claim_set(
     for intent in intents.iter().filter(|intent| {
         matches!(
             intent.status.as_str(),
-            GOAL_STATUS_CLAIMED | GOAL_STATUS_ACTIVE | GOAL_STATUS_COMPLETED
+            GOAL_STATUS_CLAIMED
+                | GOAL_STATUS_ACTIVE
+                | GOAL_STATUS_COMPLETED
+                | GOAL_STATUS_CANCELLED_ACTIVE
         )
     }) {
         if !claims.iter().any(|claim| claim.goal_id == intent.goal_id) {

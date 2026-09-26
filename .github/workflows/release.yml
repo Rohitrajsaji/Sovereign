@@ -1,0 +1,77 @@
+# Publishes a macOS arm64 release for `install.sh` and `sovereign update`.
+#
+# On a `v*` tag: build the UI and `sovereign`, bundle the pinned llama.cpp runner, and upload
+# sovereign-macos-arm64.tar.gz and SHA256SUMS to the GitHub release for that tag.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, for example v0.2.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Resolve the tag
+        id: tag
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          case "$tag" in v*) ;; *) echo "tags start with v" >&2; exit 1 ;; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/sovereign/ui/package-lock.json
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - name: The committed UI matches a fresh build
+        run: |
+          npm --prefix apps/sovereign/ui ci
+          npm --prefix apps/sovereign/ui run build
+          git diff --exit-code -- apps/sovereign/ui-dist
+      - name: Build sovereign
+        run: cargo build --release --locked -p sovereign --bin sovereign
+      - name: Check the version matches the tag
+        run: |
+          built="$(target/release/sovereign --version | awk '{ print $2 }')"
+          [ "$built" = "${{ steps.tag.outputs.version }}" ] || {
+            echo "Cargo version $built does not match tag ${{ steps.tag.outputs.tag }}" >&2
+            exit 1
+          }
+      - name: Package
+        run: scripts/package-release.sh "${{ steps.tag.outputs.version }}" target/release/sovereign dist
+      - name: Smoke-test the package
+        run: |
+          mkdir -p smoke
+          tar -xzf dist/sovereign-macos-arm64.tar.gz -C smoke
+          smoke/sovereign-macos-arm64/bin/sovereign --version
+          smoke/sovereign-macos-arm64/libexec/llama/llama-server --version
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.tag.outputs.tag }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/sovereign-macos-arm64.tar.gz dist/SHA256SUMS --clobber
+          else
+            gh release create "$tag" dist/sovereign-macos-arm64.tar.gz dist/SHA256SUMS \
+              --title "Sovereign ${{ steps.tag.outputs.version }}" --generate-notes
+          fi

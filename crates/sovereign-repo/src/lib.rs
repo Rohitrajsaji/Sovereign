@@ -4,10 +4,15 @@
 //! symbol, dependency, and semantic projections are later derived extensions;
 //! they never replace source files or Git as repository truth.
 
+mod landing;
 mod lexical;
 mod structural;
 mod worktree;
 
+pub use landing::{
+    LandingOutcome, ManagedRepositoryInit, RESULT_REF_PREFIX, UndoOutcome, checkpoint_user_edits,
+    init_managed_repository, land_change_sets, project_text_files, undo_landing,
+};
 pub use lexical::{
     IndexCalibration, IndexConfig, IndexResourceHealth, IndexSnapshot, LexicalHit, LexicalQuery,
     LexicalRetriever, RefreshReport, ResourceHealthLevel,
@@ -1055,7 +1060,7 @@ fn hardened_git_command(root: &Path) -> Result<Command, RepoError> {
     Ok(command)
 }
 
-fn git_output(root: &Path, args: &[&str]) -> Result<Output, RepoError> {
+pub(crate) fn git_output(root: &Path, args: &[&str]) -> Result<Output, RepoError> {
     let mut command = hardened_git_command(root)?;
     command.args(args);
     Ok(command.output()?)

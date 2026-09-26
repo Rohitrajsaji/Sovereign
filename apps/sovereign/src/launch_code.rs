@@ -144,7 +144,8 @@ mod tests {
             .ok();
         assert_eq!(mode, Some(0o600));
         assert!(!redeem(&dir, "wrong"));
-        assert!(!redeem(&dir, &format!("{}0", &code[..63])) || code.ends_with('0'));
+        let last_differs = if code.ends_with('0') { '1' } else { '0' };
+        assert!(!redeem(&dir, &format!("{}{last_differs}", &code[..63])));
         assert!(redeem(&dir, &code));
         assert!(!redeem(&dir, &code), "a code must not be redeemable twice");
         let _ = fs::remove_dir_all(dir);

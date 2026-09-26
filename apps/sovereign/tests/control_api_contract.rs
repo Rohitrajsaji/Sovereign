@@ -176,6 +176,101 @@ fn control_api_v2_live_serve_matches_frozen_schema() {
     assert_eq!(status, 200, "{detail}");
     assert!(load_validator("GoalDetail").is_valid(&detail), "{detail}");
 
+    let post = |path: &str, body: &Value| {
+        let bytes = serde_json::to_vec(body).unwrap();
+        http(
+            &addr,
+            &format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{cookie}X-Sovereign-CSRF: {csrf}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                bytes.len(),
+                String::from_utf8(bytes).unwrap()
+            ),
+        )
+    };
+    let (status, created) = post("/v2/projects/create", &json!({"name": "Contract Demo"}));
+    assert_eq!(status, 200, "{created}");
+    assert!(
+        load_validator("ProjectOpenResponse").is_valid(&created),
+        "{created}"
+    );
+    assert_eq!(created["project"]["managed"], json!(true), "{created}");
+    let created_root = PathBuf::from(created["project"]["root"].as_str().unwrap());
+    assert!(created_root.starts_with(home.join("Sovereign Projects")));
+    assert!(created_root.join("index.html").is_file());
+
+    let plain = home.join("plain-folder");
+    fs::create_dir_all(&plain).unwrap();
+    fs::write(plain.join("notes.txt"), "hello").unwrap();
+    let (status, opened) = post(
+        "/v2/projects/open",
+        &json!({"root": plain.to_string_lossy()}),
+    );
+    assert_eq!(status, 200, "{opened}");
+    assert!(
+        load_validator("ProjectOpenResponse").is_valid(&opened),
+        "{opened}"
+    );
+    let (status, listed) = http(
+        &addr,
+        &format!("GET /v2/projects HTTP/1.1\r\nHost: 127.0.0.1\r\n{cookie}\r\n"),
+    );
+    assert_eq!(status, 200, "{listed}");
+    assert!(
+        load_validator("ProjectsResponse").is_valid(&listed),
+        "{listed}"
+    );
+    assert_eq!(listed["projects"].as_array().map(Vec::len), Some(2));
+    assert_eq!(listed["active_project_id"], opened["project"]["project_id"]);
+
+    let (status, setup) = http(
+        &addr,
+        &format!("GET /v2/setup HTTP/1.1\r\nHost: 127.0.0.1\r\n{cookie}\r\n"),
+    );
+    assert_eq!(status, 200, "{setup}");
+    assert!(load_validator("SetupStatus").is_valid(&setup), "{setup}");
+    let (status, cancelled) = post("/v2/setup/model/cancel", &json!({}));
+    assert_eq!(status, 200, "{cancelled}");
+    assert!(
+        load_validator("DownloadResponse").is_valid(&cancelled),
+        "{cancelled}"
+    );
+
+    for (path, def) in [
+        ("/v2/preview", "PreviewResponse"),
+        ("/v2/files", "ProjectFilesResponse"),
+        ("/v2/files/content?path=notes.txt", "ProjectFileContent"),
+    ] {
+        let (status, body) = http(
+            &addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{cookie}\r\n"),
+        );
+        assert_eq!(status, 200, "{path} {body}");
+        assert!(
+            load_validator(def).is_valid(&body),
+            "{path} failed {def}: {body}"
+        );
+    }
+    let (status, hidden) = http(
+        &addr,
+        &format!(
+            "GET /v2/files/content?path=.git%2Fconfig HTTP/1.1\r\nHost: 127.0.0.1\r\n{cookie}\r\n"
+        ),
+    );
+    assert_eq!(status, 404, "{hidden}");
+
+    // Undo and Apply exist and explain, in words, why there is nothing to do yet.
+    for action in ["undo", "apply"] {
+        let (status, refused) = post(&format!("/v2/goals/{goal_id}/{action}"), &json!({}));
+        assert!(
+            status != 200 && status != 404,
+            "{action}: {status} {refused}"
+        );
+        assert!(
+            load_validator("ErrorResponse").is_valid(&refused),
+            "{action}: {refused}"
+        );
+    }
+
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_dir_all(&home);

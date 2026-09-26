@@ -20,6 +20,9 @@ function tsType(node) {
   if (node.$ref) {
     return node.$ref.replace("#/definitions/", "");
   }
+  if (Array.isArray(node.anyOf)) {
+    return node.anyOf.map((item) => tsType(item)).join(" | ");
+  }
   if (Array.isArray(node.type)) {
     return node.type.map((item) => (item === "null" ? "null" : tsType({ type: item }))).join(" | ");
   }
@@ -39,6 +42,9 @@ function tsType(node) {
   }
   if (node.type === "integer" || node.type === "number") {
     return "number";
+  }
+  if (node.type === "null") {
+    return "null";
   }
   if (node.type === "boolean") {
     return "boolean";

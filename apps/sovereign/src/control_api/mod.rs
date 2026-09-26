@@ -21,10 +21,30 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-pub(crate) const BASE_SECURITY_HEADERS: &str = "\
-X-Content-Type-Options: nosniff\r\n\
+/// The app's security headers. Frames may load only the project preview's origin, once the
+/// preview is running; nothing may frame the app.
+pub(crate) struct SecurityHeaders;
+
+impl std::fmt::Display for SecurityHeaders {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let frame_src = PREVIEW_ORIGIN.get().map_or("'none'", String::as_str);
+        write!(
+            formatter,
+            "X-Content-Type-Options: nosniff\r\n\
 Referrer-Policy: no-referrer\r\n\
-Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n";
+Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src {frame_src}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n"
+        )
+    }
+}
+
+pub(crate) const BASE_SECURITY_HEADERS: SecurityHeaders = SecurityHeaders;
+
+static PREVIEW_ORIGIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Lets the app frame the project preview at `origin` (for example `http://localhost:7778`).
+pub(crate) fn allow_preview_frames(origin: String) {
+    let _ = PREVIEW_ORIGIN.set(origin);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlApiRequest {
@@ -53,13 +73,29 @@ pub(crate) enum ControlApiRequest {
     ActivateProject {
         project_id: String,
     },
+    CreateProject {
+        name: String,
+    },
+    /// Adopts a folder. Without `root`, the native folder picker asks the person.
+    OpenFolder {
+        root: Option<String>,
+    },
     ListGoals,
     GetGoal {
+        goal_id: String,
+    },
+    GetGoalActivity {
         goal_id: String,
     },
     CancelGoal {
         goal_id: String,
         principal: String,
+    },
+    UndoGoal {
+        goal_id: String,
+    },
+    ApplyGoal {
+        goal_id: String,
     },
     ListEvents {
         after: i64,
@@ -82,6 +118,14 @@ pub(crate) enum ControlApiRequest {
     DownloadModel {
         confirmation: Option<String>,
     },
+    SetupStatus,
+    CancelModelDownload,
+    InstallDeveloperTools,
+    Preview,
+    ListFiles,
+    ReadFile {
+        path: String,
+    },
     GetRecovery,
     VerifyModel {
         runtime_path: String,
@@ -96,11 +140,34 @@ pub(crate) enum ControlApiRequest {
     },
 }
 
+/// Where the current project's state lives right now. The service switches projects, so the
+/// event stream asks on every poll instead of keeping the path it started with.
+#[derive(Clone)]
+pub(crate) struct StatePathSource(Arc<dyn Fn() -> PathBuf + Send + Sync>);
+
+impl StatePathSource {
+    pub(crate) fn new(current: impl Fn() -> PathBuf + Send + Sync + 'static) -> Self {
+        Self(Arc::new(current))
+    }
+
+    pub(crate) fn get(&self) -> PathBuf {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for StatePathSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StatePathSource")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ServerConfig {
     pub(crate) session_token: Option<String>,
     pub(crate) require_token_for_v1_post: bool,
+    /// The state the event stream tails when no `state_path_source` follows the active project.
     pub(crate) state_path: Option<PathBuf>,
+    pub(crate) state_path_source: Option<StatePathSource>,
     pub(crate) sse_clients: Arc<AtomicUsize>,
     /// App-data directory holding the single-use `launch-code` file, when launch codes are on.
     pub(crate) launch_code_dir: Option<PathBuf>,
@@ -112,6 +179,7 @@ impl Default for ServerConfig {
             session_token: None,
             require_token_for_v1_post: false,
             state_path: None,
+            state_path_source: None,
             sse_clients: Arc::new(AtomicUsize::new(0)),
             launch_code_dir: None,
         }
@@ -221,13 +289,15 @@ mod tests {
         assert!(error.contains(&taken.to_string()), "{error}");
     }
 
+    use super::sse::MAX_SSE_CLIENTS;
     use super::{
-        ControlApiRequest, IDLE_CLOSE, MAX_BODY_BYTES, ServerConfig, bind_loopback, parse_request,
-        serve_listener, validate_loopback_addr,
+        ControlApiRequest, IDLE_CLOSE, MAX_BODY_BYTES, ServerConfig, StatePathSource,
+        bind_loopback, parse_request, serve_listener, validate_loopback_addr,
     };
     use serde_json::json;
     use std::io::{Read, Write};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
+    use std::sync::Arc;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -518,6 +588,73 @@ mod tests {
             "GET /v2/overview?t={secret} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
         );
         assert!(read_status(addr, &query_token).starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn open_event_streams_never_starve_requests_and_closed_ones_free_their_slot() {
+        use std::sync::atomic::Ordering;
+        let dir = std::env::temp_dir().join(format!(
+            "sovereign-sse-slots-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("{error}"));
+        let state = dir.join("state.sqlite3");
+        drop(sovereign_state::StateStore::open(&state).unwrap_or_else(|error| panic!("{error}")));
+        let listener = bind_loopback(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .unwrap_or_else(|error| panic!("bind: {error}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("addr: {error}"));
+        let cfg = ServerConfig {
+            state_path_source: Some(StatePathSource::new(move || state.clone())),
+            ..ServerConfig::default()
+        };
+        let clients = Arc::clone(&cfg.sse_clients);
+        thread::spawn(move || {
+            let _ = serve_listener(&listener, |_| Ok(json!({"ok": true})), cfg);
+        });
+        let open_stream = || {
+            let mut stream =
+                std::net::TcpStream::connect(addr).unwrap_or_else(|error| panic!("{error}"));
+            stream
+                .write_all(b"GET /v2/events/stream HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+                .unwrap_or_else(|error| panic!("{error}"));
+            let mut head = [0_u8; 15];
+            stream
+                .read_exact(&mut head)
+                .unwrap_or_else(|error| panic!("{error}"));
+            assert_eq!(&head, b"HTTP/1.1 200 OK");
+            stream
+        };
+        // As many live streams as there are request workers.
+        let streams = (0..MAX_SSE_CLIENTS)
+            .map(|_| open_stream())
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let answer = read_status(
+            addr,
+            "GET /v2/overview HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(answer.starts_with("HTTP/1.1 200 OK"), "{answer}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "requests waited on open streams"
+        );
+        drop(streams);
+        let freed = Instant::now();
+        while clients.load(Ordering::SeqCst) > 0 && freed.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            clients.load(Ordering::SeqCst),
+            0,
+            "closed pages must free their streams"
+        );
+        assert!(freed.elapsed() < Duration::from_secs(3));
         let _ = std::fs::remove_dir_all(dir);
     }
 

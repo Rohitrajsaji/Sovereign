@@ -1,127 +1,100 @@
 // Callers: src/main.tsx.
-// API: HashRouter screens plus TanStack Query and SSE invalidation.
-// Schema: schemas/control-api-v2.json.
-// User instruction: Continue from the current tree and finish the remaining consumer-product gaps you identified. Prioritize turning the existing SPA into the exceptional polished Sovereign UI specified by the plan.
+// API: `App`: connects to the local service, shows onboarding until Sovereign is set up and
+// has a project, then the workspace. Live updates come from the event stream.
+// Schema: SessionResponse, SetupStatus, ProjectsResponse from control-api-v2.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useEffect, useMemo, useRef, useState } from "react";
-import { HashRouter, Navigate, Route, Routes, useNavigate } from "react-router-dom";
-import type { OverviewResponse } from "./api/generated";
-import {
-  useDoctor,
-  useInvalidateOnEvents,
-  useOverview,
-  useProjects,
-  useSession,
-  useSettings,
-} from "./api/query";
-import { desktopNotify, transitionNotice } from "./lib/notify";
-import { AppShell, CommandPalette, OfflineState, Toast } from "./components/ui";
-import { WelcomeScreen } from "./screens/Welcome";
-import {
-  ApprovalsScreen,
-  DiagnosticsScreen,
-  GoalDetailScreen,
-  GoalsScreen,
-  HomeScreen,
-  ProjectsScreen,
-  RecoveryScreen,
-  SettingsScreen,
-} from "./screens/Workspace";
+import { useState } from "react";
+import { ApiError } from "./api/client";
+import { useLiveUpdates, useProjects, useSession, useSetup } from "./api/query";
+import { BrandMark, Button, Spinner, ToastProvider } from "./components/ui";
+import { Onboarding } from "./screens/Onboarding";
+import { Workspace } from "./screens/Workspace";
+
+const ONBOARDING_KEY = "sovereign.onboarding.done";
 
 const queryClient = new QueryClient({
-  defaultOptions: { queries: { refetchOnWindowFocus: false, retry: 1 } },
+  defaultOptions: { queries: { refetchOnWindowFocus: true, retry: 1 } },
 });
 
+function readFlag(key: string): boolean {
+  try {
+    return window.localStorage.getItem(key) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function writeFlag(key: string): void {
+  try {
+    window.localStorage.setItem(key, "1");
+  } catch {
+    // Private windows may refuse storage; onboarding then shows again next time.
+  }
+}
+
+function Offline({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+  const expired = error instanceof ApiError && error.status === 401;
+  return (
+    <main className="offline">
+      <BrandMark className="brand-mark" />
+      <h1>{expired ? "This page needs a fresh link" : "Sovereign isn't running"}</h1>
+      <p className="muted">
+        Open Sovereign from Spotlight or Launchpad, or type <code>sovereign</code> in Terminal. It
+        starts Sovereign and opens this page again.
+      </p>
+      <div>
+        <Button onClick={onRetry}>Try again</Button>
+      </div>
+    </main>
+  );
+}
+
 function Shell() {
-  const navigate = useNavigate();
   const session = useSession();
   const ready = session.isSuccess;
-  const doctor = useDoctor(ready);
+  const setup = useSetup(ready);
   const projects = useProjects(ready);
-  const settings = useSettings(ready);
-  const overview = useOverview(ready);
-  const previousOverview = useRef<OverviewResponse | undefined>(undefined);
-  const [palette, setPalette] = useState(false);
-  const [toast, setToast] = useState("Connecting to the local Controller.");
-  useInvalidateOnEvents(ready);
+  useLiveUpdates(ready);
+  const [onboarded, setOnboarded] = useState(() => readFlag(ONBOARDING_KEY));
+  const [showSetup, setShowSetup] = useState(false);
 
-  useEffect(() => {
-    document.documentElement.dataset.theme = localStorage.getItem("sovereign-theme") ?? "system";
-    const onKey = (event: KeyboardEvent) => {
-      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        setPalette((open) => !open);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  useEffect(() => {
-    if (session.isError) {
-      setToast("Offline. The local Controller did not answer.");
-    } else if (session.isSuccess) {
-      setToast("Connected to the local Controller.");
-    }
-  }, [session.isError, session.isSuccess]);
-
-  useEffect(() => {
-    const next = overview.data;
-    if (!next) {
-      return;
-    }
-    const notice = transitionNotice(previousOverview.current, next);
-    previousOverview.current = next;
-    if (notice) {
-      setToast(notice);
-      desktopNotify(notice);
-    }
-  }, [overview.data]);
-
-  const needsOnboarding = useMemo(() => {
-    const doctorFailed = (doctor.data ?? []).some((check) => check.status === "fail");
-    const noProjects = (projects.data?.projects.length ?? 0) === 0;
-    const noModel = !settings.data?.model_path;
-    return doctorFailed || noProjects || noModel;
-  }, [doctor.data, projects.data, settings.data]);
-
-  return (
-    <AppShell message={toast} onOpenPalette={() => setPalette(true)}>
-      {session.isError ? <OfflineState /> : null}
-      <Routes>
-        <Route path="/welcome" element={<WelcomeScreen ready={ready} />} />
-        <Route
-          path="/"
-          element={
-            needsOnboarding && ready ? (
-              <Navigate to="/welcome" replace />
-            ) : (
-              <HomeScreen ready={ready} />
-            )
-          }
-        />
-        <Route path="/projects" element={<ProjectsScreen ready={ready} />} />
-        <Route path="/goals" element={<GoalsScreen ready={ready} />} />
-        <Route path="/goals/new" element={<GoalsScreen ready={ready} />} />
-        <Route path="/goals/:id" element={<GoalDetailScreen ready={ready} />} />
-        <Route path="/approvals" element={<ApprovalsScreen ready={ready} />} />
-        <Route path="/recovery" element={<RecoveryScreen ready={ready} />} />
-        <Route path="/settings" element={<SettingsScreen ready={ready} />} />
-        <Route path="/diagnostics" element={<DiagnosticsScreen ready={ready} />} />
-      </Routes>
-      <Toast message={toast} />
-      <CommandPalette open={palette} onClose={() => setPalette(false)} onNavigate={navigate} />
-    </AppShell>
-  );
+  if (session.isError) {
+    return <Offline error={session.error} onRetry={() => void session.refetch()} />;
+  }
+  if (!ready || setup.isPending || projects.isPending) {
+    return (
+      <main className="offline">
+        <Spinner label="Opening Sovereign" />
+      </main>
+    );
+  }
+  const hasProjects = (projects.data?.projects.length ?? 0) > 0;
+  const needsOnboarding = showSetup || (!onboarded && (!setup.data?.ready || !hasProjects));
+  if (needsOnboarding) {
+    return (
+      <Onboarding
+        setup={setup.data}
+        hasProjects={hasProjects}
+        initialStep={showSetup ? 1 : 0}
+        onRecheck={() => void setup.refetch()}
+        onDone={() => {
+          writeFlag(ONBOARDING_KEY);
+          setOnboarded(true);
+          setShowSetup(false);
+        }}
+      />
+    );
+  }
+  return <Workspace setup={setup.data} onOpenSetup={() => setShowSetup(true)} />;
 }
 
 export function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <HashRouter>
+      <ToastProvider>
         <Shell />
-      </HashRouter>
+      </ToastProvider>
     </QueryClientProvider>
   );
 }

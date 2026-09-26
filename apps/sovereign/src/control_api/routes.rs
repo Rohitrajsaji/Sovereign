@@ -6,7 +6,7 @@
 
 use super::parse::{
     HttpEnvelope, optional_string, parse_json_object, parse_optional_json_object, query_i64,
-    query_usize, require_empty_body, require_only_fields, required_string,
+    query_string, query_usize, require_empty_body, require_only_fields, required_string,
 };
 use super::{ApiError, ApiStatus, ControlApiRequest};
 
@@ -93,6 +93,20 @@ pub(crate) fn parse_control_request(
             Ok(ControlApiRequest::AddProject {
                 root: required_string(&value, "root")?,
                 display_name: required_string(&value, "display_name")?,
+            })
+        }
+        ("POST", "/v2/projects/create") => {
+            let value = parse_json_object(body)?;
+            require_only_fields(&value, &["name"])?;
+            Ok(ControlApiRequest::CreateProject {
+                name: required_string(&value, "name")?,
+            })
+        }
+        ("POST", "/v2/projects/open") => {
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &["root"])?;
+            Ok(ControlApiRequest::OpenFolder {
+                root: optional_string(&value, "root")?,
             })
         }
         ("GET", "/v2/goals") => {
@@ -206,6 +220,19 @@ pub(crate) fn parse_control_request(
                 project_id: project_id.to_owned(),
             })
         }
+        ("GET", path) if path.starts_with("/v2/goals/") && path.ends_with("/activity") => {
+            require_empty_body(body)?;
+            let goal_id = path
+                .strip_prefix("/v2/goals/")
+                .and_then(|p| p.strip_suffix("/activity"))
+                .ok_or_else(|| ApiError::new(ApiStatus::BadRequest, "invalid goal path"))?;
+            if goal_id.is_empty() || goal_id.contains('/') {
+                return Err(ApiError::new(ApiStatus::BadRequest, "invalid goal path"));
+            }
+            Ok(ControlApiRequest::GetGoalActivity {
+                goal_id: goal_id.to_owned(),
+            })
+        }
         ("GET", path) if path.starts_with("/v2/goals/") && !path.contains("/cancel") => {
             require_empty_body(body)?;
             let goal_id = path
@@ -230,6 +257,56 @@ pub(crate) fn parse_control_request(
                 goal_id: goal_id.to_owned(),
                 principal,
             })
+        }
+        ("POST", path)
+            if path.starts_with("/v2/goals/")
+                && (path.ends_with("/undo") || path.ends_with("/apply")) =>
+        {
+            let (goal_id, undo) = match path.strip_prefix("/v2/goals/") {
+                Some(rest) if rest.ends_with("/undo") => (rest.strip_suffix("/undo"), true),
+                Some(rest) => (rest.strip_suffix("/apply"), false),
+                None => (None, false),
+            };
+            let goal_id = goal_id
+                .filter(|goal_id| !goal_id.is_empty() && !goal_id.contains('/'))
+                .ok_or_else(|| ApiError::new(ApiStatus::BadRequest, "invalid goal path"))?
+                .to_owned();
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &[])?;
+            Ok(if undo {
+                ControlApiRequest::UndoGoal { goal_id }
+            } else {
+                ControlApiRequest::ApplyGoal { goal_id }
+            })
+        }
+        ("GET", "/v2/preview") => {
+            require_empty_body(body)?;
+            Ok(ControlApiRequest::Preview)
+        }
+        ("GET", "/v2/files") => {
+            require_empty_body(body)?;
+            Ok(ControlApiRequest::ListFiles)
+        }
+        ("GET", "/v2/files/content") => {
+            require_empty_body(body)?;
+            let path = query_string(&info.query, "path")
+                .filter(|path| !path.is_empty() && path.len() <= 1_024)
+                .ok_or_else(|| ApiError::new(ApiStatus::BadRequest, "path is required"))?;
+            Ok(ControlApiRequest::ReadFile { path })
+        }
+        ("GET", "/v2/setup") => {
+            require_empty_body(body)?;
+            Ok(ControlApiRequest::SetupStatus)
+        }
+        ("POST", "/v2/setup/model/cancel") => {
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &[])?;
+            Ok(ControlApiRequest::CancelModelDownload)
+        }
+        ("POST", "/v2/setup/developer-tools/install") => {
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &[])?;
+            Ok(ControlApiRequest::InstallDeveloperTools)
         }
         ("POST", "/v2/setup/model/download") => {
             let value = parse_optional_json_object(body)?;

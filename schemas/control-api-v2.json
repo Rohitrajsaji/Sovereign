@@ -5,46 +5,114 @@
   "definitions": {
     "SessionResponse": {
       "type": "object",
-      "required": ["authenticated", "csrf_token"],
+      "required": [
+        "authenticated",
+        "csrf_token"
+      ],
       "properties": {
-        "authenticated": { "type": "boolean" },
-        "csrf_token": { "type": "string" }
+        "authenticated": {
+          "type": "boolean"
+        },
+        "csrf_token": {
+          "type": "string"
+        }
       },
       "additionalProperties": false
     },
     "DoctorCheck": {
       "type": "object",
-      "required": ["id", "status", "detail", "fix_hint"],
+      "required": [
+        "id",
+        "status",
+        "detail",
+        "fix_hint"
+      ],
       "properties": {
-        "id": { "type": "string" },
-        "status": { "type": "string", "enum": ["pass", "warn", "fail"] },
-        "detail": { "type": "string" },
-        "fix_hint": { "type": "string" }
+        "id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "pass",
+            "warn",
+            "fail"
+          ]
+        },
+        "detail": {
+          "type": "string"
+        },
+        "fix_hint": {
+          "type": "string"
+        }
       },
       "additionalProperties": false
     },
     "DoctorResponse": {
       "type": "array",
-      "items": { "$ref": "#/definitions/DoctorCheck" }
+      "items": {
+        "$ref": "#/definitions/DoctorCheck"
+      }
     },
     "OverviewResponse": {
       "type": "object",
-      "required": ["schema_version", "service_phase", "active_project", "paused"],
+      "required": [
+        "schema_version",
+        "service_phase",
+        "active_project",
+        "paused"
+      ],
       "properties": {
-        "schema_version": { "type": "integer" },
-        "service_phase": { "type": "string" },
-        "active_project": { "type": ["string", "null"] },
-        "paused": { "type": "boolean" },
-        "detail": { "type": "string" },
-        "last_outcome": { "type": "string" },
-        "model_residency": { "type": "string" },
-        "pressure_band": { "type": "string" },
-        "goal_count": { "type": "integer" },
-        "approval_count": { "type": "integer" },
-        "unknown_action_count": { "type": "integer" },
+        "schema_version": {
+          "type": "integer"
+        },
+        "service_phase": {
+          "type": "string"
+        },
+        "active_project": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "last_outcome": {
+          "type": "string"
+        },
+        "model_residency": {
+          "type": "string"
+        },
+        "pressure_band": {
+          "type": "string"
+        },
+        "goal_count": {
+          "type": "integer"
+        },
+        "approval_count": {
+          "type": "integer"
+        },
+        "unknown_action_count": {
+          "type": "integer"
+        },
         "blocked_approvals": {
           "type": "array",
-          "items": { "$ref": "#/definitions/ApprovalRequest" }
+          "items": {
+            "$ref": "#/definitions/ApprovalRequest"
+          }
+        },
+        "working": {
+          "type": "boolean"
+        },
+        "pending_commands": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/PendingCommand"
+          }
         }
       }
     },
@@ -63,158 +131,1013 @@
         "status"
       ],
       "properties": {
-        "schema_version": { "type": "integer" },
-        "request_id": { "type": "string" },
-        "action_id": { "type": "string" },
-        "plan_id": { "type": "string" },
-        "plan_revision": { "type": "integer" },
-        "task_id": { "type": "string" },
-        "permission_class": { "type": "string" },
-        "execution_epoch": { "type": "integer" },
-        "expires_at_ms": { "type": "integer" },
-        "status": { "type": "string" }
+        "schema_version": {
+          "type": "integer"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "action_id": {
+          "type": "string"
+        },
+        "plan_id": {
+          "type": "string"
+        },
+        "plan_revision": {
+          "type": "integer"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "permission_class": {
+          "type": "string"
+        },
+        "execution_epoch": {
+          "type": "integer"
+        },
+        "expires_at_ms": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string"
+        }
       }
     },
     "ProjectRecord": {
       "type": "object",
-      "required": ["project_id", "display_name", "root", "state_path", "cas_root", "created_at_ms"],
+      "required": [
+        "project_id",
+        "display_name",
+        "root",
+        "state_path",
+        "cas_root",
+        "created_at_ms",
+        "managed"
+      ],
       "properties": {
-        "project_id": { "type": "string" },
-        "display_name": { "type": "string" },
-        "root": { "type": "string" },
-        "state_path": { "type": "string" },
-        "cas_root": { "type": "string" },
-        "created_at_ms": { "type": "integer" }
+        "project_id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string"
+        },
+        "state_path": {
+          "type": "string"
+        },
+        "cas_root": {
+          "type": "string"
+        },
+        "created_at_ms": {
+          "type": "integer"
+        },
+        "managed": {
+          "type": "boolean"
+        }
       },
       "additionalProperties": false
     },
     "ProjectsResponse": {
       "type": "object",
-      "required": ["schema_version", "active_project_id", "projects"],
+      "required": [
+        "schema_version",
+        "active_project_id",
+        "projects"
+      ],
       "properties": {
-        "schema_version": { "type": "integer" },
-        "active_project_id": { "type": ["string", "null"] },
+        "schema_version": {
+          "type": "integer"
+        },
+        "active_project_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "projects": {
           "type": "array",
-          "items": { "$ref": "#/definitions/ProjectRecord" }
+          "items": {
+            "$ref": "#/definitions/ProjectRecord"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProjectOpenResponse": {
+      "type": "object",
+      "required": [
+        "cancelled"
+      ],
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        },
+        "project": {
+          "$ref": "#/definitions/ProjectRecord"
+        },
+        "projects": {
+          "$ref": "#/definitions/ProjectsResponse"
         }
       },
       "additionalProperties": false
     },
     "GoalIntent": {
       "type": "object",
-      "required": ["schema_version", "goal_id", "natural_language_goal", "status", "submitted_at_ms"],
+      "required": [
+        "schema_version",
+        "goal_id",
+        "natural_language_goal",
+        "status",
+        "submitted_at_ms"
+      ],
       "properties": {
-        "schema_version": { "type": "integer" },
-        "goal_id": { "type": "string" },
-        "natural_language_goal": { "type": "string" },
-        "status": { "type": "string" },
-        "submitted_at_ms": { "type": "integer" }
+        "schema_version": {
+          "type": "integer"
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "natural_language_goal": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "submitted_at_ms": {
+          "type": "integer"
+        }
       }
     },
     "GoalsResponse": {
       "type": "array",
-      "items": { "$ref": "#/definitions/GoalIntent" }
+      "items": {
+        "$ref": "#/definitions/GoalView"
+      }
     },
     "ControlResponse": {
       "type": "object",
-      "required": ["schema_version", "paused", "changed_at_ms"],
+      "required": [
+        "schema_version",
+        "paused",
+        "changed_at_ms"
+      ],
       "properties": {
-        "schema_version": { "type": "integer" },
-        "paused": { "type": "boolean" },
-        "reason": { "type": ["string", "null"] },
-        "changed_at_ms": { "type": "integer" }
+        "schema_version": {
+          "type": "integer"
+        },
+        "paused": {
+          "type": "boolean"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "changed_at_ms": {
+          "type": "integer"
+        }
       }
     },
     "ErrorResponse": {
       "type": "object",
-      "required": ["error"],
+      "required": [
+        "error"
+      ],
       "properties": {
-        "error": { "type": "string" }
+        "error": {
+          "type": "string"
+        }
       },
       "additionalProperties": false
     },
     "EventProjection": {
       "type": "object",
-      "required": ["sequence", "event_id", "entity_type", "entity_id", "event_kind", "summary", "occurred_at_ms"],
+      "required": [
+        "sequence",
+        "event_id",
+        "entity_type",
+        "entity_id",
+        "event_kind",
+        "summary",
+        "occurred_at_ms"
+      ],
       "properties": {
-        "sequence": { "type": "integer" },
-        "event_id": { "type": "string" },
-        "entity_type": { "type": "string" },
-        "entity_id": { "type": "string" },
-        "event_kind": { "type": "string" },
-        "summary": { "type": "string" },
-        "occurred_at_ms": { "type": "integer" }
+        "sequence": {
+          "type": "integer"
+        },
+        "event_id": {
+          "type": "string"
+        },
+        "entity_type": {
+          "type": "string"
+        },
+        "entity_id": {
+          "type": "string"
+        },
+        "event_kind": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "occurred_at_ms": {
+          "type": "integer"
+        }
       },
       "additionalProperties": false
     },
     "EventsResponse": {
       "type": "array",
-      "items": { "$ref": "#/definitions/EventProjection" }
+      "items": {
+        "$ref": "#/definitions/EventProjection"
+      }
     },
     "RecoveryExplanation": {
       "type": "object",
-      "required": ["mutation_blocked", "headline", "explanation", "next_steps"],
+      "required": [
+        "mutation_blocked",
+        "headline",
+        "explanation",
+        "next_steps"
+      ],
       "properties": {
-        "mutation_blocked": { "type": "boolean" },
-        "headline": { "type": "string" },
-        "explanation": { "type": "string" },
-        "next_steps": { "type": "array", "items": { "type": "string" } }
+        "mutation_blocked": {
+          "type": "boolean"
+        },
+        "headline": {
+          "type": "string"
+        },
+        "explanation": {
+          "type": "string"
+        },
+        "next_steps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
       }
     },
     "ModelVerifyResponse": {
       "type": "object",
-      "required": ["ok", "runtime_sha256", "model_sha256", "detail"],
+      "required": [
+        "ok",
+        "runtime_sha256",
+        "model_sha256",
+        "detail"
+      ],
       "properties": {
-        "ok": { "type": "boolean" },
-        "runtime_sha256": { "type": "string" },
-        "model_sha256": { "type": "string" },
-        "detail": { "type": "string" }
+        "ok": {
+          "type": "boolean"
+        },
+        "runtime_sha256": {
+          "type": "string"
+        },
+        "model_sha256": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        }
       }
     },
     "SettingsV1": {
       "type": "object",
-      "required": ["schema_version", "execute_on_start", "approval_principal"],
+      "required": [
+        "schema_version",
+        "execute_on_start",
+        "approval_principal"
+      ],
       "properties": {
-        "schema_version": { "type": "integer" },
-        "model_runtime": { "type": ["string", "null"] },
-        "model_path": { "type": ["string", "null"] },
-        "model_name": { "type": ["string", "null"] },
-        "chrome_path": { "type": ["string", "null"] },
-        "node_path": { "type": ["string", "null"] },
-        "execute_on_start": { "type": "boolean" },
-        "approval_principal": { "type": "string" }
+        "schema_version": {
+          "type": "integer"
+        },
+        "model_runtime": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "chrome_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "node_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "execute_on_start": {
+          "type": "boolean"
+        },
+        "approval_principal": {
+          "type": "string"
+        }
       }
     },
     "GoalDetail": {
       "type": "object",
-      "required": ["intent", "plan_revisions", "tasks", "attempts", "verifications", "evidence", "completion_decided_by"],
+      "required": [
+        "intent",
+        "plan_revisions",
+        "tasks",
+        "attempts",
+        "verifications",
+        "evidence",
+        "completion_decided_by"
+      ],
       "properties": {
-        "intent": { "$ref": "#/definitions/GoalIntent" },
-        "plan_revisions": { "type": "array" },
-        "tasks": { "type": "array" },
-        "attempts": { "type": "array" },
-        "verifications": { "type": "array" },
-        "evidence": { "type": "array" },
-        "completion_decided_by": { "type": "string" }
+        "intent": {
+          "$ref": "#/definitions/GoalIntent"
+        },
+        "plan_revisions": {
+          "type": "array"
+        },
+        "tasks": {
+          "type": "array"
+        },
+        "attempts": {
+          "type": "array"
+        },
+        "verifications": {
+          "type": "array"
+        },
+        "evidence": {
+          "type": "array"
+        },
+        "completion_decided_by": {
+          "type": "string"
+        },
+        "view": {
+          "$ref": "#/definitions/GoalView"
+        }
       }
     },
     "ArtifactRead": {
       "type": "object",
-      "required": ["digest", "utf8", "byte_len"],
+      "required": [
+        "digest",
+        "utf8",
+        "byte_len"
+      ],
       "properties": {
-        "digest": { "type": "string" },
-        "utf8": { "type": "boolean" },
-        "text": { "type": ["string", "null"] },
-        "byte_len": { "type": "integer" }
+        "digest": {
+          "type": "string"
+        },
+        "utf8": {
+          "type": "boolean"
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "byte_len": {
+          "type": "integer"
+        }
       }
     },
     "RecoveryResponse": {
       "type": "object",
-      "required": ["explanation"],
+      "required": [
+        "explanation"
+      ],
       "properties": {
-        "explanation": { "$ref": "#/definitions/RecoveryExplanation" }
+        "explanation": {
+          "$ref": "#/definitions/RecoveryExplanation"
+        }
       }
+    },
+    "GoalStep": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "title",
+        "phase"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "phase": {
+          "type": "string",
+          "enum": [
+            "waiting",
+            "working",
+            "checking",
+            "done",
+            "failed",
+            "stopped"
+          ]
+        }
+      }
+    },
+    "GoalProgress": {
+      "type": "object",
+      "required": [
+        "phase",
+        "headline",
+        "sentence",
+        "steps_done",
+        "steps_total",
+        "percent",
+        "terminal"
+      ],
+      "properties": {
+        "phase": {
+          "type": "string",
+          "enum": [
+            "received",
+            "queued",
+            "waiting",
+            "planning",
+            "building",
+            "checking",
+            "waiting_for_you",
+            "stopping",
+            "applying",
+            "done",
+            "failed",
+            "cancelled",
+            "not_applied",
+            "undone"
+          ]
+        },
+        "headline": {
+          "type": "string"
+        },
+        "sentence": {
+          "type": "string"
+        },
+        "steps_done": {
+          "type": "integer"
+        },
+        "steps_total": {
+          "type": "integer"
+        },
+        "percent": {
+          "type": "integer"
+        },
+        "terminal": {
+          "type": "boolean"
+        }
+      }
+    },
+    "GoalOutcome": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "goal_id",
+        "kind",
+        "reason_code",
+        "detail",
+        "recorded_at_ms"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "failed",
+            "cancelled"
+          ]
+        },
+        "reason_code": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        },
+        "plan_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan_revision": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "recorded_at_ms": {
+          "type": "integer"
+        }
+      }
+    },
+    "LandingRecord": {
+      "type": "object",
+      "required": [
+        "goal_id",
+        "status",
+        "commit",
+        "undo_commit",
+        "changed_paths",
+        "detail",
+        "technical_detail",
+        "updated_at_ms"
+      ],
+      "properties": {
+        "goal_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "predates_landing",
+            "landed",
+            "nothing_to_land",
+            "blocked_by_local_changes",
+            "conflict",
+            "undone",
+            "failed"
+          ]
+        },
+        "commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "undo_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "changed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "technical_detail": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updated_at_ms": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoalView": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "goal_id",
+        "natural_language_goal",
+        "status",
+        "submitted_at_ms",
+        "progress",
+        "steps"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "goal_id": {
+          "type": "string"
+        },
+        "natural_language_goal": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "submitted_at_ms": {
+          "type": "integer"
+        },
+        "progress": {
+          "$ref": "#/definitions/GoalProgress"
+        },
+        "steps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/GoalStep"
+          }
+        },
+        "outcome": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/GoalOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "queue_position": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "landing": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/LandingRecord"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "GoalActivity": {
+      "type": "object",
+      "required": [
+        "sequence",
+        "occurred_at_ms",
+        "text",
+        "tone"
+      ],
+      "properties": {
+        "sequence": {
+          "type": "integer"
+        },
+        "occurred_at_ms": {
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "tone": {
+          "type": "string",
+          "enum": [
+            "info",
+            "success",
+            "warning",
+            "error"
+          ]
+        }
+      }
+    },
+    "GoalActivityResponse": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/GoalActivity"
+      }
+    },
+    "PendingCommand": {
+      "type": "object",
+      "required": [
+        "ticket",
+        "kind",
+        "accepted_at_ms"
+      ],
+      "properties": {
+        "ticket": {
+          "type": "integer"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "goal_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "accepted_at_ms": {
+          "type": "integer"
+        }
+      }
+    },
+    "QueuedCommandResponse": {
+      "type": "object",
+      "required": [
+        "accepted",
+        "applied",
+        "ticket",
+        "message"
+      ],
+      "properties": {
+        "accepted": {
+          "type": "boolean"
+        },
+        "applied": {
+          "type": "boolean"
+        },
+        "ticket": {
+          "type": "integer"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "MachineInfo": {
+      "type": "object",
+      "required": [
+        "supported",
+        "apple_silicon",
+        "memory_mib",
+        "free_disk_mib",
+        "problems"
+      ],
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "apple_silicon": {
+          "type": "boolean"
+        },
+        "memory_mib": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "free_disk_mib": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "problems": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DeveloperTools": {
+      "type": "object",
+      "required": [
+        "installed",
+        "detail"
+      ],
+      "properties": {
+        "installed": {
+          "type": "boolean"
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelChoice": {
+      "type": "object",
+      "required": [
+        "id",
+        "display_name",
+        "size_bytes"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DownloadProgress": {
+      "type": "object",
+      "required": [
+        "phase",
+        "bytes_done",
+        "bytes_total",
+        "percent",
+        "detail"
+      ],
+      "properties": {
+        "phase": {
+          "type": "string",
+          "enum": [
+            "idle",
+            "checking",
+            "downloading_runtime",
+            "downloading_model",
+            "verifying",
+            "done",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "bytes_done": {
+          "type": "integer"
+        },
+        "bytes_total": {
+          "type": "integer"
+        },
+        "percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SetupStatus": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "machine",
+        "developer_tools",
+        "model",
+        "runtime_ready",
+        "model_ready",
+        "download",
+        "ready"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "machine": {
+          "$ref": "#/definitions/MachineInfo"
+        },
+        "developer_tools": {
+          "$ref": "#/definitions/DeveloperTools"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelChoice"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runtime_ready": {
+          "type": "boolean"
+        },
+        "model_ready": {
+          "type": "boolean"
+        },
+        "download": {
+          "$ref": "#/definitions/DownloadProgress"
+        },
+        "ready": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DownloadResponse": {
+      "type": "object",
+      "required": [
+        "download"
+      ],
+      "properties": {
+        "download": {
+          "$ref": "#/definitions/DownloadProgress"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DeveloperToolsInstallResponse": {
+      "type": "object",
+      "required": [
+        "started",
+        "detail"
+      ],
+      "properties": {
+        "started": {
+          "type": "boolean"
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PreviewResponse": {
+      "type": "object",
+      "required": [
+        "available",
+        "url"
+      ],
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProjectFile": {
+      "type": "object",
+      "required": [
+        "path",
+        "size_bytes"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProjectFilesResponse": {
+      "type": "object",
+      "required": [
+        "files",
+        "truncated"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ProjectFile"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProjectFileContent": {
+      "type": "object",
+      "required": [
+        "path",
+        "size_bytes",
+        "binary",
+        "truncated",
+        "text"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer"
+        },
+        "binary": {
+          "type": "boolean"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

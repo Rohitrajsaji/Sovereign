@@ -35,12 +35,12 @@ pub fn doctor_checks(model_path: Option<&Path>, runtime_path: Option<&Path>) -> 
         optional_file(
             "model-runtime",
             runtime_path,
-            "Choose the llama-server binary in Settings.",
+            "Download the local model from Setup.",
         ),
         optional_file(
             "model-weights",
             model_path,
-            "Choose the GGUF file in Settings.",
+            "Download the local model from Setup.",
         ),
         path_check(
             "chrome",

@@ -122,6 +122,8 @@ impl ExecutionService {
             | ProductionAdvanceOutcome::TaskVerified { .. }
             | ProductionAdvanceOutcome::TaskFailed { .. }
             | ProductionAdvanceOutcome::GoalCompleted { .. }
+            | ProductionAdvanceOutcome::GoalFailed { .. }
+            | ProductionAdvanceOutcome::GoalCancelled { .. }
             | ProductionAdvanceOutcome::Complete { .. } => (ServicePhase::Running, false),
         };
         let previous = self.status.last_outcome.clone();
@@ -253,6 +255,8 @@ mod tests {
             ActorOptions {
                 execute: true,
                 git_root: Some(root.clone()),
+                managed: false,
+                lands_results: false,
             },
         )
         .unwrap_or_else(|error| panic!("{error}"));
@@ -271,6 +275,7 @@ mod tests {
                     session_token: Some(token),
                     require_token_for_v1_post: true,
                     state_path: Some(state),
+                    state_path_source: None,
                     sse_clients: Arc::new(AtomicUsize::new(0)),
                     launch_code_dir: None,
                 },
@@ -325,6 +330,8 @@ mod tests {
             ActorOptions {
                 execute: true,
                 git_root: Some(root.clone()),
+                managed: false,
+                lands_results: false,
             },
         )
         .unwrap_or_else(|error| panic!("{error}"));

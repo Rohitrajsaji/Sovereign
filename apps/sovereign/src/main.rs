@@ -7,21 +7,28 @@ mod doctor;
 mod execution;
 #[cfg(any(test, feature = "e2e-fixtures"))]
 mod fixture_backend;
+mod goal_views;
+mod install;
+mod landing_service;
 mod launch_agent;
 mod launch_code;
 mod model_assets;
+mod model_setup;
+mod preview;
 mod projections;
 mod projects;
 mod run_lock;
 mod runner;
+mod scaffold;
 mod service_logs;
+mod service_state;
 
 #[cfg(test)]
 use control_api::ControlApiRequest;
 use control_api::{bind_loopback, serve_listener};
-use dispatch::handle_actor_request;
 #[cfg(test)]
-use dispatch::{artifact_response, download_model_response};
+use dispatch::artifact_response;
+use dispatch::handle_actor_request;
 #[cfg(test)]
 use serde_json::{Value, json};
 use sovereign_controller::{ApprovalDecisionV1, LocalControl};
@@ -63,7 +70,15 @@ fn render_result(result: Result<String, String>) -> ExitCode {
 fn run(args: &[String], state_path: &Path) -> Result<String, String> {
     match args.first().map(String::as_str) {
         Some("--version" | "-V") => Ok(format!("sovereign {VERSION}")),
+        // People who install Sovereign type `sovereign` to open it.
+        None if cfg!(target_os = "macos") => app_command(),
         Some("help" | "--help" | "-h") | None => Ok(help_text()),
+        Some("self-install") => {
+            let data = app_data::AppData::open_default().map_err(|error| error.to_string())?;
+            install::self_install(&install::InstallLayout::from_env()?, &data)
+        }
+        Some("update") => install::update(&install::InstallLayout::from_env()?),
+        Some("uninstall") => install::uninstall(&install::InstallLayout::from_env()?, args),
         Some("doctor") => doctor_command(args, state_path),
         Some("goal") => {
             let goal = args.get(1..).unwrap_or_default().join(" ");
@@ -286,13 +301,26 @@ fn run_serve(args: &[String], state_path: &Path) -> Result<String, String> {
     );
     let (actor, actor_handle) = actor::ControllerActorHandle::spawn_with(
         actor_state,
-        actor::ActorOptions { execute, git_root },
+        actor::ActorOptions {
+            execute,
+            git_root,
+            managed: active.as_ref().is_some_and(|record| record.managed),
+            lands_results: active.is_some(),
+        },
     )?;
+    // The preview is optional: without it the app still works, only the Preview tab is empty.
+    if let Err(error) = actor.start_preview(&format!("http://{local_address}")) {
+        eprintln!("sovereign: project preview unavailable: {error}");
+    }
     let actor_for_server = actor.clone();
+    let actor_for_events = actor.clone();
     let server_config = control_api::ServerConfig {
         session_token: token,
         require_token_for_v1_post: require_token,
         state_path: Some(state_path.to_path_buf()),
+        state_path_source: Some(control_api::StatePathSource::new(move || {
+            actor_for_events.state_path()
+        })),
         sse_clients: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         launch_code_dir: app_data_root,
     };
@@ -471,8 +499,32 @@ fn handle_control_request(
         }
         ControlApiRequest::GetGoal { goal_id } => {
             let model = control.read_model().map_err(|e| e.to_string())?;
-            projections::goal_detail(&model, &goal_id)
-                .ok_or_else(|| format!("unknown goal {goal_id}"))
+            let status = execution::ServiceStatusV1::default();
+            let views = goal_views::goal_views(
+                &model,
+                &[],
+                None,
+                &goal_views::ServiceFacts {
+                    status: &status,
+                    working: false,
+                    paused: model.status.execution_control.paused,
+                    pending: &[],
+                },
+            );
+            let view = views
+                .iter()
+                .find(|view| view.goal_id == goal_id)
+                .ok_or_else(|| format!("unknown goal {goal_id}"))?;
+            projections::goal_detail(&model, view).ok_or_else(|| format!("unknown goal {goal_id}"))
+        }
+        ControlApiRequest::GetGoalActivity { .. } => {
+            Err("goal activity is served by the local service".to_owned())
+        }
+        ControlApiRequest::CreateProject { .. }
+        | ControlApiRequest::OpenFolder { .. }
+        | ControlApiRequest::UndoGoal { .. }
+        | ControlApiRequest::ApplyGoal { .. } => {
+            Err("projects and results are served by the local service".to_owned())
         }
         ControlApiRequest::ListEvents { after, limit } => {
             let store = StateStore::open(
@@ -536,7 +588,11 @@ fn handle_control_request(
             digest,
             offset,
             length,
-        } => artifact_response(&digest, offset, length),
+        } => {
+            let path = std::env::var_os("SOVEREIGN_STATE_DB")
+                .map_or_else(|| PathBuf::from(".sovereign/state.sqlite3"), PathBuf::from);
+            artifact_response(&path, &digest, offset, length)
+        }
         ControlApiRequest::GetTaskDiff { key } => {
             let model = control.read_model().map_err(|e| e.to_string())?;
             projections::task_diff_from_status(&model.status.tasks, &key)
@@ -553,8 +609,14 @@ fn handle_control_request(
                 .ok_or_else(|| format!("not found: approval {request_id}"))
                 .and_then(|item| serde_json::to_value(item).map_err(|e| e.to_string()))
         }
-        ControlApiRequest::DownloadModel { confirmation } => {
-            download_model_response(confirmation.as_deref())
+        ControlApiRequest::DownloadModel { .. }
+        | ControlApiRequest::SetupStatus
+        | ControlApiRequest::CancelModelDownload
+        | ControlApiRequest::InstallDeveloperTools
+        | ControlApiRequest::Preview
+        | ControlApiRequest::ListFiles
+        | ControlApiRequest::ReadFile { .. } => {
+            Err("model setup is served by the local service".to_owned())
         }
         ControlApiRequest::CancelGoal { goal_id, principal } => control
             .cancel_goal(&goal_id, &principal)
@@ -568,6 +630,11 @@ fn handle_control_request(
 fn help_text() -> String {
     [
         "Sovereign local Controller CLI",
+        "",
+        "Everyday use:",
+        "  sovereign                     Open Sovereign in your browser (starts it if needed)",
+        "  update                        Install the newest release",
+        "  uninstall [--keep-data|--delete-data]  Remove Sovereign; your project folders stay",
         "",
         "Commands:",
         "  goal <natural-language goal>  Durably queue a Controller-owned goal intent",

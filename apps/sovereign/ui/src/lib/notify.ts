@@ -1,45 +1,41 @@
-// Callers: `Shell` in App.tsx.
-// API: `transitionNotice` turns two overview snapshots into one user-facing notice, or null.
-// Schema: OverviewResponse from control-api-v2.
-// Notices are plain strings rendered as text nodes. They never include repository or model text.
+// Callers: the workspace shell.
+// API: `goalNotice` turns two snapshots of requests into one notice, or null; `desktopNotify`.
+// Schema: GoalView from control-api-v2. Notices quote the person's own words only, as text.
 
-import type { OverviewResponse } from "../api/generated";
+import type { GoalView } from "../api/generated";
 
-type Snapshot = Pick<
-  OverviewResponse,
-  "service_phase" | "paused" | "approval_count" | "unknown_action_count" | "last_outcome"
->;
+function shortWords(text: string): string {
+  const single = text.replace(/\s+/g, " ").trim();
+  return single.length > 60 ? `${single.slice(0, 59)}…` : single;
+}
 
-export function transitionNotice(previous: Snapshot | undefined, next: Snapshot): string | null {
+/** The notice for the most important change between two snapshots of the same project. */
+export function goalNotice(previous: GoalView[] | undefined, next: GoalView[]): string | null {
   if (!previous) {
     return null;
   }
-  const approvals = next.approval_count ?? 0;
-  if (approvals > (previous.approval_count ?? 0)) {
-    return approvals === 1
-      ? "An action needs your approval."
-      : `${approvals} actions need your approval.`;
+  const before = new Map(previous.map((goal) => [goal.goal_id, goal.progress.phase]));
+  for (const goal of next) {
+    const was = before.get(goal.goal_id);
+    const now = goal.progress.phase;
+    if (was === undefined || was === now) {
+      continue;
+    }
+    const words = shortWords(goal.natural_language_goal);
+    switch (now) {
+      case "waiting_for_you":
+        return `Sovereign needs your OK to continue “${words}”.`;
+      case "done":
+        return `Done: “${words}”.`;
+      case "not_applied":
+        return `“${words}” is finished but needs your attention.`;
+      case "failed":
+        return `“${words}” didn't finish.`;
+      default:
+        break;
+    }
   }
-  if ((next.unknown_action_count ?? 0) > (previous.unknown_action_count ?? 0)) {
-    return "An action has an unknown outcome. Open Recovery before continuing.";
-  }
-  const completed = (outcome: string | undefined) => (outcome ?? "").startsWith("GoalCompleted");
-  if (completed(next.last_outcome) && !completed(previous.last_outcome)) {
-    return "A goal completed and passed verification.";
-  }
-  if (next.service_phase === previous.service_phase) {
-    return null;
-  }
-  switch (next.service_phase) {
-    case "recovery_blocked":
-      return "Work is blocked until recovery finishes.";
-    case "error":
-      return "The last step recorded an error.";
-    case "deferred_resource":
-      return "Work is waiting for memory or host pressure to ease.";
-    default:
-      return null;
-  }
+  return null;
 }
 
 /** Shows a desktop notification only when permission was granted and the tab is hidden. */
