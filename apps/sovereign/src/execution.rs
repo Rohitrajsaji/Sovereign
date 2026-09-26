@@ -122,6 +122,8 @@ impl ExecutionService {
             | ProductionAdvanceOutcome::TaskVerified { .. }
             | ProductionAdvanceOutcome::TaskFailed { .. }
             | ProductionAdvanceOutcome::GoalCompleted { .. }
+            | ProductionAdvanceOutcome::GoalFailed { .. }
+            | ProductionAdvanceOutcome::GoalCancelled { .. }
             | ProductionAdvanceOutcome::Complete { .. } => (ServicePhase::Running, false),
         };
         let previous = self.status.last_outcome.clone();

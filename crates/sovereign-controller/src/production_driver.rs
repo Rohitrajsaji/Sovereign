@@ -23,6 +23,10 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Mutex;
 
+use super::goal_runner::{
+    GOAL_REASON_CANCELLED_BY_USER, GOAL_REASON_COMPILATION_BUDGET_EXHAUSTED,
+    GOAL_REASON_COMPILATION_FAILED, GOAL_REASON_TASK_FAILED, GoalOutcomeKindV1,
+};
 use super::{
     Controller, ControllerError, ExecutionRuntime, GoalIntentV1, ReadinessInputs, TaskState,
     digest_json, required_array, required_str, sha256_prefixed,
@@ -136,6 +140,15 @@ pub enum ProductionAdvanceOutcome {
         goal_id: String,
     },
     Complete {
+        goal_id: String,
+    },
+    /// The goal ended as failed and its plan, if any, was retired. The queue moves on.
+    GoalFailed {
+        goal_id: String,
+        reason_code: String,
+    },
+    /// The goal ended as cancelled and its plan, if any, was retired. The queue moves on.
+    GoalCancelled {
         goal_id: String,
     },
 }
@@ -403,6 +416,24 @@ impl Controller {
                 Err(error) => Err(error),
             };
         }
+        if super::goal_runner::plan_has_durable_goal_intent(&self.state, &active.plan_document)?
+            && self.active_plan_cancellation_requested()?
+        {
+            // A cancelled goal must not wait on a question nobody will answer.
+            for request_id in self.pending_approval_request_ids_for_active_plan()? {
+                self.respond_to_approval(
+                    &request_id,
+                    super::ApprovalDecisionV1::Deny,
+                    "sovereign@cancellation",
+                )?;
+            }
+            return self.end_active_goal(
+                &goal_id,
+                GoalOutcomeKindV1::Cancelled,
+                GOAL_REASON_CANCELLED_BY_USER,
+                "Cancelled while in progress.",
+            );
+        }
         if active.tasks.values().any(|task| {
             matches!(
                 task.state,
@@ -434,18 +465,33 @@ impl Controller {
             }
         }
         let Some(task_id) = task_id else {
-            let reason = if active
+            let failed_task = active
                 .tasks
-                .values()
-                .any(|task| task.state == TaskState::FailedTerminal)
-            {
-                ProductionBlockReason::FailedTerminal
-            } else {
-                ProductionBlockReason::NoRunnableTask
-            };
+                .iter()
+                .find(|(_, task)| task.state == TaskState::FailedTerminal)
+                .map(|(task_id, _)| task_id.clone());
+            if let Some(failed_task) = failed_task {
+                if super::goal_runner::plan_has_durable_goal_intent(
+                    &self.state,
+                    &active.plan_document,
+                )? {
+                    return self.end_active_goal(
+                        &goal_id,
+                        GoalOutcomeKindV1::Failed,
+                        GOAL_REASON_TASK_FAILED,
+                        &format!(
+                            "Step {failed_task} failed and could not be repaired automatically."
+                        ),
+                    );
+                }
+                return Ok(ProductionAdvanceOutcome::Blocked {
+                    task_id: None,
+                    reason: ProductionBlockReason::FailedTerminal,
+                });
+            }
             return Ok(ProductionAdvanceOutcome::Blocked {
                 task_id: None,
-                reason,
+                reason: ProductionBlockReason::NoRunnableTask,
             });
         };
         let task = self.active_ref()?.tasks.get(&task_id).ok_or_else(|| {
@@ -782,11 +828,13 @@ impl Controller {
             calls_used: 0,
         };
         if compilation_budget_exhausted(&self.state, &binding)? {
-            return Ok(ProductionAdvanceOutcome::Blocked {
-                task_id: None,
-                reason: ProductionBlockReason::CompilationBudgetExhausted,
-            });
+            return self.end_queued_goal_as_failed(
+                &intent.goal_id,
+                GOAL_REASON_COMPILATION_BUDGET_EXHAUSTED,
+                "Sovereign could not turn this request into a plan after every allowed attempt.",
+            );
         }
+        let calls_before = compilation_calls_used(&self.state, &binding)?;
         let result = {
             let backend = ReservedCompilationBackend {
                 backend: compilation.backend,
@@ -804,27 +852,33 @@ impl Controller {
         let plan = match result {
             Ok(plan) => plan,
             Err(error) => {
-                if compilation_budget_exhausted(
-                    &self.state,
-                    &CompilationBudgetRecord {
-                        schema_version: COMPILATION_BUDGET_SCHEMA_VERSION,
-                        goal_id: intent.goal_id.clone(),
-                        goal_statement_digest: sha256_prefixed(
-                            intent.natural_language_goal.as_bytes(),
+                let expected = CompilationBudgetRecord {
+                    schema_version: COMPILATION_BUDGET_SCHEMA_VERSION,
+                    goal_id: intent.goal_id.clone(),
+                    goal_statement_digest: sha256_prefixed(intent.natural_language_goal.as_bytes()),
+                    compilation_input_digest: digest_json(&serde_json::to_value(input)?)?,
+                    compiler_version: compilation.compiler_version.to_owned(),
+                    max_model_calls: u32::from(input.max_model_calls),
+                    calls_used: 0,
+                };
+                if compilation_budget_exhausted(&self.state, &expected)? {
+                    return self.end_queued_goal_as_failed(
+                        &intent.goal_id,
+                        GOAL_REASON_COMPILATION_BUDGET_EXHAUSTED,
+                        &format!(
+                            "Sovereign could not turn this request into a plan after every allowed attempt. Last error: {error}"
                         ),
-                        compilation_input_digest: digest_json(&serde_json::to_value(input)?)?,
-                        compiler_version: compilation.compiler_version.to_owned(),
-                        max_model_calls: u32::from(input.max_model_calls),
-                        calls_used: 0,
-                    },
-                )? && matches!(
-                    error,
-                    sovereign_plan::PlanCompilationError::Model(ModelError::LeaseUnavailable(_))
-                ) {
-                    return Ok(ProductionAdvanceOutcome::Blocked {
-                        task_id: None,
-                        reason: ProductionBlockReason::CompilationBudgetExhausted,
-                    });
+                    );
+                }
+                // A failure that consumed no model call is deterministic for this input and
+                // would repeat forever, so it ends the goal. A failure that consumed a call can
+                // succeed on the next attempt, so the goal stays queued for the remaining budget.
+                if compilation_calls_used(&self.state, &expected)? == calls_before {
+                    return self.end_queued_goal_as_failed(
+                        &intent.goal_id,
+                        GOAL_REASON_COMPILATION_FAILED,
+                        &format!("Sovereign could not plan this request: {error}"),
+                    );
                 }
                 return Ok(ProductionAdvanceOutcome::Blocked {
                     task_id: None,
@@ -873,6 +927,64 @@ impl Controller {
             plan_id: activation.plan_id,
         })
     }
+}
+
+impl Controller {
+    /// Ends the active goal and maps a still-busy precondition to a readiness block.
+    fn end_active_goal(
+        &mut self,
+        goal_id: &str,
+        kind: GoalOutcomeKindV1,
+        reason_code: &str,
+        detail: &str,
+    ) -> Result<ProductionAdvanceOutcome, ControllerError> {
+        match self.abandon_active_goal(kind, reason_code, detail) {
+            Ok(_) => Ok(match kind {
+                GoalOutcomeKindV1::Failed => ProductionAdvanceOutcome::GoalFailed {
+                    goal_id: goal_id.to_owned(),
+                    reason_code: reason_code.to_owned(),
+                },
+                GoalOutcomeKindV1::Cancelled => ProductionAdvanceOutcome::GoalCancelled {
+                    goal_id: goal_id.to_owned(),
+                },
+            }),
+            Err(ControllerError::NotReady(reason)) => Ok(ProductionAdvanceOutcome::Blocked {
+                task_id: None,
+                reason: ProductionBlockReason::Readiness(reason),
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn end_queued_goal_as_failed(
+        &mut self,
+        goal_id: &str,
+        reason_code: &str,
+        detail: &str,
+    ) -> Result<ProductionAdvanceOutcome, ControllerError> {
+        self.fail_queued_goal_intent(goal_id, reason_code, detail)?;
+        Ok(ProductionAdvanceOutcome::GoalFailed {
+            goal_id: goal_id.to_owned(),
+            reason_code: reason_code.to_owned(),
+        })
+    }
+}
+
+/// Model calls already charged to this goal's compilation budget.
+fn compilation_calls_used(
+    state: &StateStore,
+    expected: &CompilationBudgetRecord,
+) -> Result<u32, ControllerError> {
+    let Some(row) = state
+        .state_records(COMPILATION_BUDGET_NAMESPACE)?
+        .into_iter()
+        .find(|row| row.key == expected.goal_id)
+    else {
+        return Ok(0);
+    };
+    let current: CompilationBudgetRecord = serde_json::from_str(&row.value_json)?;
+    validate_compilation_budget_binding(&current, expected)?;
+    Ok(current.calls_used)
 }
 
 fn compilation_budget_exhausted(

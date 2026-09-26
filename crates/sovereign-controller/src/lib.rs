@@ -87,6 +87,11 @@ pub use browser::{
     browser_destination,
 };
 
+pub use goal_runner::{
+    GOAL_REASON_CANCELLED_BY_USER, GOAL_REASON_COMPILATION_BUDGET_EXHAUSTED,
+    GOAL_REASON_COMPILATION_FAILED, GOAL_REASON_COMPOSITION_ERROR, GOAL_REASON_TASK_FAILED,
+    GoalOutcomeKindV1, GoalOutcomeV1, goal_outcomes,
+};
 pub use local_control::{
     LOCAL_CONTROL_READ_MODEL_SCHEMA_VERSION, LocalControl, LocalControlCheckpointV1,
     LocalControlReadModelV1, LocalControlRecoveryProjectionV1,
@@ -2901,6 +2906,58 @@ impl Controller {
             handle.cancel()?;
         }
         Ok(handle)
+    }
+
+    /// Returns a cloneable handle for the active goal's cancellation scope. Cancelling it from
+    /// another thread interrupts in-flight model dispatch and processes of this goal at their
+    /// next cancellation check. It records nothing durable; the Controller still records the
+    /// request through [`Self::request_goal_cancellation`] at the next safe point.
+    ///
+    /// # Errors
+    /// Returns a fail-closed error when no plan is active or the scope identity conflicts.
+    pub fn goal_cancellation_handle(&self) -> Result<CancellationHandle, ControllerError> {
+        let active = self.active_ref()?;
+        let goal = cancellation_scope(active, CancellationScopeKindV1::Goal, None, None, None);
+        self.cancellations.register_root(goal)
+    }
+
+    /// Durably requests cancellation of the active goal and every task in it. The next
+    /// production step ends the goal as cancelled once nothing is in flight.
+    ///
+    /// # Errors
+    /// Returns a fail-closed state/identity error.
+    pub fn request_goal_cancellation(
+        &mut self,
+        reason: &str,
+    ) -> Result<CancellationRecordV1, ControllerError> {
+        self.require_active_revision_not_completed()?;
+        let handle = self.goal_cancellation_handle()?;
+        handle.cancel()?;
+        let scope = handle.cancellation_origin().ok_or_else(|| {
+            ControllerError::InvalidPlan("goal cancellation origin disappeared".to_owned())
+        })?;
+        self.persist_cancellation_request(&scope, reason)
+    }
+
+    /// True when any durable cancellation request binds the active plan revision.
+    pub(crate) fn active_plan_cancellation_requested(&self) -> Result<bool, ControllerError> {
+        let active = self.active_ref()?;
+        for record in self.state.state_records(CANCELLATION_REQUEST_NAMESPACE)? {
+            if !key_belongs_to_revision(&record.key, &active.plan_id, active.revision) {
+                continue;
+            }
+            let cancellation: CancellationRecordV1 = serde_json::from_str(&record.value_json)?;
+            if cancellation.schema_version != CANCELLATION_RECORD_SCHEMA_VERSION
+                || cancellation.scope.plan_id != active.plan_id
+                || cancellation.scope.plan_revision != active.revision
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "durable cancellation request is misbound".to_owned(),
+                ));
+            }
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     /// Durably requests cancellation of one active task and all descendants.
@@ -18512,6 +18569,67 @@ impl Controller {
             result.insert(task_id.clone(), task_digests);
         }
         Ok(result)
+    }
+
+    /// Ids of pending approval requests that belong to the active plan revision.
+    fn pending_approval_request_ids_for_active_plan(&self) -> Result<Vec<String>, ControllerError> {
+        let active = self.active_ref()?;
+        let mut pending = Vec::new();
+        for record in self.state.state_records(APPROVAL_REQUEST_NAMESPACE)? {
+            let request: ApprovalRequestV1 = serde_json::from_str(&record.value_json)?;
+            if request.request_id != record.key {
+                return Err(ControllerError::InvalidPlan(
+                    "approval request durable key does not match request identity".to_owned(),
+                ));
+            }
+            if request.plan_id == active.plan_id
+                && request.plan_revision == active.revision
+                && request.status == ApprovalRequestStatusV1::Pending
+            {
+                pending.push(request.request_id);
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Preconditions for ending an active goal as failed or cancelled. Nothing may be in flight:
+    /// no dispatched, observed, or unknown action, no running process or rollback, no pending
+    /// approval, and no task mid-attempt. Unlike completion, Sovereign-owned worktree conflicts
+    /// do not block, because nothing is applied. Prepared or authorized actions that were never
+    /// dispatched do not block either: dispatch needs this active plan and its execution epoch,
+    /// the plan is removed in the same transaction, and the next activation starts a new epoch.
+    fn require_abandonment_recovery_clear(&self) -> Result<(), ControllerError> {
+        validate_durable_action_lifecycle_states(&self.state)?;
+        require_no_unresolved_secret_action_lifecycles(&self.state, None)?;
+        let active = self.active_ref()?;
+        if let Some(request_id) = self
+            .pending_approval_request_ids_for_active_plan()?
+            .into_iter()
+            .next()
+        {
+            return Err(ControllerError::NotReady(format!(
+                "ending the goal waits for pending approval request {request_id}"
+            )));
+        }
+        if self.any_unresolved_action()?
+            || has_unresolved_process_lease(&self.state)?
+            || has_unresolved_rollback(&self.state, None)?
+        {
+            return Err(ControllerError::NotReady(
+                "ending the goal waits for unresolved action/process/rollback authority".to_owned(),
+            ));
+        }
+        if let Some((task_id, _)) = active.tasks.iter().find(|(_, runtime)| {
+            matches!(
+                runtime.state,
+                TaskState::Running | TaskState::Verifying | TaskState::ReconcilingUnknown
+            )
+        }) {
+            return Err(ControllerError::NotReady(format!(
+                "ending the goal waits for in-flight task {task_id}"
+            )));
+        }
+        Ok(())
     }
 
     fn require_completion_recovery_clear(&self) -> Result<(), ControllerError> {
@@ -34998,6 +35116,424 @@ mod tests {
             .unwrap_or_else(|error| panic!("read finalized durable status: {error}"));
         drop(reopened);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    fn goal_status(controller: &Controller, goal_id: &str) -> String {
+        let raw = controller
+            .state
+            .get_state("controller.goal_intent", goal_id)
+            .unwrap_or_else(|error| panic!("read goal intent: {error}"))
+            .unwrap_or_else(|| panic!("goal intent {goal_id} missing"));
+        serde_json::from_str::<super::GoalIntentV1>(&raw)
+            .unwrap_or_else(|error| panic!("decode goal intent: {error}"))
+            .status
+    }
+
+    #[test]
+    fn cancelled_queued_goal_keeps_the_queue_moving_and_records_an_outcome() {
+        let (base, state) = temp_state("queued-goal-cancel-queue");
+        let mut controller = Controller::new(state);
+        let first = controller
+            .submit_goal_intent("first request")
+            .unwrap_or_else(|error| panic!("submit first: {error}"));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = controller
+            .submit_goal_intent("second request")
+            .unwrap_or_else(|error| panic!("submit second: {error}"));
+
+        let cancelled = controller
+            .cancel_goal_intent(&first.goal_id, "tester")
+            .unwrap_or_else(|error| panic!("cancel queued goal: {error}"));
+        assert_eq!(cancelled.status, "cancelled_before_dispatch");
+        // Before the fix, the cancelled intent broke lifecycle validation and every later
+        // queue read failed.
+        let next = controller
+            .next_queued_goal_intent()
+            .unwrap_or_else(|error| panic!("queue after cancel: {error}"));
+        assert_eq!(
+            next.map(|intent| intent.goal_id),
+            Some(second.goal_id.clone())
+        );
+        // Cancelling again is idempotent.
+        assert_eq!(
+            controller
+                .cancel_goal_intent(&first.goal_id, "tester")
+                .map(|intent| intent.status)
+                .ok(),
+            Some("cancelled_before_dispatch".to_owned())
+        );
+
+        let failed = controller
+            .fail_queued_goal_intent(
+                &second.goal_id,
+                super::GOAL_REASON_COMPOSITION_ERROR,
+                "bad input",
+            )
+            .unwrap_or_else(|error| panic!("fail queued goal: {error}"));
+        assert_eq!(failed.status, "failed");
+        assert!(
+            controller
+                .next_queued_goal_intent()
+                .unwrap_or_else(|error| panic!("queue after failure: {error}"))
+                .is_none()
+        );
+        let outcomes = super::goal_outcomes(&controller.state)
+            .unwrap_or_else(|error| panic!("read goal outcomes: {error}"));
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].kind, super::GoalOutcomeKindV1::Cancelled);
+        assert_eq!(
+            outcomes[0].reason_code,
+            super::GOAL_REASON_CANCELLED_BY_USER
+        );
+        assert_eq!(outcomes[1].kind, super::GoalOutcomeKindV1::Failed);
+        assert_eq!(outcomes[1].detail, "bad input");
+        // A failed goal cannot be cancelled into a different state.
+        assert_eq!(
+            controller
+                .cancel_goal_intent(&second.goal_id, "tester")
+                .map(|intent| intent.status)
+                .ok(),
+            Some("failed".to_owned())
+        );
+
+        let third = controller
+            .submit_goal_intent("third request")
+            .unwrap_or_else(|error| panic!("submit third: {error}"));
+        let state_path = controller.state.path().to_path_buf();
+        drop(controller);
+        let reopened = Controller::reopen_local(
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("reopen store: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("reopen after terminal queue transitions: {error}"));
+        assert_eq!(
+            reopened
+                .next_queued_goal_intent()
+                .unwrap_or_else(|error| panic!("queue after reopen: {error}"))
+                .map(|intent| intent.goal_id),
+            Some(third.goal_id)
+        );
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn cancel_after_released_claim_keeps_lifecycle_versions_valid() {
+        let (base, state) = temp_state("queued-goal-cancel-released-claim");
+        let mut controller = Controller::new(state);
+        let goal = controller
+            .submit_goal_intent("released then cancelled")
+            .unwrap_or_else(|error| panic!("submit goal: {error}"));
+        // Simulate claim and release back to the queue (intent v2 claimed + claim v1, then
+        // intent v3 queued + claim v2 released).
+        let mut intent = goal.clone();
+        intent.status = "claimed_for_plan_compilation".to_owned();
+        controller
+            .state
+            .put_state(
+                "controller.goal_intent",
+                &goal.goal_id,
+                &serde_json::to_string(&intent).unwrap_or_default(),
+            )
+            .unwrap_or_else(|error| panic!("claim intent: {error}"));
+        let mut claim = super::goal_runner::GoalIntentClaimV1 {
+            schema_version: 1,
+            goal_id: goal.goal_id.clone(),
+            goal_statement_digest: sha256_prefixed(goal.natural_language_goal.as_bytes()),
+            plan_id: "plan.released".to_owned(),
+            plan_revision: 1,
+            plan_digest: sha256_prefixed(b"plan"),
+            compilation_evidence_digest: sha256_prefixed(b"evidence"),
+            status: super::goal_runner::GoalIntentClaimStatusV1::Claimed,
+            claimed_at_ms: goal.submitted_at_ms + 1,
+            updated_at_ms: goal.submitted_at_ms + 1,
+        };
+        controller
+            .state
+            .put_state(
+                "controller.goal_intent_claim",
+                &goal.goal_id,
+                &serde_json::to_string(&claim).unwrap_or_default(),
+            )
+            .unwrap_or_else(|error| panic!("claim: {error}"));
+        intent.status = "queued_for_plan_compilation".to_owned();
+        controller
+            .state
+            .put_state(
+                "controller.goal_intent",
+                &goal.goal_id,
+                &serde_json::to_string(&intent).unwrap_or_default(),
+            )
+            .unwrap_or_else(|error| panic!("release intent: {error}"));
+        claim.status = super::goal_runner::GoalIntentClaimStatusV1::Released;
+        controller
+            .state
+            .put_state(
+                "controller.goal_intent_claim",
+                &goal.goal_id,
+                &serde_json::to_string(&claim).unwrap_or_default(),
+            )
+            .unwrap_or_else(|error| panic!("release claim: {error}"));
+        controller
+            .next_queued_goal_intent()
+            .unwrap_or_else(|error| panic!("released fixture is valid: {error}"));
+
+        controller
+            .cancel_goal_intent(&goal.goal_id, "tester")
+            .unwrap_or_else(|error| panic!("cancel released goal: {error}"));
+        assert!(
+            controller
+                .next_queued_goal_intent()
+                .unwrap_or_else(|error| panic!("queue after released cancel: {error}"))
+                .is_none()
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn assert_active_goal_abandonment(kind: super::GoalOutcomeKindV1, label: &str) {
+        let (base, mut controller, _registry) = completion_ready_fixture(label);
+        controller
+            .persist_all_runtime()
+            .unwrap_or_else(|error| panic!("persist active fixture: {error}"));
+        persist_active_queued_goal_lifecycle(&mut controller);
+        let (goal_id, plan_id, plan_revision) = {
+            let active = controller
+                .active_ref()
+                .unwrap_or_else(|error| panic!("active fixture: {error}"));
+            (
+                active.goal_id.clone(),
+                active.plan_id.clone(),
+                active.revision,
+            )
+        };
+        if kind == super::GoalOutcomeKindV1::Cancelled {
+            controller
+                .cancel_goal_intent(&goal_id, "tester")
+                .unwrap_or_else(|error| panic!("request active cancellation: {error}"));
+            assert!(
+                controller
+                    .active_plan_cancellation_requested()
+                    .unwrap_or_else(|error| panic!("read cancellation: {error}"))
+            );
+            assert_eq!(goal_status(&controller, &goal_id), "active_plan");
+        }
+        let reason = if kind == super::GoalOutcomeKindV1::Cancelled {
+            super::GOAL_REASON_CANCELLED_BY_USER
+        } else {
+            super::GOAL_REASON_TASK_FAILED
+        };
+        let outcome = controller
+            .abandon_active_goal(kind, reason, "ended in test")
+            .unwrap_or_else(|error| panic!("abandon active goal: {error}"));
+        assert_eq!(outcome.kind, kind);
+        assert_eq!(outcome.plan_id.as_deref(), Some(plan_id.as_str()));
+        assert!(controller.active.is_none());
+        for (namespace, key) in [
+            ("controller.plan", "active"),
+            ("controller.plan_document", "active"),
+            ("controller.repository_baseline", "active"),
+        ] {
+            assert!(
+                controller
+                    .state
+                    .get_state(namespace, key)
+                    .unwrap_or_else(|error| panic!("read pointer: {error}"))
+                    .is_none(),
+                "abandoned pointer {namespace}/{key} remained durable"
+            );
+        }
+        let expected_status = if kind == super::GoalOutcomeKindV1::Cancelled {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        assert_eq!(goal_status(&controller, &goal_id), expected_status);
+        let revision_key = revision_record_key(&plan_id, plan_revision);
+        let lifecycle: Value = serde_json::from_str(
+            &controller
+                .state
+                .get_state("controller.plan_revision_lifecycle", &revision_key)
+                .unwrap_or_else(|error| panic!("read lifecycle: {error}"))
+                .unwrap_or_default(),
+        )
+        .unwrap_or_else(|error| panic!("decode lifecycle: {error}"));
+        assert_eq!(lifecycle["status"], "abandoned");
+        assert!(
+            controller
+                .state
+                .get_state(
+                    "controller.task",
+                    &revision_scoped_key(&plan_id, plan_revision, "task.completion")
+                )
+                .unwrap_or_else(|error| panic!("read preserved task: {error}"))
+                .is_some(),
+            "abandonment must keep revision-scoped task history"
+        );
+
+        // The queue accepts and selects new work after the abandonment.
+        let next = controller
+            .submit_goal_intent("next request after abandonment")
+            .unwrap_or_else(|error| panic!("submit after abandonment: {error}"));
+        assert_eq!(
+            controller
+                .next_queued_goal_intent()
+                .unwrap_or_else(|error| panic!("queue after abandonment: {error}"))
+                .map(|intent| intent.goal_id),
+            Some(next.goal_id.clone())
+        );
+
+        let state_path = controller.state.path().to_path_buf();
+        drop(controller);
+        let reopened = Controller::reopen_local(
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("reopen store: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("reopen after abandonment: {error}"));
+        assert!(reopened.active.is_none());
+        reopened
+            .durable_status()
+            .unwrap_or_else(|error| panic!("durable status after abandonment: {error}"));
+        drop(reopened);
+
+        // Tampering with the abandonment binding is detected on reopen.
+        let mut store =
+            StateStore::open(&state_path).unwrap_or_else(|error| panic!("open store: {error}"));
+        let mut tampered = lifecycle.clone();
+        tampered["abandonment_record_digest"] = json!(sha256_prefixed(b"tampered"));
+        store
+            .put_state(
+                "controller.plan_revision_lifecycle",
+                &revision_key,
+                &tampered.to_string(),
+            )
+            .unwrap_or_else(|error| panic!("tamper lifecycle: {error}"));
+        drop(store);
+        assert!(
+            Controller::reopen_local(
+                StateStore::open(&state_path)
+                    .unwrap_or_else(|error| panic!("reopen tampered store: {error}"))
+            )
+            .is_err(),
+            "tampered abandonment must fail closed on reopen"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn production_step_ends_a_goal_whose_task_failed_for_good() {
+        let (base, mut controller, registry) = completion_ready_fixture("driver-task-failed");
+        controller
+            .active_mut()
+            .unwrap_or_else(|error| panic!("active fixture: {error}"))
+            .tasks
+            .values_mut()
+            .for_each(|task| task.state = TaskState::FailedTerminal);
+        controller
+            .persist_all_runtime()
+            .unwrap_or_else(|error| panic!("persist failed task fixture: {error}"));
+        persist_active_queued_goal_lifecycle(&mut controller);
+        let goal_id = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active fixture: {error}"))
+            .goal_id
+            .clone();
+        let outcome = controller
+            .advance_production_goal::<sovereign_policy::MacSandboxExecBackend>(
+                &registry,
+                super::ProductionAdvanceResources::default(),
+            )
+            .unwrap_or_else(|error| panic!("advance failed goal: {error}"));
+        assert_eq!(
+            outcome,
+            super::ProductionAdvanceOutcome::GoalFailed {
+                goal_id: goal_id.clone(),
+                reason_code: super::GOAL_REASON_TASK_FAILED.to_owned(),
+            }
+        );
+        assert_eq!(goal_status(&controller, &goal_id), "failed");
+        // Before the fix the step kept returning Blocked { FailedTerminal } forever.
+        assert_eq!(
+            controller
+                .advance_production_goal::<sovereign_policy::MacSandboxExecBackend>(
+                    &registry,
+                    super::ProductionAdvanceResources::default(),
+                )
+                .unwrap_or_else(|error| panic!("advance after failure: {error}")),
+            super::ProductionAdvanceOutcome::Idle
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn production_step_ends_a_cancelled_goal_and_runs_the_next_one() {
+        let (base, mut controller, registry) = completion_ready_fixture("driver-goal-cancelled");
+        controller
+            .active_mut()
+            .unwrap_or_else(|error| panic!("active fixture: {error}"))
+            .tasks
+            .values_mut()
+            .for_each(|task| task.state = TaskState::Planned);
+        controller
+            .persist_all_runtime()
+            .unwrap_or_else(|error| panic!("persist planned task fixture: {error}"));
+        persist_active_queued_goal_lifecycle(&mut controller);
+        let goal_id = controller
+            .active_ref()
+            .unwrap_or_else(|error| panic!("active fixture: {error}"))
+            .goal_id
+            .clone();
+        let queued = controller
+            .submit_goal_intent("request queued behind the cancelled one")
+            .unwrap_or_else(|error| panic!("submit queued goal: {error}"));
+        controller
+            .cancel_goal_intent(&goal_id, "tester")
+            .unwrap_or_else(|error| panic!("cancel active goal: {error}"));
+        let outcome = controller
+            .advance_production_goal::<sovereign_policy::MacSandboxExecBackend>(
+                &registry,
+                super::ProductionAdvanceResources::default(),
+            )
+            .unwrap_or_else(|error| panic!("advance cancelled goal: {error}"));
+        assert_eq!(
+            outcome,
+            super::ProductionAdvanceOutcome::GoalCancelled {
+                goal_id: goal_id.clone()
+            }
+        );
+        assert_eq!(goal_status(&controller, &goal_id), "cancelled");
+        // The next step moves to the queued goal (it asks for compilation input).
+        assert_eq!(
+            controller
+                .advance_production_goal::<sovereign_policy::MacSandboxExecBackend>(
+                    &registry,
+                    super::ProductionAdvanceResources::default(),
+                )
+                .unwrap_or_else(|error| panic!("advance next goal: {error}")),
+            super::ProductionAdvanceOutcome::Blocked {
+                task_id: None,
+                reason: super::ProductionBlockReason::CompilationInputRequired,
+            }
+        );
+        assert_eq!(
+            controller
+                .next_queued_goal_intent()
+                .unwrap_or_else(|error| panic!("next queued: {error}"))
+                .map(|intent| intent.goal_id),
+            Some(queued.goal_id)
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn cancelled_active_goal_retires_its_plan_and_reopens_idle() {
+        assert_active_goal_abandonment(super::GoalOutcomeKindV1::Cancelled, "active-goal-cancel");
+    }
+
+    #[test]
+    fn failed_active_goal_retires_its_plan_and_reopens_idle() {
+        assert_active_goal_abandonment(super::GoalOutcomeKindV1::Failed, "active-goal-fail");
     }
 
     #[test]
