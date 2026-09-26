@@ -216,6 +216,9 @@ fn active_progress(
             percent,
         );
     }
+    if let Some(problem) = service_problem(facts, (done, total), percent) {
+        return problem;
+    }
     if steps.iter().any(|step| step.phase == "checking") {
         return progress(
             "checking",
@@ -238,6 +241,39 @@ fn active_progress(
         (done, total),
         percent,
     )
+}
+
+/// A service problem in words a person can act on. The raw detail stays in Details.
+fn plain_service_problem(detail: &str) -> String {
+    let lowered = detail.to_ascii_lowercase();
+    if lowered.contains("sandbox-exec") || lowered.contains("isolation unavailable") {
+        "Sovereign's safety sandbox isn't available on this computer, so it can't run the checks. Sovereign needs macOS.".to_owned()
+    } else if lowered.contains("sovereign_model_runtime")
+        || lowered.contains("model runtime")
+        || lowered.contains("model path")
+        || lowered.contains("load local model")
+    {
+        "The AI model isn't set up yet. Finish setup and Sovereign continues on its own.".to_owned()
+    } else {
+        "Sovereign hit a problem and keeps retrying. Details has what went wrong.".to_owned()
+    }
+}
+
+/// The request cannot move because the service keeps failing; says why instead of "Building".
+fn service_problem(
+    facts: &ServiceFacts<'_>,
+    done_total: (u32, u32),
+    percent: u8,
+) -> Option<GoalProgressV1> {
+    (facts.status.phase == "error" && !facts.status.detail.is_empty()).then(|| {
+        progress(
+            "waiting",
+            "Having trouble",
+            plain_service_problem(&facts.status.detail),
+            done_total,
+            percent,
+        )
+    })
 }
 
 fn queued_progress(position: u32, head_is_next: bool, facts: &ServiceFacts<'_>) -> GoalProgressV1 {
@@ -268,17 +304,8 @@ fn queued_progress(position: u32, head_is_next: bool, facts: &ServiceFacts<'_>) 
             2,
         );
     }
-    if facts.status.phase == "error" && !facts.status.detail.is_empty() {
-        return progress(
-            "waiting",
-            "Having trouble",
-            format!(
-                "Sovereign hit a problem and will retry: {}",
-                facts.status.detail
-            ),
-            (0, 0),
-            2,
-        );
+    if let Some(problem) = service_problem(facts, (0, 0), 2) {
+        return problem;
     }
     if facts.working {
         return progress(
@@ -617,6 +644,31 @@ mod tests {
         assert_eq!(view.percent, 41);
         assert_eq!(view.sentence, "Step 2 of 4: Add styles");
         assert!(!view.terminal);
+    }
+
+    #[test]
+    fn a_failing_service_is_explained_instead_of_building() {
+        let mut status = ServiceStatusV1 {
+            phase: "error".to_owned(),
+            detail: "invalid active plan: isolation unavailable: macOS sandbox-exec is unavailable"
+                .to_owned(),
+            ..ServiceStatusV1::default()
+        };
+        let steps = steps_from_tasks(&[step("planned", "A")]);
+        let view = active_progress(&steps, false, &facts(&status));
+        assert_eq!(view.headline, "Having trouble");
+        assert!(
+            view.sentence.contains("safety sandbox"),
+            "{}",
+            view.sentence
+        );
+        status.detail = "load local model: connection refused".to_owned();
+        let queued = queued_progress(1, true, &facts(&status));
+        assert!(
+            queued.sentence.contains("Finish setup"),
+            "{}",
+            queued.sentence
+        );
     }
 
     #[test]

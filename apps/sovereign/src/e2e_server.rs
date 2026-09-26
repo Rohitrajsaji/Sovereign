@@ -106,10 +106,14 @@ fn run() -> Result<(), String> {
     actor.start_preview(&format!("http://{addr}"))?;
     println!("e2e-server {addr}");
     let actor_for_server = actor.clone();
+    let actor_for_events = actor.clone();
     let config = ServerConfig {
         session_token: Some("e2e-session-token".to_owned()),
         require_token_for_v1_post: true,
         state_path: Some(PathBuf::from(&state)),
+        state_path_source: Some(control_api::StatePathSource::new(move || {
+            actor_for_events.state_path()
+        })),
         sse_clients: Arc::new(AtomicUsize::new(0)),
         launch_code_dir: None,
     };

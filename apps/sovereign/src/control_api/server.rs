@@ -228,7 +228,17 @@ where
     match request {
         ControlApiRequest::Dashboard => serve_static_asset(stream, "/", None),
         ControlApiRequest::EventStream { last_event_id } => {
-            serve_event_stream(stream, config, last_event_id)
+            // A stream lasts as long as the page stays open, so it runs on its own thread and
+            // never holds one of the request workers.
+            let mut owned = stream.try_clone().map_err(|error| error.to_string())?;
+            let config = config.clone();
+            thread::Builder::new()
+                .name("sovereign-events".to_owned())
+                .spawn(move || {
+                    let _ = serve_event_stream(&mut owned, &config, last_event_id);
+                })
+                .map(|_| ())
+                .map_err(|error| error.to_string())
         }
         ControlApiRequest::Session => {
             let csrf_token = config.session_token.clone().unwrap_or_default();

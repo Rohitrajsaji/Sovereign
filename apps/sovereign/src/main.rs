@@ -313,10 +313,14 @@ fn run_serve(args: &[String], state_path: &Path) -> Result<String, String> {
         eprintln!("sovereign: project preview unavailable: {error}");
     }
     let actor_for_server = actor.clone();
+    let actor_for_events = actor.clone();
     let server_config = control_api::ServerConfig {
         session_token: token,
         require_token_for_v1_post: require_token,
         state_path: Some(state_path.to_path_buf()),
+        state_path_source: Some(control_api::StatePathSource::new(move || {
+            actor_for_events.state_path()
+        })),
         sse_clients: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         launch_code_dir: app_data_root,
     };

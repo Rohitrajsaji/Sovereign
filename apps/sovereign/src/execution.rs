@@ -275,6 +275,7 @@ mod tests {
                     session_token: Some(token),
                     require_token_for_v1_post: true,
                     state_path: Some(state),
+                    state_path_source: None,
                     sse_clients: Arc::new(AtomicUsize::new(0)),
                     launch_code_dir: None,
                 },
