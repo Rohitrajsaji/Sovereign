@@ -35585,6 +35585,82 @@ mod tests {
     }
 
     #[test]
+    fn calibration_samples_never_leave_the_checkpoint_behind_the_journal() {
+        fn level(controller: &Controller) -> bool {
+            let sequence = controller
+                .state
+                .latest_journal_sequence()
+                .unwrap_or_else(|error| panic!("journal sequence: {error}"));
+            controller
+                .state
+                .validate_checkpoint_integrity_floor(sequence)
+                .is_ok()
+        }
+        let (base, mut controller, _registry) = completion_ready_fixture("calibration-checkpoint");
+        controller
+            .persist_all_runtime()
+            .unwrap_or_else(|error| panic!("persist fixture: {error}"));
+        persist_active_queued_goal_lifecycle(&mut controller);
+        controller
+            .checkpoint_now()
+            .unwrap_or_else(|error| panic!("checkpoint: {error}"));
+        assert!(level(&controller));
+
+        controller.set_model_calibration_identity(Some("sha256:model".to_owned()));
+        assert_eq!(
+            controller.record_model_call_calibration(Some(3_130)).ok(),
+            Some(true)
+        );
+        assert!(level(&controller), "a call sample must be checkpointed");
+
+        // A sample written without a checkpoint (as before this fix) blocks dispatch until the
+        // trailing samples are checkpointed.
+        let key = controller
+            .model_calibration_key()
+            .unwrap_or_else(|| panic!("calibration key"));
+        super::model_calibration::record_calibration_sample(&mut controller.state, &key, 3_140, 1)
+            .unwrap_or_else(|error| panic!("unchecked sample: {error}"));
+        assert!(!level(&controller));
+        // A restarted service opens the stuck state through recovery, and the mutation gate
+        // checkpoints the trailing sample before any work.
+        let path = controller.state.path().to_path_buf();
+        drop(controller);
+        let mut local = super::LocalControl::reopen(
+            StateStore::open(&path).unwrap_or_else(|error| panic!("reopen state: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("reopen stuck state: {error}"));
+        local
+            .with_controller_mut(|reopened| {
+                assert!(level(reopened));
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("mutation gate: {error}"));
+
+        // Any other event after the checkpoint is left for the integrity checks to refuse.
+        local
+            .with_controller_mut(|reopened| {
+                reopened
+                    .state
+                    .append_event(sovereign_state::NewJournalEvent {
+                        event_id: "test.unexpected",
+                        entity_type: "controller",
+                        entity_id: "test",
+                        event_kind: "unexpected_event",
+                        payload_json: "{}",
+                    })?;
+                assert_eq!(
+                    reopened.checkpoint_trailing_calibration_samples().ok(),
+                    Some(false)
+                );
+                assert!(!level(reopened));
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("unexpected event: {error}"));
+        drop(local);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn cancelled_active_goal_retires_its_plan_and_reopens_idle() {
         assert_active_goal_abandonment(super::GoalOutcomeKindV1::Cancelled, "active-goal-cancel");
     }

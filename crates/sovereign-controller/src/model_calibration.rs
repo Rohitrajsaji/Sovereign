@@ -24,6 +24,7 @@ use sovereign_state::{NewJournalEvent, StateRecordCasMutation, StateStore};
 use std::sync::Mutex;
 
 pub(crate) const MODEL_CALIBRATION_NAMESPACE: &str = "controller.model_calibration";
+const CALIBRATION_EVENT_KIND: &str = "model_calibration_sample_recorded";
 
 /// The one server context the Controller loads on this profile. Samples from any other context
 /// are not recorded under this key.
@@ -111,7 +112,7 @@ pub(crate) fn record_calibration_sample(
             event_id: &event_id,
             entity_type: "controller",
             entity_id: &storage_key,
-            event_kind: "model_calibration_sample_recorded",
+            event_kind: CALIBRATION_EVENT_KIND,
             payload_json: &payload_json,
         }],
     )?;
@@ -311,6 +312,41 @@ impl Controller {
             return Ok(false);
         };
         record_calibration_sample(&mut self.state, &key, sample, crate::unix_millis()?)?;
+        // The sample is a journal event. When the model stays loaded for the next task, no other
+        // checkpoint follows it, and dispatch refuses a checkpoint behind the journal.
+        if self.active.is_some() {
+            self.checkpoint_now()?;
+        }
+        Ok(true)
+    }
+
+    /// Checkpoints again when the only journal events after the latest checkpoint are
+    /// calibration samples. Earlier versions wrote a call sample without a checkpoint, which left
+    /// the active plan unable to dispatch. Any other event after the checkpoint is left alone for
+    /// the integrity checks to judge. Returns whether a checkpoint was written.
+    ///
+    /// # Errors
+    /// Returns a state error when the journal or checkpoint cannot be read or written.
+    pub(crate) fn checkpoint_trailing_calibration_samples(
+        &mut self,
+    ) -> Result<bool, ControllerError> {
+        if self.active.is_none() {
+            return Ok(false);
+        }
+        let Some(checkpoint) = self.state.latest_valid_checkpoint_integrity()? else {
+            return Ok(false);
+        };
+        if checkpoint.action_sequence >= self.state.latest_journal_sequence()? {
+            return Ok(false);
+        }
+        let trailing = self.state.journal_after(checkpoint.action_sequence)?;
+        if !trailing
+            .iter()
+            .all(|event| event.event_kind == CALIBRATION_EVENT_KIND)
+        {
+            return Ok(false);
+        }
+        self.checkpoint_now()?;
         Ok(true)
     }
 }
@@ -405,7 +441,7 @@ mod tests {
             .journal()
             .unwrap_or_default()
             .into_iter()
-            .filter(|event| event.event_kind == "model_calibration_sample_recorded")
+            .filter(|event| event.event_kind == CALIBRATION_EVENT_KIND)
             .count();
         assert_eq!(events, MODEL_CALIBRATION_MIN_SAMPLES);
         let _ = std::fs::remove_dir_all(dir);

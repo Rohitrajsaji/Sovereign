@@ -171,17 +171,17 @@ impl LocalControl {
 
     fn ensure_mutation_authority(&mut self) -> Result<(), ControllerError> {
         validate_durable_action_lifecycle_states(&self.controller.state)?;
-        if self.controller.active.is_some()
-            || self
+        if self.controller.active.is_none()
+            && self
                 .controller
                 .state
                 .get_state("controller.plan", "active")?
-                .is_none()
+                .is_some()
         {
-            return Ok(());
+            let state = StateStore::open(self.controller.state.path())?;
+            self.controller = Controller::reopen_local(state)?;
         }
-        let state = StateStore::open(self.controller.state.path())?;
-        self.controller = Controller::reopen_local(state)?;
+        self.controller.checkpoint_trailing_calibration_samples()?;
         Ok(())
     }
 
