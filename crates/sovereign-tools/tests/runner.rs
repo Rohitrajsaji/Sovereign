@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "macos"), allow(unused_imports))]
+
 use sovereign_evidence::ArtifactStore;
 use sovereign_policy::{
     CommandMode, CommandPolicy, CommandRisk, CommandSpec, ControllerSecretLocator,

@@ -22,6 +22,8 @@ mod execution;
 mod fixture_backend;
 #[path = "launch_agent.rs"]
 mod launch_agent;
+#[path = "launch_code.rs"]
+mod launch_code;
 #[path = "model_assets.rs"]
 mod model_assets;
 #[path = "projections.rs"]
@@ -103,6 +105,7 @@ fn run() -> Result<(), String> {
         require_token_for_v1_post: true,
         state_path: Some(PathBuf::from(&state)),
         sse_clients: Arc::new(AtomicUsize::new(0)),
+        launch_code_dir: None,
     };
     serve_listener(
         &listener,

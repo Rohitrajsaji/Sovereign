@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "macos"), allow(unused_imports, dead_code))]
+
 use rusqlite::Connection;
 use sovereign_controller::{
     CancellationScopeKindV1, CancellationScopeV1, CancellationTree, RecoveryIntegrityGate,

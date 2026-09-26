@@ -42,11 +42,13 @@ import {
   Tabs,
   Timeline,
 } from "../components/ui";
-import { GOAL_LIMIT, phaseCopy } from "../lib/status";
+import { GOAL_LIMIT, outcomeLabel, phaseCopy } from "../lib/status";
 
 function asTasks(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value)
-    ? value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    ? value.filter(
+        (item): item is Record<string, unknown> => Boolean(item) && typeof item === "object",
+      )
     : [];
 }
 
@@ -63,7 +65,12 @@ export function HomeScreen({ ready }: { ready: boolean }) {
   }
   const data = overview.data;
   if (!data) {
-    return <EmptyState title="No overview" detail="The Controller has not published service status yet." />;
+    return (
+      <EmptyState
+        title="No overview"
+        detail="The Controller has not published service status yet."
+      />
+    );
   }
   return (
     <>
@@ -77,6 +84,7 @@ export function HomeScreen({ ready }: { ready: boolean }) {
           {data.pressure_band ? ` · Pressure ${data.pressure_band}` : ""}
         </p>
         <p className="sv-muted">{phaseCopy(data.service_phase, data.paused)}</p>
+        {data.detail ? <p className="sv-muted">{data.detail}</p> : null}
         <div className="sv-row">
           <Button onClick={() => void pause.mutate()}>Pause</Button>
           <Button variant="ghost" onClick={() => void resume.mutate()}>
@@ -98,7 +106,7 @@ export function HomeScreen({ ready }: { ready: boolean }) {
           </div>
           <div className="sv-metric">
             <dt>last outcome</dt>
-            <dd>{data.last_outcome ?? "none"}</dd>
+            <dd title={data.last_outcome ?? "none"}>{outcomeLabel(data.last_outcome)}</dd>
           </div>
         </dl>
       </Card>
@@ -133,7 +141,9 @@ export function ProjectsScreen({ ready }: { ready: boolean }) {
       <input id="project-root" value={root} onChange={(event) => setRoot(event.target.value)} />
       <label htmlFor="project-name">Display name</label>
       <input id="project-name" value={name} onChange={(event) => setName(event.target.value)} />
-      <Button onClick={() => void add.mutateAsync({ root, display_name: name }).catch(() => undefined)}>
+      <Button
+        onClick={() => void add.mutateAsync({ root, display_name: name }).catch(() => undefined)}
+      >
         Add project
       </Button>
       {projects.data?.projects.length ? (
@@ -153,7 +163,10 @@ export function ProjectsScreen({ ready }: { ready: boolean }) {
           ))}
         </ul>
       ) : (
-        <EmptyState title="No projects" detail="Add a git work tree. State is stored outside the repository." />
+        <EmptyState
+          title="No projects"
+          detail="Add a git work tree. State is stored outside the repository."
+        />
       )}
     </Card>
   );
@@ -170,9 +183,15 @@ export function GoalsScreen({ ready }: { ready: boolean }) {
     <>
       <Card title="New goal" eyebrow="Composer">
         <label htmlFor="goal">What should Sovereign do?</label>
-        <textarea id="goal" value={text} maxLength={GOAL_LIMIT} onChange={(event) => setText(event.target.value)} />
+        <textarea
+          id="goal"
+          value={text}
+          maxLength={GOAL_LIMIT}
+          onChange={(event) => setText(event.target.value)}
+        />
         <p>
-          {text.length}/{GOAL_LIMIT}. Bounded edits, file create or patch, governed build/test; up to 16 tasks.
+          {text.length}/{GOAL_LIMIT}. Bounded edits, file create or patch, governed build/test; up
+          to 16 tasks.
         </p>
         {over ? <ErrorState message={`Goal exceeds ${GOAL_LIMIT} characters.`} /> : null}
         <Button
@@ -259,13 +278,18 @@ export function GoalDetailScreen({ ready }: { ready: boolean }) {
       {goal.status === "completed" ? (
         <div className="sv-banner sv-banner-success">
           <strong>Verified complete.</strong>
-          <p>The Controller recorded completion after verification, not because the model said so.</p>
+          <p>
+            The Controller recorded completion after verification, not because the model said so.
+          </p>
         </div>
       ) : null}
       {/fail|error|cancelled/i.test(goal.status) ? (
         <div className="sv-banner sv-banner-danger">
           <strong>This goal is terminal.</strong>
-          <p>Edit and resubmit, or open Recovery if mutation is blocked. Dispatched work is not rolled back.</p>
+          <p>
+            Edit and resubmit, or open Recovery if mutation is blocked. Dispatched work is not
+            rolled back.
+          </p>
         </div>
       ) : null}
       {revisions.length > 1 ? (
@@ -297,12 +321,18 @@ export function GoalDetailScreen({ ready }: { ready: boolean }) {
             variant="ghost"
             onClick={() => {
               if (!taskId) {
-                setDiff("--- a/example\n+++ b/example\n@@\n-old\n+new\n<script>alert(1)</script>\n");
+                setDiff(
+                  "--- a/example\n+++ b/example\n@@\n-old\n+new\n<script>alert(1)</script>\n",
+                );
                 return;
               }
               void api<{ diff: string }>(`/v2/tasks/${taskId}/diff`)
                 .then((body) => setDiff(body.diff))
-                .catch(() => setDiff("--- a/example\n+++ b/example\n@@\n-old\n+new\n<script>alert(1)</script>\n"));
+                .catch(() =>
+                  setDiff(
+                    "--- a/example\n+++ b/example\n@@\n-old\n+new\n<script>alert(1)</script>\n",
+                  ),
+                );
             }}
           >
             Load task diff
@@ -310,9 +340,15 @@ export function GoalDetailScreen({ ready }: { ready: boolean }) {
           <DiffViewer diff={diff || "No diff loaded."} />
         </>
       ) : null}
-      {tab === "Verification" ? <CodeBlock text={JSON.stringify(detail.data?.verifications ?? [], null, 2)} /> : null}
-      {tab === "Evidence" ? <CodeBlock text={JSON.stringify(detail.data?.evidence ?? [], null, 2)} /> : null}
-      {tab === "Attempts" ? <CodeBlock text={JSON.stringify(detail.data?.attempts ?? [], null, 2)} /> : null}
+      {tab === "Verification" ? (
+        <CodeBlock text={JSON.stringify(detail.data?.verifications ?? [], null, 2)} />
+      ) : null}
+      {tab === "Evidence" ? (
+        <CodeBlock text={JSON.stringify(detail.data?.evidence ?? [], null, 2)} />
+      ) : null}
+      {tab === "Attempts" ? (
+        <CodeBlock text={JSON.stringify(detail.data?.attempts ?? [], null, 2)} />
+      ) : null}
       <Button variant="danger" onClick={() => setConfirm(true)}>
         Cancel goal
       </Button>
@@ -328,7 +364,10 @@ export function GoalDetailScreen({ ready }: { ready: boolean }) {
           setConfirm(false);
         }}
       >
-        <p>Dispatched side effects stay unknown until reconciliation. This does not roll back git work.</p>
+        <p>
+          Dispatched side effects stay unknown until reconciliation. This does not roll back git
+          work.
+        </p>
       </ConfirmDialog>
     </Card>
   );
@@ -375,8 +414,8 @@ export function ApprovalsScreen({ ready }: { ready: boolean }) {
                   ]}
                 />
                 <p className="sv-muted">
-                  Risk {item.permission_class}: the UI cannot widen this capability. The Controller will run only the
-                  bound action after an explicit decision.
+                  Risk {item.permission_class}: the UI cannot widen this capability. The Controller
+                  will run only the bound action after an explicit decision.
                 </p>
                 <div className="sv-row">
                   <Button disabled={expired} onClick={() => setConfirmId(item.request_id)}>
@@ -396,7 +435,9 @@ export function ApprovalsScreen({ ready }: { ready: boolean }) {
                     Deny
                   </Button>
                 </div>
-                {expired ? <p className="sv-muted">Expired. The Controller will not accept this decision.</p> : null}
+                {expired ? (
+                  <p className="sv-muted">Expired. The Controller will not accept this decision.</p>
+                ) : null}
               </li>
             );
           })}
@@ -406,7 +447,9 @@ export function ApprovalsScreen({ ready }: { ready: boolean }) {
         open={confirmId !== null}
         title="Confirm approval"
         confirmLabel="Approve"
-        confirmDisabled={Boolean(selected && needsTypedApprove(selected) && typed.trim().toLowerCase() !== "approve")}
+        confirmDisabled={Boolean(
+          selected && needsTypedApprove(selected) && typed.trim().toLowerCase() !== "approve",
+        )}
         onClose={() => {
           setConfirmId(null);
           setTyped("");
@@ -431,7 +474,11 @@ export function ApprovalsScreen({ ready }: { ready: boolean }) {
         {selected && needsTypedApprove(selected) ? (
           <>
             <label htmlFor="approve-type">Type approve</label>
-            <input id="approve-type" value={typed} onChange={(event) => setTyped(event.target.value)} />
+            <input
+              id="approve-type"
+              value={typed}
+              onChange={(event) => setTyped(event.target.value)}
+            />
           </>
         ) : null}
       </ConfirmDialog>
@@ -547,9 +594,39 @@ export function SettingsScreen({ ready }: { ready: boolean }) {
         </Button>
       </div>
       <p className="sv-muted">
-        Background service: `sovereign service install` writes the LaunchAgent. This UI does not bootstrap launchd.
+        Background service: `sovereign service install` writes the LaunchAgent. This UI does not
+        bootstrap launchd.
       </p>
+      <NotificationSetting />
     </Card>
+  );
+}
+
+function NotificationSetting() {
+  const supported = typeof window !== "undefined" && "Notification" in window;
+  const [permission, setPermission] = useState(() =>
+    supported ? Notification.permission : "denied",
+  );
+  if (!supported) {
+    return <p className="sv-muted">This browser does not support desktop notifications.</p>;
+  }
+  return (
+    <div className="sv-row">
+      <p className="sv-muted">
+        Desktop notifications: {permission}. Sovereign notifies you about approvals, recovery, and
+        completed goals while this tab is in the background.
+      </p>
+      {permission === "default" ? (
+        <Button
+          variant="ghost"
+          onClick={() =>
+            void Notification.requestPermission().then((result) => setPermission(result))
+          }
+        >
+          Enable desktop notifications
+        </Button>
+      ) : null}
+    </div>
   );
 }
 
@@ -573,7 +650,9 @@ export function DiagnosticsScreen({ ready }: { ready: boolean }) {
       <Button
         variant="ghost"
         onClick={() => {
-          void navigator.clipboard.writeText(text.replace(/csrf_token|sovereign_session/g, "redacted"));
+          void navigator.clipboard.writeText(
+            text.replace(/csrf_token|sovereign_session/g, "redacted"),
+          );
         }}
       >
         Copy diagnostics

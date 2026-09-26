@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "macos"), allow(unused_imports, dead_code))]
+
 use sha2::{Digest, Sha256};
 use sovereign_policy::browser::{
     BROWSER_DOWNLOAD_POLICY_SCHEMA_VERSION, BROWSER_LOOPBACK_CAPABILITY_SCHEMA_VERSION,

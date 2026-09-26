@@ -7,15 +7,15 @@ use sovereign_context::{
     ContextBudget, ContextMode, ContextPacket, ContextPacketInput, ContextPlanner, EvidenceItem,
 };
 use sovereign_controller::{
-    Controller, ExecutionRuntime, ProductionAdvanceOutcome, ProductionAdvanceResources,
-    ProductionBlockReason, ProductionBrowserResources, ProductionCompilationResources,
-    ProductionExecutionCatalog, ProductionExecutionResources, ReadinessInputs, RoleId,
-    RoleRegistry,
+    Controller, ExecutionRuntime, PeakRssRecorder, ProductionAdvanceOutcome,
+    ProductionAdvanceResources, ProductionBlockReason, ProductionBrowserResources,
+    ProductionCompilationResources, ProductionExecutionCatalog, ProductionExecutionResources,
+    ReadinessInputs, RoleId, RoleRegistry,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_model::{
     LlamaServerLaunch, LocalOpenAiBackend, LocalOpenAiConfig, MODEL_SCHEMA_VERSION, ModelBackend,
-    ModelCapabilities, ModelLoadProfile,
+    ModelCapabilities, ModelLease, ModelLoadProfile,
 };
 use sovereign_plan::{
     DepthClassifier, DepthFeatureInput, ExecutionDepth, M3PlanningInput,
@@ -202,7 +202,8 @@ fn bounded_context(
     ).map_err(|error| format!("build bounded context: {error}"))
 }
 
-fn model_backend(require_launch: bool) -> Result<LocalOpenAiBackend, String> {
+/// Model runtime and GGUF paths. Environment variables override settings.
+fn configured_model_paths() -> (Option<PathBuf>, Option<PathBuf>) {
     let settings = crate::app_data::AppData::open_default()
         .and_then(|data| data.load_settings())
         .unwrap_or_default();
@@ -212,6 +213,47 @@ fn model_backend(require_launch: bool) -> Result<LocalOpenAiBackend, String> {
     let model = env::var_os("SOVEREIGN_MODEL_PATH")
         .map(PathBuf::from)
         .or_else(|| settings.model_path.as_ref().map(PathBuf::from));
+    (runtime, model)
+}
+
+fn configured_model_name() -> String {
+    env::var("SOVEREIGN_MODEL_NAME").unwrap_or_else(|_| "Qwen3-4B-Q4_K_M".to_owned())
+}
+
+/// Cheap identity for model calibration: canonical path, size, and modification time of the
+/// runtime and weights, plus the model name. Replacing either file changes the identity, so the
+/// Controller falls back to the uncalibrated estimate until new samples exist.
+/// Returns `None` when either file is not configured or cannot be read.
+fn model_calibration_identity() -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let (Some(runtime), Some(model)) = configured_model_paths() else {
+        return None;
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"sovereign-model-calibration-identity-v1\0");
+    for path in [runtime, model] {
+        let canonical = path.canonicalize().ok()?;
+        let metadata = std::fs::metadata(&canonical).ok()?;
+        if !metadata.is_file() {
+            return None;
+        }
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        hasher.update(canonical.as_os_str().as_encoded_bytes());
+        hasher.update(b"\0");
+        hasher.update(metadata.len().to_le_bytes());
+        hasher.update(modified.to_le_bytes());
+    }
+    hasher.update(configured_model_name().as_bytes());
+    Some(format!("sha256:{:x}", hasher.finalize()))
+}
+
+fn model_backend(require_launch: bool) -> Result<LocalOpenAiBackend, String> {
+    let (runtime, model) = configured_model_paths();
     let launch = match (runtime, model) {
         (Some(runtime), Some(model)) => {
             let runtime = runtime
@@ -242,7 +284,7 @@ fn model_backend(require_launch: bool) -> Result<LocalOpenAiBackend, String> {
         .and_then(|socket| socket.local_addr())
         .map_err(|error| format!("allocate model loopback port: {error}"))?
         .port();
-    let name = env::var("SOVEREIGN_MODEL_NAME").unwrap_or_else(|_| "Qwen3-4B-Q4_K_M".to_owned());
+    let name = configured_model_name();
     let mut config = LocalOpenAiConfig::with_defaults(
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         port,
@@ -262,7 +304,7 @@ fn model_backend(require_launch: bool) -> Result<LocalOpenAiBackend, String> {
     LocalOpenAiBackend::new(config).map_err(|error| error.to_string())
 }
 
-fn load_model(backend: &dyn ModelBackend) -> Result<(), String> {
+fn load_model(backend: &dyn ModelBackend) -> Result<ModelLease, String> {
     backend
         .load(ModelLoadProfile {
             context_tokens: 8_192,
@@ -270,7 +312,6 @@ fn load_model(backend: &dyn ModelBackend) -> Result<(), String> {
             startup_timeout_ms: 180_000,
             provider_call_timeout_ms: 180_000,
         })
-        .map(|_| ())
         .map_err(|error| format!("load local model: {error}"))
 }
 
@@ -522,6 +563,13 @@ fn advance_with_overrides(
     chrome_override: Option<&Path>,
     project_config: &ProjectConfigurationV1,
 ) -> Result<ProductionAdvanceOutcome, String> {
+    // Fixture backends are not the configured model, so they never calibrate it.
+    controller.set_model_calibration_identity(
+        backend_override
+            .is_none()
+            .then(model_calibration_identity)
+            .flatten(),
+    );
     let probe = controller
         .advance_production_goal(
             registry,
@@ -535,6 +583,18 @@ fn advance_with_overrides(
         } => {
             let input = compilation_input(controller, registry, project_config)?
                 .ok_or("queued compilation lost its goal intent")?;
+            // The configured model is never started without resource-governor admission.
+            // Fixture backends start no process, so they skip this gate.
+            if backend_override.is_none()
+                && let Some(reason) = controller
+                    .compilation_model_admission()
+                    .map_err(|error| error.to_string())?
+            {
+                return Ok(ProductionAdvanceOutcome::Blocked {
+                    task_id: None,
+                    reason: ProductionBlockReason::Readiness(reason),
+                });
+            }
             let owned_backend = backend_override
                 .is_none()
                 .then(|| model_backend(true))
@@ -546,7 +606,10 @@ fn advance_with_overrides(
                         .map(|backend| backend as &dyn ModelBackend)
                 })
                 .ok_or("compilation backend unavailable")?;
-            load_model(backend)?;
+            let model_lease = load_model(backend)?;
+            // Calibration is telemetry, never authority: a failed write must not block work.
+            let _ = controller.record_model_load_calibration(&model_lease);
+            let recorder = PeakRssRecorder::new(backend);
             let validator = PlanValidator::new(ValidationEnvironment::default())
                 .map_err(|error| error.to_string())?;
             let mut budget = ModelCallBudget::new(2, 180_000);
@@ -556,7 +619,7 @@ fn advance_with_overrides(
                     ProductionAdvanceResources::<MacSandboxExecBackend> {
                         compilation: Some(ProductionCompilationResources {
                             input: &input,
-                            backend,
+                            backend: &recorder,
                             validator: &validator,
                             compiler_version: COMPILER_VERSION,
                             model_budget: &mut budget,
@@ -565,6 +628,7 @@ fn advance_with_overrides(
                     },
                 )
                 .map_err(|error| error.to_string());
+            let _ = controller.record_model_call_calibration(recorder.peak_mib());
             backend
                 .unload()
                 .map_err(|error| format!("unload local model: {error}"))?;

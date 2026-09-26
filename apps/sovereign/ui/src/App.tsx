@@ -4,9 +4,18 @@
 // User instruction: Continue from the current tree and finish the remaining consumer-product gaps you identified. Prioritize turning the existing SPA into the exceptional polished Sovereign UI specified by the plan.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { HashRouter, Navigate, Route, Routes, useNavigate } from "react-router-dom";
-import { useDoctor, useInvalidateOnEvents, useProjects, useSession, useSettings } from "./api/query";
+import type { OverviewResponse } from "./api/generated";
+import {
+  useDoctor,
+  useInvalidateOnEvents,
+  useOverview,
+  useProjects,
+  useSession,
+  useSettings,
+} from "./api/query";
+import { desktopNotify, transitionNotice } from "./lib/notify";
 import { AppShell, CommandPalette, OfflineState, Toast } from "./components/ui";
 import { WelcomeScreen } from "./screens/Welcome";
 import {
@@ -31,6 +40,8 @@ function Shell() {
   const doctor = useDoctor(ready);
   const projects = useProjects(ready);
   const settings = useSettings(ready);
+  const overview = useOverview(ready);
+  const previousOverview = useRef<OverviewResponse | undefined>(undefined);
   const [palette, setPalette] = useState(false);
   const [toast, setToast] = useState("Connecting to the local Controller.");
   useInvalidateOnEvents(ready);
@@ -55,6 +66,19 @@ function Shell() {
     }
   }, [session.isError, session.isSuccess]);
 
+  useEffect(() => {
+    const next = overview.data;
+    if (!next) {
+      return;
+    }
+    const notice = transitionNotice(previousOverview.current, next);
+    previousOverview.current = next;
+    if (notice) {
+      setToast(notice);
+      desktopNotify(notice);
+    }
+  }, [overview.data]);
+
   const needsOnboarding = useMemo(() => {
     const doctorFailed = (doctor.data ?? []).some((check) => check.status === "fail");
     const noProjects = (projects.data?.projects.length ?? 0) === 0;
@@ -67,7 +91,16 @@ function Shell() {
       {session.isError ? <OfflineState /> : null}
       <Routes>
         <Route path="/welcome" element={<WelcomeScreen ready={ready} />} />
-        <Route path="/" element={needsOnboarding && ready ? <Navigate to="/welcome" replace /> : <HomeScreen ready={ready} />} />
+        <Route
+          path="/"
+          element={
+            needsOnboarding && ready ? (
+              <Navigate to="/welcome" replace />
+            ) : (
+              <HomeScreen ready={ready} />
+            )
+          }
+        />
         <Route path="/projects" element={<ProjectsScreen ready={ready} />} />
         <Route path="/goals" element={<GoalsScreen ready={ready} />} />
         <Route path="/goals/new" element={<GoalsScreen ready={ready} />} />

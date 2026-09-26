@@ -171,3 +171,13 @@ Two failures from the gate run were fixed on the working tree and re-run once ea
 `cargo clippy -p sovereign -p sovereign-controller --all-targets -- -D warnings` passed after those edits.
 
 A later full `./scripts/verify.sh` on the same day (about 1006 s) passed fmt, clippy, both previously failing tests, and every crate through `sovereign-tools` unit tests. It then failed `crates/sovereign-tools/tests/browser.rs` test `real_chrome_contains_page_js_writes_and_worker_network_before_execution` (`safe HEAD subresource was not allowed`). That case talks to live Chrome and is unrelated to CX-T01/CX-T02. Re-run it in isolation before treating it as a product regression.
+
+## CI and Linux baseline (2026-09-26)
+
+`.github/workflows/ci.yml` runs `verify.sh` and `e2e.sh` on macOS arm64, fmt, clippy, and the UI gate on Linux, checks that the committed `ui-dist/` matches a fresh build, and prints `scripts/evidence-freshness.py`.
+
+Clippy now passes on Linux: macOS-only paths gate their lints on `target_os` instead of leaving unused imports.
+
+On Linux, `cargo test --workspace --no-fail-fast` has 26 failures that need macOS or network: `sandbox-exec` (eval corpus, release suite, cross-repo gates, runner D4 and browser cases, `offline_eval_cli`), DNS and IDNA resolution (policy network tests, `web_acquire`), Python/Scrapling, and one Postgres broker socket case. The same 26 fail before and after the 2026-09-26 changes. Treat a new Linux failure outside that set as a regression.
+
+`scripts/evidence-freshness.py` re-hashes every `source_hashes` entry under `implementation/evidence/`. `--strict` exits 1 on stale or missing evidence.

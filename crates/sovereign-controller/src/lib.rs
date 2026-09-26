@@ -73,6 +73,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 mod browser;
 mod goal_runner;
 mod local_control;
+mod model_calibration;
 #[cfg(unix)]
 mod postgres_broker;
 mod production_driver;
@@ -90,6 +91,7 @@ pub use local_control::{
     LOCAL_CONTROL_READ_MODEL_SCHEMA_VERSION, LocalControl, LocalControlCheckpointV1,
     LocalControlReadModelV1, LocalControlRecoveryProjectionV1,
 };
+pub use model_calibration::PeakRssRecorder;
 pub use production_driver::{
     ProductionAdvanceOutcome, ProductionAdvanceResources, ProductionBlockReason,
     ProductionBrowserResources, ProductionCompilationResources, ProductionExecutionCatalog,
@@ -2811,6 +2813,7 @@ pub struct Controller {
     #[cfg(unix)]
     managed_postgres_backend: Option<postgres_broker::PostgresBrokerConfig>,
     trusted_recovery_intent_digests: BTreeMap<String, String>,
+    model_calibration_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2838,6 +2841,7 @@ impl Controller {
             #[cfg(unix)]
             managed_postgres_backend: None,
             trusted_recovery_intent_digests: BTreeMap::new(),
+            model_calibration_identity: None,
         }
     }
 
@@ -2857,6 +2861,7 @@ impl Controller {
             #[cfg(unix)]
             managed_postgres_backend: None,
             trusted_recovery_intent_digests: BTreeMap::new(),
+            model_calibration_identity: None,
         }
     }
 
@@ -9125,11 +9130,14 @@ impl Controller {
                 "task resource contract has zero subprocess capacity".to_owned(),
             )));
         }
-        if task_budget.max_peak_rss_mib < M1_MODEL_UNCALIBRATED_ADMISSION_MIB {
+        // A measured calibration for this exact model, runtime, context, and profile replaces the
+        // conservative estimate. Without one, admission stays at the uncalibrated estimate.
+        let (model_calibrated, model_admission_mib) = self.model_admission_estimate()?;
+        if task_budget.max_peak_rss_mib < model_admission_mib {
             return Err(ControllerError::Policy(PolicyError::ResourceDenied(
                 format!(
-                    "task max-RSS contract {} MiB is below conservative MODEL admission {} MiB",
-                    task_budget.max_peak_rss_mib, M1_MODEL_UNCALIBRATED_ADMISSION_MIB
+                    "task max-RSS contract {} MiB is below MODEL admission {} MiB",
+                    task_budget.max_peak_rss_mib, model_admission_mib
                 ),
             )));
         }
@@ -9147,10 +9155,8 @@ impl Controller {
                 task_id: task_id.to_owned(),
             },
             class: HeavyLeaseClass::Model,
-            // M6-T01 has no durable named-model calibration store yet. This is therefore a
-            // conservative admission estimate, explicitly *not* measured calibration evidence.
-            calibrated: false,
-            calibrated_p95_rss_mib: M1_MODEL_UNCALIBRATED_ADMISSION_MIB,
+            calibrated: model_calibrated,
+            calibrated_p95_rss_mib: model_admission_mib,
             evictable_idle_rss_mib: 0,
             task_budget,
             conditional: ConditionalLeaseContextV1::default(),
@@ -9702,6 +9708,9 @@ impl Controller {
             .chain(model_lease.post_load_rss_kb)
             .max()
             .map(|kib| kib.div_ceil(1_024));
+        // Calibration is telemetry, never authority: a failed sample write must not change the
+        // outcome of this load.
+        let _ = self.record_model_load_calibration(&model_lease);
         let mut resident = residency;
         resident.model_lease = Some(model_lease);
         resident.state = ResourceResidencyStateV1::Resident;
@@ -13056,13 +13065,15 @@ impl Controller {
                 "task cancelled before model dispatch".to_owned(),
             ));
         }
+        let recorder = PeakRssRecorder::new(runtime.backend);
         let proposal_result = Self::request_model_proposal(
-            runtime.backend,
+            &recorder,
             context,
             &lease.task_id,
             model_deadline_ms,
             &cancellation,
         );
+        let _ = self.record_model_call_calibration(recorder.peak_mib());
         self.unload_model_for_ready_lease(lease, runtime.backend)?;
         if cancellation.is_cancelled() {
             self.persist_observed_cancellation(&cancellation)?;
@@ -20964,6 +20975,7 @@ fn bootstrap_uncheckpointed_initial_activation(
         #[cfg(unix)]
         managed_postgres_backend: None,
         trusted_recovery_intent_digests: BTreeMap::new(),
+        model_calibration_identity: None,
     };
     controller.checkpoint_now()?;
     Ok(controller.state)
@@ -21149,6 +21161,7 @@ impl RecoveryManager {
             #[cfg(unix)]
             managed_postgres_backend: None,
             trusted_recovery_intent_digests,
+            model_calibration_identity: None,
         };
 
         reconcile_recovered_resources_before_epoch(&mut controller, execution_epoch_before)?;

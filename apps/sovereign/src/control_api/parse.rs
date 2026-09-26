@@ -14,6 +14,7 @@ pub(crate) struct HttpEnvelope {
     pub(crate) content_length: usize,
     pub(crate) if_none_match: Option<String>,
     pub(crate) token_param: Option<String>,
+    pub(crate) launch_code_param: Option<String>,
     pub(crate) cookie_token: Option<String>,
     pub(crate) csrf_header: Option<String>,
     pub(crate) auth_bearer: Option<String>,
@@ -52,17 +53,20 @@ pub(crate) fn parse_http_envelope(bytes: &[u8]) -> Result<HttpEnvelope, ApiError
 
     validate_local_request_headers(header_text, version)?;
 
-    let (path_str, query, token_param) = match raw_path.split_once('?') {
+    let (path_str, query, token_param, launch_code_param) = match raw_path.split_once('?') {
         Some((p, query)) => {
             let mut tok = None;
+            let mut code = None;
             for part in query.split('&') {
                 if let Some(val) = part.strip_prefix("t=") {
                     tok = Some(val.to_owned());
+                } else if let Some(val) = part.strip_prefix("c=") {
+                    code = Some(val.to_owned());
                 }
             }
-            (p.to_owned(), query.to_owned(), tok)
+            (p.to_owned(), query.to_owned(), tok, code)
         }
-        None => (raw_path.to_owned(), String::new(), None),
+        None => (raw_path.to_owned(), String::new(), None, None),
     };
 
     let mut content_length = 0;
@@ -113,6 +117,7 @@ pub(crate) fn parse_http_envelope(bytes: &[u8]) -> Result<HttpEnvelope, ApiError
         content_length,
         if_none_match,
         token_param,
+        launch_code_param,
         cookie_token,
         csrf_header,
         auth_bearer,

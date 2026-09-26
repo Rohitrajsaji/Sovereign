@@ -8,11 +8,13 @@ mod execution;
 #[cfg(any(test, feature = "e2e-fixtures"))]
 mod fixture_backend;
 mod launch_agent;
+mod launch_code;
 mod model_assets;
 mod projections;
 mod projects;
 mod run_lock;
 mod runner;
+mod service_logs;
 
 #[cfg(test)]
 use control_api::ControlApiRequest;
@@ -253,7 +255,11 @@ fn run_serve(args: &[String], state_path: &Path) -> Result<String, String> {
     let address = address
         .parse::<SocketAddr>()
         .map_err(|error| format!("invalid serve address: {error}"))?;
+    let app_data_root = app_data::AppData::open_default()
+        .ok()
+        .map(|data| data.root().to_path_buf());
     let token = if let Ok(data) = app_data::AppData::open_default() {
+        service_logs::spawn_rotation(data.root().join("logs"));
         doctor::write_session_token(&data.token_path()).ok()
     } else {
         None
@@ -288,6 +294,7 @@ fn run_serve(args: &[String], state_path: &Path) -> Result<String, String> {
         require_token_for_v1_post: require_token,
         state_path: Some(state_path.to_path_buf()),
         sse_clients: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        launch_code_dir: app_data_root,
     };
     serve_listener(
         &listener,

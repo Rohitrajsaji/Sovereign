@@ -1,3 +1,9 @@
+// The pressure probe is macOS-only. Other hosts compile a fail-closed stub.
+#![cfg_attr(
+    not(target_os = "macos"),
+    allow(unused_imports, dead_code, clippy::needless_return)
+)]
+
 use serde::{Deserialize, Serialize};
 use sovereign_model::ModelLease;
 use sovereign_policy::{
