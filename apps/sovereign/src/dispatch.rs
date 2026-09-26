@@ -4,20 +4,71 @@
 //! Schema: `schemas/control-api-v2.json`.
 //! User instruction: verify the consumer plan and execute only what is genuinely missing.
 
-use crate::actor::ControllerActorHandle;
+use crate::actor::{ControllerActorHandle, Reply};
 use crate::control_api::ControlApiRequest;
-use crate::{app_data, doctor, model_assets, projections, projects};
+use crate::{app_data, doctor, goal_views, model_assets, projections, projects};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sovereign_controller::ApprovalDecisionV1;
 use sovereign_state::StateStore;
 use std::path::{Path, PathBuf};
 
-const STATE_DB_ENV: &str = "SOVEREIGN_STATE_DB";
+/// Serializes an applied command, or explains in plain words that it is queued behind the
+/// current step.
+fn reply_json<T: Serialize>(reply: Reply<T>, queued_message: &str) -> Result<Value, String> {
+    match reply {
+        Reply::Applied(value) => serde_json::to_value(value).map_err(|error| error.to_string()),
+        Reply::Queued { ticket } => Ok(json!({
+            "accepted": true,
+            "applied": false,
+            "ticket": ticket,
+            "message": queued_message,
+        })),
+    }
+}
 
-pub(crate) fn artifact_response(digest: &str, offset: u64, length: usize) -> Result<Value, String> {
-    let path = std::env::var_os(STATE_DB_ENV)
-        .map_or_else(|| PathBuf::from(".sovereign/state.sqlite3"), PathBuf::from);
-    let store = StateStore::open(&path).map_err(|error| error.to_string())?;
+/// Request views for the current project, including commands still waiting to apply.
+fn current_goal_views(
+    actor: &ControllerActorHandle,
+) -> Result<Vec<goal_views::GoalViewV1>, String> {
+    let model = actor.read_model()?;
+    let store = actor.open_state()?;
+    let outcomes = sovereign_controller::goal_outcomes(&store).map_err(|e| e.to_string())?;
+    let status = actor.service_status();
+    let pending = actor.pending_commands();
+    Ok(goal_views::goal_views(
+        &model,
+        &outcomes,
+        &goal_views::ServiceFacts {
+            status: &status,
+            working: actor.working(),
+            paused: model.status.execution_control.paused,
+            pending: &pending,
+        },
+    ))
+}
+
+/// Plan ids a goal was bound to, from its claim and outcome records.
+fn goal_plan_ids(store: &StateStore, goal_id: &str) -> Result<Vec<String>, String> {
+    let mut plan_ids = Vec::new();
+    if let Some(raw) = store
+        .get_state("controller.goal_intent_claim", goal_id)
+        .map_err(|e| e.to_string())?
+        && let Ok(claim) = serde_json::from_str::<Value>(&raw)
+        && let Some(plan_id) = claim.get("plan_id").and_then(Value::as_str)
+    {
+        plan_ids.push(plan_id.to_owned());
+    }
+    Ok(plan_ids)
+}
+
+pub(crate) fn artifact_response(
+    path: &Path,
+    digest: &str,
+    offset: u64,
+    length: usize,
+) -> Result<Value, String> {
+    let store = StateStore::open(path).map_err(|error| error.to_string())?;
     let cas = path.parent().unwrap_or(Path::new(".")).join("cas");
     let artifacts =
         sovereign_evidence::ArtifactStore::open(&cas).map_err(|error| error.to_string())?;
@@ -46,18 +97,22 @@ pub(crate) fn handle_actor_request(
         ControlApiRequest::ReadModel => actor
             .read_model()
             .and_then(|view| serde_json::to_value(view).map_err(|e| e.to_string())),
-        ControlApiRequest::SubmitGoal { goal } => actor
-            .submit_goal(goal)
-            .and_then(|intent| serde_json::to_value(intent).map_err(|e| e.to_string())),
-        ControlApiRequest::Pause { reason } => actor
-            .pause(reason)
-            .and_then(|control| serde_json::to_value(control).map_err(|e| e.to_string())),
-        ControlApiRequest::Resume => actor
-            .resume()
-            .and_then(|control| serde_json::to_value(control).map_err(|e| e.to_string())),
-        ControlApiRequest::CancelGoal { goal_id, principal } => actor
-            .cancel_goal(goal_id, principal)
-            .and_then(|intent| serde_json::to_value(intent).map_err(|e| e.to_string())),
+        ControlApiRequest::SubmitGoal { goal } => reply_json(
+            actor.submit_goal(goal)?,
+            "Got it. Sovereign will add this request as soon as the current step finishes.",
+        ),
+        ControlApiRequest::Pause { reason } => reply_json(
+            actor.pause(reason)?,
+            "Sovereign will pause as soon as the current step finishes.",
+        ),
+        ControlApiRequest::Resume => reply_json(
+            actor.resume()?,
+            "Sovereign will resume as soon as the current step finishes.",
+        ),
+        ControlApiRequest::CancelGoal { goal_id, principal } => reply_json(
+            actor.cancel_goal(goal_id, principal)?,
+            "Stopping. The current work was interrupted and the request will show as cancelled in a moment.",
+        ),
         ControlApiRequest::RespondToApproval {
             request_id,
             decision,
@@ -68,9 +123,10 @@ pub(crate) fn handle_actor_request(
                 "deny" => ApprovalDecisionV1::Deny,
                 _ => return Err("approval decision must be `approve` or `deny`".to_owned()),
             };
-            actor
-                .respond_to_approval(request_id, decision, principal)
-                .and_then(|request| serde_json::to_value(request).map_err(|e| e.to_string()))
+            reply_json(
+                actor.respond_to_approval(request_id, decision, principal)?,
+                "Your answer is recorded and applies as soon as the current step finishes.",
+            )
         }
         ControlApiRequest::Session => Ok(serde_json::json!({"authenticated": true})),
         ControlApiRequest::Doctor => {
@@ -84,7 +140,7 @@ pub(crate) fn handle_actor_request(
         }
         ControlApiRequest::Overview => {
             let model = actor.read_model()?;
-            let service = actor.service_status().unwrap_or_default();
+            let service = actor.service_status();
             let phase = if model.recovery.mutation_blocked {
                 "recovery_blocked"
             } else if model.status.execution_control.paused {
@@ -96,15 +152,14 @@ pub(crate) fn handle_actor_request(
                 .and_then(|d| d.load_projects())
                 .ok()
                 .and_then(|p| p.active_project_id);
-            let path = std::env::var_os(STATE_DB_ENV)
-                .map_or_else(|| PathBuf::from(".sovereign/state.sqlite3"), PathBuf::from);
-            let residency = StateStore::open(&path).ok().map_or_else(
-                || "unknown".to_owned(),
-                |store| projections::model_residency_label(&store),
-            );
-            let pressure = StateStore::open(&path).ok().map_or_else(
-                || "unknown".to_owned(),
-                |store| projections::pressure_band_label(&store),
+            let (residency, pressure) = actor.open_state().ok().map_or_else(
+                || ("unknown".to_owned(), "unknown".to_owned()),
+                |store| {
+                    (
+                        projections::model_residency_label(&store),
+                        projections::pressure_band_label(&store),
+                    )
+                },
             );
             Ok(serde_json::json!({
                 "schema_version": 1,
@@ -119,6 +174,8 @@ pub(crate) fn handle_actor_request(
                 "approval_count": model.blocked_approvals.len() + model.pending_approvals.len(),
                 "unknown_action_count": model.recovery.unknown_action_ids.len(),
                 "blocked_approvals": model.blocked_approvals,
+                "working": actor.working(),
+                "pending_commands": actor.pending_commands(),
             }))
         }
         ControlApiRequest::ListProjects => {
@@ -131,7 +188,7 @@ pub(crate) fn handle_actor_request(
             let data = app_data::AppData::open_default().map_err(|e| e.to_string())?;
             let projects = projects::register_project(&data, Path::new(&root), &display_name)?;
             if let Some(record) = projects::active_record(&projects) {
-                actor.switch_project(
+                let _ = actor.switch_project(
                     PathBuf::from(&record.state_path),
                     Some(PathBuf::from(&record.root)),
                 )?;
@@ -148,7 +205,7 @@ pub(crate) fn handle_actor_request(
             else {
                 return Err(format!("unknown project id {project_id}"));
             };
-            actor.switch_project(
+            let _ = actor.switch_project(
                 PathBuf::from(&target.state_path),
                 Some(PathBuf::from(&target.root)),
             )?;
@@ -157,20 +214,27 @@ pub(crate) fn handle_actor_request(
             serde_json::to_value(projects).map_err(|e| e.to_string())
         }
         ControlApiRequest::ListGoals => {
-            let model = actor.read_model()?;
-            serde_json::to_value(&model.status.goal_intents).map_err(|e| e.to_string())
+            let views = current_goal_views(actor)?;
+            serde_json::to_value(views).map_err(|e| e.to_string())
         }
         ControlApiRequest::GetGoal { goal_id } => {
             let model = actor.read_model()?;
-            projections::goal_detail(&model, &goal_id)
-                .ok_or_else(|| format!("unknown goal {goal_id}"))
+            let view = current_goal_views(actor)?
+                .into_iter()
+                .find(|view| view.goal_id == goal_id)
+                .ok_or_else(|| format!("not found: unknown goal {goal_id}"))?;
+            projections::goal_detail(&model, &view)
+                .ok_or_else(|| format!("not found: unknown goal {goal_id}"))
+        }
+        ControlApiRequest::GetGoalActivity { goal_id } => {
+            let store = actor.open_state()?;
+            let plan_ids = goal_plan_ids(&store, &goal_id)?;
+            let events = store.journal().map_err(|e| e.to_string())?;
+            serde_json::to_value(goal_views::goal_activity(&events, &goal_id, &plan_ids))
+                .map_err(|e| e.to_string())
         }
         ControlApiRequest::ListEvents { after, limit } => {
-            let store = StateStore::open(
-                std::env::var_os(STATE_DB_ENV)
-                    .map_or_else(|| PathBuf::from(".sovereign/state.sqlite3"), PathBuf::from),
-            )
-            .map_err(|e| e.to_string())?;
+            let store = actor.open_state()?;
             let events = store.journal_after(after).map_err(|e| e.to_string())?;
             let projected = projections::project_events(&events, after, limit);
             serde_json::to_value(projected).map_err(|e| e.to_string())
@@ -236,7 +300,7 @@ pub(crate) fn handle_actor_request(
             digest,
             offset,
             length,
-        } => artifact_response(&digest, offset, length),
+        } => artifact_response(&actor.state_path(), &digest, offset, length),
         ControlApiRequest::GetTaskDiff { key } => {
             let model = actor.read_model()?;
             projections::task_diff_from_status(&model.status.tasks, &key)

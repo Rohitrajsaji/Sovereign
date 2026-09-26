@@ -239,6 +239,13 @@ impl LocalControl {
         self.controller.cancel_goal_intent(goal_id, principal)
     }
 
+    /// The active goal and a handle that interrupts its in-flight work. The handle carries no
+    /// authority: it only sets the cancellation bit the Controller already polls.
+    #[must_use]
+    pub fn active_goal_interrupt(&self) -> Option<(String, super::CancellationHandle)> {
+        self.controller.active_goal_interrupt()
+    }
+
     /// Runs one caller-composed Controller mutation while keeping the facade closed.
     ///
     /// Used by the local execution service so production advances stay inside

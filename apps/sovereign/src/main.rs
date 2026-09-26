@@ -7,6 +7,7 @@ mod doctor;
 mod execution;
 #[cfg(any(test, feature = "e2e-fixtures"))]
 mod fixture_backend;
+mod goal_views;
 mod launch_agent;
 mod launch_code;
 mod model_assets;
@@ -15,6 +16,7 @@ mod projects;
 mod run_lock;
 mod runner;
 mod service_logs;
+mod service_state;
 
 #[cfg(test)]
 use control_api::ControlApiRequest;
@@ -471,8 +473,25 @@ fn handle_control_request(
         }
         ControlApiRequest::GetGoal { goal_id } => {
             let model = control.read_model().map_err(|e| e.to_string())?;
-            projections::goal_detail(&model, &goal_id)
-                .ok_or_else(|| format!("unknown goal {goal_id}"))
+            let status = execution::ServiceStatusV1::default();
+            let views = goal_views::goal_views(
+                &model,
+                &[],
+                &goal_views::ServiceFacts {
+                    status: &status,
+                    working: false,
+                    paused: model.status.execution_control.paused,
+                    pending: &[],
+                },
+            );
+            let view = views
+                .iter()
+                .find(|view| view.goal_id == goal_id)
+                .ok_or_else(|| format!("unknown goal {goal_id}"))?;
+            projections::goal_detail(&model, view).ok_or_else(|| format!("unknown goal {goal_id}"))
+        }
+        ControlApiRequest::GetGoalActivity { .. } => {
+            Err("goal activity is served by the local service".to_owned())
         }
         ControlApiRequest::ListEvents { after, limit } => {
             let store = StateStore::open(
@@ -536,7 +555,11 @@ fn handle_control_request(
             digest,
             offset,
             length,
-        } => artifact_response(&digest, offset, length),
+        } => {
+            let path = std::env::var_os("SOVEREIGN_STATE_DB")
+                .map_or_else(|| PathBuf::from(".sovereign/state.sqlite3"), PathBuf::from);
+            artifact_response(&path, &digest, offset, length)
+        }
         ControlApiRequest::GetTaskDiff { key } => {
             let model = control.read_model().map_err(|e| e.to_string())?;
             projections::task_diff_from_status(&model.status.tasks, &key)

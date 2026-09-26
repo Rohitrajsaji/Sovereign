@@ -2921,6 +2921,14 @@ impl Controller {
         self.cancellations.register_root(goal)
     }
 
+    /// The active goal and a handle that interrupts its in-flight work, when a plan is active.
+    #[must_use]
+    pub fn active_goal_interrupt(&self) -> Option<(String, CancellationHandle)> {
+        let goal_id = self.active.as_ref()?.goal_id.clone();
+        let handle = self.goal_cancellation_handle().ok()?;
+        Some((goal_id, handle))
+    }
+
     /// Durably requests cancellation of the active goal and every task in it. The next
     /// production step ends the goal as cancelled once nothing is in flight.
     ///

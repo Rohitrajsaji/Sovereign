@@ -27,6 +27,8 @@ export type OverviewResponse = {
   approval_count?: number;
   unknown_action_count?: number;
   blocked_approvals?: Array<ApprovalRequest>;
+  working?: boolean;
+  pending_commands?: Array<PendingCommand>;
 };
 
 export type ApprovalRequest = {
@@ -65,7 +67,7 @@ export type GoalIntent = {
   submitted_at_ms: number;
 };
 
-export type GoalsResponse = Array<GoalIntent>;
+export type GoalsResponse = Array<GoalView>;
 
 export type ControlResponse = {
   schema_version: number;
@@ -123,6 +125,7 @@ export type GoalDetail = {
   verifications: Array<unknown>;
   evidence: Array<unknown>;
   completion_decided_by: string;
+  view?: GoalView;
 };
 
 export type ArtifactRead = {
@@ -134,4 +137,67 @@ export type ArtifactRead = {
 
 export type RecoveryResponse = {
   explanation: RecoveryExplanation;
+};
+
+export type GoalStep = {
+  task_id: string;
+  title: string;
+  phase: "waiting" | "working" | "checking" | "done" | "failed" | "stopped";
+};
+
+export type GoalProgress = {
+  phase: "received" | "queued" | "waiting" | "planning" | "building" | "checking" | "waiting_for_you" | "stopping" | "done" | "failed" | "cancelled";
+  headline: string;
+  sentence: string;
+  steps_done: number;
+  steps_total: number;
+  percent: number;
+  terminal: boolean;
+};
+
+export type GoalOutcome = {
+  schema_version: number;
+  goal_id: string;
+  kind: "failed" | "cancelled";
+  reason_code: string;
+  detail: string;
+  plan_id?: string | null;
+  plan_revision?: number | null;
+  recorded_at_ms: number;
+};
+
+export type GoalView = {
+  schema_version: number;
+  goal_id: string;
+  natural_language_goal: string;
+  status: string;
+  submitted_at_ms: number;
+  progress: GoalProgress;
+  steps: Array<GoalStep>;
+  outcome?: GoalOutcome | null;
+  queue_position?: number | null;
+};
+
+export type GoalActivity = {
+  sequence: number;
+  occurred_at_ms: number;
+  text: string;
+  tone: "info" | "success" | "warning" | "error";
+};
+
+export type GoalActivityResponse = Array<GoalActivity>;
+
+export type PendingCommand = {
+  ticket: number;
+  kind: string;
+  goal_id?: string | null;
+  text?: string | null;
+  accepted_at_ms: number;
+};
+
+export type QueuedCommandResponse = {
+  accepted: boolean;
+  applied: boolean;
+  ticket: number;
+  message: string;
 };

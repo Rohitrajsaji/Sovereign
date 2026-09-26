@@ -180,34 +180,37 @@ pub fn cap_diff(diff: &str) -> String {
     format!("{}…", &diff[..end])
 }
 
-/// Goal detail assembled from the Controller read model. The model does not decide completion.
+/// Goal detail assembled from the Controller read model. Plan revisions, tasks, attempts,
+/// verifications, and evidence belong to the active plan, so they are returned only for the
+/// goal that plan is bound to. The model does not decide completion.
 #[must_use]
 pub fn goal_detail(
     model: &sovereign_controller::LocalControlReadModelV1,
-    goal_id: &str,
+    view: &crate::goal_views::GoalViewV1,
 ) -> Option<serde_json::Value> {
-    let intent = model
+    let is_active = model
         .status
-        .goal_intents
-        .iter()
-        .find(|goal| goal.goal_id == goal_id)?;
-    let tasks = model
-        .status
-        .tasks
-        .iter()
-        .filter(|task| {
-            task.get("goal_id").and_then(|value| value.as_str()) == Some(goal_id)
-                || task.get("task_id").is_some()
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+        .active_plan
+        .as_ref()
+        .and_then(|plan| plan.get("goal_id"))
+        .and_then(serde_json::Value::as_str)
+        == Some(view.goal_id.as_str());
+    let intent = serde_json::json!({
+        "schema_version": view.schema_version,
+        "goal_id": view.goal_id,
+        "natural_language_goal": view.natural_language_goal,
+        "status": view.status,
+        "submitted_at_ms": view.submitted_at_ms,
+    });
+    let empty = serde_json::Value::Array(Vec::new());
     Some(serde_json::json!({
         "intent": intent,
-        "plan_revisions": model.plan_revisions,
-        "tasks": tasks,
-        "attempts": model.status.attempts,
-        "verifications": model.verifications,
-        "evidence": model.status.evidence,
+        "view": view,
+        "plan_revisions": if is_active { serde_json::to_value(&model.plan_revisions).ok()? } else { empty.clone() },
+        "tasks": if is_active { serde_json::Value::Array(model.status.tasks.clone()) } else { empty.clone() },
+        "attempts": if is_active { serde_json::Value::Array(model.status.attempts.clone()) } else { empty.clone() },
+        "verifications": if is_active { serde_json::to_value(&model.verifications).ok()? } else { empty.clone() },
+        "evidence": if is_active { serde_json::Value::Array(model.status.evidence.clone()) } else { empty },
         "completion_decided_by": "verification",
     }))
 }

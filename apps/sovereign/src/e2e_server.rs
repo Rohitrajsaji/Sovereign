@@ -20,6 +20,8 @@ mod doctor;
 mod execution;
 #[path = "fixture_backend.rs"]
 mod fixture_backend;
+#[path = "goal_views.rs"]
+mod goal_views;
 #[path = "launch_agent.rs"]
 mod launch_agent;
 #[path = "launch_code.rs"]
@@ -34,6 +36,8 @@ mod projects;
 mod run_lock;
 #[path = "runner.rs"]
 mod runner;
+#[path = "service_state.rs"]
+mod service_state;
 
 use actor::{ActorOptions, ControllerActorHandle};
 use app_data::AppData;

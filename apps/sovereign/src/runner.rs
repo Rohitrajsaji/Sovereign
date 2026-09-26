@@ -39,6 +39,7 @@ use std::net::{IpAddr, Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::process::Command;
+use std::sync::Arc;
 
 const REPOSITORY_ID: &str = "repo.local";
 const COMPILER_VERSION: &str = "sovereign-local-v1";
@@ -598,14 +599,22 @@ fn advance_with_overrides(
             let owned_backend = backend_override
                 .is_none()
                 .then(|| model_backend(true))
-                .transpose()?;
+                .transpose()?
+                .map(Arc::new);
             let backend: &dyn ModelBackend = backend_override
                 .or_else(|| {
                     owned_backend
-                        .as_ref()
+                        .as_deref()
                         .map(|backend| backend as &dyn ModelBackend)
                 })
                 .ok_or("compilation backend unavailable")?;
+            // A cancel for this goal unloads the model, which ends the load or compile call.
+            let _interrupt = owned_backend.as_ref().map(|owned| {
+                crate::service_state::register_compile_interrupt(
+                    &input.goal_id,
+                    Arc::clone(owned) as Arc<dyn ModelBackend>,
+                )
+            });
             let model_lease = load_model(backend)?;
             // Calibration is telemetry, never authority: a failed write must not block work.
             let _ = controller.record_model_load_calibration(&model_lease);

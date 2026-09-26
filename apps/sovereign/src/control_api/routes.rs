@@ -206,6 +206,19 @@ pub(crate) fn parse_control_request(
                 project_id: project_id.to_owned(),
             })
         }
+        ("GET", path) if path.starts_with("/v2/goals/") && path.ends_with("/activity") => {
+            require_empty_body(body)?;
+            let goal_id = path
+                .strip_prefix("/v2/goals/")
+                .and_then(|p| p.strip_suffix("/activity"))
+                .ok_or_else(|| ApiError::new(ApiStatus::BadRequest, "invalid goal path"))?;
+            if goal_id.is_empty() || goal_id.contains('/') {
+                return Err(ApiError::new(ApiStatus::BadRequest, "invalid goal path"));
+            }
+            Ok(ControlApiRequest::GetGoalActivity {
+                goal_id: goal_id.to_owned(),
+            })
+        }
         ("GET", path) if path.starts_with("/v2/goals/") && !path.contains("/cancel") => {
             require_empty_body(body)?;
             let goal_id = path

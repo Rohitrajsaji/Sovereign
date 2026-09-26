@@ -57,6 +57,9 @@ pub(crate) enum ControlApiRequest {
     GetGoal {
         goal_id: String,
     },
+    GetGoalActivity {
+        goal_id: String,
+    },
     CancelGoal {
         goal_id: String,
         principal: String,

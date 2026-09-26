@@ -1,62 +1,98 @@
 //! Single-writer actor for Controller lifecycle and mutation operations.
 //!
-//! Web request handlers communicate with this actor over bounded channels,
-//! ensuring all mutations are serialized and the `RunLock` is held continuously.
+//! Callers: `dispatch.rs` (HTTP), `execution.rs` tests, `main.rs` `serve`.
+//! API: `ControllerActorHandle`, `Reply`, `ActorOptions`.
+//!
+//! Every mutation is serialized on the actor thread, which holds the `RunLock` continuously.
+//! Reads never go through the actor: they open read-only state handles on the current project
+//! database, so they answer while a long step (model load, plan compilation, tests) runs. A
+//! command sent during such a step is acknowledged as queued instead of timing out, and a cancel
+//! interrupts the running step at once through `ServiceShared`.
 
 use sovereign_controller::{
-    ApprovalDecisionV1, ApprovalRequestV1, ExecutionControlV1, GoalIntentV1, LocalControl,
-    LocalControlReadModelV1,
+    ApprovalDecisionV1, ApprovalRequestV1, ExecutionControlV1, GOAL_REASON_COMPOSITION_ERROR,
+    GoalIntentV1, LocalControl, LocalControlReadModelV1,
 };
 use sovereign_state::StateStore;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::execution::{ExecutionService, ServiceStatusV1};
 use crate::run_lock::RunLock;
+use crate::service_state::{PendingCommandV1, ServiceShared, with_step_context};
 use sovereign_repo::ProjectRegistry;
 
 const ACTOR_QUEUE_BOUND: usize = 64;
-const DEFAULT_RECV_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a command waits for the actor when it is idle.
+const IDLE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a command waits while a step runs before it is acknowledged as queued.
+const BUSY_REPLY_TIMEOUT: Duration = Duration::from_millis(600);
+/// Identical composition errors in a row before the queued goal is failed.
+const COMPOSITION_ERROR_LIMIT: u32 = 3;
+const STATE_READY_POLLS: u32 = 40;
+const STATE_BUSY_RETRIES: u32 = 5;
+const STATE_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+/// Result of a command sent to the actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reply<T> {
+    /// The Controller applied the command.
+    Applied(T),
+    /// The actor was busy; the command is queued and applies at the next safe point.
+    Queued { ticket: u64 },
+}
+
+impl<T> Reply<T> {
+    /// The applied value, or `None` while the command is queued.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn applied(self) -> Option<T> {
+        match self {
+            Self::Applied(value) => Some(value),
+            Self::Queued { .. } => None,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ActorCommand {
     SubmitGoal {
+        ticket: u64,
         goal: String,
         reply: Sender<Result<GoalIntentV1, String>>,
     },
     Pause {
+        ticket: u64,
         reason: Option<String>,
         reply: Sender<Result<ExecutionControlV1, String>>,
     },
     Resume {
+        ticket: u64,
         reply: Sender<Result<ExecutionControlV1, String>>,
     },
     CancelGoal {
+        ticket: u64,
         goal_id: String,
         principal: String,
         reply: Sender<Result<GoalIntentV1, String>>,
     },
     RespondToApproval {
+        ticket: u64,
         request_id: String,
         decision: ApprovalDecisionV1,
         principal: String,
         reply: Sender<Result<ApprovalRequestV1, String>>,
     },
-    ReadModel {
-        reply: Sender<Result<LocalControlReadModelV1, String>>,
-    },
     SwitchProject {
+        ticket: u64,
         state_path: PathBuf,
         git_root: Option<PathBuf>,
         reply: Sender<Result<(), String>>,
     },
     Shutdown {
         reply: Sender<Result<(), String>>,
-    },
-    ServiceStatus {
-        reply: Sender<Result<ServiceStatusV1, String>>,
     },
 }
 
@@ -66,9 +102,10 @@ pub struct ActorOptions {
     pub git_root: Option<PathBuf>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ControllerActorHandle {
     sender: SyncSender<ActorCommand>,
+    shared: Arc<ServiceShared>,
 }
 
 impl ControllerActorHandle {
@@ -88,58 +125,148 @@ impl ControllerActorHandle {
         options: ActorOptions,
     ) -> Result<(Self, JoinHandle<()>), String> {
         let (sender, receiver) = mpsc::sync_channel(ACTOR_QUEUE_BOUND);
+        let shared = ServiceShared::new(state_path.clone());
+        let actor_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("sovereign-controller-actor".to_owned())
             .spawn(move || {
-                run_actor_loop(state_path, receiver, options);
+                run_actor_loop(state_path, receiver, options, &actor_shared);
             })
             .map_err(|error| format!("failed to spawn controller actor thread: {error}"))?;
 
-        Ok((Self { sender }, thread))
+        Ok((Self { sender, shared }, thread))
     }
 
+    /// The current project database. Reads open their own handle on it.
+    #[must_use]
+    pub fn state_path(&self) -> PathBuf {
+        self.shared.state_path()
+    }
+
+    /// The last status the execution service published.
+    #[must_use]
+    pub fn service_status(&self) -> ServiceStatusV1 {
+        self.shared.status()
+    }
+
+    /// True while a step has been running for more than a moment.
+    #[must_use]
+    pub fn working(&self) -> bool {
+        self.shared.working()
+    }
+
+    /// Commands accepted but not yet applied.
+    #[must_use]
+    pub fn pending_commands(&self) -> Vec<PendingCommandV1> {
+        self.shared.pending()
+    }
+
+    /// Opens a read handle on the current project database. Waits briefly while the actor is
+    /// still opening it, and retries a busy database a few times.
+    ///
     /// # Errors
-    /// Returns an error if the actor is dead or times out.
-    pub fn service_status(&self) -> Result<ServiceStatusV1, String> {
-        let (reply, rx) = mpsc::channel();
-        self.send_cmd(ActorCommand::ServiceStatus { reply }, &rx)
+    /// Returns an error while Sovereign is still starting, or a state error.
+    pub fn open_state(&self) -> Result<StateStore, String> {
+        for _ in 0..STATE_READY_POLLS {
+            if self.shared.state_ready() {
+                break;
+            }
+            thread::sleep(STATE_RETRY_DELAY);
+        }
+        if !self.shared.state_ready() {
+            return Err("Sovereign is still starting. Try again in a moment.".to_owned());
+        }
+        let mut last_error = String::new();
+        for _ in 0..STATE_BUSY_RETRIES {
+            match StateStore::open(self.shared.state_path()) {
+                Ok(store) => return Ok(store),
+                Err(error) => {
+                    last_error = error.to_string();
+                    if !last_error.contains("locked") && !last_error.contains("busy") {
+                        break;
+                    }
+                    thread::sleep(STATE_RETRY_DELAY);
+                }
+            }
+        }
+        Err(format!("state store error: {last_error}"))
+    }
+
+    /// Reads the Controller read model from a read-only handle, without waiting on the actor.
+    ///
+    /// # Errors
+    /// Returns a state or read-model error.
+    pub fn read_model(&self) -> Result<LocalControlReadModelV1, String> {
+        LocalControl::read_only(self.open_state()?)
+            .read_model()
+            .map_err(|error| error.to_string())
     }
 
     /// Submits a natural-language goal.
     ///
     /// # Errors
-    /// Returns an error if the actor is dead, times out, or Controller rejects the goal.
-    pub fn submit_goal(&self, goal: String) -> Result<GoalIntentV1, String> {
+    /// Returns an error if the actor is gone or the Controller rejects the goal.
+    pub fn submit_goal(&self, goal: String) -> Result<Reply<GoalIntentV1>, String> {
+        let ticket = self.shared.enqueue("submit_goal", None, Some(goal.clone()));
         let (reply, rx) = mpsc::channel();
-        self.send_cmd(ActorCommand::SubmitGoal { goal, reply }, &rx)
+        self.send_tracked(
+            ticket,
+            ActorCommand::SubmitGoal {
+                ticket,
+                goal,
+                reply,
+            },
+            &rx,
+        )
     }
 
-    /// Pauses execution.
+    /// Pauses execution after the current step.
     ///
     /// # Errors
-    /// Returns an error if the actor is dead, times out, or Controller rejects pause.
-    pub fn pause(&self, reason: Option<String>) -> Result<ExecutionControlV1, String> {
+    /// Returns an error if the actor is gone or the Controller rejects pause.
+    pub fn pause(&self, reason: Option<String>) -> Result<Reply<ExecutionControlV1>, String> {
+        let ticket = self.shared.enqueue("pause", None, None);
         let (reply, rx) = mpsc::channel();
-        self.send_cmd(ActorCommand::Pause { reason, reply }, &rx)
+        self.send_tracked(
+            ticket,
+            ActorCommand::Pause {
+                ticket,
+                reason,
+                reply,
+            },
+            &rx,
+        )
     }
 
     /// Resumes execution.
     ///
     /// # Errors
-    /// Returns an error if the actor is dead, times out, or Controller rejects resume.
-    pub fn resume(&self) -> Result<ExecutionControlV1, String> {
+    /// Returns an error if the actor is gone or the Controller rejects resume.
+    pub fn resume(&self) -> Result<Reply<ExecutionControlV1>, String> {
+        let ticket = self.shared.enqueue("resume", None, None);
         let (reply, rx) = mpsc::channel();
-        self.send_cmd(ActorCommand::Resume { reply }, &rx)
+        self.send_tracked(ticket, ActorCommand::Resume { ticket, reply }, &rx)
     }
 
-    /// Cancels a goal.
+    /// Cancels a goal. In-flight work for it is interrupted at once; the Controller records the
+    /// cancellation at the next safe point.
     ///
     /// # Errors
-    /// Returns an error if the actor is dead, times out, or Controller rejects cancel.
-    pub fn cancel_goal(&self, goal_id: String, principal: String) -> Result<GoalIntentV1, String> {
+    /// Returns an error if the actor is gone or the Controller rejects cancel.
+    pub fn cancel_goal(
+        &self,
+        goal_id: String,
+        principal: String,
+    ) -> Result<Reply<GoalIntentV1>, String> {
+        self.shared.interrupt_goal(&goal_id);
+        let ticket = self
+            .shared
+            .enqueue("cancel_goal", Some(goal_id.clone()), None);
         let (reply, rx) = mpsc::channel();
-        self.send_cmd(
+        self.send_tracked(
+            ticket,
             ActorCommand::CancelGoal {
+                ticket,
                 goal_id,
                 principal,
                 reply,
@@ -151,16 +278,19 @@ impl ControllerActorHandle {
     /// Responds to an approval request.
     ///
     /// # Errors
-    /// Returns an error if the actor is dead, times out, or Controller rejects the decision.
+    /// Returns an error if the actor is gone or the Controller rejects the decision.
     pub fn respond_to_approval(
         &self,
         request_id: String,
         decision: ApprovalDecisionV1,
         principal: String,
-    ) -> Result<ApprovalRequestV1, String> {
+    ) -> Result<Reply<ApprovalRequestV1>, String> {
+        let ticket = self.shared.enqueue("approval", None, None);
         let (reply, rx) = mpsc::channel();
-        self.send_cmd(
+        self.send_tracked(
+            ticket,
             ActorCommand::RespondToApproval {
+                ticket,
                 request_id,
                 decision,
                 principal,
@@ -170,29 +300,23 @@ impl ControllerActorHandle {
         )
     }
 
-    /// Fetches the read model.
-    ///
-    /// # Errors
-    /// Returns an error if the actor is dead, times out, or read model generation fails.
-    pub fn read_model(&self) -> Result<LocalControlReadModelV1, String> {
-        let (reply, rx) = mpsc::channel();
-        self.send_cmd(ActorCommand::ReadModel { reply }, &rx)
-    }
-
     /// Switches the active project, re-acquiring `RunLock` on the new state path.
     /// When `git_root` is set and this actor was spawned with `execute`, the
     /// production tick binds that work tree so UI-registered projects can run.
     ///
     /// # Errors
-    /// Returns an error if the actor is dead, times out, or switching project fails.
+    /// Returns an error if the actor is gone or switching project fails.
     pub fn switch_project(
         &self,
         state_path: PathBuf,
         git_root: Option<PathBuf>,
-    ) -> Result<(), String> {
+    ) -> Result<Reply<()>, String> {
+        let ticket = self.shared.enqueue("switch_project", None, None);
         let (reply, rx) = mpsc::channel();
-        self.send_cmd(
+        self.send_tracked(
+            ticket,
             ActorCommand::SwitchProject {
+                ticket,
                 state_path,
                 git_root,
                 reply,
@@ -204,25 +328,44 @@ impl ControllerActorHandle {
     /// Gracefully shuts down the actor thread.
     ///
     /// # Errors
-    /// Returns an error if the actor is dead or times out.
+    /// Returns an error if the actor is gone or times out.
     pub fn shutdown(&self) -> Result<(), String> {
         let (reply, rx) = mpsc::channel();
-        self.send_cmd(ActorCommand::Shutdown { reply }, &rx)
+        self.sender
+            .send(ActorCommand::Shutdown { reply })
+            .map_err(|_| "controller actor is not running".to_owned())?;
+        rx.recv_timeout(IDLE_REPLY_TIMEOUT)
+            .map_err(|_| "controller actor did not stop in time".to_owned())?
     }
 
-    fn send_cmd<T>(
+    fn send_tracked<T>(
         &self,
+        ticket: u64,
         cmd: ActorCommand,
         rx: &Receiver<Result<T, String>>,
-    ) -> Result<T, String> {
-        self.sender
-            .send(cmd)
-            .map_err(|_| "controller actor is not running".to_owned())?;
-        rx.recv_timeout(DEFAULT_RECV_TIMEOUT)
-            .map_err(|err| match err {
-                RecvTimeoutError::Timeout => "controller actor request timed out".to_owned(),
-                RecvTimeoutError::Disconnected => "controller actor disconnected".to_owned(),
-            })?
+    ) -> Result<Reply<T>, String> {
+        if let Err(error) = self.sender.try_send(cmd) {
+            self.shared.complete(ticket);
+            return Err(match error {
+                TrySendError::Full(_) => {
+                    "Sovereign is busy with many requests. Try again in a moment.".to_owned()
+                }
+                TrySendError::Disconnected(_) => "controller actor is not running".to_owned(),
+            });
+        }
+        let wait = if self.shared.is_busy() {
+            BUSY_REPLY_TIMEOUT
+        } else {
+            IDLE_REPLY_TIMEOUT
+        };
+        match rx.recv_timeout(wait) {
+            Ok(result) => result.map(Reply::Applied),
+            Err(RecvTimeoutError::Timeout) => Ok(Reply::Queued { ticket }),
+            Err(RecvTimeoutError::Disconnected) => {
+                self.shared.complete(ticket);
+                Err("controller actor disconnected".to_owned())
+            }
+        }
     }
 }
 
@@ -265,6 +408,16 @@ impl ActorState {
         self.control = Some(new_control);
         Ok(())
     }
+
+    fn with_control<T>(
+        &mut self,
+        apply: impl FnOnce(&mut LocalControl) -> Result<T, String>,
+    ) -> Result<T, String> {
+        match self.control.as_mut() {
+            Some(control) => apply(control),
+            None => Err("actor controller state not available".to_owned()),
+        }
+    }
 }
 
 fn bind_workspace(
@@ -287,12 +440,119 @@ fn bind_workspace(
     }
 }
 
+/// Errors that come from the environment (model files, memory probe) rather than from the
+/// queued goal. They never fail the goal: fixing setup lets it run.
+fn is_environment_error(error: &str) -> bool {
+    let lowered = error.to_ascii_lowercase();
+    [
+        "load local model",
+        "sovereign_model",
+        "model runtime",
+        "model path",
+        "llama",
+        "memory pressure",
+        "pressure probe",
+        "run lock",
+        "state store error",
+        "sandbox",
+    ]
+    .iter()
+    .any(|needle| lowered.contains(needle))
+}
+
+/// Tracks identical composition errors so one bad request cannot block the queue forever.
+#[derive(Default)]
+struct CompositionErrors {
+    last: Option<String>,
+    count: u32,
+}
+
+impl CompositionErrors {
+    /// Returns true when this error has now repeated often enough to fail the queued goal.
+    fn record(&mut self, error: &str) -> bool {
+        if is_environment_error(error) {
+            self.clear();
+            return false;
+        }
+        if self.last.as_deref() == Some(error) {
+            self.count += 1;
+        } else {
+            self.last = Some(error.to_owned());
+            self.count = 1;
+        }
+        self.count >= COMPOSITION_ERROR_LIMIT
+    }
+
+    fn clear(&mut self) {
+        self.last = None;
+        self.count = 0;
+    }
+}
+
+/// Runs one execution step with interrupt registration and status publication around it.
+fn run_step(
+    service: &mut ExecutionService,
+    state: &mut ActorState,
+    registry: &ProjectRegistry,
+    shared: &Arc<ServiceShared>,
+    errors: &mut CompositionErrors,
+) {
+    let Some(control) = state.control.as_mut() else {
+        return;
+    };
+    if let Some((goal_id, handle)) = control.active_goal_interrupt() {
+        shared.set_goal_interrupt(goal_id, handle);
+    }
+    shared.begin_step();
+    let result = with_step_context(shared, || service.step(control, registry));
+    shared.end_step();
+    shared.clear_interrupt();
+    match result {
+        Ok(_) => errors.clear(),
+        Err(error) => {
+            if errors.record(&error) {
+                let failed = control
+                    .with_controller_mut(|controller| {
+                        match controller.next_queued_goal_intent()? {
+                            Some(head) => controller
+                                .fail_queued_goal_intent(
+                                    &head.goal_id,
+                                    GOAL_REASON_COMPOSITION_ERROR,
+                                    &error,
+                                )
+                                .map(Some),
+                            None => Ok(None),
+                        }
+                    })
+                    .ok()
+                    .flatten();
+                errors.clear();
+                if failed.is_some() {
+                    service.record_error(format!(
+                        "A request could not be prepared and was stopped: {error}"
+                    ));
+                } else {
+                    service.record_error(error);
+                }
+            } else {
+                service.record_error(error);
+            }
+        }
+    }
+    shared.publish_status(service.status().clone());
+}
+
 #[expect(
     clippy::too_many_lines,
     clippy::needless_pass_by_value,
     reason = "actor loop serializes every command"
 )]
-fn run_actor_loop(initial_state: PathBuf, receiver: Receiver<ActorCommand>, options: ActorOptions) {
+fn run_actor_loop(
+    initial_state: PathBuf,
+    receiver: Receiver<ActorCommand>,
+    options: ActorOptions,
+    shared: &Arc<ServiceShared>,
+) {
     let mut execution = options
         .git_root
         .as_ref()
@@ -302,12 +562,16 @@ fn run_actor_loop(initial_state: PathBuf, receiver: Receiver<ActorCommand>, opti
         let _ = registry.register("repo.local", root);
     }
     let mut actor_state = match ActorState::open(initial_state.clone()) {
-        Ok(state) => Some(state),
+        Ok(state) => {
+            shared.mark_state_ready();
+            Some(state)
+        }
         Err(err) => {
             eprintln!("controller actor initial state open failed: {err}");
             None
         }
     };
+    let mut errors = CompositionErrors::default();
 
     loop {
         let cmd = if options.execute {
@@ -320,10 +584,8 @@ fn run_actor_loop(initial_state: PathBuf, receiver: Receiver<ActorCommand>, opti
                 Ok(cmd) => Some(cmd),
                 Err(RecvTimeoutError::Timeout) => {
                     if let (Some(service), Some(state)) = (execution.as_mut(), actor_state.as_mut())
-                        && let Some(control) = state.control.as_mut()
-                        && let Err(error) = service.step(control, &registry)
                     {
-                        service.record_error(error);
+                        run_step(service, state, &registry, shared, &mut errors);
                     }
                     None
                 }
@@ -343,6 +605,7 @@ fn run_actor_loop(initial_state: PathBuf, receiver: Receiver<ActorCommand>, opti
                 break;
             }
             ActorCommand::SwitchProject {
+                ticket,
                 state_path,
                 git_root,
                 reply,
@@ -352,12 +615,14 @@ fn run_actor_loop(initial_state: PathBuf, receiver: Receiver<ActorCommand>, opti
                     None => match ActorState::open(state_path.clone()) {
                         Ok(new_state) => {
                             actor_state = Some(new_state);
+                            shared.mark_state_ready();
                             Ok(())
                         }
                         Err(e) => Err(e),
                     },
                 };
                 if res.is_ok() {
+                    shared.set_state_path(state_path.clone());
                     bind_workspace(
                         options.execute,
                         &mut execution,
@@ -365,107 +630,87 @@ fn run_actor_loop(initial_state: PathBuf, receiver: Receiver<ActorCommand>, opti
                         git_root.as_deref(),
                         &state_path,
                     );
+                    errors.clear();
+                    shared.publish_status(
+                        execution
+                            .as_ref()
+                            .map_or_else(ServiceStatusV1::default, |service| {
+                                service.status().clone()
+                            }),
+                    );
                 }
+                shared.complete(ticket);
                 let _ = reply.send(res);
             }
-            ActorCommand::SubmitGoal { goal, reply } => {
-                let res = match &mut actor_state {
-                    Some(s) if s.control.is_some() => {
-                        if let Some(control) = s.control.as_mut() {
-                            control.submit_goal(&goal).map_err(|e| e.to_string())
-                        } else {
-                            Err("controller unavailable".to_owned())
-                        }
-                    }
-                    _ => Err("actor controller state not available".to_owned()),
-                };
+            ActorCommand::SubmitGoal {
+                ticket,
+                goal,
+                reply,
+            } => {
+                let res = with_state(&mut actor_state, |control| {
+                    control.submit_goal(&goal).map_err(|e| e.to_string())
+                });
+                shared.complete(ticket);
                 let _ = reply.send(res);
             }
-            ActorCommand::Pause { reason, reply } => {
-                let res = match &mut actor_state {
-                    Some(s) if s.control.is_some() => {
-                        if let Some(control) = s.control.as_mut() {
-                            control.pause(reason.as_deref()).map_err(|e| e.to_string())
-                        } else {
-                            Err("controller unavailable".to_owned())
-                        }
-                    }
-                    _ => Err("actor controller state not available".to_owned()),
-                };
+            ActorCommand::Pause {
+                ticket,
+                reason,
+                reply,
+            } => {
+                let res = with_state(&mut actor_state, |control| {
+                    control.pause(reason.as_deref()).map_err(|e| e.to_string())
+                });
+                shared.complete(ticket);
                 let _ = reply.send(res);
             }
-            ActorCommand::Resume { reply } => {
-                let res = match &mut actor_state {
-                    Some(s) if s.control.is_some() => {
-                        if let Some(control) = s.control.as_mut() {
-                            control.resume().map_err(|e| e.to_string())
-                        } else {
-                            Err("controller unavailable".to_owned())
-                        }
-                    }
-                    _ => Err("actor controller state not available".to_owned()),
-                };
+            ActorCommand::Resume { ticket, reply } => {
+                let res = with_state(&mut actor_state, |control| {
+                    control.resume().map_err(|e| e.to_string())
+                });
+                shared.complete(ticket);
                 let _ = reply.send(res);
             }
             ActorCommand::CancelGoal {
+                ticket,
                 goal_id,
                 principal,
                 reply,
             } => {
-                let res = match &mut actor_state {
-                    Some(s) if s.control.is_some() => {
-                        if let Some(control) = s.control.as_mut() {
-                            control
-                                .cancel_goal(&goal_id, &principal)
-                                .map_err(|e| e.to_string())
-                        } else {
-                            Err("controller unavailable".to_owned())
-                        }
-                    }
-                    _ => Err("actor controller state not available".to_owned()),
-                };
+                let res = with_state(&mut actor_state, |control| {
+                    control
+                        .cancel_goal(&goal_id, &principal)
+                        .map_err(|e| e.to_string())
+                });
+                shared.complete(ticket);
                 let _ = reply.send(res);
             }
             ActorCommand::RespondToApproval {
+                ticket,
                 request_id,
                 decision,
                 principal,
                 reply,
             } => {
-                let res = match &mut actor_state {
-                    Some(s) if s.control.is_some() => {
-                        if let Some(control) = s.control.as_mut() {
-                            control
-                                .respond_to_approval(&request_id, decision, &principal)
-                                .map_err(|e| e.to_string())
-                        } else {
-                            Err("controller unavailable".to_owned())
-                        }
-                    }
-                    _ => Err("actor controller state not available".to_owned()),
-                };
-                let _ = reply.send(res);
-            }
-            ActorCommand::ServiceStatus { reply } => {
-                let status = execution
-                    .as_ref()
-                    .map_or_else(ServiceStatusV1::default, |service| service.status().clone());
-                let _ = reply.send(Ok(status));
-            }
-            ActorCommand::ReadModel { reply } => {
-                let res = match &mut actor_state {
-                    Some(s) if s.control.is_some() => {
-                        if let Some(control) = s.control.as_mut() {
-                            control.read_model().map_err(|e| e.to_string())
-                        } else {
-                            Err("controller unavailable".to_owned())
-                        }
-                    }
-                    _ => Err("actor controller state not available".to_owned()),
-                };
+                let res = with_state(&mut actor_state, |control| {
+                    control
+                        .respond_to_approval(&request_id, decision, &principal)
+                        .map_err(|e| e.to_string())
+                });
+                shared.complete(ticket);
                 let _ = reply.send(res);
             }
         }
+    }
+}
+
+fn with_state<T>(
+    actor_state: &mut Option<ActorState>,
+    apply: impl FnOnce(&mut LocalControl) -> Result<T, String>,
+) -> Result<T, String> {
+    match actor_state {
+        Some(state) => state.with_control(apply),
+        None => Err("actor controller state not available".to_owned()),
     }
 }
 
@@ -498,11 +743,17 @@ mod tests {
 
         let paused = actor
             .pause(Some("test pause".to_owned()))
-            .unwrap_or_else(|e| panic!("pause: {e}"));
+            .unwrap_or_else(|e| panic!("pause: {e}"))
+            .applied()
+            .unwrap_or_else(|| panic!("idle actor applies pause at once"));
         assert!(paused.paused);
         assert_eq!(paused.reason.as_deref(), Some("test pause"));
 
-        let resumed = actor.resume().unwrap_or_else(|e| panic!("resume: {e}"));
+        let resumed = actor
+            .resume()
+            .unwrap_or_else(|e| panic!("resume: {e}"))
+            .applied()
+            .unwrap_or_else(|| panic!("idle actor applies resume at once"));
         assert!(!resumed.paused);
 
         actor.shutdown().unwrap_or_else(|e| panic!("shutdown: {e}"));
@@ -515,6 +766,38 @@ mod tests {
         assert!(lock2.is_ok());
 
         let _ = fs::remove_file(&state_path);
+    }
+
+    #[test]
+    fn command_during_a_long_step_is_queued_not_timed_out() {
+        let (sender, receiver) = mpsc::sync_channel(ACTOR_QUEUE_BOUND);
+        let shared = ServiceShared::new(temp_state("queued-command"));
+        let actor = ControllerActorHandle {
+            sender,
+            shared: Arc::clone(&shared),
+        };
+        // Simulate the actor thread inside a long step: nothing drains the channel.
+        shared.begin_step();
+        let started = std::time::Instant::now();
+        let reply = actor
+            .pause(Some("while busy".to_owned()))
+            .unwrap_or_else(|error| panic!("pause while busy: {error}"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let Reply::Queued { ticket } = reply else {
+            panic!("a busy actor must acknowledge the command as queued");
+        };
+        let pending = actor.pending_commands();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, "pause");
+        assert_eq!(pending[0].ticket, ticket);
+
+        // The actor applies it at the next safe point and clears the pending entry.
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(ActorCommand::Pause { ticket: queued, .. }) => shared.complete(queued),
+            other => panic!("expected the queued pause, got {other:?}"),
+        }
+        shared.end_step();
+        assert!(actor.pending_commands().is_empty());
     }
 
     #[test]
@@ -541,18 +824,14 @@ mod tests {
         )
         .unwrap_or_else(|error| panic!("spawn: {error}"));
         thread::sleep(Duration::from_millis(1_200));
-        let before = actor
-            .service_status()
-            .unwrap_or_else(|error| panic!("status before: {error}"));
+        let before = actor.service_status();
         assert_eq!(before.last_outcome, "none");
 
         actor
             .switch_project(state_path.clone(), Some(repo))
             .unwrap_or_else(|error| panic!("switch: {error}"));
         thread::sleep(Duration::from_millis(1_500));
-        let after = actor
-            .service_status()
-            .unwrap_or_else(|error| panic!("status after: {error}"));
+        let after = actor.service_status();
         assert_ne!(
             after.last_outcome, "none",
             "execute tick must run after a UI project bind"
