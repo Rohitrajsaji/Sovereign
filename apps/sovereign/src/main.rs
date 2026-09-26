@@ -8,6 +8,7 @@ mod execution;
 #[cfg(any(test, feature = "e2e-fixtures"))]
 mod fixture_backend;
 mod goal_views;
+mod install;
 mod landing_service;
 mod launch_agent;
 mod launch_code;
@@ -68,7 +69,15 @@ fn render_result(result: Result<String, String>) -> ExitCode {
 fn run(args: &[String], state_path: &Path) -> Result<String, String> {
     match args.first().map(String::as_str) {
         Some("--version" | "-V") => Ok(format!("sovereign {VERSION}")),
+        // People who install Sovereign type `sovereign` to open it.
+        None if cfg!(target_os = "macos") => app_command(),
         Some("help" | "--help" | "-h") | None => Ok(help_text()),
+        Some("self-install") => {
+            let data = app_data::AppData::open_default().map_err(|error| error.to_string())?;
+            install::self_install(&install::InstallLayout::from_env()?, &data)
+        }
+        Some("update") => install::update(&install::InstallLayout::from_env()?),
+        Some("uninstall") => install::uninstall(&install::InstallLayout::from_env()?, args),
         Some("doctor") => doctor_command(args, state_path),
         Some("goal") => {
             let goal = args.get(1..).unwrap_or_default().join(" ");
@@ -609,6 +618,11 @@ fn handle_control_request(
 fn help_text() -> String {
     [
         "Sovereign local Controller CLI",
+        "",
+        "Everyday use:",
+        "  sovereign                     Open Sovereign in your browser (starts it if needed)",
+        "  update                        Install the newest release",
+        "  uninstall [--keep-data|--delete-data]  Remove Sovereign; your project folders stay",
         "",
         "Commands:",
         "  goal <natural-language goal>  Durably queue a Controller-owned goal intent",

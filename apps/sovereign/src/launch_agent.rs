@@ -15,6 +15,26 @@ use std::process::Command;
 
 pub const LABEL: &str = "dev.sovereign.agent";
 pub const DEFAULT_BIND: &str = "127.0.0.1:7777";
+const SERVICE_START_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// True once the local service accepts connections, polling for up to `wait`.
+fn service_answers(wait: std::time::Duration) -> bool {
+    let Ok(address) = DEFAULT_BIND.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    loop {
+        if std::net::TcpStream::connect_timeout(&address, std::time::Duration::from_millis(250))
+            .is_ok()
+        {
+            return true;
+        }
+        if started.elapsed() >= wait {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
 
 /// Injectable launchctl so tests never call the real daemon.
 pub trait Launchctl {
@@ -113,6 +133,16 @@ pub fn open_ui<L: Launchctl>(
         && let Err(error) = install(data, launchctl, sovereign_path, DEFAULT_BIND)
     {
         return Ok(missing_service_guidance(&error));
+    }
+    // A freshly started service needs a moment; a stopped one gets one restart.
+    if !service_answers(SERVICE_START_WAIT) {
+        let target = format!("gui/{}/{LABEL}", current_uid());
+        let _ = launchctl.run(&["kickstart", "-k", &target]);
+        if !service_answers(SERVICE_START_WAIT) {
+            return Ok(missing_service_guidance(
+                "it did not start listening on 127.0.0.1:7777",
+            ));
+        }
     }
     // A single-use, short-lived code keeps the long-lived session token out of browser history.
     let code = crate::launch_code::issue(data.root()).map_err(|error| error.to_string())?;
