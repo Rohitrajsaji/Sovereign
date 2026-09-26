@@ -4,7 +4,15 @@
 //! not grant itself authority from repository/model/tool text.
 
 pub mod browser;
+mod model_calibration;
 mod resources;
+
+pub use model_calibration::{
+    MODEL_CALIBRATION_FLOOR_MIB, MODEL_CALIBRATION_MARGIN_PERCENT,
+    MODEL_CALIBRATION_MAX_SAMPLE_MIB, MODEL_CALIBRATION_MAX_SAMPLES, MODEL_CALIBRATION_MIN_SAMPLES,
+    MODEL_CALIBRATION_SCHEMA_VERSION, ModelCalibrationKeyV1, ModelCalibrationSampleError,
+    ModelCalibrationV1,
+};
 
 pub use resources::{
     AUTONOMY_BUDGET_SCHEMA_VERSION, AdmissionStatus, AutonomyBudgetV1, ConditionalLeaseContextV1,

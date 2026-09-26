@@ -88,7 +88,8 @@ impl ExecutionService {
                     .map_err(sovereign_controller::ControllerError::InvalidPlan)
             })
             .map_err(|error| error.to_string())?;
-        self.record(&outcome, None);
+        let detail = outcome_detail(&outcome);
+        self.record(&outcome, detail.as_deref());
         Ok(outcome)
     }
 
@@ -138,6 +139,19 @@ impl ExecutionService {
     }
 }
 
+/// Human-readable reason carried by a blocked outcome, shown as the service detail.
+fn outcome_detail(outcome: &ProductionAdvanceOutcome) -> Option<String> {
+    match outcome {
+        ProductionAdvanceOutcome::Blocked {
+            reason:
+                ProductionBlockReason::Readiness(reason)
+                | ProductionBlockReason::CompilationFailed(reason),
+            ..
+        } => Some(reason.clone()),
+        _ => None,
+    }
+}
+
 fn unix_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -162,6 +176,23 @@ pub fn phase_from_read_model(paused: bool, mutation_blocked: bool) -> ServicePha
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_reason_becomes_service_detail() {
+        let mut service = ExecutionService::new(PathBuf::from("/tmp"), PathBuf::from("/tmp/state"));
+        let outcome = ProductionAdvanceOutcome::Blocked {
+            task_id: None,
+            reason: ProductionBlockReason::Readiness("waiting for memory".to_owned()),
+        };
+        let detail = outcome_detail(&outcome);
+        service.record(&outcome, detail.as_deref());
+        assert_eq!(service.status().detail, "waiting for memory");
+        assert_eq!(
+            service.status().phase,
+            ServicePhase::DeferredResource.as_str()
+        );
+        assert_eq!(outcome_detail(&ProductionAdvanceOutcome::Idle), None);
+    }
 
     #[test]
     fn idle_and_progress_backoff() {
