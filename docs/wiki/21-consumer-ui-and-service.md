@@ -12,7 +12,7 @@ The UI and HTTP API are clients. They never write SQLite. Mutations go through `
 
 ## Token and CSP
 
-At serve start a 32-byte token is written to `~/Library/Application Support/Sovereign/service-token` (mode 0600). `GET /?t=<token>` sets `sovereign_session` (`HttpOnly`, `SameSite=Strict`). Every `/v2/*` request needs that cookie. POSTs also need `X-Sovereign-CSRF` equal to the session token from `GET /v2/session`.
+At serve start a 32-byte token is written to `~/Library/Application Support/Sovereign/service-token` (mode 0600). `sovereign app` writes a single-use launch code (`launch-code`, mode 0600, 60 s TTL, `apps/sovereign/src/launch_code.rs`) and opens `/?c=<code>`. The service redeems it once and sets `sovereign_session` (`HttpOnly`, `SameSite=Strict`), so the long-lived token never appears in a URL. `GET /?t=<token>` still sets the cookie for the e2e harness. Every `/v2/*` request needs the cookie or a bearer token; a `?t=` query no longer authenticates `/v2`. POSTs also need `X-Sovereign-CSRF` equal to the session token from `GET /v2/session`.
 
 Every response includes:
 
@@ -37,7 +37,9 @@ New project state lives outside the git root. Environment variables still overri
 
 ## LaunchAgent
 
-`sovereign service install` writes `~/Library/LaunchAgents/dev.sovereign.agent.plist` with `serve --execute 127.0.0.1:7777`. `sovereign app` installs if needed, reads the token, and opens `http://127.0.0.1:7777/?t=<token>` with `/usr/bin/open`.
+`sovereign service install` writes `~/Library/LaunchAgents/dev.sovereign.agent.plist` with `serve --execute 127.0.0.1:7777` and `ThrottleInterval` 30. `sovereign app` installs if needed, issues a launch code, and opens `http://127.0.0.1:7777/?c=<code>` with `/usr/bin/open`.
+
+`logs/stdout.log` and `logs/stderr.log` are capped at 10 MiB (`service_logs.rs`). The newest 2 MiB go to `<name>.1` and the live file is truncated in place so launchd's append handle stays valid. Rotation runs at serve start and every ten minutes. A busy port produces a message naming the address and the next step.
 
 ## UI
 

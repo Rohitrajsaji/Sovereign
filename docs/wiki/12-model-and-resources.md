@@ -21,7 +21,7 @@ The runner reads `SOVEREIGN_MODEL_RUNTIME`, `SOVEREIGN_MODEL_PATH`, and `SOVEREI
 
 ## What `sovereign run` loads
 
-`apps/sovereign/src/runner.rs` sets capability `max_context_tokens` to 16384. The load call uses context 8192 and reserve 1536, so the server `-c` is 9728. Controller output cap for the M1 slice is `M1_MODEL_OUTPUT_TOKENS` = 512. Uncalibrated model admission is `M1_MODEL_UNCALIBRATED_ADMISSION_MIB` = 4096.
+`apps/sovereign/src/runner.rs` sets capability `max_context_tokens` to 16384. The load call uses context 8192 and reserve 1536, so the server `-c` is 9728. Controller output cap for the M1 slice is `M1_MODEL_OUTPUT_TOKENS` = 512. Uncalibrated model admission is `M1_MODEL_UNCALIBRATED_ADMISSION_MIB` = 4096. A measured calibration replaces it (see below).
 
 Compilation may call the model at most twice (`MAX_COMPILER_MODEL_CALLS`). A timed-out call consumes a model-call budget unit and cannot retry outside Controller counters.
 
@@ -64,6 +64,18 @@ Pressure bands are `PressureBand::{Green, Guarded, Constrained, Emergency}`. Gua
 Uncommitted qualification tests distinguish "compiler model boundary is not reached without frozen headroom" from "admitted compiler model boundary can begin at 69 percent." Do not lower the hard working set to make a launch succeed.
 
 `admit_rust_verification` is the narrower build admission described in [09-tools-sandbox-processes.md](09-tools-sandbox-processes.md). It does not raise the RSS ceiling.
+
+## Calibration
+
+Added 2026-09-26. `ModelCalibrationV1` (`crates/sovereign-policy/src/model_calibration.rs`) holds measured peak RSS samples for one key: model identity, server context (9728 on this profile), profile id, and profile digest. The estimate is the largest sample plus 15 percent, floor 1024 MiB, and needs at least 3 samples. A larger sample always raises it.
+
+`crates/sovereign-controller/src/model_calibration.rs` stores it in namespace `controller.model_calibration` (CAS write plus a `model_calibration_sample_recorded` event). Samples come from Controller-owned loads (`startup_peak_rss_kb`, `post_load_rss_kb`) and calls (`peak_rss_kb_during_call` through `PeakRssRecorder`). A failed sample write never changes a task outcome. MODEL admission uses the estimate when one exists, otherwise 4096.
+
+The runner sets the identity from the canonical path, size, and mtime of the runtime and weights plus the model name, so replacing a file starts uncalibrated again. Fixture backends never calibrate. State is per project database.
+
+Before plan compilation loads the model, `Controller::compilation_model_admission` asks the governor whether a MODEL lease of the current estimate would be admitted. It holds no lease. A deferral or a failed pressure probe returns `Blocked { Readiness(reason) }` and `llama-server` is not started. Before 2026-09-26 the compile path loaded the model with no governor admission.
+
+Arithmetic to keep in mind: 3130 MiB measured becomes a 3600 MiB estimate, which needs about 5136 MiB of headroom with the 1536 soft launch reserve. The CX-T25 host had 3686, so it still defers there.
 
 ## Residency
 

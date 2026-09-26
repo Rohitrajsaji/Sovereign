@@ -16,7 +16,7 @@ You need `/usr/bin/git`, `/usr/bin/python3`, and `/usr/bin/sandbox-exec` on macO
 sovereign app
 ```
 
-That starts `sovereign serve --execute` through a LaunchAgent if needed and opens `http://127.0.0.1:7777/?t=<token>`. Or run `sovereign serve --execute 127.0.0.1:7777` yourself and open the printed URL.
+That starts `sovereign serve --execute` through a LaunchAgent if needed and opens the UI with a one-time link that expires after a minute. Run `sovereign app` again whenever you need a new one. Or run `sovereign serve --execute 127.0.0.1:7777` yourself and open the printed URL.
 
 Complete onboarding: doctor checks, choose existing model files, paste a git repository path.
 
@@ -25,6 +25,12 @@ Complete onboarding: doctor checks, choose existing model files, paste a git rep
 Type a bounded engineering goal. Sovereign queues it. The Controller compiles and executes. Verification, not the model, marks work complete.
 
 Pause and resume from Home. Cancel from the goal page. Cancel does not roll back git work. A dispatched action without a receipt is `unknown`.
+
+## Waiting for memory
+
+On an 8 GB Mac the model needs several gigabytes free. If Home says Sovereign is waiting for memory, it shows how much the model needs and how much is free. Close other apps. Sovereign retries on its own. After a few successful runs Sovereign measures the model's real memory use, and the requirement can drop.
+
+Turn on desktop notifications in Settings to hear about approvals, recovery, and finished goals while the tab is in the background.
 
 ## Approvals
 

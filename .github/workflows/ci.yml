@@ -1,0 +1,110 @@
+# Sovereign CI.
+#
+# The product targets macOS on Apple Silicon: `sandbox-exec`, the memory probe, and launchd are
+# macOS-only, so the full gate runs on a macOS arm64 runner. Linux runs the fast lint and the UI
+# gate. Real-model tests stay `#[ignore]` and are run by hand on the M1 (see
+# docs/wiki/15-testing-and-evals.md).
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lint-linux:
+    name: fmt and clippy (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  ui:
+    name: UI gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/sovereign/ui/package-lock.json
+      - run: ./scripts/verify-ui.sh
+      - name: Committed ui-dist matches a fresh build
+        run: |
+          if ! git diff --quiet -- apps/sovereign/ui-dist || [ -n "$(git ls-files --others --exclude-standard apps/sovereign/ui-dist)" ]; then
+            echo "apps/sovereign/ui-dist is stale. Run scripts/verify-ui.sh and commit the result." >&2
+            git status --short apps/sovereign/ui-dist >&2
+            exit 1
+          fi
+
+  verify-macos:
+    name: verify.sh (macOS arm64)
+    runs-on: macos-14
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/sovereign/ui/package-lock.json
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/verify.sh
+
+  e2e-macos:
+    name: Playwright e2e (macOS arm64)
+    runs-on: macos-14
+    timeout-minutes: 45
+    needs: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/sovereign/ui/package-lock.json
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: ./scripts/e2e.sh
+      - name: Upload server logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-server-logs
+          path: |
+            target/e2e-server.out
+            target/e2e-server.err
+            apps/sovereign/ui/test-results/
+          if-no-files-found: ignore
+
+  evidence:
+    name: Evidence freshness report
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # Report only. Stale evidence is expected after later commits and is a review signal.
+      - run: python3 scripts/evidence-freshness.py

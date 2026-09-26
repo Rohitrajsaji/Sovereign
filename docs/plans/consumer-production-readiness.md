@@ -12,7 +12,27 @@ The engine (M0–M9, PD-T01–T06) and the consumer shell (CX-T03–T24) exist. 
 
 Everything below is ordered so those three close first.
 
-## What was checked in this session
+## Progress (2026-09-26, branch `claude/festive-lovelace-iubm17`)
+
+| Item | State | Where |
+| --- | --- | --- |
+| P0.1 measured calibration | **Done in code.** Needs M1 runs to gather samples. | `sovereign-policy/src/model_calibration.rs`, `sovereign-controller/src/model_calibration.rs`, wiki 12 |
+| New finding: compile path loaded the model without governor admission | **Fixed.** `compilation_model_admission` gates the load | `apps/sovereign/src/runner.rs` |
+| P0.2 memory guidance | **Partly done.** Deferral reason (needed vs free MiB) reaches Home. Smaller-context fallback still needs an owner decision | `execution.rs`, `ui/src/lib/status.ts` |
+| P0.3 close CX-T25/T26 | Open. Needs the M1 | — |
+| P0.4 green gate on M1 | Open. Evidence freshness script **done** | `scripts/evidence-freshness.py` |
+| P0.5 landing path | Open | — |
+| P2 log caps, launchd throttle, port message | **Done** | `service_logs.rs`, `launch_agent.rs`, `control_api/mod.rs` |
+| P3.1 notifications | **Done** (in-app plus opt-in desktop) | `ui/src/lib/notify.ts` |
+| P3.2 status copy for every outcome | **Done**, with a test that fails on a new variant | `ui/src/test/status.test.ts` |
+| P4 token in URL | **Done.** Single-use launch code; `?t=` no longer authenticates `/v2` | `launch_code.rs` |
+| P5.1 CI | **Added.** Not yet observed green: expect the live-Chrome case to fail on macOS until P0.4 | `.github/workflows/ci.yml` |
+| P5.2 Linux clippy | **Done** | — |
+| P5.3 build noise | **Done** | `.gitignore` |
+
+Also found: `cargo clippy -p sovereign --all-features` fails on the `sovereign-e2e-server` binary (dead code from modules shared by `#[path]`). It predates this work and is outside `verify.sh`. CI builds that binary through `e2e.sh`, which does not deny warnings.
+
+
 
 | Check | Result |
 | --- | --- |
