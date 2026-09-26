@@ -3,7 +3,7 @@
 // Schema: schemas/control-api-v2.json (types in ./generated).
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { api, connectEvents, setCsrfToken } from "./client";
 import type {
   DeveloperToolsInstallResponse,
@@ -81,13 +81,34 @@ function anyGoalRunning(goals: GoalView[] | undefined): boolean {
   return (goals ?? []).some((goal) => !goal.progress.terminal);
 }
 
+/**
+ * True while a chosen project waits for the current step to finish. Until then the service still
+ * reads the previous project, so its requests, preview, and files are not this project's.
+ */
+export function isSwitchingProject(overview: OverviewResponse | undefined): boolean {
+  return (overview?.pending_commands ?? []).some((command) => command.kind === "switch_project");
+}
+
 export function useOverview(enabled: boolean) {
   return useQuery({
     queryKey: keys.overview,
     queryFn: () => api<OverviewResponse>("/v2/overview"),
     enabled,
-    refetchInterval: (query) => (query.state.data?.working ? WORKING_POLL_MS : false),
+    refetchInterval: (query) =>
+      query.state.data?.working || isSwitchingProject(query.state.data) ? WORKING_POLL_MS : false,
   });
+}
+
+/** Reloads everything once a project switch that had to wait is applied. */
+export function useProjectSwitchRefresh(switching: boolean) {
+  const client = useQueryClient();
+  const previous = useRef(switching);
+  useEffect(() => {
+    if (previous.current && !switching) {
+      void client.invalidateQueries();
+    }
+    previous.current = switching;
+  }, [client, switching]);
 }
 
 export function useGoals(enabled: boolean) {

@@ -17,7 +17,7 @@ The UI and HTTP API are clients. They never write SQLite. Mutations go through `
 
 **Reads never wait on the actor** (`actor.rs`). HTTP reads open read-only handles on the current project database once the actor marks it ready.
 
-**Commands answer quickly.** A command sent while a long step runs is acknowledged as queued with a ticket. `ServiceShared::pending` lists queued commands until the actor applies them. Cancel interrupts in-flight work at once: it cancels the goal's task handles, or unloads the model during a compile.
+**Commands answer quickly.** A command sent while a long step runs is acknowledged as queued with a ticket, including one sent just before the step starts. Saving "Your edits" and landing count as part of the step. `ServiceShared::pending` lists queued commands until the actor applies them. Cancel interrupts in-flight work at once: it cancels the goal's task handles, or unloads the model during a compile.
 
 `serve --execute` runs `ExecutionService::step` inside the actor between commands. Backoff is 1 s, 2 s, cap 10 s while idle, paused, blocked, or deferred. Progress outcomes reset backoff to 0. Unknown outcomes are never retried. A composition error that repeats three times fails the queued goal (`GOAL_REASON_COMPOSITION_ERROR`). Environment errors, such as a missing model or sandbox, never fail a goal.
 
@@ -110,6 +110,8 @@ The installed app lives in `~/.sovereign/versions/<version>/`, with `current` sw
 - **Rendering rules.** Untrusted text is always a text node, and `dangerouslySetInnerHTML` is banned by ESLint. `src/api/generated.ts` is generated from `schemas/control-api-v2.json`.
 
 Requests poll every 1.5 s while any is running, because a model call emits no events. The event stream refreshes goals and the overview on every journal event.
+
+A project switch that waits for the current step shows as `switch_project` in the overview's `pending_commands`. Until it applies, reads still come from the previous project, so the workspace shows the chosen project as opening instead of that project's requests, preview, and files. The overview polls, and everything reloads once the switch applies.
 
 `scripts/verify-ui.sh` runs the following when `node` exists:
 

@@ -35171,6 +35171,8 @@ mod tests {
             Some("cancelled_before_dispatch".to_owned())
         );
 
+        // Outcomes are ordered by the millisecond they were recorded.
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let failed = controller
             .fail_queued_goal_intent(
                 &second.goal_id,

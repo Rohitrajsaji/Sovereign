@@ -262,7 +262,8 @@ pub struct PlanAbandonmentV1 {
     pub abandoned_at_ms: i64,
 }
 
-/// Reads every recorded goal outcome, newest last.
+/// Reads every recorded goal outcome, oldest first by the millisecond it was recorded. Outcomes
+/// recorded in the same millisecond are in goal id order.
 ///
 /// # Errors
 /// Returns a state or decoding error.

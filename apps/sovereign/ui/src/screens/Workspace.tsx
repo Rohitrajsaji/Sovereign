@@ -7,10 +7,12 @@ import { CircleHelp, PanelRightOpen, Plus, Settings } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { GoalView, SetupStatus } from "../api/generated";
 import {
+  isSwitchingProject,
   useActivateProject,
   useGoals,
   useOverview,
   useProjects,
+  useProjectSwitchRefresh,
   useResume,
   useSettings,
 } from "../api/query";
@@ -71,6 +73,9 @@ export function Workspace({ setup, onOpenSetup }: { setup: SetupStatus | undefin
   const ready = setup?.ready ?? false;
   const status = serviceLine(overview.data?.working ?? false, paused, running, ready);
   const retry = useRetry(toast);
+  // Until a chosen project opens, requests and the preview still come from the previous one.
+  const switching = isSwitchingProject(overview.data);
+  useProjectSwitchRefresh(switching);
 
   useEffect(() => {
     const notice = goalNotice(previousGoals.current, list);
@@ -85,7 +90,7 @@ export function Workspace({ setup, onOpenSetup }: { setup: SetupStatus | undefin
     // A new project starts with an empty conversation and its own preview.
     previousGoals.current = undefined;
     setSelectedGoal(undefined);
-  }, [activeId]);
+  }, [activeId, switching]);
 
   const detailsGoal = list.find((goal) => goal.goal_id === selectedGoal) ?? list.at(-1);
 
@@ -175,7 +180,13 @@ export function Workspace({ setup, onOpenSetup }: { setup: SetupStatus | undefin
                 </Notice>
               </div>
             ) : null}
-            {goals.isPending ? (
+            {switching ? (
+              <div className="conversation">
+                <div className="conversation-inner">
+                  <Spinner label={`Opening ${active.display_name}. Sovereign finishes its current step first.`} />
+                </div>
+              </div>
+            ) : goals.isPending ? (
               <div className="conversation">
                 <div className="conversation-inner">
                   <Spinner label="Loading this project" />
@@ -233,9 +244,10 @@ export function Workspace({ setup, onOpenSetup }: { setup: SetupStatus | undefin
           tab={tab}
           onTabChange={setTab}
           onClose={() => setPanelOpen(false)}
-          goal={detailsGoal}
+          goal={switching ? undefined : detailsGoal}
           serviceDetail={overview.data?.service_phase === "error" ? overview.data.detail : undefined}
           reloadKey={resultKey(activeId, list)}
+          opening={switching}
         />
       ) : null}
 

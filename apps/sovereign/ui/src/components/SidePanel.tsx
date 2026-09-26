@@ -200,6 +200,7 @@ export function SidePanel({
   goal,
   serviceDetail,
   reloadKey,
+  opening = false,
 }: {
   tab: PanelTab;
   onTabChange: (tab: PanelTab) => void;
@@ -207,6 +208,8 @@ export function SidePanel({
   goal: GoalView | undefined;
   serviceDetail?: string;
   reloadKey: string;
+  /** The chosen project hasn't opened yet: the preview and files would be the previous one's. */
+  opening?: boolean;
 }) {
   return (
     <aside className="panel" aria-label="Preview and details">
@@ -233,10 +236,10 @@ export function SidePanel({
           </IconButton>
         </div>
         <TabsPrimitive.Content className="tab-content" value="preview">
-          <PreviewTab reloadKey={reloadKey} />
+          {opening ? <Spinner label="Opening the project" /> : <PreviewTab reloadKey={reloadKey} />}
         </TabsPrimitive.Content>
         <TabsPrimitive.Content className="tab-content" value="files">
-          <FilesTab key={reloadKey} />
+          {opening ? <Spinner label="Opening the project" /> : <FilesTab key={reloadKey} />}
         </TabsPrimitive.Content>
         <TabsPrimitive.Content className="tab-content" value="details">
           <DetailsTab goal={goal} serviceDetail={serviceDetail} />

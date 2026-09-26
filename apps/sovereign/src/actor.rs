@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::execution::{ExecutionService, ServiceStatusV1};
 use crate::landing_service::{self, LandingRecordV1, ProjectWorkspace};
@@ -31,6 +31,8 @@ const ACTOR_QUEUE_BOUND: usize = 64;
 const IDLE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a command waits while a step runs before it is acknowledged as queued.
 const BUSY_REPLY_TIMEOUT: Duration = Duration::from_millis(600);
+/// How often a waiting command checks whether the actor has started a step.
+const REPLY_POLL: Duration = Duration::from_millis(50);
 /// Identical composition errors in a row before the queued goal is failed.
 const COMPOSITION_ERROR_LIMIT: u32 = 3;
 const STATE_READY_POLLS: u32 = 40;
@@ -446,17 +448,25 @@ impl ControllerActorHandle {
                 TrySendError::Disconnected(_) => "controller actor is not running".to_owned(),
             });
         }
-        let wait = if self.shared.is_busy() {
-            BUSY_REPLY_TIMEOUT
-        } else {
-            IDLE_REPLY_TIMEOUT
-        };
-        match rx.recv_timeout(wait) {
-            Ok(result) => result.map(Reply::Applied),
-            Err(RecvTimeoutError::Timeout) => Ok(Reply::Queued { ticket }),
-            Err(RecvTimeoutError::Disconnected) => {
-                self.shared.complete(ticket);
-                Err("controller actor disconnected".to_owned())
+        // Busy is checked again while waiting: a command sent just before a step starts is
+        // acknowledged as queued once the step begins, instead of waiting the idle timeout.
+        let started = Instant::now();
+        loop {
+            let limit = if self.shared.is_busy() {
+                BUSY_REPLY_TIMEOUT
+            } else {
+                IDLE_REPLY_TIMEOUT
+            };
+            let Some(left) = limit.checked_sub(started.elapsed()) else {
+                return Ok(Reply::Queued { ticket });
+            };
+            match rx.recv_timeout(left.min(REPLY_POLL)) {
+                Ok(result) => return result.map(Reply::Applied),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.shared.complete(ticket);
+                    return Err("controller actor disconnected".to_owned());
+                }
             }
         }
     }
@@ -701,15 +711,16 @@ fn run_step(
     let Some(control) = state.control.as_mut() else {
         return;
     };
+    // Busy from the first Git command to the last, so commands sent meanwhile are acknowledged
+    // as queued instead of waiting the idle timeout.
+    shared.begin_step();
     if let Some(workspace) = workspace {
         prepare_folder_for_planning(control, workspace);
     }
     if let Some((goal_id, handle)) = control.active_goal_interrupt() {
         shared.set_goal_interrupt(goal_id, handle);
     }
-    shared.begin_step();
     let result = with_step_context(shared, || service.step(control, registry));
-    shared.end_step();
     shared.clear_interrupt();
     match result {
         Ok(_) => errors.clear(),
@@ -746,6 +757,7 @@ fn run_step(
     if let Some(workspace) = workspace {
         land_finished_goals(control, workspace);
     }
+    shared.end_step();
     shared.publish_status(service.status().clone());
 }
 
@@ -1100,6 +1112,38 @@ mod tests {
         }
         shared.end_step();
         assert!(actor.pending_commands().is_empty());
+    }
+
+    #[test]
+    fn command_sent_just_before_a_step_is_queued_once_the_step_starts() {
+        let (sender, _receiver) = mpsc::sync_channel(ACTOR_QUEUE_BOUND);
+        let shared = ServiceShared::new(temp_state("step-starts"));
+        let actor = ControllerActorHandle {
+            sender,
+            shared: Arc::clone(&shared),
+        };
+        // The actor is between steps when the command arrives, then starts a long step.
+        let step_thread = {
+            let shared = Arc::clone(&shared);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(200));
+                shared.begin_step();
+            })
+        };
+        let started = Instant::now();
+        let reply = actor
+            .pause(None)
+            .unwrap_or_else(|error| panic!("pause before a step: {error}"));
+        let waited = started.elapsed();
+        step_thread
+            .join()
+            .unwrap_or_else(|_| panic!("join step thread"));
+        assert!(
+            waited < Duration::from_secs(2),
+            "waited {waited:?}: once a step starts, the idle timeout no longer applies"
+        );
+        assert!(matches!(reply, Reply::Queued { .. }));
+        shared.end_step();
     }
 
     #[test]
