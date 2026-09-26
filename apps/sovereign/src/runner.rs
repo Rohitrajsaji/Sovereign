@@ -284,8 +284,18 @@ fn configured_model_paths() -> (Option<PathBuf>, Option<PathBuf>) {
     (runtime, model)
 }
 
+/// The model's name: the environment, then Settings (written by onboarding's download), then
+/// the default pinned model.
 fn configured_model_name() -> String {
-    env::var("SOVEREIGN_MODEL_NAME").unwrap_or_else(|_| "Qwen3-4B-Q4_K_M".to_owned())
+    env::var("SOVEREIGN_MODEL_NAME")
+        .ok()
+        .or_else(|| {
+            crate::app_data::AppData::open_default()
+                .and_then(|data| data.load_settings())
+                .ok()
+                .and_then(|settings| settings.model_name)
+        })
+        .unwrap_or_else(|| "Qwen3-4B-Q4_K_M".to_owned())
 }
 
 /// Cheap identity for model calibration: canonical path, size, and modification time of the

@@ -279,6 +279,20 @@ pub(crate) fn parse_control_request(
                 ControlApiRequest::ApplyGoal { goal_id }
             })
         }
+        ("GET", "/v2/setup") => {
+            require_empty_body(body)?;
+            Ok(ControlApiRequest::SetupStatus)
+        }
+        ("POST", "/v2/setup/model/cancel") => {
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &[])?;
+            Ok(ControlApiRequest::CancelModelDownload)
+        }
+        ("POST", "/v2/setup/developer-tools/install") => {
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &[])?;
+            Ok(ControlApiRequest::InstallDeveloperTools)
+        }
         ("POST", "/v2/setup/model/download") => {
             let value = parse_optional_json_object(body)?;
             require_only_fields(&value, &["confirmation"])?;

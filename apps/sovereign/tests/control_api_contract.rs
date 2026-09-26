@@ -222,6 +222,19 @@ fn control_api_v2_live_serve_matches_frozen_schema() {
     assert_eq!(listed["projects"].as_array().map(Vec::len), Some(2));
     assert_eq!(listed["active_project_id"], opened["project"]["project_id"]);
 
+    let (status, setup) = http(
+        &addr,
+        &format!("GET /v2/setup HTTP/1.1\r\nHost: 127.0.0.1\r\n{cookie}\r\n"),
+    );
+    assert_eq!(status, 200, "{setup}");
+    assert!(load_validator("SetupStatus").is_valid(&setup), "{setup}");
+    let (status, cancelled) = post("/v2/setup/model/cancel", &json!({}));
+    assert_eq!(status, 200, "{cancelled}");
+    assert!(
+        load_validator("DownloadResponse").is_valid(&cancelled),
+        "{cancelled}"
+    );
+
     // Undo and Apply exist and explain, in words, why there is nothing to do yet.
     for action in ["undo", "apply"] {
         let (status, refused) = post(&format!("/v2/goals/{goal_id}/{action}"), &json!({}));

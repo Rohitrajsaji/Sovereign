@@ -30,6 +30,8 @@ mod launch_agent;
 mod launch_code;
 #[path = "model_assets.rs"]
 mod model_assets;
+#[path = "model_setup.rs"]
+mod model_setup;
 #[path = "projections.rs"]
 mod projections;
 #[path = "projects.rs"]

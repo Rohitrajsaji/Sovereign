@@ -220,3 +220,50 @@ export type QueuedCommandResponse = {
   ticket: number;
   message: string;
 };
+
+export type MachineInfo = {
+  supported: boolean;
+  apple_silicon: boolean;
+  memory_mib: number | null;
+  free_disk_mib: number | null;
+  problems: Array<string>;
+};
+
+export type DeveloperTools = {
+  installed: boolean;
+  detail: string;
+};
+
+export type ModelChoice = {
+  id: string;
+  display_name: string;
+  size_bytes: number;
+};
+
+export type DownloadProgress = {
+  phase: "idle" | "checking" | "downloading_runtime" | "downloading_model" | "verifying" | "done" | "failed" | "cancelled";
+  bytes_done: number;
+  bytes_total: number;
+  percent: number;
+  detail: string;
+};
+
+export type SetupStatus = {
+  schema_version: number;
+  machine: MachineInfo;
+  developer_tools: DeveloperTools;
+  model: ModelChoice | null;
+  runtime_ready: boolean;
+  model_ready: boolean;
+  download: DownloadProgress;
+  ready: boolean;
+};
+
+export type DownloadResponse = {
+  download: DownloadProgress;
+};
+
+export type DeveloperToolsInstallResponse = {
+  started: boolean;
+  detail: string;
+};

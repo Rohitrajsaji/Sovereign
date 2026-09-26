@@ -180,6 +180,12 @@ impl ControllerActorHandle {
         self.shared.pending()
     }
 
+    /// Onboarding's model download, which runs beside the actor.
+    #[must_use]
+    pub fn model_setup(&self) -> Arc<crate::model_setup::ModelSetup> {
+        self.shared.model_setup()
+    }
+
     /// Opens a read handle on the current project database. Waits briefly while the actor is
     /// still opening it, and retries a busy database a few times.
     ///

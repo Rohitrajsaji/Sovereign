@@ -10,6 +10,7 @@
 //! is still recorded by the Controller at the next safe point.
 
 use crate::execution::ServiceStatusV1;
+use crate::model_setup::ModelSetup;
 use serde::Serialize;
 use sovereign_controller::CancellationHandle;
 use sovereign_model::ModelBackend;
@@ -52,6 +53,8 @@ pub struct ServiceShared {
     pending: Mutex<Vec<PendingCommandV1>>,
     next_ticket: AtomicU64,
     interrupt: Mutex<InterruptTarget>,
+    /// Onboarding's model download. It runs beside the actor and never touches Controller state.
+    model_setup: Arc<ModelSetup>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -77,7 +80,13 @@ impl ServiceShared {
             pending: Mutex::new(Vec::new()),
             next_ticket: AtomicU64::new(1),
             interrupt: Mutex::new(InterruptTarget::default()),
+            model_setup: Arc::new(ModelSetup::default()),
         })
+    }
+
+    #[must_use]
+    pub fn model_setup(&self) -> Arc<ModelSetup> {
+        Arc::clone(&self.model_setup)
     }
 
     /// The state database of the project the actor currently holds.

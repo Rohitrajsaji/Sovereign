@@ -6,7 +6,9 @@
 
 use crate::actor::{ControllerActorHandle, Reply};
 use crate::control_api::ControlApiRequest;
-use crate::{app_data, doctor, goal_views, landing_service, model_assets, projections, projects};
+use crate::{
+    app_data, doctor, goal_views, landing_service, model_assets, model_setup, projections, projects,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sovereign_controller::ApprovalDecisionV1;
@@ -102,11 +104,45 @@ pub(crate) fn artifact_response(
     }
 }
 
-pub(crate) fn download_model_response(confirmation: Option<&str>) -> Result<Value, String> {
-    if confirmation.is_none() {
-        return Err("download without the confirmation token is rejected".to_owned());
-    }
-    Err("model download is disabled because the committed manifest has no URL".to_owned())
+/// Where onboarding keeps the runtime and model, and what Settings already points at.
+fn setup_context() -> Result<(model_setup::SetupPaths, app_data::SettingsV1), String> {
+    let data = app_data::AppData::open_default().map_err(|e| e.to_string())?;
+    let settings = data.load_settings().unwrap_or_default();
+    Ok((
+        model_setup::SetupPaths {
+            app_data: data.root().to_path_buf(),
+        },
+        settings,
+    ))
+}
+
+fn setup_status(actor: &ControllerActorHandle) -> Result<Value, String> {
+    let (paths, settings) = setup_context()?;
+    let status = actor.model_setup().status(
+        &paths,
+        settings.model_runtime.as_deref().map(Path::new),
+        settings.model_path.as_deref().map(Path::new),
+    );
+    serde_json::to_value(status).map_err(|e| e.to_string())
+}
+
+/// Starts the pinned download and saves the installed paths in Settings when it finishes.
+fn start_model_download(actor: &ControllerActorHandle) -> Result<Value, String> {
+    let (paths, settings) = setup_context()?;
+    let progress = actor.model_setup().start(
+        paths,
+        settings.model_runtime.as_deref().map(PathBuf::from),
+        |installed| {
+            if let Ok(data) = app_data::AppData::open_default() {
+                let mut settings = data.load_settings().unwrap_or_default();
+                settings.model_runtime = Some(installed.runtime.display().to_string());
+                settings.model_path = Some(installed.model.display().to_string());
+                settings.model_name = Some(installed.model_name.clone());
+                let _ = data.save_settings(&settings);
+            }
+        },
+    )?;
+    Ok(json!({ "download": progress }))
 }
 
 #[expect(clippy::too_many_lines, reason = "v2 dispatch is an explicit match")]
@@ -369,8 +405,19 @@ pub(crate) fn handle_actor_request(
                 .ok_or_else(|| format!("not found: approval {request_id}"))
                 .and_then(|item| serde_json::to_value(item).map_err(|e| e.to_string()))
         }
-        ControlApiRequest::DownloadModel { confirmation } => {
-            download_model_response(confirmation.as_deref())
+        ControlApiRequest::DownloadModel { .. } => start_model_download(actor),
+        ControlApiRequest::SetupStatus => setup_status(actor),
+        ControlApiRequest::CancelModelDownload => {
+            let setup = actor.model_setup();
+            setup.cancel();
+            Ok(json!({ "download": setup.progress() }))
+        }
+        ControlApiRequest::InstallDeveloperTools => {
+            model_setup::install_developer_tools()?;
+            Ok(json!({
+                "started": true,
+                "detail": "Apple's installer is open. When it finishes, choose Check again.",
+            }))
         }
     }
 }

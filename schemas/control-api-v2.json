@@ -865,6 +865,194 @@
           "type": "string"
         }
       }
+    },
+    "MachineInfo": {
+      "type": "object",
+      "required": [
+        "supported",
+        "apple_silicon",
+        "memory_mib",
+        "free_disk_mib",
+        "problems"
+      ],
+      "properties": {
+        "supported": {
+          "type": "boolean"
+        },
+        "apple_silicon": {
+          "type": "boolean"
+        },
+        "memory_mib": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "free_disk_mib": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "problems": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "DeveloperTools": {
+      "type": "object",
+      "required": [
+        "installed",
+        "detail"
+      ],
+      "properties": {
+        "installed": {
+          "type": "boolean"
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelChoice": {
+      "type": "object",
+      "required": [
+        "id",
+        "display_name",
+        "size_bytes"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DownloadProgress": {
+      "type": "object",
+      "required": [
+        "phase",
+        "bytes_done",
+        "bytes_total",
+        "percent",
+        "detail"
+      ],
+      "properties": {
+        "phase": {
+          "type": "string",
+          "enum": [
+            "idle",
+            "checking",
+            "downloading_runtime",
+            "downloading_model",
+            "verifying",
+            "done",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "bytes_done": {
+          "type": "integer"
+        },
+        "bytes_total": {
+          "type": "integer"
+        },
+        "percent": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SetupStatus": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "machine",
+        "developer_tools",
+        "model",
+        "runtime_ready",
+        "model_ready",
+        "download",
+        "ready"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer"
+        },
+        "machine": {
+          "$ref": "#/definitions/MachineInfo"
+        },
+        "developer_tools": {
+          "$ref": "#/definitions/DeveloperTools"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/ModelChoice"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "runtime_ready": {
+          "type": "boolean"
+        },
+        "model_ready": {
+          "type": "boolean"
+        },
+        "download": {
+          "$ref": "#/definitions/DownloadProgress"
+        },
+        "ready": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DownloadResponse": {
+      "type": "object",
+      "required": [
+        "download"
+      ],
+      "properties": {
+        "download": {
+          "$ref": "#/definitions/DownloadProgress"
+        }
+      },
+      "additionalProperties": false
+    },
+    "DeveloperToolsInstallResponse": {
+      "type": "object",
+      "required": [
+        "started",
+        "detail"
+      ],
+      "properties": {
+        "started": {
+          "type": "boolean"
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

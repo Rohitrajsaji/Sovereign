@@ -98,6 +98,9 @@ pub(crate) enum ControlApiRequest {
     DownloadModel {
         confirmation: Option<String>,
     },
+    SetupStatus,
+    CancelModelDownload,
+    InstallDeveloperTools,
     GetRecovery,
     VerifyModel {
         runtime_path: String,

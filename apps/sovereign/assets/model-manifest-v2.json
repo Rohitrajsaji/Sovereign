@@ -1,0 +1,23 @@
+{
+  "schema_version": 2,
+  "runtime": {
+    "id": "llama.cpp-b10516-macos-arm64",
+    "archive_url": "https://github.com/ggml-org/llama.cpp/releases/download/b10516/llama-b10516-bin-macos-arm64.tar.gz",
+    "archive_sha256": "ee3324327d621026ae80c24031670e65fa62a0b23a3a027dbe2f65f240affd30",
+    "archive_size_bytes": 11089823,
+    "executable_name": "llama-server",
+    "executable_sha256": "d0878274b8d6bd3c8ea26a78eb66cd1ffd943d007c62b9dff31c8aa99922d713"
+  },
+  "models": [
+    {
+      "id": "qwen3-4b-q4_k_m",
+      "display_name": "Qwen3 4B",
+      "model_name": "Qwen3-4B-Q4_K_M",
+      "file_name": "Qwen3-4B-Q4_K_M.gguf",
+      "url": "https://huggingface.co/Qwen/Qwen3-4B-GGUF/resolve/bc640142c66e1fdd12af0bd68f40445458f3869b/Qwen3-4B-Q4_K_M.gguf",
+      "sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+      "size_bytes": 2497280256,
+      "min_memory_mib": 8192
+    }
+  ]
+}

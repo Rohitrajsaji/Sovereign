@@ -12,6 +12,7 @@ mod landing_service;
 mod launch_agent;
 mod launch_code;
 mod model_assets;
+mod model_setup;
 mod projections;
 mod projects;
 mod run_lock;
@@ -23,9 +24,9 @@ mod service_state;
 #[cfg(test)]
 use control_api::ControlApiRequest;
 use control_api::{bind_loopback, serve_listener};
-use dispatch::handle_actor_request;
 #[cfg(test)]
-use dispatch::{artifact_response, download_model_response};
+use dispatch::artifact_response;
+use dispatch::handle_actor_request;
 #[cfg(test)]
 use serde_json::{Value, json};
 use sovereign_controller::{ApprovalDecisionV1, LocalControl};
@@ -590,8 +591,11 @@ fn handle_control_request(
                 .ok_or_else(|| format!("not found: approval {request_id}"))
                 .and_then(|item| serde_json::to_value(item).map_err(|e| e.to_string()))
         }
-        ControlApiRequest::DownloadModel { confirmation } => {
-            download_model_response(confirmation.as_deref())
+        ControlApiRequest::DownloadModel { .. }
+        | ControlApiRequest::SetupStatus
+        | ControlApiRequest::CancelModelDownload
+        | ControlApiRequest::InstallDeveloperTools => {
+            Err("model setup is served by the local service".to_owned())
         }
         ControlApiRequest::CancelGoal { goal_id, principal } => control
             .cancel_goal(&goal_id, &principal)
