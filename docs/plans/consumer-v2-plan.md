@@ -26,6 +26,19 @@ A person who cannot code installs Sovereign with one command, sets it up by foll
 
 Each milestone ends with: Rust fmt, clippy, and tests; the UI gate; Playwright against the fixture server; screenshots reviewed; commit, push, and a PR update.
 
+### Status (2026-09-26)
+
+- **M1 done in the backend.** Its UI item (7) moves into M5, because the new UI replaces those screens.
+- **M2 done.**
+  - `POST /v2/projects/create` and `POST /v2/projects/open` (path or folder picker), the starter scaffold, and invisible Git.
+  - Landing after the plan is finalized, with `landings-v1.json` beside the project state.
+  - "Your edits" checkpoints in managed projects only.
+  - `POST /v2/goals/{id}/undo` and `/apply`.
+- **Findings that change later work.**
+  - Without `SOVEREIGN_PROJECT_CONFIG`, compiles saw no files and could not plan any change. The runner now shows the model up to 12 KiB of the project's own files. That fits the 8K compile packet, but a project whose main file outgrows 12 KiB will need a bigger context tier (M3).
+  - Consumer compiles use the minimal compiler path. Its only acceptance check is the scoped-diff evaluator. The starter's `tests/test_site.py` is not yet run as acceptance, so a Controller-authored check command belongs in M6.
+  - Task worktrees are pinned to HEAD. So the folder is only changed when no plan is active: before planning and after finalization.
+
 ### M1. Nothing hangs, nothing lies (CX2-T01 to T05)
 
 1. **Reads off the actor.** Serve overview, goals, goal detail, events, recovery, and settings from `LocalControl::read_only(StateStore::open(path))` on the HTTP worker threads. SQLite WAL allows concurrent readers. The actor keeps only mutations.
