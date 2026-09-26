@@ -136,6 +136,20 @@ where
         return write_session_redirect(stream, token);
     }
 
+    // Single-use launch code from `sovereign app`: GET /?c=<code>. The long-lived session token
+    // travels only in the HttpOnly cookie, never in a URL the browser keeps in history.
+    if parsed_info.path == "/"
+        && parsed_info.method == "GET"
+        && let (Some(code), Some(dir), Some(token)) = (
+            parsed_info.launch_code_param.as_ref(),
+            config.launch_code_dir.as_ref(),
+            config.session_token.as_ref(),
+        )
+        && crate::launch_code::redeem(dir, code)
+    {
+        return write_session_redirect(stream, token);
+    }
+
     // Static asset serving: anything not under /v1/ or /v2/, including /dashboard SPA.
     if !parsed_info.path.starts_with("/v1/")
         && !parsed_info.path.starts_with("/v2/")
@@ -157,10 +171,6 @@ where
             .cookie_token
             .as_ref()
             .is_some_and(|cookie| cookie == expected_token)
-            || parsed_info
-                .token_param
-                .as_ref()
-                .is_some_and(|query| query == expected_token)
             || parsed_info
                 .auth_bearer
                 .as_ref()

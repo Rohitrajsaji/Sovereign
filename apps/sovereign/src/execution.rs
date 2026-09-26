@@ -272,6 +272,7 @@ mod tests {
                     require_token_for_v1_post: true,
                     state_path: Some(state),
                     sse_clients: Arc::new(AtomicUsize::new(0)),
+                    launch_code_dir: None,
                 },
             );
         });

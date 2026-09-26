@@ -5,7 +5,6 @@
 //! User instruction: implement the attached consumer product plan (CX-T15).
 
 use crate::app_data::AppData;
-use crate::doctor;
 use std::fs;
 #[cfg(test)]
 use std::io::Write;
@@ -115,12 +114,9 @@ pub fn open_ui<L: Launchctl>(
     {
         return Ok(missing_service_guidance(&error));
     }
-    let token = if data.token_path().is_file() {
-        fs::read_to_string(data.token_path()).map_err(|error| error.to_string())?
-    } else {
-        doctor::write_session_token(&data.token_path()).map_err(|error| error.to_string())?
-    };
-    let url = format!("http://{DEFAULT_BIND}/?t={token}");
+    // A single-use, short-lived code keeps the long-lived session token out of browser history.
+    let code = crate::launch_code::issue(data.root()).map_err(|error| error.to_string())?;
+    let url = format!("http://{DEFAULT_BIND}/?c={code}");
     opener(&url)?;
     Ok(format!("opened {DEFAULT_BIND}"))
 }
@@ -175,6 +171,7 @@ pub fn render_plist(sovereign: &Path, bind: &str, logs: &Path) -> String {
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key>
   <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
   <key>StandardOutPath</key><string>{}/stdout.log</string>
   <key>StandardErrorPath</key><string>{}/stderr.log</string>
 </dict>
@@ -229,6 +226,7 @@ mod tests {
         assert!(xml.contains("<string>127.0.0.1:7777</string>"));
         assert!(xml.contains("<key>RunAtLoad</key><true/>"));
         assert!(xml.contains("SuccessfulExit"));
+        assert!(xml.contains("<key>ThrottleInterval</key><integer>30</integer>"));
     }
 
     #[test]

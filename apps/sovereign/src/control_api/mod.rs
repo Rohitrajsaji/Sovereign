@@ -102,6 +102,8 @@ pub(crate) struct ServerConfig {
     pub(crate) require_token_for_v1_post: bool,
     pub(crate) state_path: Option<PathBuf>,
     pub(crate) sse_clients: Arc<AtomicUsize>,
+    /// App-data directory holding the single-use `launch-code` file, when launch codes are on.
+    pub(crate) launch_code_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -111,6 +113,7 @@ impl Default for ServerConfig {
             require_token_for_v1_post: false,
             state_path: None,
             sse_clients: Arc::new(AtomicUsize::new(0)),
+            launch_code_dir: None,
         }
     }
 }
@@ -193,12 +196,31 @@ pub(crate) fn validate_loopback_addr(address: SocketAddr) -> Result<(), String> 
 
 pub(crate) fn bind_loopback(address: SocketAddr) -> Result<TcpListener, String> {
     validate_loopback_addr(address)?;
-    TcpListener::bind(address).map_err(|error| error.to_string())
+    TcpListener::bind(address).map_err(|error| bind_error_message(address, &error))
+}
+
+fn bind_error_message(address: SocketAddr, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        format!(
+            "{address} is already in use. Another Sovereign service may be running (check `sovereign service status`), or another app owns this port. Stop it or pass a different loopback address to `sovereign serve`."
+        )
+    } else {
+        format!("cannot listen on {address}: {error}")
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::similar_names, clippy::too_many_lines)]
 mod tests {
+    #[test]
+    fn port_in_use_names_the_address_and_next_step() {
+        let first = super::bind_loopback("127.0.0.1:0".parse().unwrap()).unwrap();
+        let taken = first.local_addr().unwrap();
+        let error = super::bind_loopback(taken).unwrap_err();
+        assert!(error.contains("already in use"), "{error}");
+        assert!(error.contains(&taken.to_string()), "{error}");
+    }
+
     use super::{
         ControlApiRequest, IDLE_CLOSE, MAX_BODY_BYTES, ServerConfig, bind_loopback, parse_request,
         serve_listener, validate_loopback_addr,
@@ -454,6 +476,49 @@ mod tests {
             "POST /v2/control/pause HTTP/1.1\r\nHost: localhost\r\nCookie: sovereign_session={secret}\r\nX-Sovereign-CSRF: {secret}\r\nContent-Length: 2\r\n\r\n{{}}"
         );
         assert!(read_status(addr, &with_csrf).starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn launch_code_sets_cookie_once_and_query_token_does_not_authenticate_v2() {
+        let listener = bind_loopback(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .unwrap_or_else(|error| panic!("bind: {error}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("addr: {error}"));
+        let dir = std::env::temp_dir().join(format!(
+            "sovereign-launch-code-http-{}-{}",
+            std::process::id(),
+            addr.port()
+        ));
+        let code = crate::launch_code::issue(&dir).unwrap_or_else(|error| panic!("{error}"));
+        let secret = "secret-token-launch-code".to_owned();
+        let cfg = ServerConfig {
+            session_token: Some(secret.clone()),
+            launch_code_dir: Some(dir.clone()),
+            ..ServerConfig::default()
+        };
+        thread::spawn(move || {
+            let _ = serve_listener(
+                &listener,
+                |req| match req {
+                    ControlApiRequest::Overview => Ok(json!({"overview": "ok"})),
+                    _ => Err("unsupported".to_owned()),
+                },
+                cfg,
+            );
+        });
+        let redeem =
+            format!("GET /?c={code} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+        let first = read_status(addr, &redeem);
+        assert!(first.starts_with("HTTP/1.1 302 Found\r\n"), "{first}");
+        assert!(first.contains(&format!("sovereign_session={secret}; HttpOnly")));
+        let replay = read_status(addr, &redeem);
+        assert!(!replay.contains("Set-Cookie"), "{replay}");
+        let query_token = format!(
+            "GET /v2/overview?t={secret} HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n"
+        );
+        assert!(read_status(addr, &query_token).starts_with("HTTP/1.1 401 Unauthorized\r\n"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
