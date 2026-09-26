@@ -14,6 +14,7 @@ use std::fmt::{Display, Formatter, Write as _};
 use std::fs;
 use std::net::{IpAddr, TcpListener};
 use std::path::{Component, Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1178,6 +1179,7 @@ impl MacBrowserSandboxExecBackend {
     }
 
     #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::unused_self)]
     fn self_test(&self) -> Result<(), BrowserPolicyError> {
         Err(BrowserPolicyError::IsolationUnavailable(
             "browser Seatbelt isolation is available only on macOS".to_owned(),

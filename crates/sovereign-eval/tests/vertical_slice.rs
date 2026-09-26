@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "macos"), allow(unused_imports, dead_code))]
+
 use serde_json::{Value, json};
 use sovereign_context::{
     AttemptOutcomeFacts, ContextBudget, ContextMode, ContextPacket, ContextPacketInput,

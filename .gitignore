@@ -34,3 +34,8 @@
 *.swp
 .DS_Store
 
+
+# UI build and test noise (ui-dist/ stays committed)
+apps/sovereign/ui/tsconfig.tsbuildinfo
+apps/sovereign/ui/test-results/
+apps/sovereign/ui/playwright-report/

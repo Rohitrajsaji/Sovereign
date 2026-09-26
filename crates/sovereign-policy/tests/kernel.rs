@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_os = "macos"), allow(unused_imports, dead_code))]
+
 use sovereign_policy::{
     Capability, CapabilityLayers, CapabilitySet, CheckpointIntegrityFloor, CommandMode,
     CommandPolicy, CommandRisk, CommandSpec, ExecutionIsolationBackend, HeavyLeaseClass,
