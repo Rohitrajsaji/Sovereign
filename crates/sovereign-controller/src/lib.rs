@@ -88,9 +88,9 @@ pub use browser::{
 };
 
 pub use goal_runner::{
-    GOAL_REASON_CANCELLED_BY_USER, GOAL_REASON_COMPILATION_BUDGET_EXHAUSTED,
+    CompletedGoalWorkV1, GOAL_REASON_CANCELLED_BY_USER, GOAL_REASON_COMPILATION_BUDGET_EXHAUSTED,
     GOAL_REASON_COMPILATION_FAILED, GOAL_REASON_COMPOSITION_ERROR, GOAL_REASON_TASK_FAILED,
-    GoalOutcomeKindV1, GoalOutcomeV1, goal_outcomes,
+    GoalOutcomeKindV1, GoalOutcomeV1, completed_goal_work, goal_outcomes,
 };
 pub use local_control::{
     LOCAL_CONTROL_READ_MODEL_SCHEMA_VERSION, LocalControl, LocalControlCheckpointV1,
@@ -35529,6 +35529,46 @@ mod tests {
                 .unwrap_or_else(|error| panic!("next queued: {error}"))
                 .map(|intent| intent.goal_id),
             Some(queued.goal_id)
+        );
+        drop(controller);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn only_completed_goals_expose_work_to_land() {
+        let (base, mut controller, registry) = completion_ready_fixture("completed-goal-work");
+        controller
+            .persist_all_runtime()
+            .unwrap_or_else(|error| panic!("persist fixture: {error}"));
+        persist_active_queued_goal_lifecycle(&mut controller);
+        let (goal_id, plan_id, plan_revision) = {
+            let active = controller
+                .active_ref()
+                .unwrap_or_else(|error| panic!("active fixture: {error}"));
+            (
+                active.goal_id.clone(),
+                active.plan_id.clone(),
+                active.revision,
+            )
+        };
+        assert!(
+            super::completed_goal_work(&controller.state, &goal_id)
+                .unwrap_or_else(|error| panic!("work before completion: {error}"))
+                .is_none(),
+            "an active goal must not expose work to land"
+        );
+        controller
+            .complete_queued_goal_intent(&registry)
+            .unwrap_or_else(|error| panic!("complete goal: {error}"));
+        let work = super::completed_goal_work(&controller.state, &goal_id)
+            .unwrap_or_else(|error| panic!("work after completion: {error}"))
+            .unwrap_or_else(|| panic!("a completed goal exposes its work"));
+        assert_eq!(work.plan_id, plan_id);
+        assert_eq!(work.plan_revision, plan_revision);
+        assert!(
+            super::completed_goal_work(&controller.state, "goal-unknown")
+                .unwrap_or_else(|error| panic!("unknown goal: {error}"))
+                .is_none()
         );
         drop(controller);
         let _ = std::fs::remove_dir_all(base);

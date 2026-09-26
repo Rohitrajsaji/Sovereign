@@ -95,6 +95,20 @@ pub(crate) fn parse_control_request(
                 display_name: required_string(&value, "display_name")?,
             })
         }
+        ("POST", "/v2/projects/create") => {
+            let value = parse_json_object(body)?;
+            require_only_fields(&value, &["name"])?;
+            Ok(ControlApiRequest::CreateProject {
+                name: required_string(&value, "name")?,
+            })
+        }
+        ("POST", "/v2/projects/open") => {
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &["root"])?;
+            Ok(ControlApiRequest::OpenFolder {
+                root: optional_string(&value, "root")?,
+            })
+        }
         ("GET", "/v2/goals") => {
             require_empty_body(body)?;
             Ok(ControlApiRequest::ListGoals)

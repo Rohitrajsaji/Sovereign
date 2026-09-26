@@ -280,6 +280,131 @@ pub fn goal_outcomes(state: &StateStore) -> Result<Vec<GoalOutcomeV1>, Controlle
     Ok(outcomes)
 }
 
+/// A completed goal's verified work, ready to land in the project folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedGoalWorkV1 {
+    pub goal_id: String,
+    pub natural_language_goal: String,
+    pub plan_id: String,
+    pub plan_revision: u32,
+    /// Each succeeded task's own change set, upstream tasks first.
+    pub change_sets: Vec<sovereign_repo::ChangeSet>,
+}
+
+/// Returns the verified change sets of a goal the Controller recorded as completed, in dependency
+/// order. Returns `None` for any goal that is not completed with a completion record, so only
+/// verified work can ever be landed.
+///
+/// # Errors
+/// Returns a state or decoding error, or a fail-closed error for a misbound plan or a task graph
+/// with a cycle.
+pub fn completed_goal_work(
+    state: &StateStore,
+    goal_id: &str,
+) -> Result<Option<CompletedGoalWorkV1>, ControllerError> {
+    let Some(intent_row) = state
+        .state_records(GOAL_INTENT_NAMESPACE)?
+        .into_iter()
+        .find(|record| record.key == goal_id)
+    else {
+        return Ok(None);
+    };
+    let intent = decode_versioned_goal_intent(&intent_row)?;
+    if intent.status != GOAL_STATUS_COMPLETED {
+        return Ok(None);
+    }
+    let Some(claim_row) = state
+        .state_records(GOAL_INTENT_CLAIM_NAMESPACE)?
+        .into_iter()
+        .find(|record| record.key == goal_id)
+    else {
+        return Ok(None);
+    };
+    let claim = decode_versioned_goal_claim(&claim_row)?;
+    if claim.status != GoalIntentClaimStatusV1::Completed {
+        return Ok(None);
+    }
+    if state
+        .get_state(
+            "controller.completion_record",
+            &completion_record_key(&claim.plan_id, claim.plan_revision),
+        )?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let mut tasks = BTreeMap::<String, (Vec<String>, Option<sovereign_repo::ChangeSet>)>::new();
+    for record in state.state_records("controller.task")? {
+        if !super::key_belongs_to_revision(&record.key, &claim.plan_id, claim.plan_revision) {
+            continue;
+        }
+        let runtime: Value = serde_json::from_str(&record.value_json)?;
+        if runtime.get("state").and_then(Value::as_str) != Some("succeeded") {
+            return Err(ControllerError::InvalidPlan(format!(
+                "completed goal {goal_id} has a task that did not succeed"
+            )));
+        }
+        let task_id = required_str(&runtime, "/task/task_id")?.to_owned();
+        let dependencies = runtime
+            .pointer("/task/dependencies")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let change_set = match runtime.get("change_set") {
+            Some(value) if !value.is_null() => {
+                let change_set: sovereign_repo::ChangeSet = serde_json::from_value(value.clone())?;
+                if change_set.plan_id != claim.plan_id
+                    || change_set.plan_revision != claim.plan_revision
+                    || change_set.task_id != task_id
+                {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "task {task_id} change set is bound to another plan or task"
+                    )));
+                }
+                Some(change_set)
+            }
+            _ => None,
+        };
+        tasks.insert(task_id, (dependencies, change_set));
+    }
+    // Upstream tasks first; ties broken by task id for a stable order.
+    let mut ordered = Vec::with_capacity(tasks.len());
+    let mut placed = std::collections::BTreeSet::<String>::new();
+    while placed.len() < tasks.len() {
+        let ready = tasks
+            .iter()
+            .find(|(task_id, (dependencies, _))| {
+                !placed.contains(*task_id)
+                    && dependencies.iter().all(|dependency| {
+                        placed.contains(dependency) || !tasks.contains_key(dependency)
+                    })
+            })
+            .map(|(task_id, _)| task_id.clone());
+        let Some(task_id) = ready else {
+            return Err(ControllerError::InvalidPlan(format!(
+                "completed goal {goal_id} task graph has a cycle"
+            )));
+        };
+        if let Some((_, Some(change_set))) = tasks.get(&task_id) {
+            ordered.push(change_set.clone());
+        }
+        placed.insert(task_id);
+    }
+    Ok(Some(CompletedGoalWorkV1 {
+        goal_id: goal_id.to_owned(),
+        natural_language_goal: intent.natural_language_goal,
+        plan_id: claim.plan_id,
+        plan_revision: claim.plan_revision,
+        change_sets: ordered,
+    }))
+}
+
 fn validate_goal_outcome(record_key: &str, outcome: &GoalOutcomeV1) -> Result<(), ControllerError> {
     if outcome.schema_version != GOAL_OUTCOME_SCHEMA_VERSION
         || outcome.goal_id != record_key

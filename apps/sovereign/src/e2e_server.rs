@@ -36,6 +36,8 @@ mod projects;
 mod run_lock;
 #[path = "runner.rs"]
 mod runner;
+#[path = "scaffold.rs"]
+mod scaffold;
 #[path = "service_state.rs"]
 mod service_state;
 

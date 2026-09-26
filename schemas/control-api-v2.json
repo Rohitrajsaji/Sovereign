@@ -171,7 +171,8 @@
         "root",
         "state_path",
         "cas_root",
-        "created_at_ms"
+        "created_at_ms",
+        "managed"
       ],
       "properties": {
         "project_id": {
@@ -191,6 +192,9 @@
         },
         "created_at_ms": {
           "type": "integer"
+        },
+        "managed": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -217,6 +221,24 @@
           "items": {
             "$ref": "#/definitions/ProjectRecord"
           }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProjectOpenResponse": {
+      "type": "object",
+      "required": [
+        "cancelled"
+      ],
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        },
+        "project": {
+          "$ref": "#/definitions/ProjectRecord"
+        },
+        "projects": {
+          "$ref": "#/definitions/ProjectsResponse"
         }
       },
       "additionalProperties": false

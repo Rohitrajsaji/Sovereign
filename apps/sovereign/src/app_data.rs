@@ -48,6 +48,10 @@ pub struct ProjectRecordV1 {
     pub state_path: String,
     pub cas_root: String,
     pub created_at_ms: i64,
+    /// True when Sovereign created or adopted the folder and keeps its history for the user.
+    /// Managed projects get "Your edits" checkpoints; existing developer repositories do not.
+    #[serde(default)]
+    pub managed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

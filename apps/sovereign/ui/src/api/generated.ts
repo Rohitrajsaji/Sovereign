@@ -51,12 +51,19 @@ export type ProjectRecord = {
   state_path: string;
   cas_root: string;
   created_at_ms: number;
+  managed: boolean;
 };
 
 export type ProjectsResponse = {
   schema_version: number;
   active_project_id: string | null;
   projects: Array<ProjectRecord>;
+};
+
+export type ProjectOpenResponse = {
+  cancelled: boolean;
+  project?: ProjectRecord;
+  projects?: ProjectsResponse;
 };
 
 export type GoalIntent = {

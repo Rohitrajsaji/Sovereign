@@ -53,6 +53,13 @@ pub(crate) enum ControlApiRequest {
     ActivateProject {
         project_id: String,
     },
+    CreateProject {
+        name: String,
+    },
+    /// Adopts a folder. Without `root`, the native folder picker asks the person.
+    OpenFolder {
+        root: Option<String>,
+    },
     ListGoals,
     GetGoal {
         goal_id: String,

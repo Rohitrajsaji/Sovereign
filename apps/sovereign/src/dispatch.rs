@@ -48,6 +48,23 @@ fn current_goal_views(
     ))
 }
 
+/// Points the actor at a project that `projects` just made active, and answers with the record.
+fn switch_to_project(
+    actor: &ControllerActorHandle,
+    projects: &app_data::ProjectsV1,
+    record: &app_data::ProjectRecordV1,
+) -> Result<Value, String> {
+    let _ = actor.switch_project(
+        PathBuf::from(&record.state_path),
+        Some(PathBuf::from(&record.root)),
+    )?;
+    Ok(json!({
+        "cancelled": false,
+        "project": record,
+        "projects": projects,
+    }))
+}
+
 /// Plan ids a goal was bound to, from its claim and outcome records.
 fn goal_plan_ids(store: &StateStore, goal_id: &str) -> Result<Vec<String>, String> {
     let mut plan_ids = Vec::new();
@@ -194,6 +211,24 @@ pub(crate) fn handle_actor_request(
                 )?;
             }
             serde_json::to_value(projects).map_err(|e| e.to_string())
+        }
+        ControlApiRequest::CreateProject { name } => {
+            let data = app_data::AppData::open_default().map_err(|e| e.to_string())?;
+            let parent = projects::projects_home()?;
+            let (projects, record) = projects::create_project(&data, &name, &parent)?;
+            switch_to_project(actor, &projects, &record)
+        }
+        ControlApiRequest::OpenFolder { root } => {
+            let root = match root {
+                Some(root) => PathBuf::from(root),
+                None => match projects::choose_folder_dialog()? {
+                    Some(root) => root,
+                    None => return Ok(json!({"cancelled": true})),
+                },
+            };
+            let data = app_data::AppData::open_default().map_err(|e| e.to_string())?;
+            let (projects, record) = projects::open_folder(&data, &root)?;
+            switch_to_project(actor, &projects, &record)
         }
         ControlApiRequest::ActivateProject { project_id } => {
             let data = app_data::AppData::open_default().map_err(|e| e.to_string())?;

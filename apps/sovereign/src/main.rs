@@ -15,6 +15,7 @@ mod projections;
 mod projects;
 mod run_lock;
 mod runner;
+mod scaffold;
 mod service_logs;
 mod service_state;
 
@@ -492,6 +493,9 @@ fn handle_control_request(
         }
         ControlApiRequest::GetGoalActivity { .. } => {
             Err("goal activity is served by the local service".to_owned())
+        }
+        ControlApiRequest::CreateProject { .. } | ControlApiRequest::OpenFolder { .. } => {
+            Err("project setup is served by the local service".to_owned())
         }
         ControlApiRequest::ListEvents { after, limit } => {
             let store = StateStore::open(
