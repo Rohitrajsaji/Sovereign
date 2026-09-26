@@ -143,6 +143,34 @@ pub(crate) fn query_i64(query: &str, name: &str, default: i64) -> i64 {
     default
 }
 
+/// A percent-decoded query value (`+` is a space), or `None` when absent or malformed.
+pub(crate) fn query_string(query: &str, name: &str) -> Option<String> {
+    let raw = query
+        .split('&')
+        .find_map(|part| part.strip_prefix(&format!("{name}=")))?;
+    let bytes = raw.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let hex = raw.get(index + 1..index + 3)?;
+                decoded.push(u8::from_str_radix(hex, 16).ok()?);
+                index += 3;
+            }
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
 pub(crate) fn query_usize(query: &str, name: &str, default: usize, max: usize) -> usize {
     let value = query_i64(query, name, i64::try_from(default).unwrap_or(0));
     let as_usize = usize::try_from(value).unwrap_or(default);

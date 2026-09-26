@@ -11,6 +11,7 @@
 
 use crate::execution::ServiceStatusV1;
 use crate::model_setup::ModelSetup;
+use crate::preview::{PreviewAddressV1, PreviewRoot};
 use serde::Serialize;
 use sovereign_controller::CancellationHandle;
 use sovereign_model::ModelBackend;
@@ -55,6 +56,9 @@ pub struct ServiceShared {
     interrupt: Mutex<InterruptTarget>,
     /// Onboarding's model download. It runs beside the actor and never touches Controller state.
     model_setup: Arc<ModelSetup>,
+    /// The bound project's folder, which the preview and the Files tab show read-only.
+    project_root: PreviewRoot,
+    preview: std::sync::OnceLock<PreviewAddressV1>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -81,7 +85,39 @@ impl ServiceShared {
             next_ticket: AtomicU64::new(1),
             interrupt: Mutex::new(InterruptTarget::default()),
             model_setup: Arc::new(ModelSetup::default()),
+            project_root: Arc::new(RwLock::new(None)),
+            preview: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The folder shared with the preview server.
+    #[must_use]
+    pub fn project_root_handle(&self) -> PreviewRoot {
+        Arc::clone(&self.project_root)
+    }
+
+    #[must_use]
+    pub fn project_root(&self) -> Option<PathBuf> {
+        self.project_root
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set_project_root(&self, root: Option<PathBuf>) {
+        *self
+            .project_root
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = root;
+    }
+
+    pub fn set_preview(&self, address: PreviewAddressV1) {
+        let _ = self.preview.set(address);
+    }
+
+    #[must_use]
+    pub fn preview(&self) -> Option<PreviewAddressV1> {
+        self.preview.get().cloned()
     }
 
     #[must_use]

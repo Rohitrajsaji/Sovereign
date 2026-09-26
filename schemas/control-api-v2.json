@@ -577,9 +577,12 @@
             "checking",
             "waiting_for_you",
             "stopping",
+            "applying",
             "done",
             "failed",
-            "cancelled"
+            "cancelled",
+            "not_applied",
+            "undone"
           ]
         },
         "headline": {
@@ -1049,6 +1052,88 @@
           "type": "boolean"
         },
         "detail": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PreviewResponse": {
+      "type": "object",
+      "required": [
+        "available",
+        "url"
+      ],
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProjectFile": {
+      "type": "object",
+      "required": [
+        "path",
+        "size_bytes"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProjectFilesResponse": {
+      "type": "object",
+      "required": [
+        "files",
+        "truncated"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ProjectFile"
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProjectFileContent": {
+      "type": "object",
+      "required": [
+        "path",
+        "size_bytes",
+        "binary",
+        "truncated",
+        "text"
+      ],
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer"
+        },
+        "binary": {
+          "type": "boolean"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "text": {
           "type": "string"
         }
       },

@@ -32,6 +32,8 @@ mod launch_code;
 mod model_assets;
 #[path = "model_setup.rs"]
 mod model_setup;
+#[path = "preview.rs"]
+mod preview;
 #[path = "projections.rs"]
 mod projections;
 #[path = "projects.rs"]
@@ -52,7 +54,6 @@ use dispatch::handle_actor_request;
 use sovereign_state::StateStore;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
@@ -78,19 +79,11 @@ fn run() -> Result<(), String> {
     }
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     std::env::set_current_dir(&dir).map_err(|error| error.to_string())?;
-    let repo = dir.join("fixture-repo");
-    std::fs::create_dir_all(&repo).map_err(|error| error.to_string())?;
-    let git = Command::new("/usr/bin/git")
-        .args(["init", "-q"])
-        .current_dir(&repo)
-        .status()
-        .map_err(|error| error.to_string())?;
-    if !git.success() {
-        return Err("git init failed".to_owned());
-    }
     let data = AppData::open(&dir.join("Library/Application Support/Sovereign"))
         .map_err(|error| error.to_string())?;
-    let _ = projects::register_project(&data, &repo, "Fixture");
+    // A starter project, as a person gets from "New project", so the preview has a page.
+    let (_, record) = projects::create_project(&data, "Fixture", &dir.join("Sovereign Projects"))?;
+    let repo = PathBuf::from(&record.root);
     let state = std::env::var_os("SOVEREIGN_STATE_DB")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".sovereign/state.sqlite3"));
@@ -104,12 +97,13 @@ fn run() -> Result<(), String> {
         ActorOptions {
             execute: true,
             git_root: Some(repo),
-            managed: false,
-            lands_results: false,
+            managed: true,
+            lands_results: true,
         },
     )?;
     let listener = bind_loopback(SocketAddr::from(([127, 0, 0, 1], 0)))?;
     let addr = listener.local_addr().map_err(|error| error.to_string())?;
+    actor.start_preview(&format!("http://{addr}"))?;
     println!("e2e-server {addr}");
     let actor_for_server = actor.clone();
     let config = ServerConfig {

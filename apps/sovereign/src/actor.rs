@@ -186,6 +186,32 @@ impl ControllerActorHandle {
         self.shared.model_setup()
     }
 
+    /// The bound project's folder, shown read-only by the preview and the Files tab.
+    #[must_use]
+    pub fn project_root(&self) -> Option<PathBuf> {
+        self.shared.project_root()
+    }
+
+    /// Starts the project preview for the app at `app_origin` and allows the app to frame it.
+    ///
+    /// # Errors
+    /// Returns when no loopback port can be bound.
+    pub fn start_preview(
+        &self,
+        app_origin: &str,
+    ) -> Result<crate::preview::PreviewAddressV1, String> {
+        let address =
+            crate::preview::start_preview(&self.shared.project_root_handle(), app_origin)?;
+        crate::control_api::allow_preview_frames(address.origin());
+        self.shared.set_preview(address.clone());
+        Ok(address)
+    }
+
+    #[must_use]
+    pub fn preview(&self) -> Option<crate::preview::PreviewAddressV1> {
+        self.shared.preview()
+    }
+
     /// Opens a read handle on the current project database. Waits briefly while the actor is
     /// still opening it, and retries a busy database a few times.
     ///
@@ -752,6 +778,12 @@ fn run_actor_loop(
             None
         }
     };
+    shared.set_project_root(
+        options
+            .git_root
+            .as_deref()
+            .and_then(|root| root.canonicalize().ok()),
+    );
     let mut workspace = options
         .lands_results
         .then(|| {
@@ -835,6 +867,11 @@ fn run_actor_loop(
                         git_root.as_deref(),
                         managed,
                         &state_path,
+                    );
+                    shared.set_project_root(
+                        git_root
+                            .as_deref()
+                            .and_then(|root| root.canonicalize().ok()),
                     );
                     errors.clear();
                     shared.publish_status(

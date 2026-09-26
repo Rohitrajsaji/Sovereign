@@ -21,10 +21,30 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-pub(crate) const BASE_SECURITY_HEADERS: &str = "\
-X-Content-Type-Options: nosniff\r\n\
+/// The app's security headers. Frames may load only the project preview's origin, once the
+/// preview is running; nothing may frame the app.
+pub(crate) struct SecurityHeaders;
+
+impl std::fmt::Display for SecurityHeaders {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let frame_src = PREVIEW_ORIGIN.get().map_or("'none'", String::as_str);
+        write!(
+            formatter,
+            "X-Content-Type-Options: nosniff\r\n\
 Referrer-Policy: no-referrer\r\n\
-Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n";
+Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-src {frame_src}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n"
+        )
+    }
+}
+
+pub(crate) const BASE_SECURITY_HEADERS: SecurityHeaders = SecurityHeaders;
+
+static PREVIEW_ORIGIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Lets the app frame the project preview at `origin` (for example `http://localhost:7778`).
+pub(crate) fn allow_preview_frames(origin: String) {
+    let _ = PREVIEW_ORIGIN.set(origin);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ControlApiRequest {
@@ -101,6 +121,11 @@ pub(crate) enum ControlApiRequest {
     SetupStatus,
     CancelModelDownload,
     InstallDeveloperTools,
+    Preview,
+    ListFiles,
+    ReadFile {
+        path: String,
+    },
     GetRecovery,
     VerifyModel {
         runtime_path: String,

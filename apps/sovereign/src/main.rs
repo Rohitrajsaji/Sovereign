@@ -14,6 +14,7 @@ mod launch_agent;
 mod launch_code;
 mod model_assets;
 mod model_setup;
+mod preview;
 mod projections;
 mod projects;
 mod run_lock;
@@ -307,6 +308,10 @@ fn run_serve(args: &[String], state_path: &Path) -> Result<String, String> {
             lands_results: active.is_some(),
         },
     )?;
+    // The preview is optional: without it the app still works, only the Preview tab is empty.
+    if let Err(error) = actor.start_preview(&format!("http://{local_address}")) {
+        eprintln!("sovereign: project preview unavailable: {error}");
+    }
     let actor_for_server = actor.clone();
     let server_config = control_api::ServerConfig {
         session_token: token,
@@ -603,7 +608,10 @@ fn handle_control_request(
         ControlApiRequest::DownloadModel { .. }
         | ControlApiRequest::SetupStatus
         | ControlApiRequest::CancelModelDownload
-        | ControlApiRequest::InstallDeveloperTools => {
+        | ControlApiRequest::InstallDeveloperTools
+        | ControlApiRequest::Preview
+        | ControlApiRequest::ListFiles
+        | ControlApiRequest::ReadFile { .. } => {
             Err("model setup is served by the local service".to_owned())
         }
         ControlApiRequest::CancelGoal { goal_id, principal } => control

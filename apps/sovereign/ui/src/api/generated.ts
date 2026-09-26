@@ -153,7 +153,7 @@ export type GoalStep = {
 };
 
 export type GoalProgress = {
-  phase: "received" | "queued" | "waiting" | "planning" | "building" | "checking" | "waiting_for_you" | "stopping" | "done" | "failed" | "cancelled";
+  phase: "received" | "queued" | "waiting" | "planning" | "building" | "checking" | "waiting_for_you" | "stopping" | "applying" | "done" | "failed" | "cancelled" | "not_applied" | "undone";
   headline: string;
   sentence: string;
   steps_done: number;
@@ -266,4 +266,27 @@ export type DownloadResponse = {
 export type DeveloperToolsInstallResponse = {
   started: boolean;
   detail: string;
+};
+
+export type PreviewResponse = {
+  available: boolean;
+  url: string | null;
+};
+
+export type ProjectFile = {
+  path: string;
+  size_bytes: number;
+};
+
+export type ProjectFilesResponse = {
+  files: Array<ProjectFile>;
+  truncated: boolean;
+};
+
+export type ProjectFileContent = {
+  path: string;
+  size_bytes: number;
+  binary: boolean;
+  truncated: boolean;
+  text: string;
 };

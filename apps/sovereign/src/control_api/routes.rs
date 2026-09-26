@@ -6,7 +6,7 @@
 
 use super::parse::{
     HttpEnvelope, optional_string, parse_json_object, parse_optional_json_object, query_i64,
-    query_usize, require_empty_body, require_only_fields, required_string,
+    query_string, query_usize, require_empty_body, require_only_fields, required_string,
 };
 use super::{ApiError, ApiStatus, ControlApiRequest};
 
@@ -278,6 +278,21 @@ pub(crate) fn parse_control_request(
             } else {
                 ControlApiRequest::ApplyGoal { goal_id }
             })
+        }
+        ("GET", "/v2/preview") => {
+            require_empty_body(body)?;
+            Ok(ControlApiRequest::Preview)
+        }
+        ("GET", "/v2/files") => {
+            require_empty_body(body)?;
+            Ok(ControlApiRequest::ListFiles)
+        }
+        ("GET", "/v2/files/content") => {
+            require_empty_body(body)?;
+            let path = query_string(&info.query, "path")
+                .filter(|path| !path.is_empty() && path.len() <= 1_024)
+                .ok_or_else(|| ApiError::new(ApiStatus::BadRequest, "path is required"))?;
+            Ok(ControlApiRequest::ReadFile { path })
         }
         ("GET", "/v2/setup") => {
             require_empty_body(body)?;

@@ -235,6 +235,29 @@ fn control_api_v2_live_serve_matches_frozen_schema() {
         "{cancelled}"
     );
 
+    for (path, def) in [
+        ("/v2/preview", "PreviewResponse"),
+        ("/v2/files", "ProjectFilesResponse"),
+        ("/v2/files/content?path=notes.txt", "ProjectFileContent"),
+    ] {
+        let (status, body) = http(
+            &addr,
+            &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{cookie}\r\n"),
+        );
+        assert_eq!(status, 200, "{path} {body}");
+        assert!(
+            load_validator(def).is_valid(&body),
+            "{path} failed {def}: {body}"
+        );
+    }
+    let (status, hidden) = http(
+        &addr,
+        &format!(
+            "GET /v2/files/content?path=.git%2Fconfig HTTP/1.1\r\nHost: 127.0.0.1\r\n{cookie}\r\n"
+        ),
+    );
+    assert_eq!(status, 404, "{hidden}");
+
     // Undo and Apply exist and explain, in words, why there is nothing to do yet.
     for action in ["undo", "apply"] {
         let (status, refused) = post(&format!("/v2/goals/{goal_id}/{action}"), &json!({}));

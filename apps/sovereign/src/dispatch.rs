@@ -7,7 +7,8 @@
 use crate::actor::{ControllerActorHandle, Reply};
 use crate::control_api::ControlApiRequest;
 use crate::{
-    app_data, doctor, goal_views, landing_service, model_assets, model_setup, projections, projects,
+    app_data, doctor, goal_views, landing_service, model_assets, model_setup, preview, projections,
+    projects,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -407,6 +408,29 @@ pub(crate) fn handle_actor_request(
         }
         ControlApiRequest::DownloadModel { .. } => start_model_download(actor),
         ControlApiRequest::SetupStatus => setup_status(actor),
+        ControlApiRequest::Preview => {
+            let root = actor.project_root();
+            Ok(match actor.preview() {
+                Some(address) if root.is_some() => json!({
+                    "available": true,
+                    "url": address.url(),
+                }),
+                _ => json!({"available": false, "url": null}),
+            })
+        }
+        ControlApiRequest::ListFiles => {
+            let root = actor
+                .project_root()
+                .ok_or("not found: no project is open")?;
+            serde_json::to_value(preview::list_project_files(&root)?).map_err(|e| e.to_string())
+        }
+        ControlApiRequest::ReadFile { path } => {
+            let root = actor
+                .project_root()
+                .ok_or("not found: no project is open")?;
+            serde_json::to_value(preview::read_project_file(&root, &path)?)
+                .map_err(|e| e.to_string())
+        }
         ControlApiRequest::CancelModelDownload => {
             let setup = actor.model_setup();
             setup.cancel();
