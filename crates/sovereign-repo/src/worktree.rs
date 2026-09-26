@@ -1852,7 +1852,10 @@ fn detect_untracked_composition_conflict(
     Ok(None)
 }
 
-fn apply_untracked_deltas(root: &Path, deltas: &[UntrackedFileDelta]) -> Result<(), RepoError> {
+pub(crate) fn apply_untracked_deltas(
+    root: &Path,
+    deltas: &[UntrackedFileDelta],
+) -> Result<(), RepoError> {
     for delta in deltas {
         validate_relative_path(&delta.path)?;
         reject_existing_symlink_components(root, &delta.path)?;
@@ -2068,7 +2071,7 @@ fn validate_change_set_binding(
     Ok(())
 }
 
-fn reject_checkout_side_effects(root: &Path, base_head: &str) -> Result<(), RepoError> {
+pub(crate) fn reject_checkout_side_effects(root: &Path, base_head: &str) -> Result<(), RepoError> {
     let local_keys = git_output(
         root,
         &[
@@ -2257,7 +2260,7 @@ fn git_text(root: &Path, operation: &'static str, args: &[&str]) -> Result<Strin
         .to_owned())
 }
 
-fn git_required_dynamic(
+pub(crate) fn git_required_dynamic(
     root: &Path,
     operation: &'static str,
     args: &[&str],
@@ -2270,7 +2273,7 @@ fn git_required_dynamic(
     }
 }
 
-fn git_output_with_input(
+pub(crate) fn git_output_with_input(
     root: &Path,
     args: &[&str],
     input: &[u8],
@@ -2290,7 +2293,7 @@ fn git_output_with_input(
     Ok(child.wait_with_output()?)
 }
 
-fn git_failure(operation: &'static str, output: &std::process::Output) -> RepoError {
+pub(crate) fn git_failure(operation: &'static str, output: &std::process::Output) -> RepoError {
     RepoError::GitFailed {
         operation,
         status: output.status.code(),
