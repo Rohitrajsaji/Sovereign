@@ -35,8 +35,9 @@ test.describe("consumer journey", () => {
     await assertAxe(page);
     await page.getByRole("button", { name: "Get started" }).click();
     await expect(page.getByRole("heading", { name: "Getting ready" })).toBeVisible();
-    await expect(page.getByText("This Mac")).toBeVisible();
-    await expect(page.getByText("Local AI model")).toBeVisible();
+    // Exact matches: on a small runner, a problem line also mentions "This Mac".
+    await expect(page.getByText("This Mac", { exact: true })).toBeVisible();
+    await expect(page.getByText(/^Local AI model/)).toBeVisible();
     await assertAxe(page);
     await page.getByRole("button", { name: "Set up later" }).click();
     await expect(page.getByRole("navigation", { name: "Projects" })).toBeVisible();
