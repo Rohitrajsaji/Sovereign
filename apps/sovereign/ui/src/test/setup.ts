@@ -20,6 +20,9 @@ class ResizeObserverStub {
   disconnect() {}
 }
 
+// jsdom has no canvas; axe only uses it to spot icon fonts, so report "unavailable" quietly.
+Object.defineProperty(HTMLCanvasElement.prototype, "getContext", { value: () => null });
+
 if (!("ResizeObserver" in globalThis)) {
   Object.defineProperty(globalThis, "ResizeObserver", { value: ResizeObserverStub });
 }
