@@ -249,10 +249,7 @@ fn fake_backend(prepared: &PreparedContext) -> DeterministicFakeBackend {
             "title": "Rename Settings submit label",
             "objective": "Change the rendered Settings submit label from Save to Apply without altering submit behavior.",
             "rationale": "Exact current source and focused-test evidence identify one bounded SettingsForm edit.",
-            "files": [
-                "src/settings/SettingsForm.tsx",
-                "src/settings/SettingsForm.test.tsx"
-            ],
+            "files": ["src/settings/SettingsForm.tsx"],
             "symbols": ["SettingsForm"],
             "evidence_queries": [],
             "expected_change": "The scoped SettingsForm renders Apply instead of Save."
@@ -563,7 +560,7 @@ fn natural_language_goal_compiles_then_controller_edits_and_deterministically_ve
     let mut compiler_budget = ModelCallBudget::new(1, 1_000);
     let compilation = compiler
         .compile(&input, &mut compiler_budget)
-        .unwrap_or_else(|error| panic!("compile natural-language goal: {error}"));
+        .unwrap_or_else(|error| panic!("compile natural-language goal: {error:?}"));
     assert!(validator.validate(compilation.plan()).is_empty());
     assert_eq!(compiler_budget.remaining_calls(), 0);
 

@@ -1,6 +1,7 @@
 //! Production CLI composition. The Controller owns every lifecycle decision and tool action.
 
 use crate::run_lock::RunLock;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sovereign_context::{
     ContextBudget, ContextMode, ContextPacket, ContextPacketInput, ContextPlanner, EvidenceItem,
@@ -32,7 +33,6 @@ use sovereign_tools::{
     canonical_browser_tool_manifest, canonical_patch_tool_manifest, canonical_patch_tool_schema,
     canonical_process_tool_manifest, canonical_read_tool_manifest, canonical_read_tool_schema,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, TcpListener};
@@ -100,7 +100,10 @@ fn load_project_configuration() -> Result<ProjectConfigurationV1, String> {
         return Ok(ProjectConfigurationV1::default());
     };
     let bytes = std::fs::read(&path).map_err(|error| {
-        format!("read SOVEREIGN_PROJECT_CONFIG {}: {error}", Path::new(&path).display())
+        format!(
+            "read SOVEREIGN_PROJECT_CONFIG {}: {error}",
+            Path::new(&path).display()
+        )
     })?;
     let config: ProjectConfigurationV1 = serde_json::from_slice(&bytes)
         .map_err(|error| format!("parse SOVEREIGN_PROJECT_CONFIG: {error}"))?;
@@ -200,15 +203,21 @@ fn bounded_context(
 }
 
 fn model_backend(require_launch: bool) -> Result<LocalOpenAiBackend, String> {
-    let launch = match (
-        env::var_os("SOVEREIGN_MODEL_RUNTIME"),
-        env::var_os("SOVEREIGN_MODEL_PATH"),
-    ) {
+    let settings = crate::app_data::AppData::open_default()
+        .and_then(|data| data.load_settings())
+        .unwrap_or_default();
+    let runtime = env::var_os("SOVEREIGN_MODEL_RUNTIME")
+        .map(PathBuf::from)
+        .or_else(|| settings.model_runtime.as_ref().map(PathBuf::from));
+    let model = env::var_os("SOVEREIGN_MODEL_PATH")
+        .map(PathBuf::from)
+        .or_else(|| settings.model_path.as_ref().map(PathBuf::from));
+    let launch = match (runtime, model) {
         (Some(runtime), Some(model)) => {
-            let runtime = PathBuf::from(runtime)
+            let runtime = runtime
                 .canonicalize()
                 .map_err(|error| format!("model runtime: {error}"))?;
-            let model = PathBuf::from(model)
+            let model = model
                 .canonicalize()
                 .map_err(|error| format!("model path: {error}"))?;
             if !runtime.is_file() || !model.is_file() {
@@ -265,6 +274,10 @@ fn load_model(backend: &dyn ModelBackend) -> Result<(), String> {
         .map_err(|error| format!("load local model: {error}"))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "composition validates explicit configured repositories and bounded source evidence"
+)]
 fn compilation_input(
     controller: &Controller,
     registry: &ProjectRegistry,
@@ -280,7 +293,9 @@ fn compilation_input(
         || project_config.additional_repositories.len() > MAX_ADDITIONAL_REPOSITORIES
         || project_config.source_candidates.len() > MAX_SOURCE_CANDIDATES
     {
-        return Err("project configuration exceeds its versioned repository/source bounds".to_owned());
+        return Err(
+            "project configuration exceeds its versioned repository/source bounds".to_owned(),
+        );
     }
     let mut registered_ids = BTreeSet::from([REPOSITORY_ID.to_owned()]);
     for configured in &project_config.additional_repositories {
@@ -309,9 +324,14 @@ fn compilation_input(
     let retriever = ExactRetriever::new(registry);
     for candidate in &project_config.source_candidates {
         if !registered_ids.contains(&candidate.repository_id)
-            || !candidate_keys.insert((candidate.repository_id.clone(), candidate.relative_path.clone()))
+            || !candidate_keys.insert((
+                candidate.repository_id.clone(),
+                candidate.relative_path.clone(),
+            ))
         {
-            return Err("source candidate repository is unregistered or candidate is duplicated".to_owned());
+            return Err(
+                "source candidate repository is unregistered or candidate is duplicated".to_owned(),
+            );
         }
         let exact = retriever
             .read_path(&candidate.repository_id, &candidate.relative_path, None)
@@ -323,7 +343,11 @@ fn compilation_input(
         if size > MAX_SOURCE_CANDIDATE_BYTES || candidate_bytes > MAX_SOURCE_CANDIDATE_TOTAL_BYTES {
             return Err("configured source candidates exceed the bounded evidence size".to_owned());
         }
-        let language = match candidate.relative_path.extension().and_then(|extension| extension.to_str()) {
+        let language = match candidate
+            .relative_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+        {
             Some("rs") => "rust",
             Some("js" | "mjs" | "jsx") => "javascript",
             Some("ts" | "tsx") => "typescript",
@@ -331,9 +355,8 @@ fn compilation_input(
             Some("md") => "markdown",
             Some("json") => "json",
             Some("toml") => "toml",
-            Some("txt") => "text",
+            Some("txt") | None => "text",
             Some(_) => "source",
-            None => "text",
         };
         repository_languages
             .entry(candidate.repository_id.clone())
@@ -390,7 +413,10 @@ fn compilation_input(
             "Exact current repositories are Controller-bound: {}.",
             snapshots
                 .iter()
-                .map(|(id, snapshot)| format!("{id} head={:?} dirty={}", snapshot.head, snapshot.dirty_digest))
+                .map(|(id, snapshot)| format!(
+                    "{id} head={:?} dirty={}",
+                    snapshot.head, snapshot.dirty_digest
+                ))
                 .collect::<Vec<_>>()
                 .join("; ")
         ),
@@ -407,7 +433,9 @@ fn compilation_input(
             ..DepthFeatureInput::default()
         });
         if depth.mode != ExecutionDepth::D4 {
-            return Err("explicit coordinated multi-repository input did not classify as D4".to_owned());
+            return Err(
+                "explicit coordinated multi-repository input did not classify as D4".to_owned(),
+            );
         }
         Some(M3PlanningInput {
             depth,
@@ -479,6 +507,11 @@ fn compilation_input(
     }))
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "composition passes explicit pinned capabilities without choosing task authority"
+)]
 fn advance_with_overrides(
     controller: &mut Controller,
     registry: &ProjectRegistry,
@@ -575,7 +608,10 @@ fn advance_with_overrides(
                     PinnedExecutable::from_path(&cargo, "configured-local-cargo")
                         .map_err(|error| error.to_string())?,
                 );
-                let rustc = cargo.parent().ok_or("configured Cargo has no bin directory")?.join("rustc");
+                let rustc = cargo
+                    .parent()
+                    .ok_or("configured Cargo has no bin directory")?
+                    .join("rustc");
                 pins.push(
                     PinnedExecutable::from_path(&rustc, "configured-local-rustc")
                         .map_err(|error| format!("pin configured Cargo's exact rustc: {error}"))?,
@@ -684,10 +720,12 @@ fn advance_with_overrides(
     }
 }
 
+#[cfg(test)]
 fn run_at(root: &Path, state: &Path, options: RunOptions) -> Result<String, String> {
     run_at_with_overrides(root, state, options, None, None, None, None)
 }
 
+#[cfg(test)]
 fn run_at_with_overrides(
     root: &Path,
     state: &Path,
@@ -709,6 +747,10 @@ fn run_at_with_overrides(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "production composition accepts explicit pinned overrides and a test-only pressure probe"
+)]
 fn run_at_with_project_config_and_overrides(
     root: &Path,
     state: &Path,
@@ -717,8 +759,10 @@ fn run_at_with_project_config_and_overrides(
     backend_override: Option<&dyn ModelBackend>,
     node_override: Option<&Path>,
     chrome_override: Option<&Path>,
-    _pressure_override: Option<ResourcePressureSnapshotV1>,
+    pressure_override: Option<ResourcePressureSnapshotV1>,
 ) -> Result<String, String> {
+    #[cfg(not(test))]
+    let _ = pressure_override;
     let _lock = RunLock::acquire(state).map_err(|error| error.to_string())?;
     let mut registry = ProjectRegistry::new();
     registry
@@ -728,7 +772,9 @@ fn run_at_with_project_config_and_overrides(
         || project_config.additional_repositories.len() > MAX_ADDITIONAL_REPOSITORIES
         || project_config.source_candidates.len() > MAX_SOURCE_CANDIDATES
     {
-        return Err("project configuration exceeds its versioned repository/source bounds".to_owned());
+        return Err(
+            "project configuration exceeds its versioned repository/source bounds".to_owned(),
+        );
     }
     for configured in &project_config.additional_repositories {
         let configured_root = if configured.root.is_absolute() {
@@ -744,7 +790,7 @@ fn run_at_with_project_config_and_overrides(
     let mut controller =
         Controller::reopen_local(store).map_err(|error| format!("recover Controller: {error}"))?;
     #[cfg(test)]
-    if let Some(snapshot) = _pressure_override {
+    if let Some(snapshot) = pressure_override {
         controller.set_resource_pressure_probe(Box::new(FixedFixturePressure(snapshot)));
     }
     let mut last = None;
@@ -818,10 +864,43 @@ pub(crate) fn run_command(args: &[String]) -> Result<String, String> {
     )
 }
 
+pub(crate) fn advance_production_step(
+    controller: &mut Controller,
+    registry: &ProjectRegistry,
+    root: &Path,
+    state: &Path,
+) -> Result<ProductionAdvanceOutcome, String> {
+    let project_config = load_project_configuration().unwrap_or_default();
+    #[cfg(any(test, feature = "e2e-fixtures"))]
+    if let Some(backend) = crate::fixture_backend::from_context(state) {
+        return advance_with_overrides(
+            controller,
+            registry,
+            root,
+            state,
+            Some(&backend),
+            None,
+            None,
+            &project_config,
+        );
+    }
+    advance_with_overrides(
+        controller,
+        registry,
+        root,
+        state,
+        None,
+        None,
+        None,
+        &project_config,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::Value;
+    use sha2::{Digest, Sha256};
     use sovereign_model::{DeterministicFakeBackend, ModelFinishReason, ModelResponse, ModelUsage};
     use sovereign_plan::{
         BrowserAcceptanceActionV1, BrowserAcceptanceExpectationV1, BrowserAcceptanceSemanticV1,
@@ -835,7 +914,6 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use sha2::{Digest, Sha256};
 
     fn green_fixture_pressure() -> ResourcePressureSnapshotV1 {
         ResourcePressureSnapshotV1 {
@@ -859,6 +937,10 @@ mod tests {
     static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     static RUNNER_LOCK_TEST: Mutex<()> = Mutex::new(());
 
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn fixture() -> PathBuf {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -890,6 +972,10 @@ mod tests {
         root
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn compilation_fixture_backend() -> DeterministicFakeBackend {
         DeterministicFakeBackend::new(
             ModelCapabilities {
@@ -945,6 +1031,10 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn fixture_backend(responses: Vec<ModelResponse>) -> DeterministicFakeBackend {
         DeterministicFakeBackend::new(
             ModelCapabilities {
@@ -966,6 +1056,10 @@ mod tests {
         format!("sha256:{:x}", Sha256::digest(text.as_bytes()))
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "fixture builds a self-contained typed command contract"
+    )]
     fn command_acceptance(
         description: &str,
         repository_id: &str,
@@ -1138,6 +1232,11 @@ mod tests {
         }
     }
 
+    #[expect(
+        clippy::expect_used,
+        clippy::needless_raw_string_hashes,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn prepare_inventory_fixture(root: &Path) -> (PathBuf, PathBuf) {
         let app = root.join("apps/inventory");
         fs::create_dir_all(&app).expect("inventory app directory");
@@ -1163,15 +1262,19 @@ http.createServer((request, response) => {
             .canonicalize()
             .expect("canonical Node executable");
         let chrome = env::var_os("SOVEREIGN_CHROME_EXECUTABLE")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-            })
+            .map_or_else(
+                || PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                PathBuf::from,
+            )
             .canonicalize()
             .expect("installed Chrome executable");
         (node, chrome)
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn external_fixture_state(root: &Path) -> PathBuf {
         let name = root
             .file_name()
@@ -1183,6 +1286,10 @@ http.createServer((request, response) => {
             .join("state.sqlite3")
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn commit_fixture_file(root: &Path, relative: &str, content: &str) {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().expect("fixture file parent")).expect("fixture dirs");
@@ -1205,26 +1312,35 @@ http.createServer((request, response) => {
         assert!(commit.success());
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn rustup_cargo() -> PathBuf {
-        let rustup = PathBuf::from(env::var_os("HOME").expect("HOME"))
-            .join(".cargo/bin/rustup");
+        let rustup = PathBuf::from(env::var_os("HOME").expect("HOME")).join(".cargo/bin/rustup");
         let output = Command::new(rustup)
             .args(["which", "cargo"])
             .output()
             .expect("resolve exact local Cargo executable");
         assert!(output.status.success(), "rustup which cargo failed");
-        PathBuf::from(String::from_utf8(output.stdout).expect("Cargo path UTF-8").trim())
-            .canonicalize()
-            .expect("canonical Cargo executable")
+        PathBuf::from(
+            String::from_utf8(output.stdout)
+                .expect("Cargo path UTF-8")
+                .trim(),
+        )
+        .canonicalize()
+        .expect("canonical Cargo executable")
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn prepare_protocol_cargo_fixture(root: &Path, package: &str, test_source: &str) {
         commit_fixture_file(
             root,
             "Cargo.toml",
-            &format!(
-                "[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
-            ),
+            &format!("[package]\nname = \"{package}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
         );
         commit_fixture_file(root, "tests/protocol.rs", test_source);
         let status = Command::new(rustup_cargo())
@@ -1232,11 +1348,18 @@ http.createServer((request, response) => {
             .current_dir(root)
             .status()
             .expect("generate fixture lockfile");
-        assert!(status.success(), "fixture lockfile must be generated offline");
+        assert!(
+            status.success(),
+            "fixture lockfile must be generated offline"
+        );
         let lock = std::fs::read_to_string(root.join("Cargo.lock")).expect("fixture lockfile");
         commit_fixture_file(root, "Cargo.lock", &lock);
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn queued_compilation(state: &Path, goal: &str) -> Controller {
         let mut control = sovereign_controller::LocalControl::reopen(
             StateStore::open(state).expect("open queued goal state"),
@@ -1249,6 +1372,10 @@ http.createServer((request, response) => {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn run_cli_accepts_only_once_flag() {
         assert_eq!(
             parse_options(&[]).expect("default"),
@@ -1262,6 +1389,10 @@ http.createServer((request, response) => {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn subdirectory_resolves_exact_git_root_and_relative_state() {
         let root = fixture();
         let child = root.join("src");
@@ -1278,6 +1409,10 @@ http.createServer((request, response) => {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn goal_timestamp_uses_canonical_utc_format() {
         assert_eq!(utc_timestamp(0).expect("epoch"), "1970-01-01T00:00:00Z");
         assert_eq!(
@@ -1287,6 +1422,10 @@ http.createServer((request, response) => {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn production_compilation_includes_explicit_bounded_current_source_candidates() {
         let root = fixture();
         commit_fixture_file(&root, "src/contract.md", "# Exact current contract\n");
@@ -1308,17 +1447,24 @@ http.createServer((request, response) => {
             .expect("construct compilation input")
             .expect("queued goal input");
 
-        assert!(input.context_packet.items.iter().any(|item| {
-            item.repository_id.as_deref() == Some(REPOSITORY_ID)
-                && item.locator.as_deref() == Some("path:src/contract.md")
-                && item.text == "# Exact current contract\n"
-        }), "production compilation must receive the exact configured source candidate");
+        assert!(
+            input.context_packet.items.iter().any(|item| {
+                item.repository_id.as_deref() == Some(REPOSITORY_ID)
+                    && item.locator.as_deref() == Some("path:src/contract.md")
+                    && item.text == "# Exact current contract\n"
+            }),
+            "production compilation must receive the exact configured source candidate"
+        );
         fs::remove_dir_all(root).expect("cleanup source evidence fixture");
         fs::remove_dir_all(state.parent().expect("state directory"))
             .expect("cleanup state fixture");
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn production_compilation_includes_explicit_additional_repository_snapshots_for_m3() {
         let root = fixture();
         let second = fixture();
@@ -1367,11 +1513,14 @@ http.createServer((request, response) => {
             (REPOSITORY_ID, "path:src/primary.txt", "primary\n"),
             ("repo.shared", "path:src/shared.txt", "shared\n"),
         ] {
-            assert!(input.context_packet.items.iter().any(|item| {
-                item.repository_id.as_deref() == Some(repository_id)
-                    && item.locator.as_deref() == Some(path)
-                    && item.text == contents
-            }), "exact source candidate {repository_id}/{path} is missing from bounded context");
+            assert!(
+                input.context_packet.items.iter().any(|item| {
+                    item.repository_id.as_deref() == Some(repository_id)
+                        && item.locator.as_deref() == Some(path)
+                        && item.text == contents
+                }),
+                "exact source candidate {repository_id}/{path} is missing from bounded context"
+            );
         }
         fs::remove_dir_all(root).expect("cleanup primary fixture");
         fs::remove_dir_all(second).expect("cleanup additional fixture");
@@ -1380,17 +1529,19 @@ http.createServer((request, response) => {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        clippy::too_many_lines,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn sovereign_run_once_writes_repairs_and_verifies_a_two_repository_d4_goal_across_restart() {
         let _guard = RUNNER_LOCK_TEST
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = fixture();
         let shared = fixture();
-        commit_fixture_file(
-            &root,
-            "src/contract.txt",
-            "status=draft\nwire-format=v1\n",
-        );
+        commit_fixture_file(&root, "src/contract.txt", "status=draft\nwire-format=v1\n");
         commit_fixture_file(&shared, "src/contract.txt", "wire-format=v1\n");
         prepare_protocol_cargo_fixture(
             &root,
@@ -1462,10 +1613,17 @@ http.createServer((request, response) => {
             .iter()
             .find(|task| task["scope"]["files"] == json!(["src/contract.txt"]))
             .expect("one scoped primary repository write task");
-        let write_task_id = write_task["task_id"].as_str().expect("write task id").to_owned();
+        let write_task_id = write_task["task_id"]
+            .as_str()
+            .expect("write task id")
+            .to_owned();
         let integration_task = tasks
             .iter()
-            .find(|task| task["scope"]["repositories"].as_array().is_some_and(|ids| ids.len() == 2))
+            .find(|task| {
+                task["scope"]["repositories"]
+                    .as_array()
+                    .is_some_and(|ids| ids.len() == 2)
+            })
             .expect("genuine two-repository integration task");
         let integration_task_id = integration_task["task_id"]
             .as_str()
@@ -1477,10 +1635,15 @@ http.createServer((request, response) => {
             .iter()
             .filter_map(Value::as_str)
             .collect::<BTreeSet<_>>();
-        assert_eq!(integration_repositories, BTreeSet::from([REPOSITORY_ID, "repo.shared"]));
+        assert_eq!(
+            integration_repositories,
+            BTreeSet::from([REPOSITORY_ID, "repo.shared"])
+        );
         let baseline_digest = ExactRetriever::new(&{
             let mut registry = ProjectRegistry::new();
-            registry.register(REPOSITORY_ID, &root).expect("register source repo");
+            registry
+                .register(REPOSITORY_ID, &root)
+                .expect("register source repo");
             registry
         })
         .read_path(REPOSITORY_ID, Path::new("src/contract.txt"), None)
@@ -1501,10 +1664,17 @@ http.createServer((request, response) => {
             Some(green_fixture_pressure()),
         )
         .expect("first governed write reaches deterministic verification");
-        assert!(failed.contains("TaskFailed"), "first verification must fail: {failed}");
-        let mut controller = Controller::reopen_local(StateStore::open(&state).expect("reopen failed state"))
-            .expect("recover failed attempt");
-        assert_eq!(controller.task_state(&write_task_id), Some(sovereign_controller::TaskState::RepairPending));
+        assert!(
+            failed.contains("TaskFailed"),
+            "first verification must fail: {failed}"
+        );
+        let controller =
+            Controller::reopen_local(StateStore::open(&state).expect("reopen failed state"))
+                .expect("recover failed attempt");
+        assert_eq!(
+            controller.task_state(&write_task_id),
+            Some(sovereign_controller::TaskState::RepairPending)
+        );
         let failure = controller
             .latest_failure_record(&write_task_id)
             .expect("read durable failure record")
@@ -1530,7 +1700,10 @@ http.createServer((request, response) => {
             Some(green_fixture_pressure()),
         )
         .expect("execute Controller-governed repair after restart");
-        assert!(repaired.contains("TaskVerified"), "repair verification: {repaired}");
+        assert!(
+            repaired.contains("TaskVerified"),
+            "repair verification: {repaired}"
+        );
 
         for expected in ["TaskVerified", "TaskVerified", "GoalCompleted", "Complete"] {
             let stage_backend = fixture_backend(Vec::new());
@@ -1545,37 +1718,109 @@ http.createServer((request, response) => {
                 Some(green_fixture_pressure()),
             )
             .unwrap_or_else(|error| panic!("advance {expected} after restart: {error}"));
-            assert!(result.contains(expected), "expected {expected}, got {result}");
+            assert!(
+                result.contains(expected),
+                "expected {expected}, got {result}"
+            );
         }
 
         let finalized_store = StateStore::open(&state).expect("open finalized state");
-        let finalized = Controller::reopen_local(finalized_store).expect("recover finalized controller");
+        let finalized =
+            Controller::reopen_local(finalized_store).expect("recover finalized controller");
         let status = finalized.durable_status().expect("final durable status");
         assert!(status.active_plan.is_none());
-        assert!(status.tasks.iter().all(|task| task["state"] == "succeeded"));
+        assert!(
+            status.tasks.is_empty(),
+            "finalization clears the active projection"
+        );
+        let evidence_store = StateStore::open(&state).expect("archived C7 evidence");
+        let scope = format!("{plan_id}@r1:");
+        let archived_tasks = evidence_store
+            .state_records("controller.task")
+            .expect("archived tasks")
+            .into_iter()
+            .filter(|record| record.key.starts_with(&scope))
+            .map(|record| {
+                (
+                    record.key,
+                    serde_json::from_str::<Value>(&record.value_json).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(archived_tasks.len(), 3);
+        assert!(
+            archived_tasks
+                .values()
+                .all(|task| task["state"] == "succeeded")
+        );
+        let archived_evidence = evidence_store
+            .state_records("controller.verification")
+            .expect("archived verification")
+            .into_iter()
+            .filter(|record| record.key.starts_with(&scope))
+            .map(|record| serde_json::from_str::<Value>(&record.value_json).unwrap())
+            .collect::<Vec<_>>();
         let actions_before_restart = status
             .actions
             .iter()
             .map(|action| action.action_id.clone())
             .collect::<BTreeSet<_>>();
-        let output_root = status
-            .tasks
-            .iter()
-            .find(|task| task["task_id"] == write_task_id)
+        let output_root = archived_tasks
+            .get(&format!("{scope}{write_task_id}"))
             .and_then(|task| task["worktree_lease"]["worktree_path"].as_str())
             .map(PathBuf::from)
             .expect("durable write worktree path");
-        assert_eq!(
-            fs::read_to_string(output_root.join("src/contract.txt")).expect("read governed result"),
-            "status=approved\nwire-format=v1\n"
+        let archived_write = &archived_tasks[&format!("{scope}{write_task_id}")];
+        assert_eq!(archived_write["worktree_state"], "released");
+        assert!(
+            !output_root.exists(),
+            "verified task worktree must be released"
         );
-        let integration_evidence = status
-            .evidence
+        let artifact_store =
+            ArtifactStore::open(state.parent().unwrap().join("cas")).expect("result CAS");
+        let change_set: Value = serde_json::from_reader(
+            artifact_store
+                .open_artifact(
+                    &evidence_store,
+                    archived_write["change_set_artifact_digest"]
+                        .as_str()
+                        .expect("change-set CAS digest"),
+                )
+                .expect("verified change-set CAS object"),
+        )
+        .expect("decode durable change set");
+        assert_eq!(change_set, archived_write["change_set"]);
+        assert_eq!(change_set["plan_id"], plan_id);
+        assert_eq!(change_set["task_id"], write_task_id);
+        assert_eq!(change_set["repository_id"], REPOSITORY_ID);
+        assert_eq!(change_set["changed_paths"], json!(["src/contract.txt"]));
+        assert_eq!(
+            change_set["diff_content"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .skip(4)
+                .collect::<Vec<_>>(),
+            vec![
+                "@@ -1,2 +1,2 @@",
+                "-status=draft",
+                "+status=approved",
+                " wire-format=v1"
+            ]
+        );
+        let integration_evidence = archived_evidence
             .iter()
-            .find(|evidence| evidence["task_id"] == integration_task_id && evidence["passed"] == true)
+            .find(|evidence| {
+                evidence["task_id"] == integration_task_id && evidence["passed"] == true
+            })
             .expect("accepted integration evidence bound to exact task");
         assert_eq!(integration_evidence["plan_id"], plan_id);
-        assert_eq!(integration_evidence["command_results"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            integration_evidence["command_results"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
         let verification_steps = integration_task["verification"]["steps"]
             .as_array()
             .expect("integration command verification steps");
@@ -1583,7 +1828,65 @@ http.createServer((request, response) => {
             .iter()
             .filter_map(|step| step["command_spec"]["repository_id"].as_str())
             .collect::<BTreeSet<_>>();
-        assert_eq!(verified_repositories, BTreeSet::from([REPOSITORY_ID, "repo.shared"]));
+        assert_eq!(
+            verified_repositories,
+            BTreeSet::from([REPOSITORY_ID, "repo.shared"])
+        );
+
+        // Every verification receipt must prove group cleanup before finalization.
+        // Also check live group membership, rather than only the leader's absence.
+        let live_groups = Command::new("/bin/ps")
+            .args(["-axo", "pgid="])
+            .output()
+            .expect("inspect remaining process groups");
+        assert!(live_groups.status.success());
+        let live_groups = String::from_utf8(live_groups.stdout).expect("process groups UTF-8");
+        let live_groups = live_groups.split_whitespace().collect::<BTreeSet<_>>();
+        let mut verified_actions = BTreeSet::new();
+        for evidence in &archived_evidence {
+            if let Some(commands) = evidence["command_results"].as_array() {
+                for result in commands {
+                    let action_id = result["action_id"]
+                        .as_str()
+                        .expect("verification action ID");
+                    assert_eq!(result["process_group_reaped"], true);
+                    let lease: Value = serde_json::from_str(
+                        &evidence_store
+                            .get_state("controller.process_lease", action_id)
+                            .expect("process lease")
+                            .expect("durable process lease"),
+                    )
+                    .expect("decode process lease");
+                    assert_eq!(lease["state"], "reaped");
+                    let pgid = lease["process_group_id"]
+                        .as_u64()
+                        .expect("process group ID")
+                        .to_string();
+                    assert!(
+                        !live_groups.contains(pgid.as_str()),
+                        "verification group {pgid} survived"
+                    );
+                    verified_actions.insert(action_id.to_owned());
+                }
+            }
+        }
+        assert!(
+            verified_actions.len() >= 4,
+            "failed write, repair, and both D4 commands need receipts"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/contract.txt")).unwrap(),
+            "status=draft\nwire-format=v1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(shared.join("src/contract.txt")).unwrap(),
+            "wire-format=v1\n"
+        );
+        eprintln!(
+            "C7 goal={} plan={} write={} integration={} verification_actions={verified_actions:?}",
+            intent.goal_id, plan_id, write_task_id, integration_task_id
+        );
+        drop(evidence_store);
 
         let restarted = run_at_with_project_config_and_overrides(
             &root,
@@ -1597,8 +1900,9 @@ http.createServer((request, response) => {
         )
         .expect("restart after finalization without replay");
         assert!(restarted.contains("Idle"), "{restarted}");
-        let after_restart = Controller::reopen_local(StateStore::open(&state).expect("restart state"))
-            .expect("recover after finalization");
+        let after_restart =
+            Controller::reopen_local(StateStore::open(&state).expect("restart state"))
+                .expect("recover after finalization");
         let actions_after_restart = after_restart
             .durable_status()
             .expect("post-restart status")
@@ -1606,7 +1910,10 @@ http.createServer((request, response) => {
             .into_iter()
             .map(|action| action.action_id)
             .collect::<BTreeSet<_>>();
-        assert_eq!(actions_after_restart, actions_before_restart, "no completed action replayed");
+        assert_eq!(
+            actions_after_restart, actions_before_restart,
+            "no completed action replayed"
+        );
         let completion = StateStore::open(&state)
             .expect("completion state")
             .get_state("controller.plan_finalization", &format!("{plan_id}@r1"))
@@ -1624,6 +1931,10 @@ http.createServer((request, response) => {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn idle_run_reopens_same_state_after_restart_and_holds_lock() {
         let _guard = RUNNER_LOCK_TEST
             .lock()
@@ -1641,6 +1952,10 @@ http.createServer((request, response) => {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn paused_queued_goal_survives_runner_restart_without_model_dispatch() {
         let _guard = RUNNER_LOCK_TEST
             .lock()
@@ -1674,6 +1989,11 @@ http.createServer((request, response) => {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        clippy::too_many_lines,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn browser_goal_run_once_requires_durable_opt_in_and_executes_controller_browser_task() {
         let _guard = RUNNER_LOCK_TEST
             .lock()
@@ -1936,9 +2256,9 @@ http.createServer((request, response) => {
                 .any(|capability| capability == "browser_interactive")
         );
         assert!(
-            !plan["tasks"].as_array().expect("ungranted tasks")[0]
+            plan["tasks"].as_array().expect("ungranted tasks")[0]
                 .get("browser_acceptance")
-                .is_some_and(|contract| !contract.is_null())
+                .is_none_or(Value::is_null)
         );
         assert!(
             !plan["tasks"][0]["permissions"]

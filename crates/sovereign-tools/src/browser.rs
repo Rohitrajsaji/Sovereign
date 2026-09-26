@@ -1955,6 +1955,10 @@ impl BrowserAdapter {
     /// # Errors
     /// Returns the same errors as [`Self::dispatch_intercepted_action`] and fails once `deadline` is
     /// exhausted.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "browser dispatch keeps preflight, CDP call, and receipt binding in one authority path"
+    )]
     pub fn dispatch_intercepted_action_until(
         &mut self,
         lease: &BrowserLease,
@@ -2041,16 +2045,10 @@ impl BrowserAdapter {
                 let selector_json = serde_json::to_string(selector).map_err(|error| {
                     BrowserError::Protocol(format!("selector serialization failed: {error}"))
                 })?;
-                let fields_json = serde_json::to_string(
-                    &fields
-                        .0
-                        .iter()
-                        .map(|(field_selector, value)| (field_selector, value))
-                        .collect::<Vec<_>>(),
-                )
-                .map_err(|error| {
-                    BrowserError::Protocol(format!("form field serialization failed: {error}"))
-                })?;
+                let fields_json = serde_json::to_string(&fields.0.iter().collect::<Vec<_>>())
+                    .map_err(|error| {
+                        BrowserError::Protocol(format!("form field serialization failed: {error}"))
+                    })?;
                 (
                     "Runtime.evaluate",
                     serde_json::json!({
@@ -4961,11 +4959,12 @@ while True:
                 .unwrap_or_else(|error| panic!("remove employee browser test root: {error}"));
         }
 
-        let error = BrowserFormFieldValues::new(BTreeMap::from([(
+        let Err(error) = BrowserFormFieldValues::new(BTreeMap::from([(
             "input[name=password]".to_owned(),
             "never-retain-this".to_owned(),
-        )]))
-        .expect_err("credential-like controls must be refused");
+        )])) else {
+            panic!("credential-like controls must be refused");
+        };
         assert!(!error.to_string().contains("never-retain-this"));
     }
 

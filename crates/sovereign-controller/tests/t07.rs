@@ -12,8 +12,8 @@ use sovereign_controller::{
     FailureClassificationKind, LocalControl, ModelProposalV1, PermissionContext, PlanValidity,
     ProductionAdvanceOutcome, ProductionAdvanceResources, ProductionBlockReason,
     ProductionBrowserResources, ProductionCompilationResources, ProductionExecutionCatalog,
-    ProductionExecutionResources, ReadinessInputs, RecoveryManager,
-    ResourcePressureProbe, RoleId, RoleRegistry, SchedulerView, SecretProcessRuntime, TaskState,
+    ProductionExecutionResources, ReadinessInputs, RecoveryManager, ResourcePressureProbe, RoleId,
+    RoleRegistry, SchedulerView, SecretProcessRuntime, TaskState,
     VERIFICATION_RESULT_SCHEMA_VERSION, VerificationResultV1,
 };
 #[cfg(feature = "recovery-test-hooks")]
@@ -31,10 +31,9 @@ use sovereign_plan::{
     BrowserAcceptanceActionV1, BrowserAcceptanceExpectationV1, BrowserAcceptanceSemanticV1,
     BrowserAcceptanceStepV1, BrowserAcceptanceTemplateV1, BrowserManagedAppLaunchV1,
     BrowserManagedArgBindingV1, BrowserManagedPersistenceBindingV1, BrowserManagedReadinessV1,
-    DepthClassifier, DepthFeatureInput, DiagnosticCode, ExecutionDepth,
-    M3PlanningInput, PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationInput,
-    PlanCompilationRepository, PlanCompilationResult, PlanCompiler, PlanIr, PlanValidator,
-    ValidationEnvironment,
+    DepthClassifier, DepthFeatureInput, DiagnosticCode, ExecutionDepth, M3PlanningInput,
+    PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationInput, PlanCompilationRepository,
+    PlanCompilationResult, PlanCompiler, PlanIr, PlanValidator, ValidationEnvironment,
 };
 use sovereign_policy::{
     CapabilityLayers, CapabilitySet, CommandMode, CommandPolicy, CommandRisk, CommandSpec,
@@ -381,6 +380,14 @@ fn latest_checkpoint_manifest(state: &StateStore) -> CheckpointManifest {
         .unwrap_or_else(|error| panic!("read checkpoint manifest: {error}"));
     serde_json::from_slice(&bytes)
         .unwrap_or_else(|error| panic!("decode checkpoint manifest: {error}"))
+}
+
+fn active_revision_key(state: &StateStore, logical_key: &str) -> String {
+    let manifest = latest_checkpoint_manifest(state);
+    format!(
+        "{}@r{}:{logical_key}",
+        manifest.plan_id, manifest.plan_revision
+    )
 }
 
 fn singleton_checkpoint_repository(
@@ -908,14 +915,26 @@ fn compiled_command_verification_fixture(
 }
 
 fn compiled_managed_loopback_fixture(label: &str, port: u16) -> CompiledFixture {
-    compiled_managed_loopback_fixture_with_launch(label, port, BrowserManagedAppLaunchV1::PythonManagedServerV1 {
-        server_relative_path: "src/other.txt".to_owned(),
-        database_filename: "managed.sqlite3".to_owned(),
-        required_generations: 2,
-    })
+    compiled_managed_loopback_fixture_with_launch(
+        label,
+        port,
+        BrowserManagedAppLaunchV1::PythonManagedServerV1 {
+            server_relative_path: "src/other.txt".to_owned(),
+            database_filename: "managed.sqlite3".to_owned(),
+            required_generations: 2,
+        },
+    )
 }
 
-fn compiled_managed_loopback_fixture_with_launch(label: &str, port: u16, launch: BrowserManagedAppLaunchV1) -> CompiledFixture {
+#[expect(
+    clippy::too_many_lines,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
+fn compiled_managed_loopback_fixture_with_launch(
+    label: &str,
+    port: u16,
+    launch: BrowserManagedAppLaunchV1,
+) -> CompiledFixture {
     let acceptance = if label == "managed-node-production-driver" {
         json!([{
             "kind":"command", "description":"Run a bounded no-recipe Makefile gate",
@@ -1009,7 +1028,9 @@ fn compiled_managed_loopback_fixture_with_launch(label: &str, port: u16, launch:
                         BrowserAcceptanceStepV1 {
                             step_id: "browser.restart.navigate".to_owned(),
                             generation: 2,
-                            action: BrowserAcceptanceActionV1::Navigate { path: "/".to_owned() },
+                            action: BrowserAcceptanceActionV1::Navigate {
+                                path: "/".to_owned(),
+                            },
                             expectation: BrowserAcceptanceExpectationV1 {
                                 semantic: BrowserAcceptanceSemanticV1::Read,
                                 required_contains: Vec::new(),
@@ -1174,6 +1195,10 @@ fn compiled_repository_update_fixture_inner(
     clippy::too_many_arguments,
     clippy::too_many_lines
 )]
+#[expect(
+    clippy::needless_raw_string_hashes,
+    reason = "embedded Node fixture remains byte-for-byte unchanged"
+)]
 fn compiled_fixture_inner(
     label: &str,
     evidence_query: bool,
@@ -1198,7 +1223,8 @@ fn compiled_fixture_inner(
     if label.starts_with("managed-node-") || label.starts_with("managed-postgres-") {
         fs::create_dir_all(repo.root.join("apps/inventory"))
             .unwrap_or_else(|error| panic!("create Node fixture directory: {error}"));
-        let server_source = if label.starts_with("managed-postgres-") { r#"
+        let server_source = if label.starts_with("managed-postgres-") {
+            r#"
 const http = require('node:http');
 const net = require('node:net');
 const args = process.argv.slice(2);
@@ -1249,7 +1275,9 @@ connection.on('data', (chunk) => {
 });
 connection.on('error', () => process.exit(5));
 connection.on('close', () => { if (!ready) process.exit(6); });
-"# } else { r#"
+"#
+        } else {
+            r#"
 const http = require('node:http');
 const fs = require('node:fs');
 const args = process.argv.slice(2);
@@ -1262,7 +1290,8 @@ http.createServer((req, res) => {
   res.writeHead(200, {'content-type': 'text/plain'});
   res.end(req.url === '/health' ? 'ok' : fs.readFileSync(db));
 }).listen(port, '127.0.0.1');
-"# };
+"#
+        };
         fs::write(repo.root.join("apps/inventory/server.js"), server_source)
             .unwrap_or_else(|error| panic!("write Node fixture: {error}"));
         git(&repo.root, &["add", "apps/inventory/server.js"]);
@@ -1562,6 +1591,11 @@ fn controller_for(fixture: &mut CompiledFixture) -> (Controller, String) {
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn production_driver_compiles_executes_verifies_and_finalizes_queued_goal() {
     let fixture = compiled_worktree_fixture("production-driver-complete");
     let state = StateStore::open(&fixture.repo.state_path).expect("open production state");
@@ -1669,6 +1703,11 @@ fn production_driver_compiles_executes_verifies_and_finalizes_queued_goal() {
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn production_compilation_failure_does_not_refill_model_calls_after_restart() {
     let fixture = compiled_fixture("production-compile-restart", false);
     let state = StateStore::open(&fixture.repo.state_path).expect("open production state");
@@ -1752,6 +1791,10 @@ fn production_compilation_failure_does_not_refill_model_calls_after_restart() {
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn production_compilation_budget_rejects_tampered_reservation_history() {
     let fixture = compiled_fixture("production-compile-tamper", false);
     let state = StateStore::open(&fixture.repo.state_path).expect("open state");
@@ -1820,6 +1863,10 @@ fn production_compilation_budget_rejects_tampered_reservation_history() {
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn production_driver_requests_browser_execution_inputs_instead_of_external_handoff() {
     let mut fixture = compiled_managed_loopback_fixture("production-browser-handoff", 41_740);
     let (mut controller, task_id) = controller_for(&mut fixture);
@@ -1839,20 +1886,30 @@ fn production_driver_requests_browser_execution_inputs_instead_of_external_hando
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn production_driver_executes_typed_browser_task_without_external_handoff() {
     let node_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|directory| directory.join("node"))
         .find(|path| path.is_file())
         .expect("installed Node fixture executable");
     let node = PinnedExecutable::from_path(&node_path, "fixture-node").expect("pin Node");
-    let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python")
-        .expect("pin Python");
-    let make = PinnedExecutable::from_path("/usr/bin/make", "macos-system-make")
-        .expect("pin Make");
+    let python =
+        PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python").expect("pin Python");
+    let make = PinnedExecutable::from_path("/usr/bin/make", "macos-system-make").expect("pin Make");
     let policy = CommandPolicy::new(
         [python.clone(), node.clone(), make.clone()],
-        [python.path.parent().unwrap().to_path_buf(), node.path.parent().unwrap().to_path_buf(), make.path.parent().unwrap().to_path_buf()],
-    ).expect("command policy");
+        [
+            python.path.parent().unwrap().to_path_buf(),
+            node.path.parent().unwrap().to_path_buf(),
+            make.path.parent().unwrap().to_path_buf(),
+        ],
+    )
+    .expect("command policy");
     let listener = TcpListener::bind("127.0.0.1:0").expect("dynamic app port");
     let port = listener.local_addr().expect("loopback address").port();
     drop(listener);
@@ -1860,28 +1917,52 @@ fn production_driver_executes_typed_browser_task_without_external_handoff() {
         working_directory_relative_path: "apps/inventory".to_owned(),
         entrypoint_relative_path: "server.js".to_owned(),
         argv: Vec::new(),
-        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag { flag: "--port".to_owned() },
-        readiness: BrowserManagedReadinessV1 { path: "/health".to_owned(), status: 200, body: "ok".to_owned(), timeout_ms: 5_000 },
-        persistence: BrowserManagedPersistenceBindingV1::ArgvFlag { flag: "--db".to_owned(), filename: "inventory.sqlite3".to_owned() },
+        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag {
+            flag: "--port".to_owned(),
+        },
+        readiness: BrowserManagedReadinessV1 {
+            path: "/health".to_owned(),
+            status: 200,
+            body: "ok".to_owned(),
+            timeout_ms: 5_000,
+        },
+        persistence: BrowserManagedPersistenceBindingV1::ArgvFlag {
+            flag: "--db".to_owned(),
+            filename: "inventory.sqlite3".to_owned(),
+        },
         required_generations: 2,
     };
-    let mut fixture = compiled_managed_loopback_fixture_with_launch("managed-node-production-driver", port, launch);
+    let mut fixture = compiled_managed_loopback_fixture_with_launch(
+        "managed-node-production-driver",
+        port,
+        launch,
+    );
     let state = StateStore::open(&fixture.repo.state_path).expect("open state");
-    let mut controller = Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
     let mut pressure = green_pressure_snapshot(1_000);
     pressure.host_free_disk_mib = Some(32_768);
     controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(pressure)));
-    let activation = controller.activate(fixture.compilation.take().expect("plan"), &fixture.registry)
+    let activation = controller
+        .activate(fixture.compilation.take().expect("plan"), &fixture.registry)
         .expect("activate browser task");
-    controller.configure_managed_node_executable(&policy, &node.path).expect("pin Controller Node");
+    controller
+        .configure_managed_node_executable(&policy, &node.path)
+        .expect("pin Controller Node");
     let parts = runtime_parts(&fixture);
     let backend = backend(Vec::new());
-    backend.unload().expect("browser fixture has no Controller-owned MODEL residency");
+    backend
+        .unload()
+        .expect("browser fixture has no Controller-owned MODEL residency");
     let isolation = MacSandboxExecBackend::detect().expect("Seatbelt");
     let runtime = ExecutionRuntime {
-        registry: &fixture.registry, backend: &backend, command_policy: &policy,
-        isolation_backend: &isolation, isolation_request: &parts.isolation_request,
-        artifacts: &parts.artifacts, tool_manifest: &parts.manifest,
+        registry: &fixture.registry,
+        backend: &backend,
+        command_policy: &policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
         python_executable: Path::new("/usr/bin/python3"),
     };
     let browser_manifest = browser_tool_manifest();
@@ -1892,29 +1973,49 @@ fn production_driver_executes_typed_browser_task_without_external_handoff() {
         browser: Some(ProductionBrowserResources {
             tool_manifest: &browser_manifest,
             chrome_path: Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            adapter_config: BrowserAdapterConfig { request_timeout_ms: 5_000, ..BrowserAdapterConfig::default() },
+            adapter_config: BrowserAdapterConfig {
+                request_timeout_ms: 5_000,
+                ..BrowserAdapterConfig::default()
+            },
         }),
     };
     let mut budget = ModelCallBudget::new(0, 30_000);
     let context = controller
         .production_task_context(&fixture.registry, &activation.task_ids[0])
         .expect("Controller-created browser context");
-    let outcome = controller.advance_production_goal_with_catalog(
-        &fixture.registry,
-        ProductionAdvanceResources {
-            compilation: None,
-            execution: Some(ProductionExecutionResources {
-                runtime: &runtime, context: &context, tool_schemas: &[],
-                readiness: readiness(), model_budget: &mut budget,
-            }),
-        },
-        Some(&catalog),
-    ).expect("Controller-owned browser execution");
-    assert_eq!(outcome, ProductionAdvanceOutcome::TaskVerified { task_id: activation.task_ids[0].clone() });
-    assert_eq!(controller.task_state(&activation.task_ids[0]), Some(TaskState::Succeeded));
+    let outcome = controller
+        .advance_production_goal_with_catalog(
+            &fixture.registry,
+            ProductionAdvanceResources {
+                compilation: None,
+                execution: Some(ProductionExecutionResources {
+                    runtime: &runtime,
+                    context: &context,
+                    tool_schemas: &[],
+                    readiness: readiness(),
+                    model_budget: &mut budget,
+                }),
+            },
+            Some(&catalog),
+        )
+        .expect("Controller-owned browser execution");
+    assert_eq!(
+        outcome,
+        ProductionAdvanceOutcome::TaskVerified {
+            task_id: activation.task_ids[0].clone()
+        }
+    );
+    assert_eq!(
+        controller.task_state(&activation.task_ids[0]),
+        Some(TaskState::Succeeded)
+    );
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn production_driver_respects_durable_pause_before_task_dispatch() {
     let mut fixture = compiled_worktree_fixture("production-driver-pause");
     let (mut controller, task_id) = controller_for(&mut fixture);
@@ -1933,6 +2034,10 @@ fn production_driver_respects_durable_pause_before_task_dispatch() {
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn production_driver_preserves_non_write_permission_denial() {
     let planning = json!({
         "tasks": [{
@@ -2035,6 +2140,11 @@ fn production_driver_preserves_non_write_permission_denial() {
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn production_driver_completes_genuine_read_only_task() {
     let planning = json!({
         "tasks": [{
@@ -2075,10 +2185,7 @@ fn production_driver_completes_genuine_read_only_task() {
     controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
         green_pressure_snapshot(1_000),
     )));
-    let compilation = fixture
-        .compilation
-        .as_ref()
-        .expect("compiled fixture plan");
+    let compilation = fixture.compilation.as_ref().expect("compiled fixture plan");
     let activation = controller
         .activate(compilation.clone(), &fixture.registry)
         .expect("activate read-only plan");
@@ -2101,7 +2208,8 @@ fn production_driver_completes_genuine_read_only_task() {
     let read_manifest = ToolManifest {
         tool_id: "tool.read".to_owned(),
         version: "1.0.0".to_owned(),
-        content_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
+        content_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            .to_owned(),
         permission_ceiling: BTreeSet::from([PermissionClass::Read]),
         declared_risk_floor: CommandRisk::ReadOnly,
         reconciliation_policy: ReconciliationPolicy::proof_required_local(),
@@ -2741,7 +2849,10 @@ fn repository_model_stale_update_repairs_from_repair_pending_to_success() {
     );
     let attempt_raw = controller
         .state()
-        .get_state("controller.attempt", &success.attempt_id)
+        .get_state(
+            "controller.attempt",
+            &active_revision_key(controller.state(), &success.attempt_id),
+        )
         .unwrap_or_else(|error| panic!("read repository repair attempt: {error}"))
         .unwrap_or_else(|| panic!("repository repair attempt missing"));
     let attempt: Value = serde_json::from_str(&attempt_raw)
@@ -2900,7 +3011,10 @@ fn readiness_requires_all_guard_classes_and_never_persists_ready_bit() {
 
     let persisted = controller
         .state()
-        .get_state("controller.task", &task_id)
+        .get_state(
+            "controller.task",
+            &active_revision_key(controller.state(), &task_id),
+        )
         .unwrap_or_else(|error| panic!("read task state: {error}"))
         .unwrap_or_else(|| panic!("missing task state"));
     assert!(!persisted.contains("\"ready\""));
@@ -3568,7 +3682,7 @@ fn stale_evidence_record_invalidates_ready_lease_before_model_dispatch() {
 
     let mut second = StateStore::open(&fixture.repo.state_path)
         .unwrap_or_else(|error| panic!("second state: {error}"));
-    let key = format!("{task_id}:{requirement_id}");
+    let key = active_revision_key(&second, &format!("{task_id}:{requirement_id}"));
     let raw = second
         .get_state("controller.evidence_satisfaction", &key)
         .unwrap_or_else(|error| panic!("read evidence satisfaction: {error}"))
@@ -3699,9 +3813,12 @@ fn verified_upstream_bindings_make_dependent_task_ready_and_misbound_record_bloc
         .cancel_ready_lease(downstream_ready)
         .unwrap_or_else(|error| panic!("cancel downstream readiness: {error}"));
 
-    let binding_key = format!("{}:{}", contract.upstream, contract.artifact);
     let mut second = StateStore::open(&fixture.repo.state_path)
         .unwrap_or_else(|error| panic!("second state: {error}"));
+    let binding_key = active_revision_key(
+        &second,
+        &format!("{}:{}", contract.upstream, contract.artifact),
+    );
     let raw = second
         .get_state("controller.artifact_binding", &binding_key)
         .unwrap_or_else(|error| panic!("read artifact binding: {error}"))
@@ -7005,6 +7122,10 @@ fn worktree_d3_execution_persists_change_set_and_never_mutates_primary() {
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn controller_materializes_existing_ignored_dependencies_under_task_lease() {
     let mut fixture = controller_offline_fixture("controller-offline-dependencies");
     let source = fixture.repo.root.join("node_modules/pkg/index.js");
@@ -7087,6 +7208,10 @@ fn offline_limits() -> OfflineDependencyLimits {
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn controller_offline_fixture(label: &str) -> CompiledFixture {
     let fixture = compiled_worktree_fixture(label);
     fs::write(
@@ -7101,6 +7226,10 @@ fn controller_offline_fixture(label: &str) -> CompiledFixture {
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn controller_offline_dependencies_deny_stale_lease_before_copy() {
     let mut fixture = controller_offline_fixture("controller-offline-stale-lease");
     let (mut controller, task_id) = controller_for(&mut fixture);
@@ -7131,14 +7260,20 @@ fn controller_offline_dependencies_deny_stale_lease_before_copy() {
     assert!(error.to_string().contains("worktree HEAD differs"));
     assert!(!lease.worktree_path.join("node_modules").exists());
     let state = StateStore::open(&fixture.repo.state_path).expect("read state");
-    assert!(state
-        .state_records("controller.offline_node_modules")
-        .expect("receipts")
-        .is_empty());
+    assert!(
+        state
+            .state_records("controller.offline_node_modules")
+            .expect("receipts")
+            .is_empty()
+    );
     controller.cancel_ready_lease(ready).expect("cancel ready");
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn controller_offline_dependencies_detect_destination_and_source_drift_on_restart() {
     let mut fixture = controller_offline_fixture("controller-offline-drift");
     let (mut controller, task_id) = controller_for(&mut fixture);
@@ -7179,6 +7314,10 @@ fn controller_offline_dependencies_detect_destination_and_source_drift_on_restar
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn controller_offline_dependencies_reject_checkpoint_receipt_tamper() {
     let mut fixture = controller_offline_fixture("controller-offline-receipt-tamper");
     let (mut controller, task_id) = controller_for(&mut fixture);
@@ -7228,6 +7367,10 @@ fn controller_offline_dependencies_reject_checkpoint_receipt_tamper() {
 }
 
 #[test]
+#[expect(
+    clippy::expect_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn controller_offline_dependencies_deny_unsafe_tree_and_never_replay_unresolved_copy() {
     let mut fixture = controller_offline_fixture("controller-offline-unsafe");
     let source = fixture.repo.root.join("node_modules/pkg/index.js");
@@ -7277,6 +7420,11 @@ fn controller_offline_dependencies_deny_unsafe_tree_and_never_replay_unresolved_
 
 #[cfg(feature = "recovery-test-hooks")]
 #[test]
+#[expect(
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn controller_offline_dependencies_crash_after_prepared_intent_is_not_replayed() {
     const CHILD: &str = "SOVEREIGN_OFFLINE_DEPENDENCY_CRASH_CHILD";
     const META: &str = "SOVEREIGN_OFFLINE_DEPENDENCY_CRASH_META";
@@ -7557,10 +7705,11 @@ fn committed_v2_action_intent_recovers_as_primary_only_and_cannot_gain_worktree_
         "pre_diff_digest": repository_baseline.baseline_diff_digest,
         "pre_changed_fingerprints": {}
     });
+    let scoped_attempt_key = active_revision_key(&state, &attempt_id);
     state
         .put_state(
             "controller.attempt",
-            &attempt_id,
+            &scoped_attempt_key,
             &serde_json::to_string(&attempt_runtime)
                 .unwrap_or_else(|error| panic!("encode attempt runtime: {error}")),
         )
@@ -8222,7 +8371,10 @@ fn committed_v4_repository_create_recovers_through_recovery_manager_to_success()
         .unwrap_or_else(|| panic!("precrash v4 task runtime missing"));
     assert_eq!(task_runtime["state"], json!("verifying"));
     let attempt_runtime = precrash_state
-        .get_state("controller.attempt", &attempt_id)
+        .get_state(
+            "controller.attempt",
+            &active_revision_key(&precrash_state, &attempt_id),
+        )
         .unwrap_or_else(|error| panic!("read precrash v4 attempt: {error}"))
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .unwrap_or_else(|| panic!("precrash v4 attempt runtime missing"));
@@ -8449,7 +8601,10 @@ fn committed_v4_repository_update_recovers_through_recovery_manager_to_success()
         .unwrap_or_else(|| panic!("precrash v4 update task runtime missing"));
     assert_eq!(task_runtime["state"], json!("verifying"));
     let attempt_runtime = precrash_state
-        .get_state("controller.attempt", &attempt_id)
+        .get_state(
+            "controller.attempt",
+            &active_revision_key(&precrash_state, &attempt_id),
+        )
         .unwrap_or_else(|error| panic!("read precrash v4 update attempt: {error}"))
         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
         .unwrap_or_else(|| panic!("precrash v4 update attempt runtime missing"));
@@ -8762,6 +8917,10 @@ fn managed_loopback_start_rejects_scope_escape_symlink_and_stale_baseline_before
 
 #[test]
 #[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn managed_node_launch_uses_controller_pin_dynamic_port_persistence_and_reaps_group() {
     let node_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|directory| directory.join("node"))
@@ -8782,69 +8941,141 @@ fn managed_node_launch_uses_controller_pin_dynamic_port_persistence_and_reaps_gr
         working_directory_relative_path: "apps/inventory".to_owned(),
         entrypoint_relative_path: "server.js".to_owned(),
         argv: Vec::new(),
-        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag { flag: "--port".to_owned() },
-        readiness: BrowserManagedReadinessV1 { path: "/health".to_owned(), status: 200, body: "ok".to_owned(), timeout_ms: 5_000 },
-        persistence: BrowserManagedPersistenceBindingV1::ArgvFlag { flag: "--db".to_owned(), filename: "inventory.sqlite3".to_owned() },
+        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag {
+            flag: "--port".to_owned(),
+        },
+        readiness: BrowserManagedReadinessV1 {
+            path: "/health".to_owned(),
+            status: 200,
+            body: "ok".to_owned(),
+            timeout_ms: 5_000,
+        },
+        persistence: BrowserManagedPersistenceBindingV1::ArgvFlag {
+            flag: "--db".to_owned(),
+            filename: "inventory.sqlite3".to_owned(),
+        },
         required_generations: 2,
     };
-    let mut fixture = compiled_managed_loopback_fixture_with_launch("managed-node-runtime", port, launch);
+    let mut fixture =
+        compiled_managed_loopback_fixture_with_launch("managed-node-runtime", port, launch);
     let state = StateStore::open(&fixture.repo.state_path).unwrap();
-    let mut controller = Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
     let mut pressure = green_pressure_snapshot(1_000);
     pressure.host_free_disk_mib = Some(32_768);
     controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(pressure)));
-    let activation = controller.activate(fixture.compilation.take().unwrap(), &fixture.registry).unwrap();
+    let activation = controller
+        .activate(fixture.compilation.take().unwrap(), &fixture.registry)
+        .unwrap();
     let task_id = &activation.task_ids[0];
     let browser_manifest = browser_tool_manifest();
-    let browser_config = BrowserAdapterConfig { request_timeout_ms: 5_000, ..BrowserAdapterConfig::default() };
-    let ready = controller.derive_browser_ready_lease(&fixture.registry, task_id, readiness(), &browser_manifest, browser_config.clone()).unwrap();
+    let browser_config = BrowserAdapterConfig {
+        request_timeout_ms: 5_000,
+        ..BrowserAdapterConfig::default()
+    };
+    let ready = controller
+        .derive_browser_ready_lease(
+            &fixture.registry,
+            task_id,
+            readiness(),
+            &browser_manifest,
+            browser_config.clone(),
+        )
+        .unwrap();
     let backend = backend(Vec::new());
     let chrome = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-    let session = controller.acquire_browser_session_from_ready_lease(ready, &fixture.registry, &browser_manifest, &backend, chrome, browser_config).unwrap();
+    let session = controller
+        .acquire_browser_session_from_ready_lease(
+            ready,
+            &fixture.registry,
+            &browser_manifest,
+            &backend,
+            chrome,
+            browser_config,
+        )
+        .unwrap();
     let parts = runtime_parts(&fixture);
     let isolation = MacSandboxExecBackend::detect().unwrap();
     let runtime = ExecutionRuntime {
-        registry: &fixture.registry, backend: &backend, command_policy: &command_policy,
-        isolation_backend: &isolation, isolation_request: &parts.isolation_request,
-        artifacts: &parts.artifacts, tool_manifest: &parts.manifest,
+        registry: &fixture.registry,
+        backend: &backend,
+        command_policy: &command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
         python_executable: Path::new("/usr/bin/python3"),
     };
-    let unconfigured = controller.start_plan_managed_loopback_app(&session, &runtime, 1).err().unwrap();
-    assert!(unconfigured.to_string().contains("Node executable is not configured"));
-    controller.configure_managed_node_executable(&command_policy, &node.path).unwrap();
-    let mut first = controller.start_plan_managed_loopback_app(&session, &runtime, 1)
+    let unconfigured = controller
+        .start_plan_managed_loopback_app(&session, &runtime, 1)
+        .err()
+        .unwrap();
+    assert!(
+        unconfigured
+            .to_string()
+            .contains("Node executable is not configured")
+    );
+    controller
+        .configure_managed_node_executable(&command_policy, &node.path)
+        .unwrap();
+    let mut first = controller
+        .start_plan_managed_loopback_app(&session, &runtime, 1)
         .unwrap_or_else(|error| panic!("start Node generation one: {error}"));
     let first_group = first.process_group_id();
     let db = first.database_path().to_path_buf();
     assert_eq!(fs::read_to_string(&db).unwrap(), "persisted");
-    controller.stop_managed_loopback_app(&session, &runtime, &mut first).unwrap();
-    assert!(sovereign_tools::process_group_leader_identity(first_group).unwrap().is_none());
+    controller
+        .stop_managed_loopback_app(&session, &runtime, &mut first)
+        .unwrap();
+    assert!(
+        sovereign_tools::process_group_leader_identity(first_group)
+            .unwrap()
+            .is_none()
+    );
     assert_process_group_absent(first_group);
-    let mut second = controller.start_plan_managed_loopback_app(&session, &runtime, 2)
+    let mut second = controller
+        .start_plan_managed_loopback_app(&session, &runtime, 2)
         .unwrap_or_else(|error| panic!("start Node generation two: {error}"));
     assert_eq!(second.database_path(), db);
     assert_eq!(fs::read_to_string(&db).unwrap(), "persisted");
     let second_group = second.process_group_id();
-    controller.stop_managed_loopback_app(&session, &runtime, &mut second).unwrap();
-    assert!(sovereign_tools::process_group_leader_identity(second_group).unwrap().is_none());
+    controller
+        .stop_managed_loopback_app(&session, &runtime, &mut second)
+        .unwrap();
+    assert!(
+        sovereign_tools::process_group_leader_identity(second_group)
+            .unwrap()
+            .is_none()
+    );
     assert_process_group_absent(second_group);
     controller.shutdown_browser_session(session).unwrap();
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn managed_node_postgres_broker_launches_two_generations_and_closes_each_endpoint() {
-    let Ok(database_oid) = std::env::var("SOVEREIGN_TEST_LIVE_POSTGRES_OID") else { return; };
+    let Ok(database_oid) = std::env::var("SOVEREIGN_TEST_LIVE_POSTGRES_OID") else {
+        return;
+    };
     let database_oid: u32 = database_oid.parse().unwrap();
-    assert!(std::net::TcpStream::connect(("127.0.0.1", 5432)).is_ok(),
-        "live PostgreSQL TCP must be reachable outside the managed-app sandbox for this denial proof");
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", 5432)).is_ok(),
+        "live PostgreSQL TCP must be reachable outside the managed-app sandbox for this denial proof"
+    );
     let node_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|directory| directory.join("node"))
-        .find(|path| path.is_file()).unwrap();
+        .find(|path| path.is_file())
+        .unwrap();
     let node = PinnedExecutable::from_path(&node_path, "fixture-node").unwrap();
     let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python").unwrap();
     let node_root = node.path.parent().unwrap().to_path_buf();
     let python_root = python.path.parent().unwrap().to_path_buf();
-    let command_policy = CommandPolicy::new([python, node.clone()], [python_root, node_root]).unwrap();
+    let command_policy =
+        CommandPolicy::new([python, node.clone()], [python_root, node_root]).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -8852,83 +9083,168 @@ fn managed_node_postgres_broker_launches_two_generations_and_closes_each_endpoin
         working_directory_relative_path: "apps/inventory".to_owned(),
         entrypoint_relative_path: "server.js".to_owned(),
         argv: Vec::new(),
-        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag { flag: "--port".to_owned() },
-        readiness: BrowserManagedReadinessV1 { path: "/health".to_owned(), status: 200, body: "ok".to_owned(), timeout_ms: 5_000 },
-        persistence: BrowserManagedPersistenceBindingV1::PostgresBrokerV1 { flag: "--database-url".to_owned() },
+        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag {
+            flag: "--port".to_owned(),
+        },
+        readiness: BrowserManagedReadinessV1 {
+            path: "/health".to_owned(),
+            status: 200,
+            body: "ok".to_owned(),
+            timeout_ms: 5_000,
+        },
+        persistence: BrowserManagedPersistenceBindingV1::PostgresBrokerV1 {
+            flag: "--database-url".to_owned(),
+        },
         required_generations: 2,
     };
-    let mut fixture = compiled_managed_loopback_fixture_with_launch("managed-postgres-runtime", port, launch);
+    let mut fixture =
+        compiled_managed_loopback_fixture_with_launch("managed-postgres-runtime", port, launch);
     let state = StateStore::open(&fixture.repo.state_path).unwrap();
-    let mut controller = Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
     let mut pressure = green_pressure_snapshot(1_000);
     pressure.host_free_disk_mib = Some(32_768);
     controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(pressure)));
-    let activation = controller.activate(fixture.compilation.take().unwrap(), &fixture.registry).unwrap();
+    let activation = controller
+        .activate(fixture.compilation.take().unwrap(), &fixture.registry)
+        .unwrap();
     let task_id = &activation.task_ids[0];
     let browser_manifest = browser_tool_manifest();
-    let browser_config = BrowserAdapterConfig { request_timeout_ms: 5_000, ..BrowserAdapterConfig::default() };
-    let ready = controller.derive_browser_ready_lease(&fixture.registry, task_id, readiness(), &browser_manifest, browser_config.clone()).unwrap();
+    let browser_config = BrowserAdapterConfig {
+        request_timeout_ms: 5_000,
+        ..BrowserAdapterConfig::default()
+    };
+    let ready = controller
+        .derive_browser_ready_lease(
+            &fixture.registry,
+            task_id,
+            readiness(),
+            &browser_manifest,
+            browser_config.clone(),
+        )
+        .unwrap();
     let backend = backend(Vec::new());
     let chrome = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-    let session = controller.acquire_browser_session_from_ready_lease(ready, &fixture.registry, &browser_manifest, &backend, chrome, browser_config).unwrap();
+    let session = controller
+        .acquire_browser_session_from_ready_lease(
+            ready,
+            &fixture.registry,
+            &browser_manifest,
+            &backend,
+            chrome,
+            browser_config,
+        )
+        .unwrap();
     let parts = runtime_parts(&fixture);
     let isolation = MacSandboxExecBackend::detect().unwrap();
     let runtime = ExecutionRuntime {
-        registry: &fixture.registry, backend: &backend, command_policy: &command_policy,
-        isolation_backend: &isolation, isolation_request: &parts.isolation_request,
-        artifacts: &parts.artifacts, tool_manifest: &parts.manifest,
+        registry: &fixture.registry,
+        backend: &backend,
+        command_policy: &command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
         python_executable: Path::new("/usr/bin/python3"),
     };
-    controller.configure_managed_node_executable(&command_policy, &node.path).unwrap();
-    controller.configure_managed_postgres_backend(Path::new("/tmp/.s.PGSQL.5432"), database_oid).unwrap();
+    controller
+        .configure_managed_node_executable(&command_policy, &node.path)
+        .unwrap();
+    controller
+        .configure_managed_postgres_backend(Path::new("/tmp/.s.PGSQL.5432"), database_oid)
+        .unwrap();
     let mut groups = BTreeSet::new();
     let mut broker_ports = Vec::new();
     for generation in 1..=2 {
-        let request_id = match controller.start_plan_managed_loopback_app(&session, &runtime, generation) {
-            Err(sovereign_controller::ControllerError::AwaitingApproval { request_id, .. }) => request_id,
-            Ok(_) => panic!("PostgreSQL generation {generation} started without network-write approval"),
+        let request_id = match controller
+            .start_plan_managed_loopback_app(&session, &runtime, generation)
+        {
+            Err(sovereign_controller::ControllerError::AwaitingApproval { request_id, .. }) => {
+                request_id
+            }
+            Ok(_) => {
+                panic!("PostgreSQL generation {generation} started without network-write approval")
+            }
             Err(error) => panic!("request PostgreSQL generation {generation} approval: {error}"),
         };
-        let approved = controller.respond_to_approval(
-            &request_id,
-            sovereign_controller::ApprovalDecisionV1::Approve,
-            "test:postgres-operator",
-        ).unwrap_or_else(|error| panic!("approve PostgreSQL generation {generation}: {error}"));
+        let approved = controller
+            .respond_to_approval(
+                &request_id,
+                sovereign_controller::ApprovalDecisionV1::Approve,
+                "test:postgres-operator",
+            )
+            .unwrap_or_else(|error| panic!("approve PostgreSQL generation {generation}: {error}"));
         assert_eq!(approved.permission_class, "network_write");
-        let mut app = controller.start_plan_managed_loopback_app(&session, &runtime, generation)
-            .unwrap_or_else(|error| panic!("start approved PostgreSQL generation {generation}: {error}"));
+        let mut app = controller
+            .start_plan_managed_loopback_app(&session, &runtime, generation)
+            .unwrap_or_else(|error| {
+                panic!("start approved PostgreSQL generation {generation}: {error}")
+            });
         let broker_port = app.postgres_broker_port().unwrap();
         broker_ports.push(broker_port);
         assert_eq!(app.database_path(), Path::new("postgresql:sovereign_app"));
         let group = app.process_group_id();
-        assert!(groups.insert(group), "managed PostgreSQL restart reused a process group");
-        controller.stop_managed_loopback_app(&session, &runtime, &mut app).unwrap();
+        assert!(
+            groups.insert(group),
+            "managed PostgreSQL restart reused a process group"
+        );
+        controller
+            .stop_managed_loopback_app(&session, &runtime, &mut app)
+            .unwrap();
         assert_process_group_absent(group);
         assert!(std::net::TcpStream::connect(("127.0.0.1", broker_port)).is_err());
     }
     controller.shutdown_browser_session(session).unwrap();
-    let grants = controller.state().action_records().unwrap().into_iter()
+    let grants = controller
+        .state()
+        .action_records()
+        .unwrap()
+        .into_iter()
         .filter(|record| record.action_id.starts_with("managed-postgres-broker."))
         .map(|record| {
             assert_eq!(record.state, "committed");
             assert!(record.result_digest.is_some());
-            (record.action_id, record.payload_digest, record.result_digest)
-        }).collect::<Vec<_>>();
-    assert_eq!(grants.len(), 2, "each generation needs one distinct durable network grant");
+            (
+                record.action_id,
+                record.payload_digest,
+                record.result_digest,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        grants.len(),
+        2,
+        "each generation needs one distinct durable network grant"
+    );
     drop(controller);
     let state = StateStore::open(&fixture.repo.state_path).unwrap();
     let (recovered, recovery) = RecoveryManager::recover_with_permission_context(
-        state, &fixture.registry, PermissionContext::m7_local_browser_execution(),
-    ).unwrap_or_else(|error| panic!("recover stopped PostgreSQL generations: {error}"));
+        state,
+        &fixture.registry,
+        PermissionContext::m7_local_browser_execution(),
+    )
+    .unwrap_or_else(|error| panic!("recover stopped PostgreSQL generations: {error}"));
     assert!(recovery.unknown_action_ids.is_empty());
     for (action_id, payload_digest, result_digest) in grants {
-        let record = recovered.state().action_record(&action_id).unwrap().unwrap();
+        let record = recovered
+            .state()
+            .action_record(&action_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(record.state, "committed");
         assert_eq!(record.payload_digest, payload_digest);
         assert_eq!(record.result_digest, result_digest);
-        assert_eq!(recovered.state().journal().unwrap().iter().filter(|event|
-            event.entity_id == action_id && event.event_kind == "dispatched").count(), 1,
-            "recovery replayed the generation-bound broker action");
+        assert_eq!(
+            recovered
+                .state()
+                .journal()
+                .unwrap()
+                .iter()
+                .filter(|event| event.entity_id == action_id && event.event_kind == "dispatched")
+                .count(),
+            1,
+            "recovery replayed the generation-bound broker action"
+        );
     }
     for port in broker_ports {
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
@@ -8939,18 +9255,30 @@ fn managed_node_postgres_broker_launches_two_generations_and_closes_each_endpoin
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    clippy::too_many_lines,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn managed_postgres_abrupt_handle_loss_recovery_reaps_generation_without_replay() {
-    let Ok(database_oid) = std::env::var("SOVEREIGN_TEST_LIVE_POSTGRES_OID") else { return; };
+    let Ok(database_oid) = std::env::var("SOVEREIGN_TEST_LIVE_POSTGRES_OID") else {
+        return;
+    };
     let database_oid: u32 = database_oid.parse().unwrap();
     let node_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|directory| directory.join("node"))
-        .find(|path| path.is_file()).unwrap();
+        .find(|path| path.is_file())
+        .unwrap();
     let node = PinnedExecutable::from_path(&node_path, "fixture-node").unwrap();
     let python = PinnedExecutable::from_path("/usr/bin/python3", "macos-system-python").unwrap();
     let command_policy = CommandPolicy::new(
         [python.clone(), node.clone()],
-        [python.path.parent().unwrap().to_path_buf(), node.path.parent().unwrap().to_path_buf()],
-    ).unwrap();
+        [
+            python.path.parent().unwrap().to_path_buf(),
+            node.path.parent().unwrap().to_path_buf(),
+        ],
+    )
+    .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -8958,48 +9286,107 @@ fn managed_postgres_abrupt_handle_loss_recovery_reaps_generation_without_replay(
         working_directory_relative_path: "apps/inventory".to_owned(),
         entrypoint_relative_path: "server.js".to_owned(),
         argv: Vec::new(),
-        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag { flag: "--port".to_owned() },
-        readiness: BrowserManagedReadinessV1 { path: "/health".to_owned(), status: 200, body: "ok".to_owned(), timeout_ms: 5_000 },
-        persistence: BrowserManagedPersistenceBindingV1::PostgresBrokerV1 { flag: "--database-url".to_owned() },
+        dynamic_port: BrowserManagedArgBindingV1::ArgvFlag {
+            flag: "--port".to_owned(),
+        },
+        readiness: BrowserManagedReadinessV1 {
+            path: "/health".to_owned(),
+            status: 200,
+            body: "ok".to_owned(),
+            timeout_ms: 5_000,
+        },
+        persistence: BrowserManagedPersistenceBindingV1::PostgresBrokerV1 {
+            flag: "--database-url".to_owned(),
+        },
         required_generations: 2,
     };
-    let mut fixture = compiled_managed_loopback_fixture_with_launch("managed-postgres-recovery", port, launch);
+    let mut fixture =
+        compiled_managed_loopback_fixture_with_launch("managed-postgres-recovery", port, launch);
     let state = StateStore::open(&fixture.repo.state_path).unwrap();
-    let mut controller = Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
+    let mut controller =
+        Controller::with_permission_context(state, PermissionContext::m7_local_browser_execution());
     let mut pressure = green_pressure_snapshot(1_000);
     pressure.host_free_disk_mib = Some(32_768);
     controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(pressure)));
-    let activation = controller.activate(fixture.compilation.take().unwrap(), &fixture.registry).unwrap();
+    let activation = controller
+        .activate(fixture.compilation.take().unwrap(), &fixture.registry)
+        .unwrap();
     let browser_manifest = browser_tool_manifest();
-    let browser_config = BrowserAdapterConfig { request_timeout_ms: 5_000, ..BrowserAdapterConfig::default() };
-    let ready = controller.derive_browser_ready_lease(&fixture.registry, &activation.task_ids[0], readiness(), &browser_manifest, browser_config.clone()).unwrap();
+    let browser_config = BrowserAdapterConfig {
+        request_timeout_ms: 5_000,
+        ..BrowserAdapterConfig::default()
+    };
+    let ready = controller
+        .derive_browser_ready_lease(
+            &fixture.registry,
+            &activation.task_ids[0],
+            readiness(),
+            &browser_manifest,
+            browser_config.clone(),
+        )
+        .unwrap();
     let backend = backend(Vec::new());
     let chrome = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
-    let session = controller.acquire_browser_session_from_ready_lease(ready, &fixture.registry, &browser_manifest, &backend, chrome, browser_config).unwrap();
+    let session = controller
+        .acquire_browser_session_from_ready_lease(
+            ready,
+            &fixture.registry,
+            &browser_manifest,
+            &backend,
+            chrome,
+            browser_config,
+        )
+        .unwrap();
     let parts = runtime_parts(&fixture);
     let isolation = MacSandboxExecBackend::detect().unwrap();
     let runtime = ExecutionRuntime {
-        registry: &fixture.registry, backend: &backend, command_policy: &command_policy,
-        isolation_backend: &isolation, isolation_request: &parts.isolation_request,
-        artifacts: &parts.artifacts, tool_manifest: &parts.manifest,
+        registry: &fixture.registry,
+        backend: &backend,
+        command_policy: &command_policy,
+        isolation_backend: &isolation,
+        isolation_request: &parts.isolation_request,
+        artifacts: &parts.artifacts,
+        tool_manifest: &parts.manifest,
         python_executable: Path::new("/usr/bin/python3"),
     };
-    controller.configure_managed_node_executable(&command_policy, &node.path).unwrap();
-    controller.configure_managed_postgres_backend(Path::new("/tmp/.s.PGSQL.5432"), database_oid).unwrap();
+    controller
+        .configure_managed_node_executable(&command_policy, &node.path)
+        .unwrap();
+    controller
+        .configure_managed_postgres_backend(Path::new("/tmp/.s.PGSQL.5432"), database_oid)
+        .unwrap();
     let request_id = match controller.start_plan_managed_loopback_app(&session, &runtime, 1) {
-        Err(sovereign_controller::ControllerError::AwaitingApproval { request_id, .. }) => request_id,
+        Err(sovereign_controller::ControllerError::AwaitingApproval { request_id, .. }) => {
+            request_id
+        }
         Ok(_) => panic!("managed PostgreSQL broker started without approval"),
         Err(error) => panic!("request managed PostgreSQL approval: {error}"),
     };
-    controller.respond_to_approval(&request_id, sovereign_controller::ApprovalDecisionV1::Approve, "test:postgres-operator").unwrap();
-    let app = controller.start_plan_managed_loopback_app(&session, &runtime, 1).unwrap();
+    controller
+        .respond_to_approval(
+            &request_id,
+            sovereign_controller::ApprovalDecisionV1::Approve,
+            "test:postgres-operator",
+        )
+        .unwrap();
+    let app = controller
+        .start_plan_managed_loopback_app(&session, &runtime, 1)
+        .unwrap();
     let broker_port = app.postgres_broker_port().unwrap();
     let group = app.process_group_id();
-    let broker_grant = controller.state().action_records().unwrap().into_iter()
+    let broker_grant = controller
+        .state()
+        .action_records()
+        .unwrap()
+        .into_iter()
         .find(|record| record.action_id.starts_with("managed-postgres-broker."))
         .unwrap();
     assert_eq!(broker_grant.state, "committed");
-    let start_action = controller.state().action_records().unwrap().into_iter()
+    let start_action = controller
+        .state()
+        .action_records()
+        .unwrap()
+        .into_iter()
         .find(|record| record.action_id.starts_with("managed-loopback-start."))
         .unwrap();
     assert_eq!(start_action.state, "committed");
@@ -9010,35 +9397,72 @@ fn managed_postgres_abrupt_handle_loss_recovery_reaps_generation_without_replay(
     drop(controller);
     let state = StateStore::open(&fixture.repo.state_path).unwrap();
     let (recovered, summary) = RecoveryManager::recover_with_permission_context(
-        state, &fixture.registry, PermissionContext::m7_local_browser_execution(),
-    ).unwrap_or_else(|error| panic!("recover lost managed PostgreSQL owner: {error}"));
-    let recovered_grant = recovered.state().action_record(&broker_grant.action_id).unwrap().unwrap();
+        state,
+        &fixture.registry,
+        PermissionContext::m7_local_browser_execution(),
+    )
+    .unwrap_or_else(|error| panic!("recover lost managed PostgreSQL owner: {error}"));
+    let recovered_grant = recovered
+        .state()
+        .action_record(&broker_grant.action_id)
+        .unwrap()
+        .unwrap();
     assert!(summary.execution_epoch_after > broker_grant.execution_epoch);
     assert_eq!(recovered_grant.state, "committed");
     assert_eq!(recovered_grant.payload_digest, broker_grant.payload_digest);
     assert_eq!(recovered_grant.result_digest, broker_grant.result_digest);
-    assert_eq!(recovered.state().journal().unwrap().iter().filter(|event|
-        event.entity_id == broker_grant.action_id && event.event_kind == "dispatched").count(), 1,
-        "recovery replayed the approved PostgreSQL grant");
-    let recovered_start = recovered.state().action_record(&start_action.action_id).unwrap().unwrap();
+    assert_eq!(
+        recovered
+            .state()
+            .journal()
+            .unwrap()
+            .iter()
+            .filter(|event| event.entity_id == broker_grant.action_id
+                && event.event_kind == "dispatched")
+            .count(),
+        1,
+        "recovery replayed the approved PostgreSQL grant"
+    );
+    let recovered_start = recovered
+        .state()
+        .action_record(&start_action.action_id)
+        .unwrap()
+        .unwrap();
     assert_eq!(recovered_start.state, "committed");
     assert_eq!(recovered_start.payload_digest, start_action.payload_digest);
     assert_eq!(recovered_start.result_digest, start_action.result_digest);
-    assert_eq!(recovered.state().journal().unwrap().iter().filter(|event|
-        event.entity_id == start_action.action_id && event.event_kind == "dispatched").count(), 1,
-        "recovery replayed the managed process start");
+    assert_eq!(
+        recovered
+            .state()
+            .journal()
+            .unwrap()
+            .iter()
+            .filter(|event| event.entity_id == start_action.action_id
+                && event.event_kind == "dispatched")
+            .count(),
+        1,
+        "recovery replayed the managed process start"
+    );
     assert!(summary.unresolved_process_lease_ids.is_empty());
     assert_process_group_absent(group);
     assert!(std::net::TcpStream::connect(("127.0.0.1", broker_port)).is_err());
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
+)]
 fn assert_process_group_absent(group: u32) {
-    let output = Command::new("/bin/ps").args(["-A", "-o", "pgid="]).output()
+    let output = Command::new("/bin/ps")
+        .args(["-A", "-o", "pgid="])
+        .output()
         .unwrap_or_else(|error| panic!("inspect process groups: {error}"));
     assert!(output.status.success(), "inspect process groups failed");
     let listing = String::from_utf8(output.stdout).unwrap();
-    assert!(!listing.lines().any(|line| line.trim() == group.to_string()),
-        "managed process group {group} retained a process or child");
+    assert!(
+        !listing.lines().any(|line| line.trim() == group.to_string()),
+        "managed process group {group} retained a process or child"
+    );
 }
 
 #[test]

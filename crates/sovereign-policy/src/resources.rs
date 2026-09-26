@@ -1036,6 +1036,39 @@ impl M6ResourceGovernor {
         request: &ResourceLeaseRequestV1,
         pressure: &ResourcePressureEventV1,
     ) -> ResourceAdmissionDecisionV1 {
+        self.admit_with_caps(request, pressure, self.execution_caps(request, pressure))
+    }
+
+    /// Admission for Controller-owned verification using an exact pinned Rust
+    /// toolchain. One Cargo job needs rustc, clang and ld (three descendants).
+    /// Memory/pressure admission and the explicit task budget remain unchanged.
+    ///
+    /// # Errors
+    /// Returns a denial unless the request is an uncalibrated `BUILD_HEAVY` verification lease.
+    pub fn admit_rust_verification(
+        &mut self,
+        request: &ResourceLeaseRequestV1,
+        pressure: &ResourcePressureEventV1,
+        _toolchain: &crate::RustToolchainAccess,
+    ) -> Result<ResourceAdmissionDecisionV1, PolicyError> {
+        if request.class != HeavyLeaseClass::BuildHeavy || request.calibrated {
+            return Err(PolicyError::ResourceDenied(
+                "pinned Rust verification allowance requires uncalibrated BUILD_HEAVY".to_owned(),
+            ));
+        }
+        Ok(self.admit_with_caps(
+            request,
+            pressure,
+            (Some(1), request.task_budget.max_subprocesses.min(3)),
+        ))
+    }
+
+    fn admit_with_caps(
+        &mut self,
+        request: &ResourceLeaseRequestV1,
+        pressure: &ResourcePressureEventV1,
+        (parallel_job_cap, subprocess_cap): (Option<u32>, u32),
+    ) -> ResourceAdmissionDecisionV1 {
         let admission_rss_mib = self.admission_rss_mib(request);
         let projected_controlled_rss_mib = pressure
             .snapshot
@@ -1047,8 +1080,6 @@ impl M6ResourceGovernor {
             .snapshot
             .host_headroom_mib
             .saturating_sub(incremental_rss_mib);
-        let (parallel_job_cap, subprocess_cap) = self.execution_caps(request, pressure);
-
         let decision = self.preflight_decision(
             request,
             pressure,

@@ -987,7 +987,7 @@ pub struct IntegrationGateLeaseV1 {
 
 /// Ephemeral Controller authority for one single-repository task that cannot mutate repository
 /// state. The task may be pure read/evidence or may execute only its frozen deterministic command
-/// verification under process_exec; multi-repository integration gates use their dedicated lease.
+/// verification under `process_exec`; multi-repository integration gates use their dedicated lease.
 #[derive(Debug)]
 pub struct NonWriteTaskLeaseV1 {
     plan_id: String,
@@ -1062,6 +1062,7 @@ pub struct HeavyPhaseLease {
     resource_lease: ResourceLeaseV1,
     parallel_job_cap: Option<u32>,
     subprocess_cap: u32,
+    rust_verification_binding: Option<String>,
     permission_decision: PermissionDecision,
     completion: Option<HeavyPhaseCompletion>,
 }
@@ -6708,6 +6709,29 @@ impl Controller {
             .transpose()?;
         if active_plan.is_none() {
             self.validate_no_active_plan_history()?;
+            for record in self.state.state_records("controller.verification")? {
+                let verification: VerificationResultV1 = serde_json::from_str(&record.value_json)?;
+                if verification.schema_version != VERIFICATION_RESULT_SCHEMA_VERSION {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "unsupported durable verification schema version {}",
+                        verification.schema_version
+                    )));
+                }
+                let scoped_key = revision_scoped_key(
+                    &verification.plan_id,
+                    verification.plan_revision,
+                    &verification.verification_id,
+                );
+                if record.key != scoped_key
+                    && !(verification.plan_revision == 1
+                        && record.key == verification.verification_id)
+                {
+                    return Err(ControllerError::InvalidPlan(format!(
+                        "durable verification record key {} does not match canonical or legacy revision-1 identity",
+                        record.key
+                    )));
+                }
+            }
         }
         let projection = self.durable_status_active_projection(active_plan.as_ref())?;
         let goal_intents = self.validated_goal_intents_for_status()?;
@@ -6737,6 +6761,10 @@ impl Controller {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "status projection validates one durable active revision"
+    )]
     fn durable_status_active_projection(
         &self,
         active_plan: Option<&Value>,
@@ -7946,8 +7974,7 @@ impl Controller {
         }))?;
         let grant_seed = sha256_prefixed(
             format!(
-                "task_capability_grants_materialized\0{}\0{}\0{}",
-                plan_id, journal_tail, grant_payload_json
+                "task_capability_grants_materialized\0{plan_id}\0{journal_tail}\0{grant_payload_json}"
             )
             .as_bytes(),
         );
@@ -8573,12 +8600,16 @@ impl Controller {
     }
 
     /// Derives Controller-owned authority for one single-repository task whose frozen Plan IR
-    /// permissions are exactly read, or read plus process_exec, and which carries no repository
+    /// permissions are exactly read, or read plus `process_exec`, and which carries no repository
     /// mutation scope. Multi-repository integration gates remain on their dedicated API.
     ///
     /// # Errors
     /// Fails closed when task scope, permissions, acceptance, evidence, checkpoint, cancellation,
     /// baseline, or resource authority is not exact and current.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "non-write lease validates the complete task and current authority"
+    )]
     pub fn derive_non_write_task_lease(
         &mut self,
         registry: &ProjectRegistry,
@@ -8746,7 +8777,7 @@ impl Controller {
     }
 
     /// Executes one single-repository non-write task. Pure read tasks produce Controller evidence
-    /// without dispatch. Tasks with process_exec run only frozen required command verification
+    /// without dispatch. Tasks with `process_exec` run only frozen required command verification
     /// through the existing governed action journal/resource/process-reap path.
     ///
     /// # Errors
@@ -8845,6 +8876,10 @@ impl Controller {
         })
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "verification binds each distinct immutable evidence identity"
+    )]
     fn build_non_write_task_verification(
         &self,
         task_id: &str,
@@ -8863,8 +8898,7 @@ impl Controller {
         let snapshot_unchanged = post_snapshot_digest == baseline_digest;
         let diff_digest = sha256_prefixed(
             format!(
-                "non_write\0{}\0{}\0{}",
-                baseline_digest, post_snapshot_digest, evidence_artifact_digest
+                "non_write\0{baseline_digest}\0{post_snapshot_digest}\0{evidence_artifact_digest}"
             )
             .as_bytes(),
         );
@@ -10005,6 +10039,7 @@ impl Controller {
             parallel_job_cap: admission.parallel_job_cap,
             subprocess_cap: admission.subprocess_cap,
             permission_decision: model_lease.permission_decision,
+            rust_verification_binding: None,
             completion: None,
         })
     }
@@ -10017,6 +10052,7 @@ impl Controller {
         step_id: &str,
         tool_manifest: &ToolManifest,
         backend: &dyn ModelBackend,
+        rust_verification: Option<(&sovereign_policy::RustToolchainAccess, String)>,
     ) -> Result<HeavyPhaseLease, ControllerError> {
         self.require_execution_not_paused()?;
         let epoch = self.state.current_execution_epoch()?;
@@ -10123,7 +10159,12 @@ impl Controller {
             automatic_reload: false,
             disk_expanding: false,
         };
-        let admission = self.resources.admit(&request, &pressure);
+        let admission = if let Some((toolchain, _)) = &rust_verification {
+            self.resources
+                .admit_rust_verification(&request, &pressure, toolchain)?
+        } else {
+            self.resources.admit(&request, &pressure)
+        };
         let Some(resource_lease) = admission.lease.clone() else {
             self.persist_resource_policy_decision(&pressure, &admission.event, None, None)?;
             return Err(ControllerError::Policy(PolicyError::ResourceDenied(
@@ -10156,6 +10197,7 @@ impl Controller {
             resource_lease,
             parallel_job_cap: admission.parallel_job_cap,
             subprocess_cap: admission.subprocess_cap,
+            rust_verification_binding: rust_verification.map(|(_, binding)| binding),
             permission_decision,
             completion: None,
         })
@@ -10275,6 +10317,26 @@ impl Controller {
             )));
         }
 
+        if let Some(binding) = &lease.rust_verification_binding {
+            let toolchain = isolation_request.rust_toolchain.as_ref().ok_or_else(|| {
+                ControllerError::Policy(PolicyError::Denied(
+                    "Rust verification allowance lost its pinned toolchain".to_owned(),
+                ))
+            })?;
+            if &toolchain.verification_process_binding(&command.executable, &command.args)?
+                != binding
+                || isolation_request.allow_repository_write
+                || !isolation_request.network_offline
+                || isolation_request.build_scratch_root.is_none()
+                || lease.parallel_job_cap != Some(1)
+                || lease.subprocess_cap > 3
+            {
+                return Err(ControllerError::Policy(PolicyError::Denied(
+                    "Rust verification process allowance is stale or misbound".to_owned(),
+                )));
+            }
+        }
+
         let (repository_id, execution_root, isolation_root, integration_gate) =
             self.build_heavy_execution_authority(&lease.task_id, &command.working_directory)?;
         if command.working_directory.canonicalize()? != execution_root.canonicalize()? {
@@ -10301,7 +10363,10 @@ impl Controller {
             ));
             if isolation_request.allow_repository_write
                 || isolation_request.rust_toolchain.is_none()
-                || command.executable.file_name().is_none_or(|name| name != "cargo")
+                || command
+                    .executable
+                    .file_name()
+                    .is_none_or(|name| name != "cargo")
                 || scratch != &expected
                 || scratch.canonicalize()? != expected.canonicalize()?
             {
@@ -10386,6 +10451,12 @@ impl Controller {
         tool_manifest: &ToolManifest,
         verification_command: Option<(&str, &RequiredCommandVerificationStep, &Path)>,
     ) -> Result<AuthorizedAction, ControllerError> {
+        if lease.rust_verification_binding.is_some() && verification_command.is_none() {
+            return Err(ControllerError::Policy(PolicyError::Denied(
+                "Rust verification process allowance requires durable verification intent"
+                    .to_owned(),
+            )));
+        }
         let action = self.lower_build_heavy_action(
             lease,
             command,
@@ -10974,12 +11045,11 @@ impl Controller {
                 && executable.starts_with(&isolation_request.user_home_root)
                 && !executable.starts_with(&isolation_request.repository_root)
             {
-                isolation_request.rust_toolchain = Some(
-                    sovereign_policy::RustToolchainAccess::from_policy(
+                isolation_request.rust_toolchain =
+                    Some(sovereign_policy::RustToolchainAccess::from_policy(
                         runtime.command_policy,
                         &executable,
-                    )?,
-                );
+                    )?);
             }
             if integration_gate
                 || !mutates_repository
@@ -10994,6 +11064,15 @@ impl Controller {
                 &step.step_id,
                 &command_manifest,
                 runtime.backend,
+                isolation_request
+                    .rust_toolchain
+                    .as_ref()
+                    .and_then(|toolchain| {
+                        toolchain
+                            .verification_process_binding(&executable, &step.args)
+                            .ok()
+                            .map(|binding| (toolchain, binding))
+                    }),
             )?;
             let action_id = heavy_build_action_id(&heavy.resource_lease.lease_id);
             let mut command_args = step.args.clone();
@@ -12315,9 +12394,7 @@ impl Controller {
         for path in repair_source_paths {
             let current = match self.task_execution_read(runtime.registry, task_id, &path, None) {
                 Ok(current) => current,
-                Err(ControllerError::Io(error))
-                    if error.kind() == std::io::ErrorKind::NotFound =>
-                {
+                Err(ControllerError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -13427,6 +13504,7 @@ impl Controller {
             let mut journal = ActionJournal::new(&mut self.state);
             journal.transition(&action, ActionState::Authorized, ActionState::Dispatched)?;
         }
+        recovery_test_hook("after_repository_action_dispatch_before_commit");
         if guard
             .commit(
                 validated.action.content().as_bytes(),
@@ -15122,12 +15200,10 @@ impl Controller {
                     || !allowed_evidence.contains(evidence_id.as_str())
             })
         {
-            return Err(ControllerError::ProposalRejected(
-                format!(
-                    "repository proposal evidence is outside the current ContextPacket or unbounded: {}",
-                    proposal.evidence_ids.join(",")
-                ),
-            ));
+            return Err(ControllerError::ProposalRejected(format!(
+                "repository proposal evidence is outside the current ContextPacket or unbounded: {}",
+                proposal.evidence_ids.join(",")
+            )));
         }
         let active = self.active_ref()?;
         let task = active
@@ -19462,15 +19538,13 @@ fn decode_verification_records_for_scope(
             if verification.plan_id == plan_id
                 && verification.plan_revision == plan_revision
                 && verification.plan_digest == plan_digest
-            {
-                if scoped
+                && scoped
                     .insert(verification.verification_id.clone(), verification)
                     .is_some()
-                {
-                    return Err(ControllerError::InvalidPlan(
-                        "duplicate scoped verification authority for active plan".to_owned(),
-                    ));
-                }
+            {
+                return Err(ControllerError::InvalidPlan(
+                    "duplicate scoped verification authority for active plan".to_owned(),
+                ));
             }
             continue;
         }
@@ -23982,6 +24056,10 @@ struct RecoveredIntegrationGateCandidate {
     binding: VerificationCommandRecoveryBinding,
 }
 
+#[expect(
+    dead_code,
+    reason = "reserved non-write recovery classification is inert in current production driver"
+)]
 #[derive(Debug, Clone)]
 struct RecoveredNonWriteTaskCandidate {
     task_id: String,
@@ -24583,6 +24661,10 @@ fn classify_recovered_integration_gates(
     Ok(classification)
 }
 
+#[expect(
+    dead_code,
+    reason = "reserved non-write recovery classifier is inert in current production driver"
+)]
 #[allow(clippy::too_many_lines)]
 fn classify_recovered_non_write_tasks(
     controller: &mut Controller,
@@ -29319,6 +29401,10 @@ fn digest_json(value: &Value) -> Result<String, serde_json::Error> {
     Ok(sha256_prefixed(&serde_json::to_vec(&canonical)?))
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "fixture owns the exact typed acceptance contract serialized into the grant"
+)]
 fn make_goal_browser_grant(
     goal_id: &str,
     granted_at_ms: i64,
@@ -29883,19 +29969,18 @@ mod tests {
         VERIFICATION_COMMAND_INTENT_SCHEMA_VERSION, VerificationResultV1, VerifiedOutputBindingV1,
         WorktreeLifecycle, acceptance_permits_cross_revision_carry, aggregate_command_verification,
         bind_cargo_verification_target_dir, build_superseding_runtime,
-        cleanup_recovered_browser_profile,
-        command_verification_failure_code, compilation_inputs_are_fresh_for_carry,
-        compiled_acceptance_contract, dependency_bindings_permit_cross_revision_carry, digest_json,
-        exact_requirement_probe, explicit_replace_relation, fresh_task_runtime,
-        has_unresolved_process_lease, heavy_build_action_id, heavy_build_attempt_id,
-        initial_task_autonomy_budget, inject_build_parallel_job_cap,
-        lineage_records_for_supersession, normalize_persisted_action_intent,
-        normalized_failure_signature, output_binding_key, plan_instruction_fingerprint_digest,
-        process_lease_is_terminal, ready_lease_digest, rebase_goal_autonomy_budget, repair_allowed,
-        required_command_verification_steps, revision_record_key, revision_scoped_key,
-        scope_lineage_id, sha256_prefixed, valid_plan_ir_fixture, valid_resource_policy_fixture,
-        valid_task_fixture, validate_post_checkpoint_action_authority_correlation,
-        verification_build_lease_id,
+        cleanup_recovered_browser_profile, command_verification_failure_code,
+        compilation_inputs_are_fresh_for_carry, compiled_acceptance_contract,
+        dependency_bindings_permit_cross_revision_carry, digest_json, exact_requirement_probe,
+        explicit_replace_relation, fresh_task_runtime, has_unresolved_process_lease,
+        heavy_build_action_id, heavy_build_attempt_id, initial_task_autonomy_budget,
+        inject_build_parallel_job_cap, lineage_records_for_supersession,
+        normalize_persisted_action_intent, normalized_failure_signature, output_binding_key,
+        plan_instruction_fingerprint_digest, process_lease_is_terminal, ready_lease_digest,
+        rebase_goal_autonomy_budget, repair_allowed, required_command_verification_steps,
+        revision_record_key, revision_scoped_key, scope_lineage_id, sha256_prefixed,
+        valid_plan_ir_fixture, valid_resource_policy_fixture, valid_task_fixture,
+        validate_post_checkpoint_action_authority_correlation, verification_build_lease_id,
     };
     use serde_json::{Value, json};
     use sovereign_evidence::ArtifactStore;
@@ -30691,6 +30776,38 @@ mod tests {
         (base, controller, action, manifest, permission_decision)
     }
 
+    fn seal_manual_fixture_checkpoint(controller: &mut Controller) {
+        let active = controller
+            .active
+            .as_mut()
+            .unwrap_or_else(|| panic!("fixture active plan missing"));
+        let plan_digest = digest_json(&active.plan_document)
+            .unwrap_or_else(|error| panic!("digest fixture plan: {error}"));
+        active.plan_digest.clone_from(&plan_digest);
+        active.compiler_plan_digest = plan_digest;
+        for runtime in active.tasks.values_mut() {
+            runtime.task_contract_digest = digest_json(&runtime.task)
+                .unwrap_or_else(|error| panic!("digest fixture task: {error}"));
+        }
+        for repository in active.repositories.values_mut() {
+            repository.baseline_diff_digest =
+                sha256_prefixed(repository.baseline_diff_content.as_bytes());
+        }
+        controller
+            .persist_all_runtime()
+            .unwrap_or_else(|error| panic!("persist fixture runtime: {error}"));
+        controller
+            .checkpoint_now()
+            .unwrap_or_else(|error| panic!("checkpoint fixture: {error}"));
+        let checkpoint = controller
+            .state
+            .latest_valid_checkpoint_integrity()
+            .unwrap_or_else(|error| panic!("read fixture checkpoint: {error}"))
+            .unwrap_or_else(|| panic!("fixture checkpoint missing"));
+        super::load_latest_recoverable_manifest(&controller.state, &checkpoint)
+            .unwrap_or_else(|error| panic!("verify fixture manifest CAS: {error}"));
+    }
+
     fn output_charge_budgets(
         controller: &Controller,
         task_id: &str,
@@ -31154,6 +31271,7 @@ mod tests {
     fn reconciliation_external_side_effect_approval_is_exact_durable_and_epoch_bound() {
         let (base, mut controller, action, manifest, permission_decision) =
             reconciliation_external_side_effect_fixture("approval-exact");
+        seal_manual_fixture_checkpoint(&mut controller);
         let action_expires_at_ms = action.expires_at_ms;
         let (action_id, request_id) = match controller.prepare_action_for_dispatch(
             &action,
@@ -31304,6 +31422,7 @@ mod tests {
     fn reconciliation_external_side_effect_denial_mints_no_claim_and_cannot_dispatch() {
         let (base, mut controller, action, manifest, permission_decision) =
             reconciliation_external_side_effect_fixture("approval-denied");
+        seal_manual_fixture_checkpoint(&mut controller);
         let request_id = match controller.prepare_action_for_dispatch(
             &action,
             &manifest,
@@ -31495,6 +31614,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "test asserts a required Controller target binding"
+    )]
     fn cargo_verification_rebinds_untrusted_target_dir_to_exact_controller_scratch() {
         let scratch = Path::new("/task/.sovereign-build-action.123");
         let original = vec![
@@ -31514,7 +31637,6 @@ mod tests {
         assert!(bind_cargo_verification_target_dir(&ambiguous, scratch).is_err());
     }
 
-
     #[test]
     #[allow(clippy::too_many_lines)]
     fn physically_resident_model_is_proven_absent_before_build_heavy_admission() {
@@ -31533,6 +31655,13 @@ mod tests {
 
         let mut controller = Controller::new(state);
         controller.active = Some(active);
+        seal_manual_fixture_checkpoint(&mut controller);
+        let plan_digest = controller
+            .active
+            .as_ref()
+            .unwrap_or_else(|| panic!("resident-model fixture active plan missing"))
+            .plan_digest
+            .clone();
         let epoch = controller
             .state
             .current_execution_epoch()
@@ -33265,6 +33394,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "fixture checks all legacy carry and checkpoint bindings"
+    )]
     fn same_plan_carry_accepts_checkpoint_trusted_legacy_rev1_history() {
         let (base, state) = temp_state("legacy-rev1-historical-carry");
         let task = valid_task_fixture("task.E", &["repo.app"], false);
@@ -33919,7 +34052,7 @@ mod tests {
         let mut task = valid_task_fixture("task.completion", &["repo.app"], false);
         task["expected_artifacts"] = json!([]);
         if artifact_evidence {
-            let artifact_id = format!("artifact.task.completion");
+            let artifact_id = "artifact.task.completion".to_owned();
             task["expected_artifacts"] = json!([{
                 "artifact_id": artifact_id,
                 "kind": "evidence",
@@ -34189,6 +34322,438 @@ mod tests {
             .complete_queued_goal_intent(&registry)
             .unwrap_or_else(|error| panic!("complete queued goal: {error}"));
         (base, controller, completion)
+    }
+
+    #[cfg(feature = "recovery-test-hooks")]
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "forced-kill child requires explicit fixture inputs and recovered state"
+    )]
+    fn production_goal_completion_crash_worker() {
+        let Ok(stage) = std::env::var("SOVEREIGN_GOAL_CRASH_STAGE") else {
+            return;
+        };
+        let state_path =
+            PathBuf::from(std::env::var("SOVEREIGN_GOAL_CRASH_STATE").expect("worker state"));
+        let repo_root =
+            PathBuf::from(std::env::var("SOVEREIGN_GOAL_CRASH_REPO").expect("worker repo"));
+        let mut registry = ProjectRegistry::new();
+        registry
+            .register("repo.app", &repo_root)
+            .expect("worker register repo");
+        let mut controller =
+            Controller::reopen_local(StateStore::open(state_path).expect("worker open state"))
+                .expect("worker recover controller");
+        let outcome = controller
+            .advance_production_goal::<sovereign_policy::MacSandboxExecBackend>(
+                &registry,
+                super::ProductionAdvanceResources::default(),
+            )
+            .expect("worker advance production goal");
+        match stage.as_str() {
+            "complete" => assert!(matches!(
+                outcome,
+                super::ProductionAdvanceOutcome::GoalCompleted { .. }
+            )),
+            "finalize" => assert!(matches!(
+                outcome,
+                super::ProductionAdvanceOutcome::Complete { .. }
+            )),
+            _ => panic!("unknown crash stage {stage}"),
+        }
+    }
+
+    #[cfg(feature = "recovery-test-hooks")]
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        clippy::too_many_lines,
+        reason = "forced-kill fixture asserts exact recovered lifecycle state"
+    )]
+    fn production_goal_driver_completion_record_before_lifecycle_kill_reconciles_once() {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let (base, mut controller, _) = completion_ready_fixture("production-goal-completion-gap");
+        controller
+            .persist_all_runtime()
+            .expect("persist completion-ready plan");
+        persist_active_queued_goal_lifecycle(&mut controller);
+        controller
+            .checkpoint_now()
+            .expect("seal completion-ready plan");
+        let state_path = controller.state.path().to_path_buf();
+        let original_budget = controller
+            .active_ref()
+            .expect("active completion plan")
+            .goal_autonomy_budget
+            .clone();
+        let original_actions = controller
+            .state
+            .action_records()
+            .expect("completion actions");
+        drop(controller);
+
+        let marker = base.join("completion-record.marker");
+        let stdout_path = base.join("completion-record.stdout");
+        let stderr_path = base.join("completion-record.stderr");
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "tests::production_goal_completion_crash_worker",
+                "--nocapture",
+            ])
+            .env("SOVEREIGN_GOAL_CRASH_STAGE", "complete")
+            .env("SOVEREIGN_GOAL_CRASH_STATE", &state_path)
+            .env("SOVEREIGN_GOAL_CRASH_REPO", base.join("repo"))
+            .env(
+                "SOVEREIGN_RECOVERY_TEST_PAUSE_AT",
+                "after_project_completion_commit",
+            )
+            .env("SOVEREIGN_RECOVERY_TEST_MARKER", &marker)
+            .stdout(Stdio::from(
+                std::fs::File::create(&stdout_path).expect("completion stdout"),
+            ))
+            .stderr(Stdio::from(
+                std::fs::File::create(&stderr_path).expect("completion stderr"),
+            ))
+            .spawn()
+            .expect("spawn completion crash worker");
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !marker.exists() && Instant::now() < deadline {
+            if child
+                .try_wait()
+                .expect("completion worker status")
+                .is_some()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !marker.exists() {
+            let stdout = std::fs::read_to_string(stdout_path).unwrap_or_default();
+            let stderr = std::fs::read_to_string(stderr_path).unwrap_or_default();
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("completion gap not reached; stdout: {stdout}; stderr: {stderr}");
+        }
+        let interrupted = StateStore::open(&state_path).expect("interrupted completion state");
+        assert_eq!(
+            interrupted
+                .state_records("controller.completion_record")
+                .expect("completion records")
+                .len(),
+            1
+        );
+        let intent: Value = serde_json::from_str(
+            &interrupted
+                .state_records("controller.goal_intent")
+                .expect("intent records")[0]
+                .value_json,
+        )
+        .expect("interrupted intent JSON");
+        assert_eq!(
+            intent["status"], "active_plan",
+            "hook must precede lifecycle commit"
+        );
+        drop(interrupted);
+        child.kill().expect("kill completion worker");
+        child.wait().expect("reap completion worker");
+
+        for restart in 0..2 {
+            let mut recovered = Controller::reopen_local(
+                StateStore::open(&state_path).expect("restart completion state"),
+            )
+            .expect("recover completion gap");
+            recovered
+                .reconcile_queued_goal_lifecycle()
+                .expect("reconcile completion lifecycle");
+            assert_eq!(
+                recovered
+                    .state
+                    .state_records("controller.completion_record")
+                    .expect("recovered completion records")
+                    .len(),
+                1
+            );
+            let intent: Value = serde_json::from_str(
+                &recovered
+                    .state
+                    .state_records("controller.goal_intent")
+                    .expect("recovered intent")[0]
+                    .value_json,
+            )
+            .expect("recovered intent JSON");
+            let claim: Value = serde_json::from_str(
+                &recovered
+                    .state
+                    .state_records("controller.goal_intent_claim")
+                    .expect("recovered claim")[0]
+                    .value_json,
+            )
+            .expect("recovered claim JSON");
+            assert_eq!(intent["status"], "completed", "restart {restart}");
+            assert_eq!(claim["status"], "completed", "restart {restart}");
+            assert_eq!(
+                recovered
+                    .active_ref()
+                    .expect("completion active plan")
+                    .goal_autonomy_budget,
+                original_budget
+            );
+            assert_eq!(
+                recovered.state.action_records().expect("recovered actions"),
+                original_actions
+            );
+            assert!(
+                recovered
+                    .state
+                    .state_records("controller.process_lease")
+                    .expect("process leases")
+                    .is_empty()
+            );
+        }
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[cfg(feature = "recovery-test-hooks")]
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        clippy::too_many_lines,
+        reason = "forced-kill matrix asserts exact restart and finalization state"
+    )]
+    fn production_goal_driver_completion_and_finalization_forced_kill() {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let (base, mut controller, _registry) =
+            completion_ready_fixture("production-goal-crash-terminal");
+        controller
+            .persist_all_runtime()
+            .expect("persist terminal-ready task");
+        persist_active_queued_goal_lifecycle(&mut controller);
+        controller
+            .checkpoint_now()
+            .expect("seal terminal-ready fixture");
+        let state_path = controller.state.path().to_path_buf();
+        let repo_root = base.join("repo");
+        let original_actions = controller
+            .state
+            .action_records()
+            .expect("initial terminal actions");
+        let original_budget = controller
+            .active_ref()
+            .expect("terminal active plan")
+            .goal_autonomy_budget
+            .clone();
+        drop(controller);
+
+        let run_kill = |stage: &str, hook: &str| {
+            let marker = base.join(format!("{stage}.marker"));
+            let stdout_path = base.join(format!("{stage}.stdout"));
+            let stderr_path = base.join(format!("{stage}.stderr"));
+            let mut child = Command::new(std::env::current_exe().expect("test binary"))
+                .args([
+                    "--exact",
+                    "tests::production_goal_completion_crash_worker",
+                    "--nocapture",
+                ])
+                .env("SOVEREIGN_GOAL_CRASH_STAGE", stage)
+                .env("SOVEREIGN_GOAL_CRASH_STATE", &state_path)
+                .env("SOVEREIGN_GOAL_CRASH_REPO", &repo_root)
+                .env("SOVEREIGN_RECOVERY_TEST_PAUSE_AT", hook)
+                .env("SOVEREIGN_RECOVERY_TEST_MARKER", &marker)
+                .stdout(Stdio::from(
+                    std::fs::File::create(&stdout_path).expect("worker stdout"),
+                ))
+                .stderr(Stdio::from(
+                    std::fs::File::create(&stderr_path).expect("worker stderr"),
+                ))
+                .spawn()
+                .expect("spawn terminal crash worker");
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !marker.exists() && Instant::now() < deadline {
+                if child.try_wait().expect("worker status").is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !marker.exists() {
+                let stdout = std::fs::read_to_string(stdout_path).unwrap_or_default();
+                let stderr = std::fs::read_to_string(stderr_path).unwrap_or_default();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{stage} did not reach {hook}; stdout: {stdout}; stderr: {stderr}");
+            }
+            child.kill().expect("kill terminal worker");
+            child.wait().expect("reap terminal worker");
+            std::fs::remove_file(marker).expect("clear terminal marker");
+        };
+
+        run_kill("complete", "after_goal_completion_lifecycle_commit");
+        let completed =
+            Controller::reopen_local(StateStore::open(&state_path).expect("completed state"))
+                .expect("recover terminal goal completion");
+        assert_eq!(
+            completed
+                .state
+                .state_records("controller.completion_record")
+                .expect("completion rows")
+                .len(),
+            1
+        );
+        assert_eq!(
+            completed
+                .state
+                .state_records("controller.goal_intent")
+                .expect("goal rows")
+                .len(),
+            1
+        );
+        assert!(
+            completed
+                .state
+                .get_state("controller.plan", "active")
+                .expect("completed active pointer")
+                .is_some()
+        );
+        assert_eq!(
+            completed
+                .active_ref()
+                .expect("completed active runtime")
+                .goal_autonomy_budget,
+            original_budget
+        );
+        assert_eq!(
+            completed.state.action_records().expect("completed actions"),
+            original_actions
+        );
+        drop(completed);
+        let second_completed = Controller::reopen_local(
+            StateStore::open(&state_path).expect("second completion state"),
+        )
+        .expect("second completion recovery");
+        assert_eq!(
+            second_completed
+                .state
+                .state_records("controller.completion_record")
+                .expect("second completion rows")
+                .len(),
+            1
+        );
+        let pointer_before = second_completed
+            .state
+            .state_records("controller.plan")
+            .expect("pre-finalization pointer");
+        let lifecycle_before = second_completed
+            .state
+            .state_records("controller.plan_revision_lifecycle")
+            .expect("pre-finalization lifecycle");
+        drop(second_completed);
+
+        run_kill("finalize", "before_completed_plan_finalization_commit");
+        let before_commit =
+            Controller::reopen_local(StateStore::open(&state_path).expect("precommit state"))
+                .expect("recover interrupted finalization before CAS");
+        assert!(
+            before_commit
+                .state
+                .get_state("controller.plan", "active")
+                .expect("precommit active pointer")
+                .is_some()
+        );
+        assert!(
+            before_commit
+                .state
+                .state_records("controller.plan_finalization")
+                .expect("precommit final rows")
+                .is_empty()
+        );
+        assert_eq!(
+            before_commit
+                .state
+                .state_records("controller.plan")
+                .expect("post-kill pointer")
+                .into_iter()
+                .map(|row| (row.key, row.value_json))
+                .collect::<Vec<_>>(),
+            pointer_before
+                .into_iter()
+                .map(|row| (row.key, row.value_json))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            before_commit
+                .state
+                .state_records("controller.plan_revision_lifecycle")
+                .expect("post-kill lifecycle")
+                .into_iter()
+                .map(|row| (row.key, row.value_json))
+                .collect::<Vec<_>>(),
+            lifecycle_before
+                .into_iter()
+                .map(|row| (row.key, row.value_json))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            before_commit
+                .active_ref()
+                .expect("precommit active runtime")
+                .goal_autonomy_budget,
+            original_budget
+        );
+        assert_eq!(
+            before_commit
+                .state
+                .action_records()
+                .expect("precommit actions"),
+            original_actions
+        );
+        drop(before_commit);
+        run_kill("finalize", "after_completed_plan_finalization_commit");
+        for restart in 0..2 {
+            let finalized =
+                Controller::reopen_local(StateStore::open(&state_path).expect("final state"))
+                    .expect("recover finalized goal");
+            assert!(
+                finalized
+                    .state
+                    .get_state("controller.plan", "active")
+                    .expect("final active pointer")
+                    .is_none(),
+                "restart {restart}"
+            );
+            assert_eq!(
+                finalized
+                    .state
+                    .state_records("controller.plan_finalization")
+                    .expect("final rows")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                finalized
+                    .state
+                    .state_records("controller.completion_record")
+                    .expect("final completion rows")
+                    .len(),
+                1
+            );
+            assert!(
+                finalized
+                    .state
+                    .state_records("controller.process_lease")
+                    .expect("process leases")
+                    .is_empty()
+            );
+            assert_eq!(
+                finalized.state.action_records().expect("final actions"),
+                original_actions
+            );
+        }
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -35056,6 +35621,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "legacy revision fixture proves all scoped recovery bindings"
+    )]
     fn finalized_legacy_rev1_history_stays_inert_when_new_rev1_plan_reuses_task_id() {
         let (base, state_path, registry) =
             legacy_rev1_checkpoint_fixture("legacy-rev1-finalized-new-plan-isolation");

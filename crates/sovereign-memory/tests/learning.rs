@@ -83,11 +83,7 @@ fn workflow_signature(pattern: &ProcedurePattern) -> String {
 }
 
 fn revision_key(plan_id: &str, revision: u32, logical_key: &str) -> String {
-    if revision == 1 {
-        logical_key.to_owned()
-    } else {
-        format!("{plan_id}@r{revision}:{logical_key}")
-    }
+    format!("{plan_id}@r{revision}:{logical_key}")
 }
 
 fn put_json(state: &mut StateStore, namespace: &str, key: &str, value: &Value) {
@@ -231,10 +227,11 @@ fn success_proof_with_journal_binding(
 
 fn failed_proof(state: &mut StateStore, attempt_id: &str) -> ControllerEpisodeProof {
     seed_task(state, PLAN_ID, 1, "failed");
+    let attempt_key = revision_key(PLAN_ID, 1, attempt_id);
     put_json(
         state,
         "controller.attempt",
-        attempt_id,
+        &attempt_key,
         &json!({
             "task_id": TASK_ID,
             "attempt_id": attempt_id,
@@ -242,7 +239,7 @@ fn failed_proof(state: &mut StateStore, attempt_id: &str) -> ControllerEpisodePr
             "task_contract_digest": TASK_CONTRACT,
         }),
     );
-    let failure_key = format!("{TASK_ID}:{attempt_id}");
+    let failure_key = revision_key(PLAN_ID, 1, &format!("{TASK_ID}:{attempt_id}"));
     let failure = json!({
         "schema_version": 1,
         "plan_id": PLAN_ID,
@@ -276,10 +273,10 @@ fn failed_proof(state: &mut StateStore, attempt_id: &str) -> ControllerEpisodePr
         task_id: TASK_ID.to_owned(),
         task_contract_digest: TASK_CONTRACT.to_owned(),
         attempt_id: attempt_id.to_owned(),
-        task_record_key: TASK_ID.to_owned(),
-        attempt_record_key: attempt_id.to_owned(),
+        task_record_key: revision_key(PLAN_ID, 1, TASK_ID),
+        attempt_record_key: attempt_key,
         outcome: ControllerEpisodeOutcomeProof::FailedAttempt {
-            failure_record_key: format!("{TASK_ID}:{attempt_id}"),
+            failure_record_key: failure_key,
             failure_signature: format!("failure.{attempt_id}"),
         },
     }
@@ -398,6 +395,21 @@ fn learning_verification_journal_must_match_exact_task_contract_and_attempt() {
             .to_string()
             .contains("lacks append-only passed journal evidence")
     );
+}
+
+#[test]
+fn learning_revision_one_bare_keys_cannot_claim_scoped_controller_proof() {
+    let temp = TestDir::new("revision-one-bare-proof");
+    let mut state = StateStore::open(temp.db()).unwrap_or_else(|error| panic!("open: {error}"));
+    let mut proof = success_proof(&mut state, PLAN_ID, 1, PLAN_DIGEST, "attempt.scoped");
+    proof.task_record_key = TASK_ID.to_owned();
+    proof.attempt_record_key = proof.attempt_id.clone();
+    let Err(error) =
+        EpisodeRecorder::new(&mut state).record(&capture(scope("project.learning"), proof))
+    else {
+        panic!("bare revision-one proof keys must not claim canonical scoped records");
+    };
+    assert!(error.to_string().contains("not revision-scoped"));
 }
 
 #[test]

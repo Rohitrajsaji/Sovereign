@@ -32,14 +32,18 @@ const COMPILATION_BUDGET_NAMESPACE: &str = "controller.goal_compilation_budget";
 const COMPILATION_BUDGET_SCHEMA_VERSION: u32 = 1;
 const MAX_PRODUCTION_TASK_CONTRACT_BYTES: usize = 3_000;
 
-fn required_from(value: &serde_json::Value, pointer: &str) -> Result<serde_json::Value, ControllerError> {
-    value.pointer(pointer).cloned().ok_or_else(|| {
-        ControllerError::InvalidPlan(format!("task contract is missing {pointer}"))
-    })
+fn required_from(
+    value: &serde_json::Value,
+    pointer: &str,
+) -> Result<serde_json::Value, ControllerError> {
+    value
+        .pointer(pointer)
+        .cloned()
+        .ok_or_else(|| ControllerError::InvalidPlan(format!("task contract is missing {pointer}")))
 }
 
 /// Resources for one exact queued goal. The Controller checks every binding against the durable
-/// intent before invoking the compiler and reserves each provider call in SQLite before dispatch.
+/// intent before invoking the compiler and reserves each provider call in `SQLite` before dispatch.
 pub struct ProductionCompilationResources<'a> {
     pub input: &'a PlanCompilationInput,
     pub backend: &'a dyn ModelBackend,
@@ -151,6 +155,13 @@ struct CompilationBudgetRecord {
 impl Controller {
     /// Builds a bounded exact-file context for the Controller-selected task. The caller supplies
     /// only the task ID returned by the typed driver; Plan contents remain Controller-owned.
+    ///
+    /// # Errors
+    /// Rejects a missing or stale Controller-selected task and invalid bounded source context.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "bounded task context includes all scoped source and evidence checks"
+    )]
     pub fn production_task_context(
         &self,
         registry: &ProjectRegistry,
@@ -172,10 +183,9 @@ impl Controller {
             )
         } else {
             let required = |pointer: &str| {
-                task.task
-                    .pointer(pointer)
-                    .cloned()
-                    .ok_or_else(|| ControllerError::InvalidPlan(format!("task contract lacks {pointer}")))
+                task.task.pointer(pointer).cloned().ok_or_else(|| {
+                    ControllerError::InvalidPlan(format!("task contract lacks {pointer}"))
+                })
             };
             let criteria = required_array(&task.task, "/acceptance_criteria")?
                 .iter()
@@ -315,6 +325,13 @@ impl Controller {
 
     /// Advances through the same durable driver with exact pinned read/browser alternatives.
     /// This keeps task-kind and authority selection inside Controller-owned code.
+    ///
+    /// # Errors
+    /// Propagates fail-closed compilation, dispatch, verification, and recovery failures.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "production driver owns one durable task transition per call"
+    )]
     pub fn advance_production_goal_with_catalog<I: ExecutionIsolationBackend>(
         &mut self,
         registry: &ProjectRegistry,
@@ -620,7 +637,10 @@ impl Controller {
             .map(|_| ())
         };
         match executed {
-            Ok(()) => Ok(ProductionAdvanceOutcome::TaskVerified { task_id }),
+            Ok(()) => {
+                super::recovery_test_hook("after_production_task_verified");
+                Ok(ProductionAdvanceOutcome::TaskVerified { task_id })
+            }
             Err(ControllerError::AwaitingApproval {
                 action_id,
                 request_id,
@@ -734,6 +754,11 @@ impl Controller {
         Ok(receipts)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        clippy::needless_pass_by_value,
+        reason = "compilation binds the owned durable goal to one exact revision"
+    )]
     fn advance_queued_compilation(
         &mut self,
         intent: GoalIntentV1,
@@ -807,6 +832,7 @@ impl Controller {
                 });
             }
         };
+        super::recovery_test_hook("after_goal_compilation_before_claim");
         let plan = if let Some(grant) = intent.browser_grant.as_ref() {
             let browser = sovereign_tools::canonical_browser_tool_manifest();
             let pin = serde_json::json!({

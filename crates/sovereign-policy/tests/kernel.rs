@@ -581,6 +581,11 @@ fn mac_sandbox_denies_protected_home_read_and_offline_network() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[expect(
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "security fixture checks each setup and output step explicitly"
+)]
 fn pinned_home_cargo_can_invoke_rustc_for_offline_verification() {
     let home = PathBuf::from(std::env::var_os("HOME").expect("HOME"));
     let rustup = home.join(".cargo/bin/rustup");
@@ -592,16 +597,24 @@ fn pinned_home_cargo_can_invoke_rustc_for_offline_verification() {
         .output()
         .expect("resolve installed Cargo");
     assert!(output.status.success(), "installed Cargo is required");
-    let cargo = PathBuf::from(String::from_utf8(output.stdout).expect("Cargo path UTF-8").trim())
-        .canonicalize()
-        .expect("canonical Cargo");
+    let cargo = PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("Cargo path UTF-8")
+            .trim(),
+    )
+    .canonicalize()
+    .expect("canonical Cargo");
     if !cargo.starts_with(&home) {
         return;
     }
     let test_home = TestDir::under(&home, "cargo-seatbelt");
     let repo = test_home.0.join("repo");
     fs::create_dir_all(repo.join("src")).expect("create package");
-    fs::write(repo.join("Cargo.toml"), "[package]\nname = \"seatbelt-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").expect("manifest");
+    fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"seatbelt-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("manifest");
     fs::write(repo.join("src/lib.rs"), "pub fn ready() -> bool { true }\n").expect("source");
     let scratch = repo.join(".sovereign-build-test");
     fs::create_dir(&scratch).expect("build scratch");
@@ -610,7 +623,10 @@ fn pinned_home_cargo_can_invoke_rustc_for_offline_verification() {
         .current_dir(&repo)
         .status()
         .expect("generate fixture lockfile");
-    assert!(lock_status.success(), "fixture lockfile must be prepared before sandboxing");
+    assert!(
+        lock_status.success(),
+        "fixture lockfile must be prepared before sandboxing"
+    );
     let lock_before = fs::read(repo.join("Cargo.lock")).expect("prepared lockfile");
     let backend = MacSandboxExecBackend::detect().expect("Seatbelt");
     let rustc = cargo.parent().expect("Cargo bin").join("rustc");
@@ -620,7 +636,8 @@ fn pinned_home_cargo_can_invoke_rustc_for_offline_verification() {
             PinnedExecutable::from_path(&rustc, "test-rustc").expect("rustc pin"),
         ],
         [cargo.parent().expect("Cargo bin").to_path_buf()],
-    ).expect("toolchain policy");
+    )
+    .expect("toolchain policy");
     let toolchain = sovereign_policy::RustToolchainAccess::from_policy(&policy, &cargo)
         .expect("exact Rust toolchain manifest");
     let request = IsolationRequest {
@@ -637,27 +654,58 @@ fn pinned_home_cargo_can_invoke_rustc_for_offline_verification() {
     spec.working_directory = repo.clone();
     let isolated = backend.isolate(&spec, &request).expect("isolate Cargo");
     let write_probe = Command::new(&isolated.executable)
-        .args(["-p", &isolated.args[1], "/bin/sh", "-c", "printf ok > .sovereign-build-test/probe"])
+        .args([
+            "-p",
+            &isolated.args[1],
+            "/bin/sh",
+            "-c",
+            "printf ok > .sovereign-build-test/probe",
+        ])
         .current_dir(&spec.working_directory)
         .output()
         .expect("probe isolated build output");
-    assert!(write_probe.status.success(), "build output must be writable: {}", String::from_utf8_lossy(&write_probe.stderr));
+    assert!(
+        write_probe.status.success(),
+        "build output must be writable: {}",
+        String::from_utf8_lossy(&write_probe.stderr)
+    );
     let result = Command::new(&isolated.executable)
         .args(&isolated.args)
         .current_dir(&spec.working_directory)
         .env_clear()
-        .env("PATH", format!("{}:/usr/bin:/bin", cargo.parent().expect("Cargo bin").display()))
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin",
+                cargo.parent().expect("Cargo bin").display()
+            ),
+        )
         .env("CARGO_TARGET_DIR", &scratch)
         .env("TMPDIR", &scratch)
         .output()
         .expect("run isolated Cargo");
-    assert!(result.status.success(), "offline Cargo verification must run pinned rustc: {}", String::from_utf8_lossy(&result.stderr));
-    assert_eq!(fs::read(repo.join("Cargo.lock")).expect("lockfile after Cargo"), lock_before);
-    assert_eq!(fs::read(repo.join("src/lib.rs")).expect("source after Cargo"), b"pub fn ready() -> bool { true }\n");
+    assert!(
+        result.status.success(),
+        "offline Cargo verification must run pinned rustc: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        fs::read(repo.join("Cargo.lock")).expect("lockfile after Cargo"),
+        lock_before
+    );
+    assert_eq!(
+        fs::read(repo.join("src/lib.rs")).expect("source after Cargo"),
+        b"pub fn ready() -> bool { true }\n"
+    );
 }
 
 #[cfg(target_os = "macos")]
 #[test]
+#[expect(
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "security fixture checks each setup and output step explicitly"
+)]
 fn rust_toolchain_access_rejects_drift_symlinks_and_unpinned_siblings() {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -689,9 +737,13 @@ fn rust_toolchain_access_rejects_drift_symlinks_and_unpinned_siblings() {
     let missing_rustc = CommandPolicy::new([cargo_pin.clone()], [bin.clone()]).expect("policy");
     assert!(sovereign_policy::RustToolchainAccess::from_policy(&missing_rustc, &cargo).is_err());
     let policy = CommandPolicy::new(
-        [cargo_pin, PinnedExecutable::from_path(&rustc, "test-rustc").expect("rustc pin")],
+        [
+            cargo_pin,
+            PinnedExecutable::from_path(&rustc, "test-rustc").expect("rustc pin"),
+        ],
         [bin],
-    ).expect("complete policy");
+    )
+    .expect("complete policy");
     let escape = lib.join("escape.rlib");
     symlink(&secret, &escape).expect("symlink escape fixture");
     assert!(sovereign_policy::RustToolchainAccess::from_policy(&policy, &cargo).is_err());
@@ -716,13 +768,18 @@ fn rust_toolchain_access_rejects_drift_symlinks_and_unpinned_siblings() {
     ] {
         let mut spec = direct_spec(&cargo, &["-c", &command]);
         spec.working_directory = repo.clone();
-        let isolated = backend.isolate(&spec, &request).expect("isolate pinned Cargo");
+        let isolated = backend
+            .isolate(&spec, &request)
+            .expect("isolate pinned Cargo");
         let result = Command::new(&isolated.executable)
             .args(&isolated.args)
             .current_dir(&repo)
             .output()
             .expect("execute denied operation");
-        assert!(!result.status.success(), "toolchain sibling or protected home read escaped Seatbelt: {command}");
+        assert!(
+            !result.status.success(),
+            "toolchain sibling or protected home read escaped Seatbelt: {command}"
+        );
     }
     let scratch = repo.join(".sovereign-build-test");
     fs::create_dir(&scratch).expect("exact build scratch");
@@ -737,28 +794,48 @@ fn rust_toolchain_access_rejects_drift_symlinks_and_unpinned_siblings() {
         widened.build_scratch_root = Some(unsafe_root.clone());
         let mut spec = direct_spec(&cargo, &["-c", "true"]);
         spec.working_directory = repo.clone();
-        assert!(backend.isolate(&spec, &widened).is_err(), "scratch root must not widen to {}", unsafe_root.display());
+        assert!(
+            backend.isolate(&spec, &widened).is_err(),
+            "scratch root must not widen to {}",
+            unsafe_root.display()
+        );
     }
     for (command, permitted) in [
-        (format!("printf ok > {}", scratch.join("output.txt").display()), true),
+        (
+            format!("printf ok > {}", scratch.join("output.txt").display()),
+            true,
+        ),
         (format!("printf no > {}", source.display()), false),
         (format!("printf no > {}", escape_link.display()), false),
     ] {
         let mut spec = direct_spec(&cargo, &["-c", &command]);
         spec.working_directory = repo.clone();
-        let isolated = backend.isolate(&spec, &scratch_request).expect("isolate scratch");
+        let isolated = backend
+            .isolate(&spec, &scratch_request)
+            .expect("isolate scratch");
         let result = Command::new(&isolated.executable)
             .args(&isolated.args)
             .current_dir(&repo)
             .output()
             .expect("execute scratch probe");
-        assert_eq!(result.status.success(), permitted, "scratch boundary: {command}; stderr={}", String::from_utf8_lossy(&result.stderr));
+        assert_eq!(
+            result.status.success(),
+            permitted,
+            "scratch boundary: {command}; stderr={}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
     assert_eq!(fs::read(&source).expect("source remains"), b"source");
     fs::write(lib.join("libstd.rlib"), b"changed library").expect("drift library");
-    assert!(access.verify().is_err(), "library digest drift must fail closed");
+    assert!(
+        access.verify().is_err(),
+        "library digest drift must fail closed"
+    );
     let spec = direct_spec(&cargo, &["-c", "true"]);
-    assert!(backend.isolate(&spec, &request).is_err(), "drift must fail before dispatch");
+    assert!(
+        backend.isolate(&spec, &request).is_err(),
+        "drift must fail before dispatch"
+    );
 }
 
 #[test]

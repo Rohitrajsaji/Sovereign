@@ -7,8 +7,9 @@ use sovereign_context::{
     ContextBudget, ContextMode, ContextPacket, ContextPacketInput, ContextPlanner, EvidenceItem,
 };
 use sovereign_controller::{
-    Controller, ExecutionRuntime, ReadinessInputs, RecoveryManager, ResourcePressureProbe, RoleId,
-    RoleRegistry, TaskState,
+    Controller, ExecutionRuntime, ProductionAdvanceOutcome, ProductionAdvanceResources,
+    ProductionCompilationResources, ProductionExecutionResources, ReadinessInputs, RecoveryManager,
+    ResourcePressureProbe, RoleId, RoleRegistry, TaskState,
 };
 use sovereign_evidence::ArtifactStore;
 use sovereign_model::{
@@ -321,6 +322,37 @@ fn fake_backend(prepared: &Prepared, with_execution: bool) -> DeterministicFakeB
             prepared.packet.metrics.final_serialized_input_tokens,
         ));
     }
+    fake_backend_with_responses(responses)
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "forced-kill fixture requires exact setup and recovered evidence"
+)]
+fn execution_only_backend(prepared: &Prepared) -> DeterministicFakeBackend {
+    let old_content =
+        fs::read_to_string(prepared.snapshot.root.join("src/settings/SettingsForm.tsx"))
+            .expect("read repository action fixture");
+    let new_content = old_content.replacen("Save", "Apply", 1);
+    assert_ne!(new_content, old_content, "fixture must contain Save");
+    fake_backend_with_responses(vec![response(
+        json!({
+            "schema_version": 1,
+            "evidence_ids": ["file:repo.app:src/settings/SettingsForm.tsx"],
+            "action": {
+                "kind": "update_file",
+                "repository_id": "repo.app",
+                "path": "src/settings/SettingsForm.tsx",
+                "expected_source_digest": prepared.form_digest,
+                "content": new_content
+            }
+        })
+        .to_string(),
+        prepared.packet.metrics.final_serialized_input_tokens,
+    )])
+}
+
+fn fake_backend_with_responses(responses: Vec<ModelResponse>) -> DeterministicFakeBackend {
     let backend = DeterministicFakeBackend::new(
         ModelCapabilities {
             schema_version: MODEL_SCHEMA_VERSION,
@@ -360,7 +392,29 @@ fn compile_and_activate_with_policy(
     backend: &DeterministicFakeBackend,
     policy: Value,
 ) -> (Controller, String) {
-    let input = PlanCompilationInput {
+    let input = crash_compilation_input(prepared, policy);
+    let validator = PlanValidator::new(ValidationEnvironment::default())
+        .unwrap_or_else(|error| panic!("validator: {error}"));
+    let compiler = PlanCompiler::new(backend, &validator, "m1-t08-crash-compiler")
+        .unwrap_or_else(|error| panic!("compiler: {error}"));
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let compilation = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("compile T08 goal: {error:?} ({error})"));
+    let state = StateStore::open(base.join("state.sqlite3"))
+        .unwrap_or_else(|error| panic!("state: {error}"));
+    let mut controller = Controller::new(state);
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(1_000),
+    )));
+    let activation = controller
+        .activate(compilation, &prepared.registry)
+        .unwrap_or_else(|error| panic!("activate: {error}"));
+    (controller, activation.task_ids[0].clone())
+}
+
+fn crash_compilation_input(prepared: &Prepared, policy: Value) -> PlanCompilationInput {
+    PlanCompilationInput {
         schema_version: PLAN_COMPILATION_SCHEMA_VERSION,
         compilation_id: "compile.t08.crash".to_owned(),
         compiled_at: "2026-09-12T20:00:00Z".to_owned(),
@@ -403,25 +457,7 @@ fn compile_and_activate_with_policy(
         model_input_token_ceiling: 8_000,
         max_output_tokens: 512,
         model_deadline_ms: 1_000,
-    };
-    let validator = PlanValidator::new(ValidationEnvironment::default())
-        .unwrap_or_else(|error| panic!("validator: {error}"));
-    let compiler = PlanCompiler::new(backend, &validator, "m1-t08-crash-compiler")
-        .unwrap_or_else(|error| panic!("compiler: {error}"));
-    let mut budget = ModelCallBudget::new(1, 1_000);
-    let compilation = compiler
-        .compile(&input, &mut budget)
-        .unwrap_or_else(|error| panic!("compile T08 goal: {error:?} ({error})"));
-    let state = StateStore::open(base.join("state.sqlite3"))
-        .unwrap_or_else(|error| panic!("state: {error}"));
-    let mut controller = Controller::new(state);
-    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
-        green_pressure_snapshot(1_000),
-    )));
-    let activation = controller
-        .activate(compilation, &prepared.registry)
-        .unwrap_or_else(|error| panic!("activate: {error}"));
-    (controller, activation.task_ids[0].clone())
+    }
 }
 
 fn canonical_value_digest(value: &Value) -> String {
@@ -459,11 +495,7 @@ fn resource_binding_key(namespace: &str, key: &str) -> String {
 }
 
 fn scoped_resource_key(plan_id: &str, revision: u32, logical_key: &str) -> String {
-    if revision == 1 {
-        logical_key.to_owned()
-    } else {
-        format!("{plan_id}@r{revision}:{logical_key}")
-    }
+    format!("{plan_id}@r{revision}:{logical_key}")
 }
 
 fn publish_resource_row_with_event(
@@ -642,7 +674,7 @@ fn install_uncheckpointed_supersession(
     let task = next_document["tasks"][0].clone();
     let task_contract_digest = canonical_value_digest(&task);
     let previous_task_runtime_raw = state
-        .get_state("controller.task", task_id)
+        .get_state("controller.task", &format!("{plan_id}@r1:{task_id}"))
         .unwrap_or_else(|error| panic!("read revision N task runtime: {error}"))
         .unwrap_or_else(|| panic!("revision N task runtime missing"));
     let previous_task_runtime: Value = serde_json::from_str(&previous_task_runtime_raw)
@@ -676,7 +708,10 @@ fn install_uncheckpointed_supersession(
     };
     let attempt_runtime_map_digest = canonical_value_digest(&json!({}));
     let prior_grant_raw = state
-        .get_state("controller.task_capability_grant", task_id)
+        .get_state(
+            "controller.task_capability_grant",
+            &format!("{plan_id}@r1:{task_id}"),
+        )
         .unwrap_or_else(|error| panic!("read revision N task capability grant: {error}"))
         .unwrap_or_else(|| panic!("revision N task capability grant missing"));
     let mut next_grant: Value = serde_json::from_str(&prior_grant_raw)
@@ -963,6 +998,10 @@ impl ExecutionIsolationBackend for CrashIsolation {
 }
 
 fn run_child(case: &str, base: &Path, root: &Path, marker: &Path) {
+    if case.starts_with("goal_driver_") {
+        run_goal_driver_child(case, base, root);
+        return;
+    }
     let prepared = prepare(root);
     if matches!(case, "build_pending_spawn" | "build_orphan_sleep") {
         run_build_heavy_child(case, base, root, &prepared);
@@ -1003,6 +1042,80 @@ fn run_child(case: &str, base: &Path, root: &Path, marker: &Path) {
     };
     let mut budget = ModelCallBudget::new(4, 30_000);
     let _ = controller.execute_replace(ready, &runtime, &prepared.packet, &mut budget);
+}
+
+fn run_goal_driver_child(case: &str, base: &Path, root: &Path) {
+    let prepared = prepare(root);
+    let state = StateStore::open(base.join("state.sqlite3"))
+        .unwrap_or_else(|error| panic!("goal driver state: {error}"));
+    let mut controller = Controller::reopen_local(state)
+        .unwrap_or_else(|error| panic!("goal driver recovery: {error}"));
+    controller.set_resource_pressure_probe(Box::new(FixedResourcePressureProbe(
+        green_pressure_snapshot(2_000),
+    )));
+    let outcome = match case {
+        "goal_driver_compile" => {
+            let backend = fake_backend(&prepared, false);
+            let intent = controller
+                .next_queued_goal_intent()
+                .unwrap_or_else(|error| panic!("queued intent: {error}"))
+                .unwrap_or_else(|| panic!("goal driver compile lacks queued intent"));
+            let mut input = crash_compilation_input(&prepared, global_policy());
+            input.goal_id = intent.goal_id;
+            "builtin.diff.scoped_change.v1".clone_into(&mut input.diff_evaluator);
+            let validator = PlanValidator::new(ValidationEnvironment::default())
+                .unwrap_or_else(|error| panic!("goal validator: {error}"));
+            let mut budget = ModelCallBudget::new(1, 1_000);
+            controller.advance_production_goal::<MacSandboxExecBackend>(
+                &prepared.registry,
+                ProductionAdvanceResources {
+                    compilation: Some(ProductionCompilationResources {
+                        input: &input,
+                        backend: &backend,
+                        validator: &validator,
+                        compiler_version: "m1-t08-crash-compiler",
+                        model_budget: &mut budget,
+                    }),
+                    execution: None,
+                },
+            )
+        }
+        "goal_driver_task" => {
+            let backend = execution_only_backend(&prepared);
+            let parts = runtime_parts(base, root);
+            let isolation = MacSandboxExecBackend::detect()
+                .unwrap_or_else(|error| panic!("goal driver Seatbelt: {error}"));
+            let runtime = normal_runtime(&prepared.registry, &backend, &parts, &isolation);
+            let task_id = first_task_id(controller.state());
+            let context = controller
+                .production_task_context(&prepared.registry, &task_id)
+                .unwrap_or_else(|error| panic!("goal driver task context: {error}"));
+            let mut budget = ModelCallBudget::new(4, 30_000);
+            controller.advance_production_goal(
+                &prepared.registry,
+                ProductionAdvanceResources {
+                    compilation: None,
+                    execution: Some(ProductionExecutionResources {
+                        runtime: &runtime,
+                        context: &context,
+                        tool_schemas: &[],
+                        readiness: ReadinessInputs::permissive_m1("sha256:t08-goal-driver"),
+                        model_budget: &mut budget,
+                    }),
+                },
+            )
+        }
+        _ => panic!("unknown goal driver crash case {case}"),
+    };
+    let outcome = outcome.unwrap_or_else(|error| panic!("goal driver advance: {error}"));
+    assert!(
+        matches!(
+            outcome,
+            ProductionAdvanceOutcome::PlanActivated { .. }
+                | ProductionAdvanceOutcome::TaskVerified { .. }
+        ),
+        "unexpected goal driver outcome: {outcome:?}"
+    );
 }
 
 fn run_build_heavy_child(case: &str, base: &Path, root: &Path, prepared: &Prepared) {
@@ -1157,10 +1270,13 @@ fn wait_for_marker(path: &Path, fixture: &Fixture, child: &mut Child) {
         }
         thread::sleep(Duration::from_millis(10));
     }
+    let diagnostics = child_diagnostics(fixture, child);
+    let _ = child.kill();
+    let _ = child.wait();
     panic!(
         "timed out waiting for crash marker {}\n{}",
         path.display(),
-        child_diagnostics(fixture, child)
+        diagnostics
     );
 }
 
@@ -1327,6 +1443,346 @@ fn normal_runtime<'a>(
         tool_manifest: &parts.manifest,
         python_executable: Path::new("/usr/bin/python3"),
     }
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "forced-kill fixture requires exact setup and recovered evidence"
+)]
+fn queued_goal_fixture(label: &str) -> Fixture {
+    let fixture = Fixture::create(label);
+    let mut controller =
+        Controller::new(StateStore::open(fixture.state_path()).expect("open queued goal state"));
+    let intent = controller
+        .submit_goal_intent("Rename the Settings button from Save to Apply.")
+        .expect("queue exact crash goal");
+    assert_eq!(intent.status, "queued_for_plan_compilation");
+    drop(controller);
+    fixture
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "forced-kill fixture requires exact setup and recovered evidence"
+)]
+fn run_goal_driver_stage(fixture: &Fixture, case: &str) {
+    let mut child = spawn_child(fixture, case, None);
+    let status = child.wait().expect("wait goal driver stage");
+    assert!(
+        status.success(),
+        "{case} failed: {}",
+        child_diagnostics(fixture, &mut child)
+    );
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "forced-kill fixture requires exact setup and recovered evidence"
+)]
+fn goal_driver_row(state: &StateStore, namespace: &str) -> Value {
+    let rows = state.state_records(namespace).expect("goal driver rows");
+    assert_eq!(rows.len(), 1, "expected one {namespace} row");
+    serde_json::from_str(&rows[0].value_json).expect("goal driver row JSON")
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "forced-kill fixture requires exact setup and recovered evidence"
+)]
+fn assert_no_live_goal_driver_descendants(state: &StateStore) {
+    for record in state
+        .state_records("controller.process_lease")
+        .expect("process leases")
+    {
+        let lease: Value = serde_json::from_str(&record.value_json).expect("process lease JSON");
+        if let Some(pgid) = lease["process_group_id"].as_u64() {
+            assert!(
+                process_group_leader_identity(u32::try_from(pgid).expect("PGID fits u32"))
+                    .expect("inspect process group")
+                    .is_none(),
+                "orphan process group {pgid} after recovery"
+            );
+        }
+    }
+}
+
+#[test]
+#[expect(
+    clippy::expect_used,
+    clippy::too_many_lines,
+    reason = "forced-kill fixture requires exact setup and recovered evidence"
+)]
+fn production_goal_driver_compile_claim_activation_kill_matrix() {
+    for (label, pause_at, expected_intent, expected_claim, active_plan) in [
+        (
+            "compiled-before-claim",
+            "after_goal_compilation_before_claim",
+            "queued_for_plan_compilation",
+            None,
+            false,
+        ),
+        (
+            "claimed-before-activation",
+            "after_goal_claim_commit",
+            "queued_for_plan_compilation",
+            Some("released"),
+            false,
+        ),
+        (
+            "activated-before-lifecycle",
+            "after_initial_plan_activation_commit",
+            "active_plan",
+            Some("active"),
+            true,
+        ),
+        (
+            "activated-before-checkpoint",
+            "after_goal_activation_lifecycle_commit",
+            "active_plan",
+            Some("active"),
+            true,
+        ),
+    ] {
+        let fixture = queued_goal_fixture(label);
+        let mut child = spawn_child(&fixture, "goal_driver_compile", Some(pause_at));
+        wait_for_marker(&fixture.marker(), &fixture, &mut child);
+        let before = StateStore::open(fixture.state_path()).expect("pre-kill goal state");
+        let budget_before = goal_driver_row(&before, "controller.goal_compilation_budget");
+        assert_eq!(
+            budget_before["calls_used"], 1,
+            "{label}: model call must be reserved"
+        );
+        drop(before);
+        kill_child(&mut child);
+
+        let mut controller = Controller::reopen_local(
+            StateStore::open(fixture.state_path()).expect("reopen goal state"),
+        )
+        .expect("recover goal driver after kill");
+        controller
+            .reconcile_queued_goal_lifecycle()
+            .expect("reconcile interrupted goal claim");
+        assert!(
+            controller
+                .state()
+                .action_records()
+                .expect("goal actions")
+                .is_empty(),
+            "{label}: early lifecycle window unexpectedly dispatched an action"
+        );
+        let intent = goal_driver_row(controller.state(), "controller.goal_intent");
+        assert_eq!(intent["status"], expected_intent, "{label}: intent state");
+        let claims = controller
+            .state()
+            .state_records("controller.goal_intent_claim")
+            .expect("goal claim rows");
+        match expected_claim {
+            Some(status) => {
+                assert_eq!(claims.len(), 1, "{label}: claim count");
+                let claim: Value = serde_json::from_str(&claims[0].value_json).expect("claim JSON");
+                assert_eq!(claim["status"], status, "{label}: claim status");
+            }
+            None => assert!(claims.is_empty(), "{label}: claim unexpectedly exists"),
+        }
+        assert_eq!(
+            controller
+                .state()
+                .get_state("controller.plan", "active")
+                .expect("active plan")
+                .is_some(),
+            active_plan,
+            "{label}: active pointer"
+        );
+        assert_eq!(
+            goal_driver_row(controller.state(), "controller.goal_compilation_budget"),
+            budget_before,
+            "{label}: compilation budget refilled or drifted"
+        );
+        assert_no_live_goal_driver_descendants(controller.state());
+        let lifecycle_events = controller
+            .state()
+            .journal()
+            .expect("goal journal")
+            .into_iter()
+            .filter(|event| event.event_kind.starts_with("goal_intent_"))
+            .count();
+        drop(controller);
+
+        let mut controller = Controller::reopen_local(
+            StateStore::open(fixture.state_path()).expect("reopen goal state twice"),
+        )
+        .expect("second goal driver recovery");
+        controller
+            .reconcile_queued_goal_lifecycle()
+            .expect("second goal claim reconciliation");
+        assert_eq!(
+            goal_driver_row(controller.state(), "controller.goal_intent")["status"],
+            expected_intent
+        );
+        assert_eq!(
+            goal_driver_row(controller.state(), "controller.goal_compilation_budget"),
+            budget_before
+        );
+        assert_eq!(
+            controller
+                .state()
+                .journal()
+                .expect("second journal")
+                .into_iter()
+                .filter(|event| event.event_kind.starts_with("goal_intent_"))
+                .count(),
+            lifecycle_events,
+            "{label}: second recovery replayed a lifecycle event"
+        );
+        assert_no_live_goal_driver_descendants(controller.state());
+    }
+}
+
+#[test]
+#[expect(
+    clippy::expect_used,
+    reason = "forced-kill fixture requires exact setup and recovered evidence"
+)]
+fn production_goal_driver_task_boundary_kill_is_stable() {
+    let fixture = queued_goal_fixture("task-boundary");
+    run_goal_driver_stage(&fixture, "goal_driver_compile");
+    let activated =
+        Controller::reopen_local(StateStore::open(fixture.state_path()).expect("active state"))
+            .expect("reopen activated goal");
+    let task_id = first_task_id(activated.state());
+    assert_eq!(activated.task_state(&task_id), Some(TaskState::Planned));
+    let compilation_budget =
+        goal_driver_row(activated.state(), "controller.goal_compilation_budget");
+    drop(activated);
+
+    let mut task_child = spawn_child(
+        &fixture,
+        "goal_driver_task",
+        Some("after_production_task_verified"),
+    );
+    wait_for_marker(&fixture.marker(), &fixture, &mut task_child);
+    kill_child(&mut task_child);
+    fs::remove_file(fixture.marker()).expect("clear task marker");
+    let mut controller =
+        Controller::reopen_local(StateStore::open(fixture.state_path()).expect("task state"))
+            .expect("recover verified task");
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Succeeded));
+    assert_eq!(controller.task_model_calls_used(&task_id), Some(1));
+    assert!(source(&fixture.root).contains("Apply"));
+    assert_no_live_goal_driver_descendants(controller.state());
+    let committed_actions = action_event_count(controller.state(), "committed");
+    let verified_evidence = controller
+        .state()
+        .state_records("controller.verification")
+        .expect("verified evidence")
+        .len();
+    assert!(
+        verified_evidence > 0,
+        "verified task must retain canonical verification"
+    );
+    assert_eq!(
+        goal_driver_row(controller.state(), "controller.goal_compilation_budget"),
+        compilation_budget
+    );
+    drop(controller);
+    controller = Controller::reopen_local(
+        StateStore::open(fixture.state_path()).expect("second task state"),
+    )
+    .expect("second verified task recovery");
+    assert_eq!(controller.task_state(&task_id), Some(TaskState::Succeeded));
+    assert_eq!(
+        action_event_count(controller.state(), "committed"),
+        committed_actions
+    );
+    assert_eq!(
+        controller
+            .state()
+            .state_records("controller.verification")
+            .expect("second evidence")
+            .len(),
+        verified_evidence
+    );
+    assert_eq!(
+        goal_driver_row(controller.state(), "controller.goal_compilation_budget"),
+        compilation_budget
+    );
+    assert_no_live_goal_driver_descendants(controller.state());
+}
+
+#[test]
+#[expect(
+    clippy::expect_used,
+    reason = "forced-kill fixture requires exact setup and recovered evidence"
+)]
+fn production_goal_driver_first_repository_dispatch_kill_never_replays_effect() {
+    let fixture = queued_goal_fixture("first-repository-dispatch");
+    run_goal_driver_stage(&fixture, "goal_driver_compile");
+    let before = StateStore::open(fixture.state_path()).expect("first dispatch initial state");
+    let compilation_budget = goal_driver_row(&before, "controller.goal_compilation_budget");
+    drop(before);
+
+    let mut child = spawn_child(
+        &fixture,
+        "goal_driver_task",
+        Some("after_repository_action_dispatch_before_commit"),
+    );
+    wait_for_marker(&fixture.marker(), &fixture, &mut child);
+    let action_id =
+        wait_for_action_state(&fixture.state_path(), "dispatched", &fixture, &mut child);
+    assert!(
+        source(&fixture.root).contains("Save"),
+        "kill point must precede repository mutation"
+    );
+    kill_child(&mut child);
+
+    let (controller, first, _) = recover(&fixture);
+    assert!(
+        first.mutation_blocked || first.pending_recovery_action_ids.contains(&action_id),
+        "dispatched action must retain exact recovery authority"
+    );
+    assert_eq!(action_event_count(controller.state(), "dispatched"), 1);
+    assert_eq!(action_event_count(controller.state(), "committed"), 0);
+    assert!(source(&fixture.root).contains("Save"));
+    assert_eq!(
+        goal_driver_row(controller.state(), "controller.goal_compilation_budget"),
+        compilation_budget
+    );
+    assert_no_live_goal_driver_descendants(controller.state());
+    let action = controller
+        .state()
+        .action_record(&action_id)
+        .expect("recovery action lookup")
+        .expect("first action retained");
+    assert_ne!(action.state, "committed");
+    let task_id = first_task_id(controller.state());
+    assert_ne!(controller.task_state(&task_id), Some(TaskState::Succeeded));
+    assert_eq!(controller.task_model_calls_used(&task_id), Some(1));
+    let action_state = action.state;
+    drop(controller);
+
+    let (controller, second, _) = recover(&fixture);
+    assert!(
+        second.mutation_blocked || second.pending_recovery_action_ids.contains(&action_id),
+        "second restart must retain exact recovery authority"
+    );
+    assert_eq!(
+        controller
+            .state()
+            .action_record(&action_id)
+            .expect("second action lookup")
+            .expect("second action retained")
+            .state,
+        action_state
+    );
+    assert_eq!(action_event_count(controller.state(), "dispatched"), 1);
+    assert_eq!(action_event_count(controller.state(), "committed"), 0);
+    assert_eq!(controller.task_model_calls_used(&task_id), Some(1));
+    assert_eq!(
+        goal_driver_row(controller.state(), "controller.goal_compilation_budget"),
+        compilation_budget
+    );
+    assert!(source(&fixture.root).contains("Save"));
+    assert_no_live_goal_driver_descendants(controller.state());
 }
 
 #[test]
@@ -1544,8 +2000,7 @@ fn assert_verification_only_recovery(pause_at: &str, label: &str) {
     let fixture = Fixture::create(label);
     let mut child = spawn_child(&fixture, "normal", Some(pause_at));
     wait_for_marker(&fixture.marker(), &fixture, &mut child);
-    let action_id =
-        wait_for_action_state(&fixture.state_path(), "committed", &fixture, &mut child);
+    let action_id = wait_for_action_state(&fixture.state_path(), "committed", &fixture, &mut child);
     kill_child(&mut child);
     assert!(source(&fixture.root).contains("Apply"));
     let before = StateStore::open(fixture.state_path())
@@ -1871,8 +2326,10 @@ fn unjournaled_task_state_drift_is_rejected_during_recovery() {
     let task_id = run_to_success(&fixture);
     let mut state = StateStore::open(fixture.state_path())
         .unwrap_or_else(|error| panic!("state for task drift: {error}"));
+    let (plan_id, revision) = active_plan_scope(&state);
+    let task_key = scoped_resource_key(&plan_id, revision, &task_id);
     let raw = state
-        .get_state("controller.task", &task_id)
+        .get_state("controller.task", &task_key)
         .unwrap_or_else(|error| panic!("read task state: {error}"))
         .unwrap_or_else(|| panic!("task state missing"));
     let mut value: Value =
@@ -1882,7 +2339,7 @@ fn unjournaled_task_state_drift_is_rejected_during_recovery() {
         .unwrap_or_else(|| panic!("model call counter missing"));
     value["model_calls_used"] = json!(calls + 1);
     state
-        .put_state("controller.task", &task_id, &value.to_string())
+        .put_state("controller.task", &task_key, &value.to_string())
         .unwrap_or_else(|error| panic!("write unjournaled task drift: {error}"));
     drop(state);
 
@@ -2638,9 +3095,11 @@ fn post_activation_pre_checkpoint_recovery_switches_to_n_plus_one_without_deleti
 
     let mut state = StateStore::open(fixture.state_path())
         .unwrap_or_else(|error| panic!("state for supersession: {error}"));
+    let (plan_id, revision) = active_plan_scope(&state);
+    let prior_task_key = scoped_resource_key(&plan_id, revision, &task_id);
     assert!(
         state
-            .get_state("controller.task", &task_id)
+            .get_state("controller.task", &prior_task_key)
             .unwrap_or_else(|error| panic!("read N task: {error}"))
             .is_some(),
         "revision N runtime must exist before supersession"
@@ -2661,7 +3120,7 @@ fn post_activation_pre_checkpoint_recovery_switches_to_n_plus_one_without_deleti
         .unwrap_or_else(|error| panic!("inspect recovered supersession: {error}"));
     assert!(
         state
-            .get_state("controller.task", &task_id)
+            .get_state("controller.task", &prior_task_key)
             .unwrap_or_else(|error| panic!("read historical N task: {error}"))
             .is_some(),
         "historical N task runtime must remain auditable"

@@ -1,0 +1,49 @@
+{
+  "task": "CX-T26",
+  "source": "manual first-run against isolated HOME /tmp/sovereign-cx-t26-firstrun and live sovereign serve --execute 127.0.0.1:17777",
+  "fabricated": false,
+  "observed_at_unix": 1790350952,
+  "goal_id": "goal-7d5f1623aef95af7",
+  "model_files_present": true,
+  "llama_server_started": false,
+  "onboarding": {
+    "completed": true,
+    "under_10_minutes": true,
+    "doctor": "pass except warn model-runtime/model-weights (before verify) and warn node missing",
+    "model_verify_ok": true,
+    "model_sha256": "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5",
+    "runtime_sha256": "d0878274b8d6bd3c8ea26a78eb66cd1ffd943d007c62b9dff31c8aa99922d713",
+    "project_id": "project-1",
+    "project_root": "/private/tmp/sovereign-cx-t26-firstrun/fixture-repo"
+  },
+  "checklist": {
+    "1_finish_onboarding_under_10_min": "pass",
+    "2_submit_goal_and_understand_statuses": "partial \u2014 queued_for_plan_compilation is shown; compile never started so later statuses were not observed",
+    "3_approve_or_deny_one_action": "not observed \u2014 no approval was requested because no plan compiled",
+    "4_recover_same_goal_after_forced_restart": "pass \u2014 same goal_id survived; unknown_action_ids empty; mutation_blocked false; no llama-server"
+  },
+  "defects_exposed": [
+    {
+      "id": "execute-unbound-after-ui-project-add",
+      "severity": "blocks consumer first-run execution",
+      "observed": "serve --execute started with cwd that is not a git root left ExecutionService unbound; UI project add did not bind the work tree; goal stayed queued_for_plan_compilation and last_outcome stayed none",
+      "fix_in_tree": "actor.switch_project now takes git_root; AddProject/ActivateProject bind the active work tree; serve startup uses AppData active project when present",
+      "compiled_and_retested": true,
+      "unit_test": "actor::tests::execute_tick_binds_after_project_switch passed",
+      "live_retest": "rebuilt serve --execute on the same isolated HOME; overview.last_outcome became Idle (was none); llama-server stayed down; a new goal goal-2474a4460ed9ac05 queued on project-1 state"
+    }
+  ],
+  "screenshots": [
+    "01-onboarding-welcome.png",
+    "02-onboarding-system-check.png",
+    "03-onboarding-model-verified.png",
+    "05-onboarding-service.png",
+    "06-onboarding-done.png",
+    "07-goal-composer.png",
+    "08-goal-queued-status.png",
+    "09-approvals-empty.png",
+    "10-recovery-before-restart.png",
+    "11-goal-after-restart.png",
+    "12-recovery-after-restart.png"
+  ]
+}

@@ -46,6 +46,7 @@ impl From<io::Error> for RunLockError {
 /// truth. Only the kernel file lock held by `_file` has meaning; the sidecar remains after release.
 pub(crate) struct RunLock {
     _file: File,
+    #[cfg(test)]
     path: PathBuf,
 }
 
@@ -66,7 +67,11 @@ impl RunLock {
             )));
         }
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file, path }),
+            Ok(()) => Ok(Self {
+                _file: file,
+                #[cfg(test)]
+                path,
+            }),
             Err(std::fs::TryLockError::WouldBlock) => Err(RunLockError::Contended(path)),
             Err(std::fs::TryLockError::Error(error)) => Err(RunLockError::Io(error)),
         }

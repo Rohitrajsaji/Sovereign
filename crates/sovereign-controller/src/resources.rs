@@ -152,6 +152,16 @@ impl ControllerResourceCoordinator {
         self.governor.admit(request, pressure)
     }
 
+    pub(crate) fn admit_rust_verification(
+        &mut self,
+        request: &ResourceLeaseRequestV1,
+        pressure: &ResourcePressureEventV1,
+        toolchain: &sovereign_policy::RustToolchainAccess,
+    ) -> Result<ResourceAdmissionDecisionV1, sovereign_policy::PolicyError> {
+        self.governor
+            .admit_rust_verification(request, pressure, toolchain)
+    }
+
     pub(crate) fn release(&mut self, lease_id: &str) -> Option<ResourcePolicyEventV1> {
         self.governor.release(lease_id)
     }

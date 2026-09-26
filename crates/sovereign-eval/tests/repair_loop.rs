@@ -417,7 +417,7 @@ fn plan_proposal() -> Value {
             "title": "Rename Settings submit label",
             "objective": "Change the rendered Settings submit label from Save to Apply without altering submit behavior.",
             "rationale": "Exact current source identifies one bounded edit.",
-            "files": ["src/settings/SettingsForm.tsx", "src/settings/SettingsForm.test.tsx"],
+            "files": ["src/settings/SettingsForm.tsx"],
             "symbols": ["SettingsForm"],
             "evidence_queries": [],
             "expected_change": "SettingsForm renders Apply instead of Save."
@@ -536,7 +536,7 @@ fn compile_and_activate(
     let mut compiler_budget = ModelCallBudget::new(2, 1_000);
     let compilation = compiler
         .compile(&input, &mut compiler_budget)
-        .unwrap_or_else(|error| panic!("compile repair goal: {error}"));
+        .unwrap_or_else(|error| panic!("compile repair goal: {error:?}"));
     assert!(validator.validate(compilation.plan()).is_empty());
     assert_eq!(compiler_budget.remaining_calls(), 1);
     backend
@@ -563,9 +563,23 @@ fn task_contract_and_acceptance(controller: &Controller, task_id: &str) -> (Stri
         .task_contract_digest(task_id)
         .unwrap_or_else(|| panic!("task contract digest missing"))
         .to_owned();
+    let active_raw = controller
+        .state()
+        .get_state("controller.plan", "active")
+        .unwrap_or_else(|error| panic!("read active plan: {error}"))
+        .unwrap_or_else(|| panic!("active plan missing"));
+    let active: Value = serde_json::from_str(&active_raw)
+        .unwrap_or_else(|error| panic!("decode active plan: {error}"));
+    let plan_id = active["plan_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("active plan id missing"));
+    let revision = active["revision"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("active plan revision missing"));
+    let task_key = format!("{plan_id}@r{revision}:{task_id}");
     let raw = controller
         .state()
-        .get_state("controller.task", task_id)
+        .get_state("controller.task", &task_key)
         .unwrap_or_else(|error| panic!("read task runtime: {error}"))
         .unwrap_or_else(|| panic!("task runtime missing"));
     let runtime: Value =

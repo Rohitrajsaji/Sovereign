@@ -63,6 +63,116 @@ fn observe_green(governor: &mut M6ResourceGovernor, at_ms: i64) -> ResourcePress
 }
 
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "this bounded fixture uses unwrap only for setup and expected successful admission"
+)]
+fn pinned_rust_verification_caps_are_specific_bounded_and_budget_limited() {
+    use sovereign_policy::{CommandPolicy, PinnedExecutable, RustToolchainAccess};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let root = std::env::temp_dir().join(format!(
+        "rust-verification-caps-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("lib")).unwrap();
+    let root = root.canonicalize().unwrap();
+    let cargo = root.join("bin/cargo");
+    let rustc = root.join("bin/rustc");
+    fs::write(&cargo, b"fixture cargo").unwrap();
+    fs::write(&rustc, b"fixture rustc").unwrap();
+    fs::write(root.join("lib/libfixture.rlib"), b"fixture library").unwrap();
+    let policy = CommandPolicy::new(
+        [
+            PinnedExecutable::from_path(&cargo, "fixture").unwrap(),
+            PinnedExecutable::from_path(&rustc, "fixture").unwrap(),
+        ],
+        [root.join("bin")],
+    )
+    .unwrap();
+    let toolchain = RustToolchainAccess::from_policy(&policy, &cargo).unwrap();
+    let args = vec!["--offline".to_owned(), "test".to_owned()];
+    assert!(
+        toolchain
+            .verification_process_binding(&cargo, &args)
+            .is_ok()
+    );
+    assert!(
+        toolchain
+            .verification_process_binding(&rustc, &args)
+            .is_err()
+    );
+    assert!(
+        toolchain
+            .verification_process_binding(&cargo, &["test".to_owned()])
+            .is_err()
+    );
+    assert!(
+        toolchain
+            .verification_process_binding(&cargo, &["--offline".to_owned(), "run".to_owned()])
+            .is_err()
+    );
+
+    for (task_cap, expected) in [(8, 3), (2, 2), (1, 1), (0, 0)] {
+        let mut governor = M6ResourceGovernor::new(HardwareProfileV1::m1_8gb());
+        let pressure = observe_green(&mut governor, 1_000);
+        let mut req = request("verification", HeavyLeaseClass::BuildHeavy, false, 4_096);
+        req.task_budget.max_subprocesses = task_cap;
+        let decision = governor
+            .admit_rust_verification(&req, &pressure, &toolchain)
+            .unwrap();
+        assert_eq!(decision.subprocess_cap, expected);
+        assert_eq!(decision.parallel_job_cap, Some(1));
+        assert_eq!(
+            decision.status,
+            if task_cap == 0 {
+                AdmissionStatus::Denied
+            } else {
+                AdmissionStatus::Admitted
+            }
+        );
+        governor.release("verification");
+        let ordinary = governor.admit(&req, &pressure);
+        assert_eq!(
+            ordinary.subprocess_cap,
+            task_cap.min(2),
+            "ordinary admission must stay unchanged"
+        );
+    }
+    let mut governor = M6ResourceGovernor::new(HardwareProfileV1::m1_8gb());
+    let pressure = observe_green(&mut governor, 1_000);
+    let wrong_class = request("unknown", HeavyLeaseClass::Unknown, false, 4_096);
+    assert!(
+        governor
+            .admit_rust_verification(&wrong_class, &pressure, &toolchain)
+            .is_err()
+    );
+    let mut snapshot = green_snapshot(2_000);
+    snapshot.allocation_failure = true;
+    let pressure = governor.observe_pressure(snapshot);
+    let req = request(
+        "verification-pressure",
+        HeavyLeaseClass::BuildHeavy,
+        false,
+        4_096,
+    );
+    assert!(
+        governor
+            .admit_rust_verification(&req, &pressure, &toolchain)
+            .unwrap()
+            .lease
+            .is_none()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn resources_m1_8gb_profile_materializes_frozen_limits_and_matrix() {
     let profile = HardwareProfileV1::m1_8gb();
     assert_eq!(profile.profile_id, "m1-8gb");

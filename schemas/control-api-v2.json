@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SovereignControlApiV2",
+  "type": "object",
+  "definitions": {
+    "SessionResponse": {
+      "type": "object",
+      "required": ["authenticated", "csrf_token"],
+      "properties": {
+        "authenticated": { "type": "boolean" },
+        "csrf_token": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "DoctorCheck": {
+      "type": "object",
+      "required": ["id", "status", "detail", "fix_hint"],
+      "properties": {
+        "id": { "type": "string" },
+        "status": { "type": "string", "enum": ["pass", "warn", "fail"] },
+        "detail": { "type": "string" },
+        "fix_hint": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "DoctorResponse": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/DoctorCheck" }
+    },
+    "OverviewResponse": {
+      "type": "object",
+      "required": ["schema_version", "service_phase", "active_project", "paused"],
+      "properties": {
+        "schema_version": { "type": "integer" },
+        "service_phase": { "type": "string" },
+        "active_project": { "type": ["string", "null"] },
+        "paused": { "type": "boolean" },
+        "detail": { "type": "string" },
+        "last_outcome": { "type": "string" },
+        "model_residency": { "type": "string" },
+        "pressure_band": { "type": "string" },
+        "goal_count": { "type": "integer" },
+        "approval_count": { "type": "integer" },
+        "unknown_action_count": { "type": "integer" },
+        "blocked_approvals": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ApprovalRequest" }
+        }
+      }
+    },
+    "ApprovalRequest": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "request_id",
+        "action_id",
+        "plan_id",
+        "plan_revision",
+        "task_id",
+        "permission_class",
+        "execution_epoch",
+        "expires_at_ms",
+        "status"
+      ],
+      "properties": {
+        "schema_version": { "type": "integer" },
+        "request_id": { "type": "string" },
+        "action_id": { "type": "string" },
+        "plan_id": { "type": "string" },
+        "plan_revision": { "type": "integer" },
+        "task_id": { "type": "string" },
+        "permission_class": { "type": "string" },
+        "execution_epoch": { "type": "integer" },
+        "expires_at_ms": { "type": "integer" },
+        "status": { "type": "string" }
+      }
+    },
+    "ProjectRecord": {
+      "type": "object",
+      "required": ["project_id", "display_name", "root", "state_path", "cas_root", "created_at_ms"],
+      "properties": {
+        "project_id": { "type": "string" },
+        "display_name": { "type": "string" },
+        "root": { "type": "string" },
+        "state_path": { "type": "string" },
+        "cas_root": { "type": "string" },
+        "created_at_ms": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "ProjectsResponse": {
+      "type": "object",
+      "required": ["schema_version", "active_project_id", "projects"],
+      "properties": {
+        "schema_version": { "type": "integer" },
+        "active_project_id": { "type": ["string", "null"] },
+        "projects": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/ProjectRecord" }
+        }
+      },
+      "additionalProperties": false
+    },
+    "GoalIntent": {
+      "type": "object",
+      "required": ["schema_version", "goal_id", "natural_language_goal", "status", "submitted_at_ms"],
+      "properties": {
+        "schema_version": { "type": "integer" },
+        "goal_id": { "type": "string" },
+        "natural_language_goal": { "type": "string" },
+        "status": { "type": "string" },
+        "submitted_at_ms": { "type": "integer" }
+      }
+    },
+    "GoalsResponse": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/GoalIntent" }
+    },
+    "ControlResponse": {
+      "type": "object",
+      "required": ["schema_version", "paused", "changed_at_ms"],
+      "properties": {
+        "schema_version": { "type": "integer" },
+        "paused": { "type": "boolean" },
+        "reason": { "type": ["string", "null"] },
+        "changed_at_ms": { "type": "integer" }
+      }
+    },
+    "ErrorResponse": {
+      "type": "object",
+      "required": ["error"],
+      "properties": {
+        "error": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "EventProjection": {
+      "type": "object",
+      "required": ["sequence", "event_id", "entity_type", "entity_id", "event_kind", "summary", "occurred_at_ms"],
+      "properties": {
+        "sequence": { "type": "integer" },
+        "event_id": { "type": "string" },
+        "entity_type": { "type": "string" },
+        "entity_id": { "type": "string" },
+        "event_kind": { "type": "string" },
+        "summary": { "type": "string" },
+        "occurred_at_ms": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "EventsResponse": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/EventProjection" }
+    },
+    "RecoveryExplanation": {
+      "type": "object",
+      "required": ["mutation_blocked", "headline", "explanation", "next_steps"],
+      "properties": {
+        "mutation_blocked": { "type": "boolean" },
+        "headline": { "type": "string" },
+        "explanation": { "type": "string" },
+        "next_steps": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "ModelVerifyResponse": {
+      "type": "object",
+      "required": ["ok", "runtime_sha256", "model_sha256", "detail"],
+      "properties": {
+        "ok": { "type": "boolean" },
+        "runtime_sha256": { "type": "string" },
+        "model_sha256": { "type": "string" },
+        "detail": { "type": "string" }
+      }
+    },
+    "SettingsV1": {
+      "type": "object",
+      "required": ["schema_version", "execute_on_start", "approval_principal"],
+      "properties": {
+        "schema_version": { "type": "integer" },
+        "model_runtime": { "type": ["string", "null"] },
+        "model_path": { "type": ["string", "null"] },
+        "model_name": { "type": ["string", "null"] },
+        "chrome_path": { "type": ["string", "null"] },
+        "node_path": { "type": ["string", "null"] },
+        "execute_on_start": { "type": "boolean" },
+        "approval_principal": { "type": "string" }
+      }
+    },
+    "GoalDetail": {
+      "type": "object",
+      "required": ["intent", "plan_revisions", "tasks", "attempts", "verifications", "evidence", "completion_decided_by"],
+      "properties": {
+        "intent": { "$ref": "#/definitions/GoalIntent" },
+        "plan_revisions": { "type": "array" },
+        "tasks": { "type": "array" },
+        "attempts": { "type": "array" },
+        "verifications": { "type": "array" },
+        "evidence": { "type": "array" },
+        "completion_decided_by": { "type": "string" }
+      }
+    },
+    "ArtifactRead": {
+      "type": "object",
+      "required": ["digest", "utf8", "byte_len"],
+      "properties": {
+        "digest": { "type": "string" },
+        "utf8": { "type": "boolean" },
+        "text": { "type": ["string", "null"] },
+        "byte_len": { "type": "integer" }
+      }
+    },
+    "RecoveryResponse": {
+      "type": "object",
+      "required": ["explanation"],
+      "properties": {
+        "explanation": { "$ref": "#/definitions/RecoveryExplanation" }
+      }
+    }
+  }
+}

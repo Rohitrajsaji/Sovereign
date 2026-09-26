@@ -721,7 +721,7 @@ impl MacLoopbackServerSandboxExecBackend {
     /// only for the exact repository and Controller data roots; extra protected roots remain denied.
     /// Writes are denied globally then reopened only for the exact Controller data root. Network is
     /// denied globally then reopened for the granted app listener and, when explicitly supplied,
-    /// outbound access to one exact Controller-owned PostgreSQL broker port.
+    /// outbound access to one exact Controller-owned `PostgreSQL` broker port.
     ///
     /// # Errors
     /// Returns a denial for malformed/stale authority or unsafe roots.
@@ -755,7 +755,9 @@ impl MacLoopbackServerSandboxExecBackend {
                 "(allow network-outbound (remote ip \"localhost:{port}\"))"
             )
             .map_err(|_| {
-                BrowserPolicyError::Denied("failed to build exact PostgreSQL broker profile".to_owned())
+                BrowserPolicyError::Denied(
+                    "failed to build exact PostgreSQL broker profile".to_owned(),
+                )
             })?;
         }
         write!(
@@ -799,9 +801,11 @@ impl MacLoopbackServerSandboxExecBackend {
                 "(allow file-read-metadata (literal {}))",
                 seatbelt_string(&ancestor)
             )
-            .map_err(|_| BrowserPolicyError::Denied(
-                "failed to build loopback server ancestor metadata profile".to_owned(),
-            ))?;
+            .map_err(|_| {
+                BrowserPolicyError::Denied(
+                    "failed to build loopback server ancestor metadata profile".to_owned(),
+                )
+            })?;
         }
         profile.push_str("(deny file-write* (subpath \"/\"))");
         profile.push_str("(allow file-write* (literal \"/dev/null\"))");

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sovereign-context = { path = "../../crates/sovereign-context" }
 sovereign-controller = { path = "../../crates/sovereign-controller" }
 sovereign-evidence = { path = "../../crates/sovereign-evidence" }
@@ -21,7 +22,20 @@ sovereign-tools = { path = "../../crates/sovereign-tools" }
 sovereign-types = { path = "../../crates/sovereign-types" }
 
 [dev-dependencies]
+jsonschema.workspace = true
 sha2.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+
+[features]
+default = []
+e2e-fixtures = []
+
+[[bin]]
+name = "sovereign-e2e-server"
+path = "src/e2e_server.rs"
+required-features = ["e2e-fixtures"]
 
 [lints]
 workspace = true

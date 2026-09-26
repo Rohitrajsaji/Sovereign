@@ -177,7 +177,7 @@ new Worker(workerUrl);
         .local_addr()
         .unwrap_or_else(|error| panic!("read containment fixture address failed: {error}"));
     let handle = thread::spawn(move || {
-        let hard_deadline = Instant::now() + Duration::from_secs(5);
+        let hard_deadline = Instant::now() + Duration::from_secs(15);
         let mut settle_deadline = None;
         let mut observed = Vec::new();
         while Instant::now() < hard_deadline

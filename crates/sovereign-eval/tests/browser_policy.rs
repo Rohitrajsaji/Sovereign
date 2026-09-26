@@ -715,11 +715,19 @@ struct BrowserRecoveryFixture {
     registry: ProjectRegistry,
     state_path: PathBuf,
     task_id: String,
+    task_key: String,
     plan_id: String,
+    plan_revision: u32,
     task_contract_digest: String,
     execution_epoch: i64,
     max_peak_rss_mib: u64,
     max_subprocesses: u32,
+}
+
+impl BrowserRecoveryFixture {
+    fn scoped_key(&self, logical_key: &str) -> String {
+        format!("{}@r{}:{logical_key}", self.plan_id, self.plan_revision)
+    }
 }
 
 fn git_fixture(root: &Path, args: &[&str]) {
@@ -938,13 +946,6 @@ fn controller_browser_recovery_fixture(max_network_bytes: u64) -> BrowserRecover
         .first()
         .cloned()
         .unwrap_or_else(|| panic!("recovery fixture activation omitted task"));
-    let task_raw = controller
-        .state()
-        .get_state("controller.task", &task_id)
-        .unwrap_or_else(|error| panic!("read recovery task runtime: {error}"))
-        .unwrap_or_else(|| panic!("recovery task runtime missing"));
-    let task: Value = serde_json::from_str(&task_raw)
-        .unwrap_or_else(|error| panic!("decode recovery task runtime: {error}"));
     let active_raw = controller
         .state()
         .get_state("controller.plan", "active")
@@ -956,6 +957,19 @@ fn controller_browser_recovery_fixture(max_network_bytes: u64) -> BrowserRecover
         .as_str()
         .unwrap_or_else(|| panic!("recovery plan id missing"))
         .to_owned();
+    let revision = active["revision"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("recovery plan revision missing"));
+    let plan_revision =
+        u32::try_from(revision).unwrap_or_else(|_| panic!("recovery plan revision exceeds u32"));
+    let task_key = format!("{plan_id}@r{revision}:{task_id}");
+    let task_raw = controller
+        .state()
+        .get_state("controller.task", &task_key)
+        .unwrap_or_else(|error| panic!("read recovery task runtime: {error}"))
+        .unwrap_or_else(|| panic!("recovery task runtime missing at {task_key}"));
+    let task: Value = serde_json::from_str(&task_raw)
+        .unwrap_or_else(|error| panic!("decode recovery task runtime: {error}"));
     let task_contract_digest = task["task_contract_digest"]
         .as_str()
         .unwrap_or_else(|| panic!("recovery task contract digest missing"))
@@ -979,7 +993,9 @@ fn controller_browser_recovery_fixture(max_network_bytes: u64) -> BrowserRecover
         registry,
         state_path,
         task_id,
+        task_key,
         plan_id,
+        plan_revision,
         task_contract_digest,
         execution_epoch,
         max_peak_rss_mib,
@@ -1020,9 +1036,12 @@ fn seed_durable_browser_recovery_state(
     residency_state: BrowserResourceResidencyStateV1,
 ) -> String {
     let lease_id = format!(
-        "browser:{}:r1:{}:{}",
-        fixture.plan_id, fixture.task_id, fixture.execution_epoch
+        "browser:{}:r{}:{}:{}",
+        fixture.plan_id, fixture.plan_revision, fixture.task_id, fixture.execution_epoch
     );
+    let lease_key = fixture.scoped_key(&lease_id);
+    let governor_key = fixture.scoped_key("active");
+    let residency_key = fixture.scoped_key("cdp_browser");
     let mut governor = M6ResourceGovernor::default();
     let pressure = governor.observe_pressure(green_pressure(1_000));
     let admission = governor.admit(
@@ -1030,7 +1049,7 @@ fn seed_durable_browser_recovery_state(
             lease_id: lease_id.clone(),
             owner: ResourceLeaseOwnerV1 {
                 plan_id: fixture.plan_id.clone(),
-                plan_revision: 1,
+                plan_revision: fixture.plan_revision,
                 task_id: fixture.task_id.clone(),
             },
             class: HeavyLeaseClass::CdpBrowser,
@@ -1057,7 +1076,7 @@ fn seed_durable_browser_recovery_state(
     let residency = BrowserResourceResidencyV1 {
         schema_version: 1,
         plan_id: fixture.plan_id.clone(),
-        plan_revision: 1,
+        plan_revision: fixture.plan_revision,
         task_id: fixture.task_id.clone(),
         task_contract_digest: fixture.task_contract_digest.clone(),
         execution_epoch: fixture.execution_epoch,
@@ -1091,7 +1110,7 @@ fn seed_durable_browser_recovery_state(
         serde_json::to_string(&json!({
             "schema_version": 1,
             "plan_id": fixture.plan_id,
-            "plan_revision": 1,
+            "plan_revision": fixture.plan_revision,
             "task_id": fixture.task_id,
             "task_contract_digest": fixture.task_contract_digest,
             "resource_lease_id": lease_id,
@@ -1107,26 +1126,26 @@ fn seed_durable_browser_recovery_state(
     });
     let mut post_images = BTreeMap::new();
     post_images.insert(
-        format!("controller.resource_lease:{lease_id}"),
+        format!("controller.resource_lease:{lease_key}"),
         sha256_binding(lease_json.as_bytes()),
     );
     post_images.insert(
-        "controller.resource_governor:active".to_owned(),
+        format!("controller.resource_governor:{governor_key}"),
         sha256_binding(governor_json.as_bytes()),
     );
     post_images.insert(
-        "controller.resource_residency:cdp_browser".to_owned(),
+        format!("controller.resource_residency:{residency_key}"),
         sha256_binding(residency_json.as_bytes()),
     );
     if let Some(reservation_json) = reservation_json.as_ref() {
         post_images.insert(
-            format!("controller.browser_network_reservation:{lease_id}"),
+            format!("controller.browser_network_reservation:{lease_key}"),
             sha256_binding(reservation_json.as_bytes()),
         );
     }
     let event_payload = json!({
         "plan_id": fixture.plan_id,
-        "plan_revision": 1,
+        "plan_revision": fixture.plan_revision,
         "post_image_digests": post_images,
     })
     .to_string();
@@ -1135,24 +1154,24 @@ fn seed_durable_browser_recovery_state(
     let mut updates = vec![
         StateRecordUpdate {
             namespace: "controller.resource_lease",
-            key: &lease_id,
+            key: &lease_key,
             value_json: &lease_json,
         },
         StateRecordUpdate {
             namespace: "controller.resource_governor",
-            key: "active",
+            key: &governor_key,
             value_json: &governor_json,
         },
         StateRecordUpdate {
             namespace: "controller.resource_residency",
-            key: "cdp_browser",
+            key: &residency_key,
             value_json: &residency_json,
         },
     ];
     if let Some(reservation_json) = reservation_json.as_ref() {
         updates.push(StateRecordUpdate {
             namespace: "controller.browser_network_reservation",
-            key: &lease_id,
+            key: &lease_key,
             value_json: reservation_json,
         });
     }
@@ -1187,7 +1206,10 @@ fn controller_recovery_settles_active_browser_network_reservation_once_at_full_r
         .unwrap_or_else(|error| panic!("recover active browser reservation: {error}"));
     let reservation_raw = recovered
         .state()
-        .get_state("controller.browser_network_reservation", &lease_id)
+        .get_state(
+            "controller.browser_network_reservation",
+            &fixture.scoped_key(&lease_id),
+        )
         .unwrap_or_else(|error| panic!("read settled browser reservation: {error}"))
         .unwrap_or_else(|| panic!("settled browser reservation disappeared"));
     let settled: Value = serde_json::from_str(&reservation_raw)
@@ -1235,7 +1257,7 @@ fn controller_recovery_settles_active_browser_network_reservation_once_at_full_r
     );
     let task_raw = recovered_again
         .state()
-        .get_state("controller.task", &fixture.task_id)
+        .get_state("controller.task", &fixture.task_key)
         .unwrap_or_else(|error| panic!("read task after second recovery: {error}"))
         .unwrap_or_else(|| panic!("task missing after second recovery"));
     let task: Value = serde_json::from_str(&task_raw)
@@ -1276,7 +1298,10 @@ fn controller_recovery_refuses_post_admission_browser_state_without_network_rese
         .unwrap_or_else(|error| panic!("reopen rejected recovery state: {error}"));
     assert!(
         state
-            .get_state("controller.browser_network_reservation", &lease_id)
+            .get_state(
+                "controller.browser_network_reservation",
+                &fixture.scoped_key(&lease_id),
+            )
             .unwrap_or_else(|error| panic!("read missing reservation slot: {error}"))
             .is_none(),
         "recovery must not synthesize a network reservation"
@@ -1292,7 +1317,7 @@ fn controller_recovery_refuses_post_admission_browser_state_without_network_rese
         "missing reservation must not be converted into a synthetic network charge"
     );
     let task_raw = state
-        .get_state("controller.task", &fixture.task_id)
+        .get_state("controller.task", &fixture.task_key)
         .unwrap_or_else(|error| panic!("read task after rejected recovery: {error}"))
         .unwrap_or_else(|| panic!("task disappeared after rejected recovery"));
     let task: Value = serde_json::from_str(&task_raw)
@@ -1306,7 +1331,10 @@ fn controller_recovery_refuses_post_admission_browser_state_without_network_rese
         "failed recovery must not advance the execution epoch"
     );
     let residency_raw = state
-        .get_state("controller.resource_residency", "cdp_browser")
+        .get_state(
+            "controller.resource_residency",
+            &fixture.scoped_key("cdp_browser"),
+        )
         .unwrap_or_else(|error| panic!("read rejected browser residency: {error}"))
         .unwrap_or_else(|| panic!("browser residency disappeared after rejected recovery"));
     let residency: BrowserResourceResidencyV1 = serde_json::from_str(&residency_raw)

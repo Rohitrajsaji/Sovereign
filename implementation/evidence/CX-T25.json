@@ -1,0 +1,42 @@
+{
+  "task": "CX-T25",
+  "completed": false,
+  "llama_server_started": false,
+  "source": "live host sample using the same commands as MacOsResourceProbe plus HardwareProfileV1::m1_8gb / M1_MODEL_UNCALIBRATED_ADMISSION_MIB arithmetic",
+  "reason": "existing resource admission policy would not admit the uncalibrated MODEL lease; llama-server was not started",
+  "assets": {
+    "model_path": "/Users/rohitrajsaji/Desktop/Sovereign/.models/Qwen3-4B-Q4_K_M.gguf",
+    "model_bytes": 2497280256,
+    "runtime_path": "/Users/rohitrajsaji/Desktop/Sovereign/.tools/llama-b10516/llama-b10516/llama-server",
+    "runtime_bytes": 33472,
+    "runtime_present": true,
+    "model_present": true
+  },
+  "probe": {
+    "observed_at_unix": 1790349298,
+    "memory_pressure_-Q": "The system has 8589934592 (524288 pages with a page size of 16384).\nSystem-wide memory free percentage: 45%\n",
+    "free_percent": 45,
+    "host_headroom_mib": 3686,
+    "swapusage": "vm.swapusage: total = 4096.00M  used = 2854.44M  free = 1241.56M  (encrypted)",
+    "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "host_free_disk_mib": 68492,
+    "llama_server_pids": []
+  },
+  "profile": {
+    "id": "m1-8gb",
+    "physical_memory_mib": 8192,
+    "minimum_launch_headroom_soft_mib": 1536,
+    "minimum_launch_headroom_hard_mib": 1280,
+    "normal_controlled_working_set_soft_mib": 4864,
+    "uncalibrated_model_admission_mib": 4096,
+    "calibrated": false
+  },
+  "admission": {
+    "os_memory_pressure": "normal",
+    "raw_band_without_warmup": "green",
+    "projected_host_headroom_mib": 0,
+    "required_headroom_mib_for_uncalibrated_admit": 5632,
+    "decision": "defer",
+    "policy_event_if_requested": "Deferred: projected host headroom is below launch reserve"
+  }
+}

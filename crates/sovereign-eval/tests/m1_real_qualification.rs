@@ -551,18 +551,88 @@ fn task_contract_and_acceptance(controller: &Controller, task_id: &str) -> (Stri
         .task_contract_digest(task_id)
         .unwrap_or_else(|| panic!("task contract digest missing"))
         .to_owned();
-    let raw = controller
-        .state()
-        .get_state("controller.task", task_id)
-        .unwrap_or_else(|error| panic!("read task runtime: {error}"))
-        .unwrap_or_else(|| panic!("task runtime missing"));
-    let runtime: Value =
-        serde_json::from_str(&raw).unwrap_or_else(|error| panic!("task runtime JSON: {error}"));
+    let runtime = active_revision_task_runtime(controller.state(), task_id);
     let acceptance = runtime
         .pointer("/task/acceptance_criteria")
         .cloned()
         .unwrap_or_else(|| panic!("acceptance criteria missing"));
     (digest, acceptance)
+}
+
+fn active_revision_task_runtime(state: &StateStore, task_id: &str) -> Value {
+    let active = state
+        .get_state("controller.plan", "active")
+        .unwrap_or_else(|error| panic!("read active plan record: {error}"))
+        .unwrap_or_else(|| panic!("active plan record missing"));
+    let active: Value =
+        serde_json::from_str(&active).unwrap_or_else(|error| panic!("active plan JSON: {error}"));
+    let plan_id = active
+        .get("plan_id")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("active plan ID missing"));
+    let revision = active
+        .get("revision")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("active plan revision missing"));
+    let key = format!("{plan_id}@r{revision}:{task_id}");
+    let raw = state
+        .get_state("controller.task", &key)
+        .unwrap_or_else(|error| panic!("read revision-scoped task runtime: {error}"))
+        .unwrap_or_else(|| panic!("revision-scoped task runtime missing at {key}"));
+    let runtime: Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|error| panic!("revision-scoped task runtime JSON: {error}"));
+    assert_eq!(
+        runtime.pointer("/task/task_id").and_then(Value::as_str),
+        Some(task_id),
+        "revision-scoped task runtime must be bound to the requested task"
+    );
+    runtime
+}
+
+#[test]
+fn qualification_runtime_lookup_uses_active_revision_scoped_record() {
+    let base = std::env::temp_dir().join(format!(
+        "sovereign-m1-qualification-runtime-key-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos())
+    ));
+    fs::create_dir_all(&base)
+        .unwrap_or_else(|error| panic!("create qualification runtime-key fixture: {error}"));
+    let state_path = base.join("state.sqlite3");
+    let mut state = StateStore::open(&state_path)
+        .unwrap_or_else(|error| panic!("open qualification runtime-key state: {error}"));
+    state
+        .put_state(
+            "controller.plan",
+            "active",
+            r#"{"plan_id":"plan.fixture","revision":7}"#,
+        )
+        .unwrap_or_else(|error| panic!("write active plan fixture: {error}"));
+    state
+        .put_state(
+            "controller.task",
+            "plan.fixture@r7:task.fixture",
+            r#"{"task":{"task_id":"task.fixture","acceptance_criteria":[{"criterion_id":"acceptance.fixture"}]}}"#,
+        )
+        .unwrap_or_else(|error| panic!("write revision-scoped task fixture: {error}"));
+    assert_eq!(
+        state
+            .get_state("controller.task", "task.fixture")
+            .unwrap_or_else(|error| panic!("check legacy task key: {error}")),
+        None,
+        "task runtime must not be fetched from an unscoped legacy key"
+    );
+
+    let runtime = active_revision_task_runtime(&state, "task.fixture");
+    assert_eq!(
+        runtime.pointer("/task/acceptance_criteria/0/criterion_id"),
+        Some(&Value::String("acceptance.fixture".to_owned()))
+    );
+    drop(state);
+    fs::remove_dir_all(&base)
+        .unwrap_or_else(|error| panic!("remove qualification runtime-key fixture: {error}"));
 }
 
 fn satisfy_compiled_execution_evidence(
@@ -687,6 +757,9 @@ fn command_text(program: &str, args: &[&str]) -> String {
     Command::new(program).args(args).output().map_or_else(
         |error| format!("unavailable: {error}"),
         |output| {
+            if !output.status.success() {
+                return format!("unavailable: {program} exited {}", output.status);
+            }
             let stdout = String::from_utf8_lossy(&output.stdout);
             if stdout.trim().is_empty() {
                 String::from_utf8_lossy(&output.stderr).trim().to_owned()
@@ -710,28 +783,45 @@ fn parse_memory_free_percent(observation: &str) -> Option<u64> {
         line.strip_prefix("System-wide memory free percentage:")
             .and_then(|value| value.trim().strip_suffix('%'))
             .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|percent| *percent <= 100)
     })
 }
 
-fn wait_for_frozen_model_launch_headroom() {
+fn admit_before_model_boundary<T>(
+    mut observation: impl FnMut() -> String,
+    timeout: Duration,
+    poll: Duration,
+    model_boundary: impl FnOnce() -> T,
+) -> Result<T, String> {
     let required_headroom_mib = M1_REAL_QUAL_MODEL_ADMISSION_MIB + M1_REAL_QUAL_LAUNCH_RESERVE_MIB;
     let required_free_percent = required_headroom_mib
         .saturating_mul(100)
         .div_ceil(M1_REAL_QUAL_PHYSICAL_MEMORY_MIB);
-    let deadline = Instant::now() + M1_REAL_QUAL_RESOURCE_RECOVERY_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
-        let observation = command_text("/usr/bin/memory_pressure", &["-Q"]);
-        if parse_memory_free_percent(&observation)
+        let sample = observation();
+        if parse_memory_free_percent(&sample)
             .is_some_and(|free_percent| free_percent >= required_free_percent)
         {
-            return;
+            return Ok(model_boundary());
         }
-        assert!(
-            Instant::now() < deadline,
-            "compiler Qwen unloaded but frozen MODEL admission headroom did not recover to {required_free_percent}% within {M1_REAL_QUAL_RESOURCE_RECOVERY_TIMEOUT:?}: {observation}"
-        );
-        thread::sleep(M1_REAL_QUAL_RESOURCE_RECOVERY_POLL);
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "frozen MODEL admission headroom did not reach {required_free_percent}% within {timeout:?}: {sample}"
+            ));
+        }
+        thread::sleep(poll);
     }
+}
+
+fn wait_for_frozen_model_launch_headroom() {
+    admit_before_model_boundary(
+        || command_text("/usr/bin/memory_pressure", &["-Q"]),
+        M1_REAL_QUAL_RESOURCE_RECOVERY_TIMEOUT,
+        M1_REAL_QUAL_RESOURCE_RECOVERY_POLL,
+        || (),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
 }
 
 #[test]
@@ -743,6 +833,43 @@ fn parses_memory_pressure_free_percent_for_frozen_headroom_gate() {
         Some(73)
     );
     assert_eq!(parse_memory_free_percent("unavailable"), None);
+    assert_eq!(
+        parse_memory_free_percent("System-wide memory free percentage: 169%"),
+        None
+    );
+    let failed_probe = command_text("/usr/bin/false", &[]);
+    assert!(failed_probe.starts_with("unavailable:"));
+}
+
+#[test]
+fn compiler_model_boundary_is_not_reached_without_frozen_headroom() {
+    let model_loads = AtomicUsize::new(0);
+    for observation in ["System-wide memory free percentage: 68%", "unavailable"] {
+        let result = admit_before_model_boundary(
+            || observation.to_owned(),
+            Duration::ZERO,
+            Duration::ZERO,
+            || model_loads.fetch_add(1, Ordering::SeqCst),
+        );
+        assert!(
+            result.is_err(),
+            "admission unexpectedly accepted {observation}"
+        );
+        assert_eq!(model_loads.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn admitted_compiler_model_boundary_can_begin_at_69_percent() {
+    let model_loads = AtomicUsize::new(0);
+    let result = admit_before_model_boundary(
+        || "System-wide memory free percentage: 69%".to_owned(),
+        Duration::ZERO,
+        Duration::ZERO,
+        || model_loads.fetch_add(1, Ordering::SeqCst),
+    );
+    assert_eq!(result.ok(), Some(0));
+    assert_eq!(model_loads.load(Ordering::SeqCst), 1);
 }
 
 fn process_absent(pid: Option<u32>) -> bool {
@@ -813,19 +940,28 @@ fn m1_real_qwen_implementation_repair_restart_qualification() {
     let prepared = Prepared::build(&fixture);
     let runtime_harness = RuntimeHarness::new(&fixture);
     let host_before = host_observation();
-    let backend = real_backend(
-        runtime_path.clone(),
-        model_path.clone(),
-        prepared.form_digest.clone(),
-    );
-    let lease = backend
-        .load(ModelLoadProfile {
-            context_tokens: 8_192,
-            output_reserve_tokens: 1_536,
-            startup_timeout_ms: 180_000,
-            provider_call_timeout_ms: 180_000,
-        })
-        .unwrap_or_else(|error| panic!("load real Qwen qualification backend: {error}"));
+    let (backend, lease) = admit_before_model_boundary(
+        || command_text("/usr/bin/memory_pressure", &["-Q"]),
+        M1_REAL_QUAL_RESOURCE_RECOVERY_TIMEOUT,
+        M1_REAL_QUAL_RESOURCE_RECOVERY_POLL,
+        || {
+            let backend = real_backend(
+                runtime_path.clone(),
+                model_path.clone(),
+                prepared.form_digest.clone(),
+            );
+            let lease = backend
+                .load(ModelLoadProfile {
+                    context_tokens: 8_192,
+                    output_reserve_tokens: 1_536,
+                    startup_timeout_ms: 180_000,
+                    provider_call_timeout_ms: 180_000,
+                })
+                .unwrap_or_else(|error| panic!("load real Qwen qualification backend: {error}"));
+            (backend, lease)
+        },
+    )
+    .unwrap_or_else(|error| panic!("compiler model admission: {error}"));
 
     let validator = PlanValidator::new(ValidationEnvironment::default())
         .unwrap_or_else(|error| panic!("construct qualification validator: {error}"));

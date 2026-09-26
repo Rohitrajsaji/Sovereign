@@ -998,7 +998,9 @@ fn controller_inflight_model_cancellation_interrupts_backend_and_keeps_call_cons
         let started = Instant::now();
         while !cancel_backend.complete_started.load(Ordering::Acquire) {
             assert!(
-                started.elapsed() < Duration::from_secs(1),
+                // Model admission, checkpoints, and Seatbelt setup run before `complete`.
+                // One second is not enough when the rest of the suite is loaded.
+                started.elapsed() < Duration::from_secs(15),
                 "Controller never entered model completion"
             );
             thread::sleep(Duration::from_millis(2));

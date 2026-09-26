@@ -2002,6 +2002,128 @@ fn output_disk_and_subprocess_ceilings_terminate_bounded_commands() {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "process-limit fixtures assert required setup and journal state"
+)]
+fn subprocess_allowance_cannot_be_widened_after_journal_authorization() {
+    let (temp, repo, home, mut store) = fixture("process-cap-binding");
+    let mut action = shell_action(
+        "process-cap-binding",
+        &repo,
+        "true",
+        Limits {
+            timeout_ms: 1_000,
+            output_bytes: 1024,
+            disk_bytes: 1024,
+            subprocesses: 3,
+        },
+        ReconciliationMode::IdempotentRead,
+    );
+    let request = isolation(&repo, &home, false);
+    bind_isolation(&mut action, &request);
+    let command_policy = shell_policy();
+    let backend = MacSandboxExecBackend::detect().expect("Seatbelt");
+    let runner = ProcessRunner::new(&command_policy, &backend);
+    let mut journal = ActionJournal::new(&mut store);
+    authorize(&mut journal, &action, &manifest()).expect("authorize exact process cap");
+    action.command.subprocess_limit = 4;
+    assert!(
+        runner
+            .run(&mut journal, &action, &request, &artifacts(&temp))
+            .is_err()
+    );
+    assert_eq!(
+        journal.record(&action.action_id).unwrap().unwrap().state,
+        "authorized"
+    );
+    assert!(
+        store
+            .get_state("controller.process_lease", &action.action_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "process-limit fixtures assert required setup and cleanup state"
+)]
+fn three_descendant_allowance_enforces_ceiling_and_cleans_children() {
+    for children in [3, 4] {
+        let label = format!("three-descendant-cap-{children}");
+        let (temp, repo, home, mut store) = fixture(&label);
+        let artifact_store = artifacts(&temp);
+        let duration = if children == 3 { "0.5" } else { "30" };
+        let script = format!(
+            "i=0; while [ $i -lt {children} ]; do /bin/sleep {duration} & echo $! >> child-pids; i=$((i+1)); done; wait"
+        );
+        let mut action = shell_action(
+            &label,
+            &repo,
+            &script,
+            Limits {
+                timeout_ms: 4_000,
+                output_bytes: 16 * 1024,
+                disk_bytes: 16 * 1024,
+                subprocesses: 3,
+            },
+            ReconciliationMode::IdempotentRead,
+        );
+        action.permission_class = PermissionClass::RepositoryWrite;
+        let command_policy = shell_policy();
+        let backend = MacSandboxExecBackend::detect().expect("Seatbelt");
+        let runner = ProcessRunner::new(&command_policy, &backend);
+        let request = isolation(&repo, &home, true);
+        bind_isolation(&mut action, &request);
+        let mut journal = ActionJournal::new(&mut store);
+        authorize(&mut journal, &action, &manifest()).expect("authorize bounded process action");
+        let result = runner.run(&mut journal, &action, &request, &artifact_store);
+        if children == 3 {
+            let result = result.expect("three descendants fit exact allowance");
+            assert_eq!(result.exit_code, Some(0));
+            assert!(result.process_group_reaped);
+            assert!(result.terminated_for_limit.is_none());
+        } else {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("subprocesses limit")
+            );
+            assert_eq!(
+                journal.record(&action.action_id).unwrap().unwrap().state,
+                "unknown"
+            );
+        }
+        let pids = fs::read_to_string(repo.join("child-pids")).expect("recorded child identities");
+        let pids = pids.lines().collect::<Vec<_>>();
+        assert_eq!(pids.len(), children);
+        for pid in pids {
+            let mut alive = true;
+            for _ in 0..40 {
+                alive = Command::new("/bin/kill")
+                    .args(["-0", pid])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success();
+                if !alive {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            assert!(!alive, "descendant {pid} survived cleanup");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn escaped_descendant_holding_output_pipe_is_bounded_and_recovery_blocked() {
     let (temp, repo, home, mut store) = fixture("escaped-pipe");
     let artifact_store = artifacts(&temp);

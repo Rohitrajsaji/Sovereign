@@ -87,6 +87,10 @@ fn task_loopback_scope(grant: &TaskLoopbackGrantV1) -> TaskLoopbackScope<'_> {
 
 #[cfg(target_os = "macos")]
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "the Seatbelt denial fixture uses unwrap only for setup and process status"
+)]
 fn managed_app_default_denies_local_database_and_other_outbound() {
     let root = TestDir::new("managed-local-database-denial");
     let repository_root = root.0.join("repo");
@@ -97,7 +101,10 @@ fn managed_app_default_denies_local_database_and_other_outbound() {
     let database_socket_path = PathBuf::from(format!(
         "/tmp/sov-pg-{}-{}.sock",
         std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     let _database_socket = std::os::unix::net::UnixListener::bind(&database_socket_path).unwrap();
     let neighboring_service = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -129,9 +136,14 @@ fn managed_app_default_denies_local_database_and_other_outbound() {
             .unwrap()
             .success()
     };
-    assert!(!connect("127.0.0.1", local_database.local_addr().unwrap().port()),
-        "default managed-app Seatbelt unexpectedly reached a local database endpoint");
-    assert!(!connect("127.0.0.1", neighboring_service.local_addr().unwrap().port()));
+    assert!(
+        !connect("127.0.0.1", local_database.local_addr().unwrap().port()),
+        "default managed-app Seatbelt unexpectedly reached a local database endpoint"
+    );
+    assert!(!connect(
+        "127.0.0.1",
+        neighboring_service.local_addr().unwrap().port()
+    ));
     assert!(!connect("8.8.8.8", 53));
     let unix_status = Command::new(sandbox)
         .args(["-p", &profile, "/usr/bin/python3", "-B", "-c"])
@@ -142,12 +154,19 @@ fn managed_app_default_denies_local_database_and_other_outbound() {
         .stderr(Stdio::null())
         .status()
         .unwrap();
-    assert!(!unix_status.success(), "default managed-app Seatbelt reached a local database socket");
+    assert!(
+        !unix_status.success(),
+        "default managed-app Seatbelt reached a local database socket"
+    );
     fs::remove_file(&database_socket_path).unwrap();
 }
 
 #[cfg(target_os = "macos")]
 #[test]
+#[expect(
+    clippy::unwrap_used,
+    reason = "the exact broker-port fixture uses unwrap only for setup and process status"
+)]
 fn managed_app_postgres_broker_grant_reaches_only_exact_controller_port() {
     let root = TestDir::new("managed-postgres-broker");
     let repository_root = root.0.join("repo");
@@ -157,8 +176,14 @@ fn managed_app_postgres_broker_grant_reaches_only_exact_controller_port() {
     let broker = TcpListener::bind("127.0.0.1:0").unwrap();
     let neighbor = TcpListener::bind("127.0.0.1:0").unwrap();
     let app_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let direct_socket_path = PathBuf::from(format!("/tmp/sov-pg-deny-{}-{}.sock",
-        std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    let direct_socket_path = PathBuf::from(format!(
+        "/tmp/sov-pg-deny-{}-{}.sock",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
     let _direct_socket = std::os::unix::net::UnixListener::bind(&direct_socket_path).unwrap();
     let mut grant = task_loopback_grant();
     grant.port = app_listener.local_addr().unwrap().port();
@@ -191,7 +216,11 @@ fn managed_app_postgres_broker_grant_reaches_only_exact_controller_port() {
     let outside = Command::new("/usr/bin/sandbox-exec")
         .args(["-p", &profile, "/usr/bin/python3", "-B", "-c"])
         .arg("import socket; s=socket.socket(); s.settimeout(0.2); s.connect(('8.8.8.8',53))")
-        .env_clear().stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap();
+        .env_clear()
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
     assert!(!outside.success());
     let direct_socket = Command::new("/usr/bin/sandbox-exec")
         .args(["-p", &profile, "/usr/bin/python3", "-B", "-c"])

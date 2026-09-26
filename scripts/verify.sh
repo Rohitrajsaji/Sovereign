@@ -18,3 +18,8 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
+if command -v node >/dev/null 2>&1; then
+    "$(dirname "$0")/verify-ui.sh"
+else
+    echo "verify.sh: node is not installed; skipping UI gate" >&2
+fi

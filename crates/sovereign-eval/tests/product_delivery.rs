@@ -18,6 +18,8 @@ use sovereign_model::{
     ModelFinishReason, ModelLoadProfile, ModelResponse, ModelUsage,
 };
 use sovereign_plan::{
+    BrowserAcceptanceActionV1, BrowserAcceptanceExpectationV1, BrowserAcceptanceSemanticV1,
+    BrowserAcceptanceStepV1, BrowserAcceptanceTemplateV1, BrowserManagedAppLaunchV1,
     DepthClassifier, DepthFeatureInput, ExecutionDepth, M3PlanningInput,
     PLAN_COMPILATION_SCHEMA_VERSION, PlanCompilationInput, PlanCompilationRepository,
     PlanCompilationResult, PlanCompiler, PlanValidator, ValidationEnvironment,
@@ -387,6 +389,155 @@ fn browser_tool_pin() -> Value {
     capability("tool.browser", BROWSER_TOOL_DIGEST)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "fixture enumerates the exact ordered 25-step browser acceptance contract"
+)]
+fn inventory_browser_acceptance() -> BrowserAcceptanceTemplateV1 {
+    let step = |id: &str,
+                generation: u32,
+                action: BrowserAcceptanceActionV1,
+                semantic: BrowserAcceptanceSemanticV1,
+                required: &[&str]| BrowserAcceptanceStepV1 {
+        step_id: id.to_owned(),
+        generation,
+        action,
+        expectation: BrowserAcceptanceExpectationV1 {
+            semantic,
+            required_contains: required.iter().map(|value| (*value).to_owned()).collect(),
+            forbidden_contains: Vec::new(),
+        },
+    };
+    let navigate = |id: &str, path: &str| {
+        step(
+            id,
+            1,
+            BrowserAcceptanceActionV1::Navigate {
+                path: path.to_owned(),
+            },
+            BrowserAcceptanceSemanticV1::Observation,
+            &[],
+        )
+    };
+    let submit = |id: &str, selector: &str, semantic| {
+        step(
+            id,
+            1,
+            BrowserAcceptanceActionV1::SubmitForm {
+                selector: selector.to_owned(),
+                fields: Vec::new(),
+            },
+            semantic,
+            &[],
+        )
+    };
+    let synopsis = |id: &str, semantic, required: &[&str]| {
+        step(
+            id,
+            1,
+            BrowserAcceptanceActionV1::CaptureSynopsis,
+            semantic,
+            required,
+        )
+    };
+    BrowserAcceptanceTemplateV1 {
+        launch: BrowserManagedAppLaunchV1::PythonManagedServerV1 {
+            server_relative_path: "server.py".to_owned(),
+            database_filename: "inventory.sqlite3".to_owned(),
+            required_generations: 2,
+        },
+        steps: vec![
+            navigate("open-empty-inventory", "/view"),
+            synopsis(
+                "empty-synopsis",
+                BrowserAcceptanceSemanticV1::Read,
+                &["No inventory items"],
+            ),
+            navigate("open-invalid-create-form", "/"),
+            submit(
+                "reject-invalid-create",
+                "form#invalid-create",
+                BrowserAcceptanceSemanticV1::InvalidValidation,
+            ),
+            synopsis(
+                "invalid-synopsis",
+                BrowserAcceptanceSemanticV1::InvalidValidation,
+                &["Validation error: name_required", "No inventory items"],
+            ),
+            navigate("return-after-invalid", "/"),
+            submit(
+                "create-widget",
+                "form#create-widget",
+                BrowserAcceptanceSemanticV1::Create,
+            ),
+            navigate("observe-created-widget", "/view"),
+            synopsis(
+                "created-synopsis",
+                BrowserAcceptanceSemanticV1::Observation,
+                &["Widget", "quantity=3"],
+            ),
+            navigate("open-created-widget-form", "/"),
+            submit(
+                "edit-widget",
+                "form#edit-1",
+                BrowserAcceptanceSemanticV1::Update,
+            ),
+            navigate("observe-edited-widget", "/view"),
+            synopsis(
+                "edited-synopsis",
+                BrowserAcceptanceSemanticV1::Observation,
+                &["Widget Pro", "quantity=5"],
+            ),
+            navigate("search-widget", "/view?q=Widget%20Pro"),
+            synopsis(
+                "search-synopsis",
+                BrowserAcceptanceSemanticV1::Observation,
+                &["Search query: Widget Pro", "Widget Pro"],
+            ),
+            navigate("open-delete-widget-form", "/"),
+            submit(
+                "delete-widget",
+                "form#delete-1",
+                BrowserAcceptanceSemanticV1::Delete,
+            ),
+            navigate("observe-deleted-widget", "/view"),
+            synopsis(
+                "deleted-synopsis",
+                BrowserAcceptanceSemanticV1::Observation,
+                &["No inventory items"],
+            ),
+            navigate("open-persistent-create-form", "/"),
+            submit(
+                "create-persistent-widget",
+                "form#create-widget",
+                BrowserAcceptanceSemanticV1::Create,
+            ),
+            navigate("observe-persistent-seed", "/view"),
+            synopsis(
+                "persistent-seed",
+                BrowserAcceptanceSemanticV1::Observation,
+                &["Widget"],
+            ),
+            step(
+                "open-after-app-restart",
+                2,
+                BrowserAcceptanceActionV1::Navigate {
+                    path: "/view".to_owned(),
+                },
+                BrowserAcceptanceSemanticV1::Observation,
+                &[],
+            ),
+            step(
+                "restart-persistence-synopsis",
+                2,
+                BrowserAcceptanceActionV1::CaptureSynopsis,
+                BrowserAcceptanceSemanticV1::RestartPersistence,
+                &["Widget", "quantity=3"],
+            ),
+        ],
+    }
+}
+
 fn compile_product(
     registry: &ProjectRegistry,
     context: &ContextPacket,
@@ -484,12 +635,13 @@ fn compile_product_input(
     let runbook_task_id = task_id_by_title(&compilation, "Create local inventory runbook");
     let browser_task_id = task_id_by_title(&compilation, "Verify inventory in real browser");
     let compilation = compilation
-        .bind_controller_loopback_browser(
+        .bind_controller_loopback_browser_acceptance(
             &validator,
             &browser_task_id,
             &browser_tool_pin(),
             port,
             PRODUCT_NETWORK_BYTES,
+            &inventory_browser_acceptance(),
         )
         .unwrap_or_else(|error| panic!("bind Controller loopback browser authority: {error:?}"));
     assert!(validator.validate(compilation.plan()).is_empty());

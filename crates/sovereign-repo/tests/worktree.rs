@@ -1196,33 +1196,45 @@ fn offline_node_modules_receipt_validation_detects_tree_and_identity_drift() {
     let fixture = Fixture::new("offline-node-modules-receipt-drift");
     configure_offline_node_project(&fixture);
     let source = fixture.primary.join("app/node_modules/pkg/index.js");
-    fs::create_dir_all(source.parent().expect("package parent")).expect("create source");
-    fs::write(&source, "original\n").expect("write source");
+    fs::create_dir_all(source.parent().unwrap_or_else(|| panic!("package parent")))
+        .unwrap_or_else(|error| panic!("create source: {error}"));
+    fs::write(&source, "original\n").unwrap_or_else(|error| panic!("write source: {error}"));
     let registry = fixture.registry();
     let lease = materialized_offline_lease(&fixture, &registry);
     let receipt = registry
         .materialize_existing_node_modules(&lease, Path::new("app"), OFFLINE_LIMITS)
-        .expect("copy ignored dependencies");
+        .unwrap_or_else(|error| panic!("copy ignored dependencies: {error}"));
     let mut misbound = receipt.clone();
     misbound.worktree_lease_id = "worktree.unrelated".to_owned();
-    assert!(registry
-        .validate_existing_node_modules_provenance(&lease, &misbound, OFFLINE_LIMITS)
-        .is_err());
+    assert!(
+        registry
+            .validate_existing_node_modules_provenance(&lease, &misbound, OFFLINE_LIMITS)
+            .is_err()
+    );
     let destination = lease.worktree_path.join("app/node_modules/pkg/index.js");
-    fs::write(&destination, "destination drift\n").expect("drift destination");
-    assert!(registry
-        .validate_existing_node_modules_provenance(&lease, &receipt, OFFLINE_LIMITS)
-        .is_err());
-    fs::write(&destination, "original\n").expect("restore destination");
-    fs::write(&source, "source drift\n").expect("drift source");
-    assert!(registry
-        .validate_existing_node_modules_provenance(&lease, &receipt, OFFLINE_LIMITS)
-        .is_err());
-    fs::write(&source, "original\n").expect("restore source");
-    fs::write(fixture.primary.join(".gitignore"), "").expect("remove ignore rule");
-    assert!(registry
-        .validate_existing_node_modules_provenance(&lease, &receipt, OFFLINE_LIMITS)
-        .is_err());
+    fs::write(&destination, "destination drift\n")
+        .unwrap_or_else(|error| panic!("drift destination: {error}"));
+    assert!(
+        registry
+            .validate_existing_node_modules_provenance(&lease, &receipt, OFFLINE_LIMITS)
+            .is_err()
+    );
+    fs::write(&destination, "original\n")
+        .unwrap_or_else(|error| panic!("restore destination: {error}"));
+    fs::write(&source, "source drift\n").unwrap_or_else(|error| panic!("drift source: {error}"));
+    assert!(
+        registry
+            .validate_existing_node_modules_provenance(&lease, &receipt, OFFLINE_LIMITS)
+            .is_err()
+    );
+    fs::write(&source, "original\n").unwrap_or_else(|error| panic!("restore source: {error}"));
+    fs::write(fixture.primary.join(".gitignore"), "")
+        .unwrap_or_else(|error| panic!("remove ignore rule: {error}"));
+    assert!(
+        registry
+            .validate_existing_node_modules_provenance(&lease, &receipt, OFFLINE_LIMITS)
+            .is_err()
+    );
 }
 
 #[test]

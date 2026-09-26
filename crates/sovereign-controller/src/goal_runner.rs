@@ -24,10 +24,15 @@ const GOAL_STATUS_QUEUED: &str = "queued_for_plan_compilation";
 const GOAL_STATUS_CLAIMED: &str = "claimed_for_plan_compilation";
 const GOAL_STATUS_ACTIVE: &str = "active_plan";
 const GOAL_STATUS_COMPLETED: &str = "completed";
+const GOAL_STATUS_CANCELLED: &str = "cancelled_before_dispatch";
 
 /// Revalidates the active goal's durable browser grant against its canonical Plan and
 /// compilation evidence. A missing grant is returned only when the active Plan has no browser
 /// binding; inconsistent authority fails closed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "durable browser grant checks all current-plan and evidence bindings together"
+)]
 pub(crate) fn durable_browser_grant_for_plan(
     state: &StateStore,
     plan_document: &Value,
@@ -392,6 +397,7 @@ impl Controller {
                 "compilation_evidence_digest": claim.compilation_evidence_digest,
             }),
         )?;
+        super::recovery_test_hook("after_goal_claim_commit");
 
         let activation = match self.activate(compilation, registry) {
             Ok(activation) => activation,
@@ -447,6 +453,7 @@ impl Controller {
                 "execution_epoch": activation.execution_epoch,
             }),
         )?;
+        super::recovery_test_hook("after_goal_activation_lifecycle_commit");
         self.checkpoint_now()?;
         Ok(activation)
     }
@@ -641,6 +648,7 @@ impl Controller {
         let completion = self.complete_goal(registry)?;
         validate_completion_binding(&completion, &active, &claim)?;
         self.persist_completed_goal_intent(intent, claim, &completion)?;
+        super::recovery_test_hook("after_goal_completion_lifecycle_commit");
         self.checkpoint_now()?;
         Ok(completion)
     }
@@ -798,6 +806,7 @@ impl Controller {
         let event_id = format!("controller.{}", &seed[7..27]);
         #[cfg(test)]
         run_finalization_pre_commit_test_hook(&mut self.state)?;
+        super::recovery_test_hook("before_completed_plan_finalization_commit");
         self.state
             .compare_and_apply_state_records_with_events_guarded(
                 Some(checkpoint.action_sequence),
@@ -989,6 +998,10 @@ impl Controller {
         }
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "lifecycle transition owns the exact canonical intent and claim values"
+    )]
     fn persist_goal_lifecycle_transition(
         &mut self,
         intent: GoalIntentV1,
@@ -1143,6 +1156,95 @@ impl Controller {
             }),
         )?;
         Ok(completed)
+    }
+
+    /// Cancels a queued goal before dispatch, or requests cancellation of non-terminal tasks.
+    ///
+    /// # Errors
+    /// Fails closed when the goal is missing, claimed for compilation, or bound to another plan.
+    pub fn cancel_goal_intent(
+        &mut self,
+        goal_id: &str,
+        principal: &str,
+    ) -> Result<GoalIntentV1, ControllerError> {
+        super::validate_durable_action_lifecycle_states(&self.state)?;
+        let principal = principal.trim();
+        if goal_id.is_empty() || principal.is_empty() {
+            return Err(ControllerError::InvalidPlan(
+                "goal cancellation requires a goal id and principal".to_owned(),
+            ));
+        }
+        let raw = self
+            .state
+            .get_state(GOAL_INTENT_NAMESPACE, goal_id)?
+            .ok_or_else(|| ControllerError::NotReady(format!("goal {goal_id} is not durable")))?;
+        let mut intent: GoalIntentV1 = serde_json::from_str(&raw)?;
+        if intent.goal_id != goal_id {
+            return Err(ControllerError::InvalidPlan(
+                "goal intent id does not match its record key".to_owned(),
+            ));
+        }
+        match intent.status.as_str() {
+            GOAL_STATUS_CANCELLED | GOAL_STATUS_COMPLETED => Ok(intent),
+            GOAL_STATUS_QUEUED => {
+                GOAL_STATUS_CANCELLED.clone_into(&mut intent.status);
+                let intent_json = serde_json::to_string(&intent)?;
+                self.persist_control_record_with_event(
+                    GOAL_INTENT_NAMESPACE,
+                    goal_id,
+                    &intent_json,
+                    "goal_intent_cancelled",
+                    &json!({"principal": principal, "status": intent.status}),
+                )?;
+                if self.active.is_some() {
+                    self.checkpoint_now()?;
+                }
+                Ok(intent)
+            }
+            GOAL_STATUS_ACTIVE => {
+                let active_goal = self
+                    .active
+                    .as_ref()
+                    .map(|active| active.goal_id.clone())
+                    .ok_or_else(|| {
+                        ControllerError::NotReady(
+                            "active goal intent has no in-memory plan".to_owned(),
+                        )
+                    })?;
+                if active_goal != goal_id {
+                    return Err(ControllerError::InvalidPlan(
+                        "active plan is bound to a different goal".to_owned(),
+                    ));
+                }
+                let task_ids = self
+                    .active
+                    .as_ref()
+                    .map(|active| {
+                        active
+                            .tasks
+                            .iter()
+                            .filter(|(_, task)| {
+                                !matches!(
+                                    task.state,
+                                    super::TaskState::Succeeded | super::TaskState::FailedTerminal
+                                )
+                            })
+                            .map(|(id, _)| id.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                for task_id in task_ids {
+                    self.request_task_cancellation(&task_id, principal)?;
+                }
+                Ok(intent)
+            }
+            GOAL_STATUS_CLAIMED => Err(ControllerError::NotReady(
+                "goal is claimed for compilation; cancel after activation or recovery".to_owned(),
+            )),
+            other => Err(ControllerError::InvalidPlan(format!(
+                "goal status {other} cannot be cancelled"
+            ))),
+        }
     }
 }
 
@@ -1683,7 +1785,11 @@ fn validate_goal_intent(record_key: &str, intent: &GoalIntentV1) -> Result<(), C
         || intent.submitted_at_ms <= 0
         || !matches!(
             intent.status.as_str(),
-            GOAL_STATUS_QUEUED | GOAL_STATUS_CLAIMED | GOAL_STATUS_ACTIVE | GOAL_STATUS_COMPLETED
+            GOAL_STATUS_QUEUED
+                | GOAL_STATUS_CLAIMED
+                | GOAL_STATUS_ACTIVE
+                | GOAL_STATUS_COMPLETED
+                | GOAL_STATUS_CANCELLED
         )
     {
         return Err(ControllerError::InvalidPlan(format!(
@@ -1790,13 +1896,13 @@ fn validate_goal_lifecycle_record_versions(
             "durable goal intent has a non-positive state-record version".to_owned(),
         ));
     }
-    if let Some(claim_version) = versions.claim_version {
-        if claim_version <= 0 || versions.intent_version != claim_version + 1 {
-            return Err(ControllerError::InvalidPlan(format!(
-                "queued-goal intent/claim record versions conflict: intent={}, claim={claim_version}",
-                versions.intent_version
-            )));
-        }
+    if let Some(claim_version) = versions.claim_version
+        && (claim_version <= 0 || versions.intent_version != claim_version + 1)
+    {
+        return Err(ControllerError::InvalidPlan(format!(
+            "queued-goal intent/claim record versions conflict: intent={}, claim={claim_version}",
+            versions.intent_version
+        )));
     }
     Ok(())
 }
@@ -1957,7 +2063,7 @@ fn intent_by_id<'a>(
 }
 
 fn with_goal_status(mut intent: GoalIntentV1, status: &str) -> GoalIntentV1 {
-    intent.status = status.to_owned();
+    status.clone_into(&mut intent.status);
     intent
 }
 

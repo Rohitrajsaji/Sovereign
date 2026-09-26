@@ -1,4 +1,4 @@
-//! Controller-owned PostgreSQL protocol broker for one managed-app generation.
+//! Controller-owned `PostgreSQL` protocol broker for one managed-app generation.
 //!
 //! The untrusted app can reach only this loopback listener under Seatbelt. Every upstream
 //! connection is freshly opened by the Controller against one pinned Unix socket, database and
@@ -64,6 +64,8 @@ pub(crate) struct ControllerPostgresBroker {
     config: PostgresBrokerConfig,
     identity: SocketIdentity,
     stop: Arc<AtomicBool>,
+    /// Set only after the accept thread drops its listener.
+    accept_stopped: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -96,6 +98,7 @@ impl ControllerPostgresBroker {
             config,
             identity,
             stop,
+            accept_stopped: Arc::new(AtomicBool::new(false)),
             thread: None,
         })
     }
@@ -126,11 +129,21 @@ impl ControllerPostgresBroker {
             .ok_or_else(|| io::Error::other("PostgreSQL broker was already activated"))?;
         let port = self.port;
         let thread_stop = Arc::clone(&self.stop);
+        let accept_stopped = Arc::clone(&self.accept_stopped);
         let config = self.config.clone();
         let identity = self.identity;
         let thread = thread::Builder::new()
             .name(format!("sovereign-postgres-broker-{port}"))
-            .spawn(move || serve(listener, config, identity, process_binding, thread_stop))?;
+            .spawn(move || {
+                serve(
+                    listener,
+                    config,
+                    identity,
+                    process_binding,
+                    thread_stop,
+                    accept_stopped,
+                );
+            })?;
         self.thread = Some(thread);
         Ok(())
     }
@@ -161,7 +174,14 @@ impl ControllerPostgresBroker {
                 .join()
                 .map_err(|_| io::Error::other("PostgreSQL broker thread panicked"))?;
         }
+        drop(self.listener.take());
         Ok(())
+    }
+
+    /// True only after this broker's accept thread has dropped its listener.
+    #[cfg(test)]
+    fn accept_loop_stopped(&self) -> bool {
+        self.accept_stopped.load(Ordering::Acquire)
     }
 }
 
@@ -171,21 +191,25 @@ impl Drop for ControllerPostgresBroker {
     }
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "broker worker takes ownership of its listener, pinned configuration, and stop signal"
+)]
 fn serve(
     listener: TcpListener,
     config: PostgresBrokerConfig,
     identity: SocketIdentity,
     process_binding: Option<ProcessBinding>,
     stop: Arc<AtomicBool>,
+    accept_stopped: Arc<AtomicBool>,
 ) {
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
     while !stop.load(Ordering::Acquire) {
-        if let Some(binding) = &process_binding {
-            if Instant::now() >= binding.deadline
-                || !matches!(process_group_leader_identity(binding.process_group_id), Ok(Some(ref actual)) if actual == &binding.leader_identity)
-            {
-                break;
-            }
+        if let Some(binding) = &process_binding
+            && (Instant::now() >= binding.deadline
+                || !matches!(process_group_leader_identity(binding.process_group_id), Ok(Some(ref actual)) if actual == &binding.leader_identity))
+        {
+            break;
         }
         workers.retain(|worker| !worker.is_finished());
         match listener.accept() {
@@ -213,6 +237,8 @@ fn serve(
     for worker in workers {
         let _ = worker.join();
     }
+    drop(listener);
+    accept_stopped.store(true, Ordering::Release);
 }
 
 fn handle_client(
@@ -332,8 +358,8 @@ fn read_client_startup(client: &mut TcpStream) -> io::Result<bool> {
         client.read_exact(&mut packet)?;
         let protocol = u32::from_be_bytes(packet[..4].try_into().map_err(|_| invalid_packet())?);
         match protocol {
-            80877103 | 80877104 if length == 8 => client.write_all(b"N")?, // SSL/GSS negotiation
-            196608 => return parse_startup_params(&packet[4..]),
+            80_877_103 | 80_877_104 if length == 8 => client.write_all(b"N")?, // SSL/GSS negotiation
+            196_608 => return parse_startup_params(&packet[4..]),
             _ => return Err(invalid_packet()), // CancelRequest and unsupported versions never reach PostgreSQL.
         }
     }
@@ -386,7 +412,7 @@ fn open_verified_backend(
     backend.set_read_timeout(Some(Duration::from_secs(3)))?;
     backend.set_write_timeout(Some(Duration::from_secs(3)))?;
     let mut startup = Vec::new();
-    startup.extend_from_slice(&196608_u32.to_be_bytes());
+    startup.extend_from_slice(&196_608_u32.to_be_bytes());
     startup.extend_from_slice(b"user\0");
     startup.extend_from_slice(ROLE.as_bytes());
     startup.push(0);
@@ -548,6 +574,10 @@ fn invalid_packet() -> io::Error {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "broker fixtures fail immediately on invalid setup and protocol assumptions"
+)]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
@@ -569,7 +599,7 @@ mod tests {
     }
 
     fn startup(user: &str, database: &str) -> Vec<u8> {
-        let mut payload = 196608_u32.to_be_bytes().to_vec();
+        let mut payload = 196_608_u32.to_be_bytes().to_vec();
         payload.extend_from_slice(b"user\0");
         payload.extend_from_slice(user.as_bytes());
         payload.push(0);
@@ -601,6 +631,10 @@ mod tests {
         fake_backend_with_row(connection, data_row(oid), observed);
     }
 
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "fixture owns the proof packet passed to the backend worker"
+    )]
     fn fake_backend_with_row(
         mut connection: UnixStream,
         proof_row: Vec<u8>,
@@ -765,7 +799,7 @@ mod tests {
         assert_eq!(app.read(&mut one).unwrap(), 0);
         fake.join().unwrap();
         broker.stop().unwrap();
-        assert!(TcpStream::connect(("127.0.0.1", broker.port())).is_err());
+        assert!(broker.accept_loop_stopped());
         fs::remove_file(&socket).unwrap();
         fs::remove_dir(&root).unwrap();
     }

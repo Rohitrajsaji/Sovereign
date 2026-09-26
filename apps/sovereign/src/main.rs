@@ -1,9 +1,27 @@
+mod actor;
+mod app_data;
+mod consumer_status;
 mod control_api;
+mod dispatch;
+mod doctor;
+mod execution;
+#[cfg(any(test, feature = "e2e-fixtures"))]
+mod fixture_backend;
+mod launch_agent;
+mod model_assets;
+mod projections;
+mod projects;
 mod run_lock;
 mod runner;
 
-use control_api::{ControlApiRequest, bind_loopback, serve_listener};
-use serde_json::Value;
+#[cfg(test)]
+use control_api::ControlApiRequest;
+use control_api::{bind_loopback, serve_listener};
+use dispatch::handle_actor_request;
+#[cfg(test)]
+use dispatch::{artifact_response, download_model_response};
+#[cfg(test)]
+use serde_json::{Value, json};
 use sovereign_controller::{ApprovalDecisionV1, LocalControl};
 use sovereign_eval::{M1_8GB_PROFILE_ID, run_offline_profile, run_release_suite};
 use sovereign_state::StateStore;
@@ -44,15 +62,7 @@ fn run(args: &[String], state_path: &Path) -> Result<String, String> {
     match args.first().map(String::as_str) {
         Some("--version" | "-V") => Ok(format!("sovereign {VERSION}")),
         Some("help" | "--help" | "-h") | None => Ok(help_text()),
-        Some("doctor") => {
-            let control = open_read_control(state_path)?;
-            let read_model = control.read_model().map_err(|error| error.to_string())?;
-            Ok(format!(
-                "sovereign local control plane: ok\nstate={}\npaused={}",
-                state_path.display(),
-                read_model.status.execution_control.paused
-            ))
-        }
+        Some("doctor") => doctor_command(args, state_path),
         Some("goal") => {
             let goal = args.get(1..).unwrap_or_default().join(" ");
             let mut control = open_read_control(state_path)?;
@@ -119,8 +129,14 @@ fn run(args: &[String], state_path: &Path) -> Result<String, String> {
                 .map_err(|error| error.to_string())?;
             serde_json::to_string_pretty(&request).map_err(|error| error.to_string())
         }
+        Some("cancel") => cancel_command(args, state_path),
+        Some("project") => project_command(args),
+        Some("service") => service_command(args),
+        Some("app") => app_command(),
         Some("serve") => run_serve(args, state_path),
-        Some("run") => Err("`run` must be dispatched by the production runner entrypoint".to_owned()),
+        Some("run") => {
+            Err("`run` must be dispatched by the production runner entrypoint".to_owned())
+        }
         Some(command) => Err(format!(
             "unsupported command {command:?}; run `sovereign help` for the local CLI surface"
         )),
@@ -162,6 +178,50 @@ fn parse_eval_invocation(args: &[String]) -> Result<EvalInvocation, String> {
     )
 }
 
+fn doctor_command(args: &[String], state_path: &Path) -> Result<String, String> {
+    let control = open_read_control(state_path)?;
+    let read_model = control.read_model().map_err(|error| error.to_string())?;
+    let settings = app_data::AppData::open_default()
+        .and_then(|data| data.load_settings())
+        .unwrap_or_default();
+    let model = settings.model_path.as_deref().map(Path::new);
+    let runtime = settings.model_runtime.as_deref().map(Path::new);
+    let checks = doctor::doctor_checks(model, runtime);
+    let _phase = consumer_status::ServicePhase::Idle.as_str();
+    if args.get(1).is_some_and(|flag| flag == "--json") {
+        return serde_json::to_string_pretty(&checks).map_err(|error| error.to_string());
+    }
+    let summary = checks
+        .iter()
+        .map(|check| format!("{} {}", check.status, check.id))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(format!(
+        "sovereign local control plane: ok\nstate={}\npaused={}\n{summary}",
+        state_path.display(),
+        read_model.status.execution_control.paused
+    ))
+}
+
+fn cancel_command(args: &[String], state_path: &Path) -> Result<String, String> {
+    let goal_id = args
+        .get(1)
+        .cloned()
+        .ok_or_else(|| "cancel requires a goal id".to_owned())?;
+    let principal = args
+        .get(2)
+        .cloned()
+        .unwrap_or_else(|| "operator".to_owned());
+    let mut control = open_local_control(state_path)?;
+    let intent = control
+        .cancel_goal(&goal_id, &principal)
+        .map_err(|error| error.to_string())?;
+    Ok(format!(
+        "goal_id={}\nstatus={}",
+        intent.goal_id, intent.status
+    ))
+}
+
 fn run_eval(args: &[String]) -> Result<String, String> {
     match parse_eval_invocation(args)? {
         EvalInvocation::Release => {
@@ -176,23 +236,114 @@ fn run_eval(args: &[String]) -> Result<String, String> {
 }
 
 fn run_serve(args: &[String], state_path: &Path) -> Result<String, String> {
-    if args.len() > 2 {
-        return Err("serve accepts at most one loopback socket address".to_owned());
+    let mut execute = false;
+    let mut require_token = true;
+    let mut address = "127.0.0.1:7777".to_owned();
+    for arg in args.iter().skip(1) {
+        match arg.as_str() {
+            "--execute" => execute = true,
+            "--require-token" => require_token = true,
+            "--no-require-token" => require_token = false,
+            other if other.starts_with('-') => {
+                return Err(format!("unsupported serve flag {other}"));
+            }
+            other => address = String::from(other),
+        }
     }
-    let address = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| "127.0.0.1:7777".to_owned())
+    let address = address
         .parse::<SocketAddr>()
         .map_err(|error| format!("invalid serve address: {error}"))?;
+    let token = if let Ok(data) = app_data::AppData::open_default() {
+        doctor::write_session_token(&data.token_path()).ok()
+    } else {
+        None
+    };
     let listener = bind_loopback(address)?;
     let local_address = listener.local_addr().map_err(|error| error.to_string())?;
-    eprintln!("sovereign local dashboard listening on http://{local_address}/dashboard");
-    let mut control = open_read_control(state_path)?;
-    serve_listener(&listener, |request| {
-        handle_control_request(&mut control, request)
-    })?;
+    eprintln!("sovereign local dashboard listening on http://{local_address}/");
+    let projects_index = app_data::AppData::open_default()
+        .ok()
+        .and_then(|data| data.load_projects().ok())
+        .unwrap_or_default();
+    let active = projects::active_record(&projects_index).cloned();
+    let git_root = active
+        .as_ref()
+        .map(|record| PathBuf::from(&record.root))
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(|cwd| projects::resolve_git_root(&cwd).ok())
+        });
+    let actor_state = active.as_ref().map_or_else(
+        || state_path.to_path_buf(),
+        |record| PathBuf::from(&record.state_path),
+    );
+    let (actor, actor_handle) = actor::ControllerActorHandle::spawn_with(
+        actor_state,
+        actor::ActorOptions { execute, git_root },
+    )?;
+    let actor_for_server = actor.clone();
+    let server_config = control_api::ServerConfig {
+        session_token: token,
+        require_token_for_v1_post: require_token,
+        state_path: Some(state_path.to_path_buf()),
+        sse_clients: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    };
+    serve_listener(
+        &listener,
+        move |request| handle_actor_request(&actor_for_server, request),
+        server_config,
+    )?;
+    let _ = actor.shutdown();
+    let _ = actor_handle.join();
     Ok(String::new())
+}
+
+fn project_command(args: &[String]) -> Result<String, String> {
+    let data = app_data::AppData::open_default().map_err(|error| error.to_string())?;
+    match args.get(1).map(String::as_str) {
+        Some("list") => {
+            let projects = data.load_projects().map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&projects).map_err(|error| error.to_string())
+        }
+        Some("add") => {
+            let root = args
+                .get(2)
+                .ok_or_else(|| "project add requires a root".to_owned())?;
+            let name = args.get(3).cloned().unwrap_or_else(|| "Project".to_owned());
+            let projects = projects::register_project(&data, Path::new(root), &name)?;
+            serde_json::to_string_pretty(&projects).map_err(|error| error.to_string())
+        }
+        Some("use") => {
+            let id = args
+                .get(2)
+                .ok_or_else(|| "project use requires an id".to_owned())?;
+            let projects = projects::set_active_project(&data, id)?;
+            serde_json::to_string_pretty(&projects).map_err(|error| error.to_string())
+        }
+        _ => Err("project requires add|list|use".to_owned()),
+    }
+}
+
+fn service_command(args: &[String]) -> Result<String, String> {
+    let data = app_data::AppData::open_default().map_err(|error| error.to_string())?;
+    let launchctl = launch_agent::SystemLaunchctl;
+    match args.get(1).map(String::as_str) {
+        Some("install") => {
+            let bin = std::env::current_exe().map_err(|error| error.to_string())?;
+            launch_agent::install(&data, &launchctl, &bin, launch_agent::DEFAULT_BIND)
+        }
+        Some("uninstall") => launch_agent::uninstall(&launchctl),
+        Some("status") => Ok(launch_agent::status()),
+        _ => Err("service requires install|uninstall|status".to_owned()),
+    }
+}
+
+fn app_command() -> Result<String, String> {
+    let data = app_data::AppData::open_default().map_err(|error| error.to_string())?;
+    let launchctl = launch_agent::SystemLaunchctl;
+    let bin = std::env::current_exe().map_err(|error| error.to_string())?;
+    launch_agent::open_ui(&data, &launchctl, &bin, launch_agent::system_open)
 }
 
 fn open_local_control(state_path: &Path) -> Result<LocalControl, String> {
@@ -207,6 +358,11 @@ fn open_read_control(state_path: &Path) -> Result<LocalControl, String> {
         .map_err(|error| error.to_string())
 }
 
+#[cfg(test)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "test helper mirrors production dispatch"
+)]
 fn handle_control_request(
     control: &mut LocalControl,
     request: ControlApiRequest,
@@ -217,19 +373,27 @@ fn handle_control_request(
         }
         ControlApiRequest::ReadModel => control
             .read_model()
-            .and_then(|view| serde_json::to_value(view).map_err(Into::into))
+            .and_then(|view| {
+                serde_json::to_value(view).map_err(sovereign_controller::ControllerError::from)
+            })
             .map_err(|error| error.to_string()),
         ControlApiRequest::SubmitGoal { goal } => control
             .submit_goal(&goal)
-            .and_then(|intent| serde_json::to_value(intent).map_err(Into::into))
+            .and_then(|intent| {
+                serde_json::to_value(intent).map_err(sovereign_controller::ControllerError::from)
+            })
             .map_err(|error| error.to_string()),
         ControlApiRequest::Pause { reason } => control
             .pause(reason.as_deref())
-            .and_then(|control| serde_json::to_value(control).map_err(Into::into))
+            .and_then(|control| {
+                serde_json::to_value(control).map_err(sovereign_controller::ControllerError::from)
+            })
             .map_err(|error| error.to_string()),
         ControlApiRequest::Resume => control
             .resume()
-            .and_then(|control| serde_json::to_value(control).map_err(Into::into))
+            .and_then(|control| {
+                serde_json::to_value(control).map_err(sovereign_controller::ControllerError::from)
+            })
             .map_err(|error| error.to_string()),
         ControlApiRequest::RespondToApproval {
             request_id,
@@ -243,9 +407,154 @@ fn handle_control_request(
             };
             control
                 .respond_to_approval(&request_id, decision, &principal)
-                .and_then(|request| serde_json::to_value(request).map_err(Into::into))
+                .and_then(|request| {
+                    serde_json::to_value(request)
+                        .map_err(sovereign_controller::ControllerError::from)
+                })
                 .map_err(|error| error.to_string())
         }
+        ControlApiRequest::Session => Ok(serde_json::json!({"authenticated": true})),
+        ControlApiRequest::Doctor => {
+            let settings = app_data::AppData::open_default()
+                .and_then(|data| data.load_settings())
+                .unwrap_or_default();
+            let model = settings.model_path.as_deref().map(Path::new);
+            let runtime = settings.model_runtime.as_deref().map(Path::new);
+            let checks = doctor::doctor_checks(model, runtime);
+            serde_json::to_value(checks).map_err(|e| e.to_string())
+        }
+        ControlApiRequest::Overview => {
+            let model = control.read_model().map_err(|e| e.to_string())?;
+            let phase = consumer_status::ServicePhase::Idle.as_str();
+            let active_project = app_data::AppData::open_default()
+                .and_then(|d| d.load_projects())
+                .ok()
+                .and_then(|p| p.active_project_id);
+            Ok(serde_json::json!({
+                "schema_version": 1,
+                "service_phase": phase,
+                "active_project": active_project,
+                "paused": model.status.execution_control.paused,
+            }))
+        }
+        ControlApiRequest::ListProjects => {
+            let projects = app_data::AppData::open_default()
+                .and_then(|d| d.load_projects())
+                .unwrap_or_default();
+            serde_json::to_value(projects).map_err(|e| e.to_string())
+        }
+        ControlApiRequest::AddProject { root, display_name } => {
+            let data = app_data::AppData::open_default().map_err(|e| e.to_string())?;
+            let projects = projects::register_project(&data, Path::new(&root), &display_name)?;
+            serde_json::to_value(projects).map_err(|e| e.to_string())
+        }
+        ControlApiRequest::ActivateProject { project_id } => {
+            let data = app_data::AppData::open_default().map_err(|e| e.to_string())?;
+            let mut projects = data.load_projects().unwrap_or_default();
+            if !projects.projects.iter().any(|p| p.project_id == project_id) {
+                return Err(format!("unknown project id {project_id}"));
+            }
+            projects.active_project_id = Some(project_id);
+            data.save_projects(&projects).map_err(|e| e.to_string())?;
+            serde_json::to_value(projects).map_err(|e| e.to_string())
+        }
+        ControlApiRequest::ListGoals => {
+            let model = control.read_model().map_err(|e| e.to_string())?;
+            serde_json::to_value(&model.status.goal_intents).map_err(|e| e.to_string())
+        }
+        ControlApiRequest::GetGoal { goal_id } => {
+            let model = control.read_model().map_err(|e| e.to_string())?;
+            projections::goal_detail(&model, &goal_id)
+                .ok_or_else(|| format!("unknown goal {goal_id}"))
+        }
+        ControlApiRequest::ListEvents { after, limit } => {
+            let store = StateStore::open(
+                std::env::var_os(STATE_DB_ENV)
+                    .map_or_else(|| PathBuf::from(".sovereign/state.sqlite3"), PathBuf::from),
+            )
+            .map_err(|e| e.to_string())?;
+            let events = store.journal_after(after).map_err(|e| e.to_string())?;
+            serde_json::to_value(projections::project_events(&events, after, limit))
+                .map_err(|e| e.to_string())
+        }
+        ControlApiRequest::GetRecovery => {
+            let model = control.read_model().map_err(|e| e.to_string())?;
+            serde_json::to_value(json!({
+                "recovery": model.recovery,
+                "explanation": projections::explain_recovery(&model.recovery),
+            }))
+            .map_err(|e| e.to_string())
+        }
+        ControlApiRequest::VerifyModel {
+            runtime_path,
+            model_path,
+        } => serde_json::to_value(model_assets::verify_model_paths(
+            Path::new(&runtime_path),
+            Path::new(&model_path),
+        )?)
+        .map_err(|e| e.to_string()),
+        ControlApiRequest::GetSettings => {
+            let settings = app_data::AppData::open_default()
+                .and_then(|data| data.load_settings())
+                .unwrap_or_default();
+            serde_json::to_value(settings).map_err(|e| e.to_string())
+        }
+        ControlApiRequest::SaveSettings {
+            approval_principal,
+            chrome_path,
+            node_path,
+            execute_on_start,
+        } => {
+            let data = app_data::AppData::open_default().map_err(|e| e.to_string())?;
+            let mut settings = data.load_settings().unwrap_or_default();
+            if let Some(principal) = approval_principal {
+                settings.approval_principal = principal;
+            }
+            if let Some(path) = chrome_path {
+                settings.chrome_path = Some(path);
+            }
+            if let Some(path) = node_path {
+                settings.node_path = Some(path);
+            }
+            if let Some(execute) = execute_on_start {
+                settings.execute_on_start = execute;
+            }
+            data.save_settings(&settings).map_err(|e| e.to_string())?;
+            serde_json::to_value(settings).map_err(|e| e.to_string())
+        }
+        ControlApiRequest::EventStream { .. } => {
+            Err("event stream is served by the HTTP layer".to_owned())
+        }
+        ControlApiRequest::GetArtifact {
+            digest,
+            offset,
+            length,
+        } => artifact_response(&digest, offset, length),
+        ControlApiRequest::GetTaskDiff { key } => {
+            let model = control.read_model().map_err(|e| e.to_string())?;
+            projections::task_diff_from_status(&model.status.tasks, &key)
+                .ok_or_else(|| format!("not found: no diff for task {key}"))
+                .map(|diff| serde_json::json!({"task_id": key, "diff": diff}))
+        }
+        ControlApiRequest::GetApproval { request_id } => {
+            let model = control.read_model().map_err(|e| e.to_string())?;
+            model
+                .pending_approvals
+                .iter()
+                .chain(model.blocked_approvals.iter())
+                .find(|item| item.request_id == request_id)
+                .ok_or_else(|| format!("not found: approval {request_id}"))
+                .and_then(|item| serde_json::to_value(item).map_err(|e| e.to_string()))
+        }
+        ControlApiRequest::DownloadModel { confirmation } => {
+            download_model_response(confirmation.as_deref())
+        }
+        ControlApiRequest::CancelGoal { goal_id, principal } => control
+            .cancel_goal(&goal_id, &principal)
+            .and_then(|intent| {
+                serde_json::to_value(intent).map_err(sovereign_controller::ControllerError::from)
+            })
+            .map_err(|error| error.to_string()),
     }
 }
 
@@ -264,8 +573,12 @@ fn help_text() -> String {
         "  resume                         Resume Controller readiness/mutation",
         "  approvals                      Render durable approval-request facts",
         "  approval <id> <approve|deny> <principal>  Respond through Controller approval validation",
-        "  serve [127.0.0.1:port]         Serve the loopback-only local dashboard and control API",
-        "  doctor                         Check local state/control access",
+        "  serve [--execute] [--require-token|--no-require-token] [127.0.0.1:port]  Serve the loopback UI and control API",
+        "  doctor [--json]               Check local state/control access and machine prerequisites",
+        "  cancel <goal_id> <principal>  Cancel a queued goal or request task cancellation",
+        "  project add|list|use          Register and activate a git repository",
+        "  service install|uninstall|status  Manage the LaunchAgent",
+        "  app                           Open the local UI",
         "  --version                      Print version",
         "",
         "State path defaults to .sovereign/state.sqlite3; override with SOVEREIGN_STATE_DB.",
@@ -729,18 +1042,26 @@ mod tests {
             .unwrap_or_else(|_| panic!("dashboard server thread panicked"));
 
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(response.contains("Content-Type: text/html; charset=utf-8\r\n"));
-        assert!(response.contains("Sovereign Local Dashboard"));
-        assert!(response.contains("Goals"));
-        assert!(response.contains("Tasks &amp; Progress"));
-        assert!(response.contains("Verification &amp; Evidence"));
-        assert!(response.contains("Blocked Approvals"));
-        assert!(response.contains("/v1/status"));
-        assert!(response.contains("/v1/control/pause"));
-        assert!(response.contains("/v1/control/resume"));
-        assert!(response.contains("/v1/approvals/respond"));
+        assert!(response.contains("text/html"));
         assert!(!response.contains("/v1/actions"));
         assert!(!response.contains("/v1/state/"));
+        let ui_dist = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui-dist/assets");
+        let mut saw_v2 = false;
+        if ui_dist.is_dir() {
+            for entry in fs::read_dir(&ui_dist).unwrap_or_else(|error| panic!("{error}")) {
+                let path = entry.unwrap_or_else(|error| panic!("{error}")).path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("js") {
+                    continue;
+                }
+                let js = fs::read_to_string(&path).unwrap_or_else(|error| panic!("{error}"));
+                assert!(!js.contains("/v1/actions"), "{}", path.display());
+                assert!(!js.contains("/v1/state/"), "{}", path.display());
+                if js.contains("/v2/") {
+                    saw_v2 = true;
+                }
+            }
+        }
+        assert!(saw_v2, "SPA must call /v2 routes listed in the schema");
 
         let after_store =
             StateStore::open(&state_path).unwrap_or_else(|error| panic!("state after: {error}"));

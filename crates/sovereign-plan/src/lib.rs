@@ -131,8 +131,14 @@ impl BrowserManagedAppLaunchV1 {
     #[must_use]
     pub const fn required_generations(&self) -> u32 {
         match self {
-            Self::PythonManagedServerV1 { required_generations, .. }
-            | Self::NodeManagedServerV1 { required_generations, .. } => *required_generations,
+            Self::PythonManagedServerV1 {
+                required_generations,
+                ..
+            }
+            | Self::NodeManagedServerV1 {
+                required_generations,
+                ..
+            } => *required_generations,
         }
     }
 }
@@ -157,10 +163,15 @@ pub struct BrowserManagedReadinessV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum BrowserManagedPersistenceBindingV1 {
-    ArgvFlag { flag: String, filename: String },
-    /// Controller supplies a credential-free URL for its task-scoped PostgreSQL broker.
+    ArgvFlag {
+        flag: String,
+        filename: String,
+    },
+    /// Controller supplies a credential-free URL for its task-scoped `PostgreSQL` broker.
     /// Database, role, backend endpoint and broker port are never selected by Plan IR.
-    PostgresBrokerV1 { flag: String },
+    PostgresBrokerV1 {
+        flag: String,
+    },
 }
 
 /// Exact Controller-owned loopback destination injected during browser authority binding.
@@ -193,7 +204,9 @@ pub struct BrowserAcceptanceStepV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrowserAcceptanceActionV1 {
-    Navigate { path: String },
+    Navigate {
+        path: String,
+    },
     SubmitForm {
         selector: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -342,11 +355,17 @@ fn validate_browser_launch(
     launch: &BrowserManagedAppLaunchV1,
 ) -> Result<(), BrowserAcceptanceContractError> {
     match launch {
-        BrowserManagedAppLaunchV1::PythonManagedServerV1 { server_relative_path, database_filename, .. } => {
+        BrowserManagedAppLaunchV1::PythonManagedServerV1 {
+            server_relative_path,
+            database_filename,
+            ..
+        } => {
             let server = Path::new(server_relative_path);
             if server_relative_path.is_empty()
                 || server.is_absolute()
-                || server.components().any(|component| !matches!(component, Component::Normal(_)))
+                || server
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
                 || !(1..=8).contains(&launch.required_generations())
             {
                 return Err(BrowserAcceptanceContractError(
@@ -356,33 +375,46 @@ fn validate_browser_launch(
             let database = Path::new(database_filename);
             if database_filename.is_empty()
                 || database_filename.contains(['/', '\\'])
-                || database.components().any(|component| !matches!(component, Component::Normal(_)))
+                || database
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
                 || database.components().count() != 1
             {
                 return Err(BrowserAcceptanceContractError(
-                    "browser managed-app database filename must be one normal path component".to_owned(),
+                    "browser managed-app database filename must be one normal path component"
+                        .to_owned(),
                 ));
             }
         }
         BrowserManagedAppLaunchV1::NodeManagedServerV1 {
-            working_directory_relative_path, entrypoint_relative_path, argv,
-            dynamic_port, readiness, persistence, ..
+            working_directory_relative_path,
+            entrypoint_relative_path,
+            argv,
+            dynamic_port,
+            readiness,
+            persistence,
+            ..
         } => {
             let BrowserManagedArgBindingV1::ArgvFlag { flag: port_flag } = dynamic_port;
             let (data_flag, filename) = match persistence {
-                BrowserManagedPersistenceBindingV1::ArgvFlag { flag, filename } => (flag, Some(filename.as_str())),
+                BrowserManagedPersistenceBindingV1::ArgvFlag { flag, filename } => {
+                    (flag, Some(filename.as_str()))
+                }
                 BrowserManagedPersistenceBindingV1::PostgresBrokerV1 { flag } => (flag, None),
             };
             if !(1..=8).contains(&launch.required_generations())
                 || !strict_relative_path(working_directory_relative_path, true)
                 || !strict_relative_path(entrypoint_relative_path, false)
                 || argv.len() > 24
-                || argv.iter().any(|arg| arg.is_empty() || arg.len() > 256 || arg.chars().any(char::is_control))
+                || argv.iter().any(|arg| {
+                    arg.is_empty() || arg.len() > 256 || arg.chars().any(char::is_control)
+                })
                 || !managed_flag(port_flag)
                 || !managed_flag(data_flag)
                 || port_flag == data_flag
                 || argv.iter().any(|arg| {
-                    arg == port_flag || arg == data_flag
+                    arg == port_flag
+                        || arg == data_flag
                         || arg.starts_with(&format!("{port_flag}="))
                         || arg.starts_with(&format!("{data_flag}="))
                 })
@@ -398,7 +430,9 @@ fn validate_browser_launch(
                 || readiness.body.chars().any(char::is_control)
                 || !(100..=5_000).contains(&readiness.timeout_ms)
             {
-                return Err(BrowserAcceptanceContractError("browser Node managed-app launch contract is invalid".to_owned()));
+                return Err(BrowserAcceptanceContractError(
+                    "browser Node managed-app launch contract is invalid".to_owned(),
+                ));
             }
         }
     }
@@ -406,23 +440,41 @@ fn validate_browser_launch(
 }
 
 fn strict_relative_path(value: &str, allow_root: bool) -> bool {
-    if allow_root && value == "." { return true; }
-    !value.is_empty() && value.len() <= 512 && !value.contains('\\') &&
-        !Path::new(value).is_absolute() &&
-        Path::new(value).components().all(|part| matches!(part, Component::Normal(_)))
+    if allow_root && value == "." {
+        return true;
+    }
+    !value.is_empty()
+        && value.len() <= 512
+        && !value.contains('\\')
+        && !Path::new(value).is_absolute()
+        && Path::new(value)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
 }
 
 fn plain_filename(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 255 && !value.contains(['/', '\\']) &&
-        Path::new(value).components().count() == 1 &&
-        Path::new(value).components().all(|part| matches!(part, Component::Normal(_)))
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.contains(['/', '\\'])
+        && Path::new(value).components().count() == 1
+        && Path::new(value)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
 }
 
 fn managed_flag(value: &str) -> bool {
-    value.len() >= 3 && value.len() <= 32 && value.starts_with("--") &&
-        value[2..].bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+    value.len() >= 3
+        && value.len() <= 32
+        && value.starts_with("--")
+        && value[2..]
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "bounded browser action validation is a single contract gate"
+)]
 fn validate_browser_steps(
     steps: &[BrowserAcceptanceStepV1],
     required_generations: u32,
@@ -544,9 +596,23 @@ fn valid_browser_form_fields(fields: &[BrowserAcceptanceFieldValueV1]) -> bool {
             .map(|ch| ch.to_ascii_lowercase())
             .collect::<String>();
         let credential_like = [
-            "password", "passwd", "secret", "token", "credential", "authorization",
-            "apikey", "accesskey", "privatekey", "creditcard", "securitycode", "cvv",
-            "ssn", "socialsecurity", "email", "phone", "telephone",
+            "password",
+            "passwd",
+            "secret",
+            "token",
+            "credential",
+            "authorization",
+            "apikey",
+            "accesskey",
+            "privatekey",
+            "creditcard",
+            "securitycode",
+            "cvv",
+            "ssn",
+            "socialsecurity",
+            "email",
+            "phone",
+            "telephone",
         ]
         .iter()
         .any(|needle| normalized.contains(needle));
@@ -563,13 +629,17 @@ fn valid_browser_form_fields(fields: &[BrowserAcceptanceFieldValueV1]) -> bool {
 #[cfg(test)]
 mod browser_form_value_contract_tests {
     use super::{
-        BrowserAcceptanceActionV1, BrowserAcceptanceExpectationV1,
-        BrowserAcceptanceFieldValueV1, BrowserAcceptanceSemanticV1,
-        BrowserAcceptanceStepV1, BrowserAcceptanceTemplateV1,
+        BrowserAcceptanceActionV1, BrowserAcceptanceExpectationV1, BrowserAcceptanceFieldValueV1,
+        BrowserAcceptanceSemanticV1, BrowserAcceptanceStepV1, BrowserAcceptanceTemplateV1,
         BrowserManagedAppLaunchV1,
     };
 
-    fn template(fields_and_semantics: Vec<(Vec<BrowserAcceptanceFieldValueV1>, BrowserAcceptanceSemanticV1)>) -> BrowserAcceptanceTemplateV1 {
+    fn template(
+        fields_and_semantics: Vec<(
+            Vec<BrowserAcceptanceFieldValueV1>,
+            BrowserAcceptanceSemanticV1,
+        )>,
+    ) -> BrowserAcceptanceTemplateV1 {
         BrowserAcceptanceTemplateV1 {
             launch: BrowserManagedAppLaunchV1::PythonManagedServerV1 {
                 server_relative_path: "apps/demo/server.py".to_owned(),
@@ -606,9 +676,18 @@ mod browser_form_value_contract_tests {
     #[test]
     fn typed_form_values_accept_chosen_and_invalid_validation_values() {
         let value = template(vec![
-            (vec![field("input[name='employee']", "Avery Chen")], BrowserAcceptanceSemanticV1::Create),
-            (vec![field("input[name='employee']", "not-a-valid-employee")], BrowserAcceptanceSemanticV1::InvalidValidation),
-            (vec![field("input[name='employee']", "")], BrowserAcceptanceSemanticV1::InvalidValidation),
+            (
+                vec![field("input[name='employee']", "Avery Chen")],
+                BrowserAcceptanceSemanticV1::Create,
+            ),
+            (
+                vec![field("input[name='employee']", "not-a-valid-employee")],
+                BrowserAcceptanceSemanticV1::InvalidValidation,
+            ),
+            (
+                vec![field("input[name='employee']", "")],
+                BrowserAcceptanceSemanticV1::InvalidValidation,
+            ),
         ])
         .bind_loopback(41_731, vec!["AC.employee-form".to_owned()])
         .unwrap_or_else(|error| panic!("bind form-value contract: {error}"));
@@ -627,24 +706,35 @@ mod browser_form_value_contract_tests {
         };
         let serialized = serde_json::to_value(action)
             .unwrap_or_else(|error| panic!("serialize legacy submit action: {error}"));
-        assert_eq!(serialized, serde_json::json!({"kind":"submit_form", "selector":"form#employee"}));
+        assert_eq!(
+            serialized,
+            serde_json::json!({"kind":"submit_form", "selector":"form#employee"})
+        );
     }
 
     #[test]
     fn form_values_reject_sensitive_fields_duplicates_and_controls() {
         for fields in [
             vec![field("input[name='password']", "not-secret")],
-            vec![field("input[name='employee']", "Avery"), field("input[name='employee']", "Jordan")],
+            vec![
+                field("input[name='employee']", "Avery"),
+                field("input[name='employee']", "Jordan"),
+            ],
             vec![field("input[name='employee']", "Avery\nChen")],
             (0..17)
                 .map(|index| field(&format!("input[name='field-{index}']"), "value"))
                 .collect(),
             vec![field("input[name='employee']", &"x".repeat(257))],
-            vec![field(&format!("input[name='{}']", "x".repeat(513)), "value")],
+            vec![field(
+                &format!("input[name='{}']", "x".repeat(513)),
+                "value",
+            )],
         ] {
-            assert!(template(vec![(fields, BrowserAcceptanceSemanticV1::Create)])
-                .bind_loopback(41_731, vec!["AC.employee-form".to_owned()])
-                .is_err());
+            assert!(
+                template(vec![(fields, BrowserAcceptanceSemanticV1::Create)])
+                    .bind_loopback(41_731, vec!["AC.employee-form".to_owned()])
+                    .is_err()
+            );
         }
     }
 }
@@ -667,6 +757,10 @@ mod node_managed_launch_contract_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "serialization fixture asserts known-valid contracts"
+    )]
     fn node_fixture_deserializes_and_round_trips_without_changing_python_json() {
         let node = node_fixture();
         let launch: BrowserManagedAppLaunchV1 = serde_json::from_value(node.clone())
@@ -684,9 +778,14 @@ mod node_managed_launch_contract_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "serialization fixture asserts known-valid contracts"
+    )]
     fn postgres_broker_launch_round_trips_and_does_not_accept_plan_supplied_endpoint() {
         let mut node = node_fixture();
-        node["persistence"] = serde_json::json!({"kind":"postgres_broker_v1","flag":"--database-url"});
+        node["persistence"] =
+            serde_json::json!({"kind":"postgres_broker_v1","flag":"--database-url"});
         let launch: BrowserManagedAppLaunchV1 = serde_json::from_value(node.clone()).unwrap();
         validate_browser_launch(&launch).unwrap();
         assert_eq!(serde_json::to_value(launch).unwrap(), node);
@@ -695,19 +794,35 @@ mod node_managed_launch_contract_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::unwrap_used,
+        reason = "serialization fixture asserts known-valid contracts"
+    )]
     fn node_fixture_rejects_escape_fixed_port_collision_and_unbounded_readiness() {
         for (pointer, value) in [
-            ("/working_directory_relative_path", serde_json::json!("../outside")),
-            ("/entrypoint_relative_path", serde_json::json!("/tmp/server.js")),
+            (
+                "/working_directory_relative_path",
+                serde_json::json!("../outside"),
+            ),
+            (
+                "/entrypoint_relative_path",
+                serde_json::json!("/tmp/server.js"),
+            ),
             ("/argv", serde_json::json!(["--port", "3000"])),
             ("/argv", serde_json::json!(["--port=3000"])),
             ("/readiness/timeout_ms", serde_json::json!(60_000)),
-            ("/persistence/filename", serde_json::json!("../outside.sqlite3")),
+            (
+                "/persistence/filename",
+                serde_json::json!("../outside.sqlite3"),
+            ),
         ] {
             let mut node = node_fixture();
             *node.pointer_mut(pointer).unwrap() = value;
             let launch: BrowserManagedAppLaunchV1 = serde_json::from_value(node).unwrap();
-            assert!(validate_browser_launch(&launch).is_err(), "accepted invalid {pointer}");
+            assert!(
+                validate_browser_launch(&launch).is_err(),
+                "accepted invalid {pointer}"
+            );
         }
     }
 }

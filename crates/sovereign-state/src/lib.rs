@@ -7,7 +7,7 @@
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 use sovereign_types::UnixMillis;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::path::{Path, PathBuf};
@@ -701,6 +701,10 @@ impl StateStore {
     /// Returns [`StateError::Integrity`] for an invalid/stale journal guard, invalid/duplicate/stale
     /// compare-only assertion, overlap between an assertion and mutation, or any ordinary compound
     /// CAS integrity failure. Other failures are returned as ordinary [`StateError`] values.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the guarded CAS validates and applies one atomic SQLite transition"
+    )]
     pub fn compare_and_apply_state_records_with_events_guarded(
         &mut self,
         expected_journal_tail: Option<i64>,
@@ -714,7 +718,7 @@ impl StateStore {
             ));
         }
 
-        let mut asserted = BTreeMap::new();
+        let mut asserted = BTreeSet::new();
         for assertion in assertions {
             if assertion.expected_version <= 0 {
                 return Err(StateError::Integrity(format!(
@@ -722,10 +726,7 @@ impl StateStore {
                     assertion.namespace, assertion.key
                 )));
             }
-            if asserted
-                .insert((assertion.namespace, assertion.key), ())
-                .is_some()
-            {
+            if !asserted.insert((assertion.namespace, assertion.key)) {
                 return Err(StateError::Integrity(format!(
                     "duplicate state CAS assertion for {}/{}",
                     assertion.namespace, assertion.key
@@ -733,7 +734,7 @@ impl StateStore {
             }
         }
 
-        let mut unique = BTreeMap::new();
+        let mut unique = BTreeSet::new();
         for mutation in mutations {
             if mutation
                 .expected_version
@@ -750,16 +751,13 @@ impl StateStore {
                     mutation.namespace, mutation.key
                 )));
             }
-            if unique
-                .insert((mutation.namespace, mutation.key), ())
-                .is_some()
-            {
+            if !unique.insert((mutation.namespace, mutation.key)) {
                 return Err(StateError::Integrity(format!(
                     "duplicate state CAS mutation for {}/{}",
                     mutation.namespace, mutation.key
                 )));
             }
-            if asserted.contains_key(&(mutation.namespace, mutation.key)) {
+            if asserted.contains(&(mutation.namespace, mutation.key)) {
                 return Err(StateError::Integrity(format!(
                     "state CAS assertion cannot also mutate {}/{}",
                     mutation.namespace, mutation.key
@@ -2466,6 +2464,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixture proves insert, update, delete, and atomic rollback together"
+    )]
     fn compound_state_cas_is_atomic_for_insert_update_and_delete() {
         let temp = TestDir::new("state-cas-compound");
         let mut store = StateStore::open(temp.db())
@@ -2655,6 +2657,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one fixture proves compare-only assertions and atomic rejection together"
+    )]
     fn guarded_compound_state_cas_assertions_are_compare_only_and_fail_atomically() {
         let temp = TestDir::new("state-cas-assertion");
         let mut store = StateStore::open(temp.db())

@@ -164,10 +164,7 @@ fn fake_backend(packet_tokens: u32) -> DeterministicFakeBackend {
             "title": "Rename Settings submit label",
             "objective": "Change the rendered Settings submit label from Save to Apply without altering submit behavior.",
             "rationale": "Exact current source and focused-test evidence identify one bounded SettingsForm edit.",
-            "files": [
-                "src/settings/SettingsForm.tsx",
-                "src/settings/SettingsForm.test.tsx"
-            ],
+            "files": ["src/settings/SettingsForm.tsx"],
             "symbols": ["SettingsForm"],
             "evidence_queries": [],
             "expected_change": "The scoped SettingsForm renders Apply instead of Save."
@@ -341,7 +338,7 @@ fn compiler_vertical_slice_starts_from_natural_language_and_exact_repository_evi
     let mut model_budget = ModelCallBudget::new(1, 1_000);
     let result = compiler
         .compile(&input, &mut model_budget)
-        .unwrap_or_else(|error| panic!("compile natural-language goal: {error}"));
+        .unwrap_or_else(|error| panic!("compile natural-language goal: {error:?}"));
 
     assert_eq!(model_budget.remaining_calls(), 0);
     assert_compilation(

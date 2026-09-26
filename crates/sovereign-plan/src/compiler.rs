@@ -665,6 +665,10 @@ impl PlanCompilationResult {
     /// # Errors
     /// Rejects stale evidence, ambiguous or mutating targets, invalid grants, and any Plan that
     /// fails validation after the exact loopback policy and typed acceptance contract are bound.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "typed browser grant validation remains one atomic policy binding"
+    )]
     pub fn bind_goal_granted_loopback_browser_acceptance(
         &self,
         validator: &PlanValidator,
@@ -779,6 +783,10 @@ impl PlanCompilationResult {
         )
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "explicit typed browser authority inputs prevent implicit selection"
+    )]
     fn bind_controller_loopback_browser_inner(
         &self,
         validator: &PlanValidator,

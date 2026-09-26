@@ -3699,6 +3699,29 @@ pub struct RustToolchainAccess {
 }
 
 impl RustToolchainAccess {
+    /// Binds the bounded, single-job Cargo verification process allowance to this
+    /// exact toolchain. Other Cargo modes keep ordinary resource admission.
+    ///
+    /// # Errors
+    /// Returns a denial unless the executable and argv match the pinned offline Cargo contract.
+    pub fn verification_process_binding(
+        &self,
+        executable: &Path,
+        args: &[String],
+    ) -> Result<String, PolicyError> {
+        if executable != self.cargo.path
+            || args.first().is_none_or(|arg| arg != "--offline")
+            || args
+                .get(1)
+                .is_none_or(|arg| !matches!(arg.as_str(), "test" | "check" | "build"))
+        {
+            return Err(PolicyError::Denied(
+                "Rust verification process allowance requires exact pinned offline Cargo build/check/test".to_owned(),
+            ));
+        }
+        Ok(self.manifest_digest.clone())
+    }
+
     #[must_use]
     pub fn rustc_path(&self) -> &Path {
         &self.rustc.path
@@ -3711,24 +3734,44 @@ impl RustToolchainAccess {
     pub fn from_policy(policy: &CommandPolicy, cargo: &Path) -> Result<Self, PolicyError> {
         let cargo = policy.pinned_executable(cargo)?.clone();
         if cargo.path.file_name().is_none_or(|name| name != "cargo") {
-            return Err(PolicyError::Denied("Rust toolchain Cargo pin has the wrong executable name".to_owned()));
+            return Err(PolicyError::Denied(
+                "Rust toolchain Cargo pin has the wrong executable name".to_owned(),
+            ));
         }
-        let bin = cargo.path.parent().ok_or_else(|| PolicyError::Denied("Cargo pin has no bin directory".to_owned()))?;
+        let bin = cargo
+            .path
+            .parent()
+            .ok_or_else(|| PolicyError::Denied("Cargo pin has no bin directory".to_owned()))?;
         if bin.file_name().is_none_or(|name| name != "bin") {
-            return Err(PolicyError::Denied("Cargo pin is outside an exact toolchain bin directory".to_owned()));
+            return Err(PolicyError::Denied(
+                "Cargo pin is outside an exact toolchain bin directory".to_owned(),
+            ));
         }
-        let root = bin.parent().ok_or_else(|| PolicyError::Denied("Cargo pin has no toolchain root".to_owned()))?.canonicalize()?;
+        let root = bin
+            .parent()
+            .ok_or_else(|| PolicyError::Denied("Cargo pin has no toolchain root".to_owned()))?
+            .canonicalize()?;
         if root.join("bin").canonicalize()? != bin {
-            return Err(PolicyError::Denied("toolchain bin directory identity drifted".to_owned()));
+            return Err(PolicyError::Denied(
+                "toolchain bin directory identity drifted".to_owned(),
+            ));
         }
         let rustc_path = root.join("bin/rustc");
         let rustc = policy.pinned_executable(&rustc_path)?.clone();
         if rustc.path != rustc_path {
-            return Err(PolicyError::Denied("Rustc pin escapes the exact toolchain bin directory".to_owned()));
+            return Err(PolicyError::Denied(
+                "Rustc pin escapes the exact toolchain bin directory".to_owned(),
+            ));
         }
         let library_files = rust_toolchain_library_files(&root)?;
         let manifest_digest = rust_toolchain_manifest_digest(&cargo, &rustc, &library_files);
-        Ok(Self { cargo, rustc, root, library_files, manifest_digest })
+        Ok(Self {
+            cargo,
+            rustc,
+            root,
+            library_files,
+            manifest_digest,
+        })
     }
 
     /// Rechecks every named file and the complete bounded library set before dispatch.
@@ -3738,12 +3781,20 @@ impl RustToolchainAccess {
     pub fn verify(&self) -> Result<(), PolicyError> {
         self.cargo.verify()?;
         self.rustc.verify()?;
-        if self.root.join("bin").canonicalize()? != self.cargo.path.parent().ok_or_else(|| PolicyError::Denied("Cargo pin lost its bin directory".to_owned()))?
+        if self.root.join("bin").canonicalize()?
+            != self
+                .cargo
+                .path
+                .parent()
+                .ok_or_else(|| PolicyError::Denied("Cargo pin lost its bin directory".to_owned()))?
             || self.root.join("bin/rustc").canonicalize()? != self.rustc.path
             || rust_toolchain_library_files(&self.root)? != self.library_files
-            || rust_toolchain_manifest_digest(&self.cargo, &self.rustc, &self.library_files) != self.manifest_digest
+            || rust_toolchain_manifest_digest(&self.cargo, &self.rustc, &self.library_files)
+                != self.manifest_digest
         {
-            return Err(PolicyError::Denied("Rust toolchain manifest drifted".to_owned()));
+            return Err(PolicyError::Denied(
+                "Rust toolchain manifest drifted".to_owned(),
+            ));
         }
         Ok(())
     }
@@ -3752,7 +3803,9 @@ impl RustToolchainAccess {
 fn rust_toolchain_library_files(root: &Path) -> Result<Vec<(PathBuf, String)>, PolicyError> {
     let library_root = root.join("lib");
     if library_root.canonicalize()? != library_root || !library_root.is_dir() {
-        return Err(PolicyError::Denied("Rust toolchain library root is not exact".to_owned()));
+        return Err(PolicyError::Denied(
+            "Rust toolchain library root is not exact".to_owned(),
+        ));
     }
     let mut pending = vec![library_root];
     let mut files = Vec::new();
@@ -3763,23 +3816,29 @@ fn rust_toolchain_library_files(root: &Path) -> Result<Vec<(PathBuf, String)>, P
             let entry = entry?;
             entries = entries.saturating_add(1);
             if entries > 4096 {
-                return Err(PolicyError::Denied("Rust toolchain library manifest exceeds its entry bound".to_owned()));
+                return Err(PolicyError::Denied(
+                    "Rust toolchain library manifest exceeds its entry bound".to_owned(),
+                ));
             }
             let path = entry.path();
             let kind = entry.file_type()?;
             if kind.is_symlink() {
-                return Err(PolicyError::Denied("Rust toolchain library contains a symlink".to_owned()));
+                return Err(PolicyError::Denied(
+                    "Rust toolchain library contains a symlink".to_owned(),
+                ));
             }
             if kind.is_dir() {
                 pending.push(path);
             } else if kind.is_file() {
                 total_bytes = total_bytes.saturating_add(entry.metadata()?.len());
                 if total_bytes > 2 * 1024 * 1024 * 1024 {
-                    return Err(PolicyError::Denied("Rust toolchain library manifest exceeds its byte bound".to_owned()));
+                    return Err(PolicyError::Denied(
+                        "Rust toolchain library manifest exceeds its byte bound".to_owned(),
+                    ));
                 }
                 let mut file = fs::File::open(&path)?;
                 let mut hasher = Sha256::new();
-                let mut buffer = [0_u8; 64 * 1024];
+                let mut buffer = vec![0_u8; 64 * 1024];
                 loop {
                     let count = file.read(&mut buffer)?;
                     if count == 0 {
@@ -3789,18 +3848,26 @@ fn rust_toolchain_library_files(root: &Path) -> Result<Vec<(PathBuf, String)>, P
                 }
                 files.push((path, format!("sha256:{:x}", hasher.finalize())));
             } else {
-                return Err(PolicyError::Denied("Rust toolchain library contains a non-file entry".to_owned()));
+                return Err(PolicyError::Denied(
+                    "Rust toolchain library contains a non-file entry".to_owned(),
+                ));
             }
         }
     }
     files.sort();
     if files.is_empty() {
-        return Err(PolicyError::Denied("Rust toolchain library manifest is empty".to_owned()));
+        return Err(PolicyError::Denied(
+            "Rust toolchain library manifest is empty".to_owned(),
+        ));
     }
     Ok(files)
 }
 
-fn rust_toolchain_manifest_digest(cargo: &PinnedExecutable, rustc: &PinnedExecutable, files: &[(PathBuf, String)]) -> String {
+fn rust_toolchain_manifest_digest(
+    cargo: &PinnedExecutable,
+    rustc: &PinnedExecutable,
+    files: &[(PathBuf, String)],
+) -> String {
     let mut hasher = Sha256::new();
     for (path, digest) in [(&cargo.path, &cargo.sha256), (&rustc.path, &rustc.sha256)] {
         digest_policy_field(&mut hasher, &path.display().to_string());
@@ -3975,6 +4042,10 @@ impl ExecutionIsolationBackend for MacSandboxExecBackend {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one construction path keeps the Seatbelt authority checks adjacent to its profile"
+    )]
     fn isolate(
         &self,
         spec: &CommandSpec,
@@ -4015,37 +4086,78 @@ impl ExecutionIsolationBackend for MacSandboxExecBackend {
                 || toolchain.root.starts_with(&repo)
                 || repo.starts_with(&toolchain.root)
                 || request.extra_protected_read_roots.iter().any(|protected| {
-                    canonicalize_existing_or_parent(protected)
-                        .is_ok_and(|root| toolchain.root.starts_with(&root) || root.starts_with(&toolchain.root))
+                    canonicalize_existing_or_parent(protected).is_ok_and(|root| {
+                        toolchain.root.starts_with(&root) || root.starts_with(&toolchain.root)
+                    })
                 })
             {
-                return Err(PolicyError::Denied("Rust toolchain access is outside the exact pinned Cargo verification boundary".to_owned()));
+                return Err(PolicyError::Denied(
+                    "Rust toolchain access is outside the exact pinned Cargo verification boundary"
+                        .to_owned(),
+                ));
             }
             // Cargo canonicalizes the task root while generating dep-info. Grant metadata on
             // each exact ancestor, never directory data or sibling contents under home.
-            for ancestor in repo.ancestors().skip(1).take_while(|ancestor| ancestor.starts_with(&home)) {
-                write!(&mut profile, "(allow file-read-metadata (literal {}))", seatbelt_string(ancestor))
-                    .map_err(|_| PolicyError::Denied("failed to build toolchain profile".to_owned()))?;
+            for ancestor in repo
+                .ancestors()
+                .skip(1)
+                .take_while(|ancestor| ancestor.starts_with(&home))
+            {
+                write!(
+                    &mut profile,
+                    "(allow file-read-metadata (literal {}))",
+                    seatbelt_string(ancestor)
+                )
+                .map_err(|_| PolicyError::Denied("failed to build toolchain profile".to_owned()))?;
             }
             // Rustc probes candidate library names that may not exist. Metadata-only access
             // distinguishes absence from denial without exposing unmanifested file contents.
-            write!(&mut profile, "(allow file-read-metadata (subpath {}))", seatbelt_string(&toolchain.root.join("lib")))
+            write!(
+                &mut profile,
+                "(allow file-read-metadata (subpath {}))",
+                seatbelt_string(&toolchain.root.join("lib"))
+            )
+            .map_err(|_| PolicyError::Denied("failed to build toolchain profile".to_owned()))?;
+            for path in [
+                &toolchain.root,
+                &toolchain.root.join("bin"),
+                &toolchain.root.join("lib"),
+            ] {
+                write!(
+                    &mut profile,
+                    "(allow file-read* (literal {}))",
+                    seatbelt_string(path)
+                )
                 .map_err(|_| PolicyError::Denied("failed to build toolchain profile".to_owned()))?;
-            for path in [&toolchain.root, &toolchain.root.join("bin"), &toolchain.root.join("lib")] {
-                write!(&mut profile, "(allow file-read* (literal {}))", seatbelt_string(path))
-                    .map_err(|_| PolicyError::Denied("failed to build toolchain profile".to_owned()))?;
             }
             for path in [&toolchain.cargo.path, &toolchain.rustc.path] {
-                write!(&mut profile, "(allow file-read* (literal {}))", seatbelt_string(path))
-                    .map_err(|_| PolicyError::Denied("failed to build toolchain profile".to_owned()))?;
+                write!(
+                    &mut profile,
+                    "(allow file-read* (literal {}))",
+                    seatbelt_string(path)
+                )
+                .map_err(|_| PolicyError::Denied("failed to build toolchain profile".to_owned()))?;
             }
             for (path, _) in &toolchain.library_files {
-                for ancestor in path.ancestors().take_while(|ancestor| ancestor.starts_with(toolchain.root.join("lib"))) {
-                    write!(&mut profile, "(allow file-read* (literal {}))", seatbelt_string(ancestor))
-                        .map_err(|_| PolicyError::Denied("failed to build toolchain profile".to_owned()))?;
+                for ancestor in path
+                    .ancestors()
+                    .take_while(|ancestor| ancestor.starts_with(toolchain.root.join("lib")))
+                {
+                    write!(
+                        &mut profile,
+                        "(allow file-read* (literal {}))",
+                        seatbelt_string(ancestor)
+                    )
+                    .map_err(|_| {
+                        PolicyError::Denied("failed to build toolchain profile".to_owned())
+                    })?;
                 }
-                write!(&mut profile, "(allow file-read* (literal {}))", seatbelt_string(path))
-                    .map_err(|_| PolicyError::Denied("failed to build toolchain profile".to_owned()))?;
+                write!(
+                    &mut profile,
+                    "(allow file-read* (literal {}))",
+                    seatbelt_string(path)
+                )
+                .map_err(|_| PolicyError::Denied("failed to build toolchain profile".to_owned()))?;
             }
             write!(&mut profile,
                 "(deny process-exec (subpath {}))(allow process-exec (literal {}))(allow process-exec (literal {}))",
@@ -4071,14 +4183,21 @@ impl ExecutionIsolationBackend for MacSandboxExecBackend {
                 || !canonical_scratch.starts_with(&repo)
                 || !canonical_scratch.is_dir()
                 || request.extra_protected_read_roots.iter().any(|protected| {
-                    canonicalize_existing_or_parent(protected)
-                        .is_ok_and(|root| canonical_scratch.starts_with(&root) || root.starts_with(&canonical_scratch))
+                    canonicalize_existing_or_parent(protected).is_ok_and(|root| {
+                        canonical_scratch.starts_with(&root) || root.starts_with(&canonical_scratch)
+                    })
                 })
             {
-                return Err(PolicyError::Denied("build scratch is outside the exact Cargo isolation boundary".to_owned()));
+                return Err(PolicyError::Denied(
+                    "build scratch is outside the exact Cargo isolation boundary".to_owned(),
+                ));
             }
-            write!(&mut profile, "(allow file-write* (subpath {}))", seatbelt_string(&canonical_scratch))
-                .map_err(|_| PolicyError::Denied("failed to build scratch profile".to_owned()))?;
+            write!(
+                &mut profile,
+                "(allow file-write* (subpath {}))",
+                seatbelt_string(&canonical_scratch)
+            )
+            .map_err(|_| PolicyError::Denied("failed to build scratch profile".to_owned()))?;
         }
         for root in &request.extra_protected_read_roots {
             let root = canonicalize_existing_or_parent(root)?;

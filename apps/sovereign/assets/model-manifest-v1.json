@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "download_enabled": false,
+  "model": {
+    "name": "Qwen3-4B-Q4_K_M.gguf",
+    "url": null,
+    "sha256": null,
+    "size_bytes": null
+  },
+  "runtime": {
+    "name": "llama-server",
+    "url": null,
+    "sha256": null,
+    "size_bytes": null
+  }
+}

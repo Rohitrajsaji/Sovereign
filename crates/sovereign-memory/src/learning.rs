@@ -894,11 +894,7 @@ fn canonical_scope(scope: &MemoryScope) -> MemoryScope {
 }
 
 fn revision_scoped_key(plan_id: &str, revision: u32, logical_key: &str) -> String {
-    if revision == 1 {
-        logical_key.to_owned()
-    } else {
-        format!("{plan_id}@r{revision}:{logical_key}")
-    }
+    format!("{plan_id}@r{revision}:{logical_key}")
 }
 
 fn stable_id(kind: &str, parts: &[&str]) -> String {

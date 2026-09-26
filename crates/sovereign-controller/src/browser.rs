@@ -545,7 +545,7 @@ impl std::fmt::Debug for ControllerBrowserSession {
             .field("adapter_config", &self.adapter_config)
             .field("adapter_present", &self.adapter.is_some())
             .field("gateway_present", &self.gateway.is_some())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -4226,6 +4226,9 @@ impl Controller {
     /// Configures the Controller-owned, digest-pinned Node executable for typed managed launches.
     /// The Plan may choose the Node runtime but cannot select or replace this executable.
     /// Reconfigure after recovery, before the first Node launch.
+    ///
+    /// # Errors
+    /// Rejects an executable missing from the Controller's pinned command policy.
     pub fn configure_managed_node_executable(
         &mut self,
         command_policy: &sovereign_policy::CommandPolicy,
@@ -4236,8 +4239,11 @@ impl Controller {
         Ok(())
     }
 
-    /// Pins the Controller's local PostgreSQL socket and dedicated `sovereign_app` database OID.
+    /// Pins the Controller's local `PostgreSQL` socket and dedicated `sovereign_app` database OID.
     /// The Plan cannot supply or override either value. Reconfigure after Controller recovery.
+    ///
+    /// # Errors
+    /// Rejects a missing, non-socket, or invalid backend identity.
     #[cfg(unix)]
     pub fn configure_managed_postgres_backend(
         &mut self,
@@ -4286,6 +4292,11 @@ impl Controller {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        clippy::needless_pass_by_value,
+        reason = "managed launch keeps one exact generation-bound authority and cleanup path"
+    )]
     fn start_managed_loopback_app_inner<I: sovereign_policy::ExecutionIsolationBackend>(
         &mut self,
         session: &ControllerBrowserSession,
@@ -5277,6 +5288,9 @@ impl Controller {
     /// Backward-compatible method name retained for callers compiled against the earlier focused
     /// proof API. It now delegates exclusively to typed Plan IR semantics and performs no symbol,
     /// title, application-name, or selector heuristic.
+    ///
+    /// # Errors
+    /// Propagates typed browser contract and current-session binding failures.
     pub fn bind_local_inventory_browser_semantics(
         &mut self,
         session: &ControllerBrowserSession,
@@ -5433,6 +5447,10 @@ impl Controller {
         })
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "semantic browser proof is validated and persisted under one authority boundary"
+    )]
     fn verify_and_persist_plan_semantic_proof(
         &mut self,
         session: &ControllerBrowserSession,
@@ -5916,6 +5934,9 @@ impl Controller {
     }
 
     /// Backward-compatible focused-proof method name. This delegates to typed Plan IR semantics.
+    ///
+    /// # Errors
+    /// Propagates browser verification, receipt, and evidence binding failures.
     pub fn prepare_local_inventory_browser_verification(
         &mut self,
         session: ControllerBrowserSession,
@@ -6020,6 +6041,9 @@ impl Controller {
     }
 
     /// Backward-compatible focused-proof method name. This delegates to typed Plan IR semantics.
+    ///
+    /// # Errors
+    /// Propagates recovery and verification binding failures.
     pub fn resume_local_inventory_browser_verification<
         I: sovereign_policy::ExecutionIsolationBackend,
     >(
@@ -6030,6 +6054,10 @@ impl Controller {
         self.resume_plan_browser_verification(runtime, task_id)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "browser verification finalization preserves a single evidence and checkpoint boundary"
+    )]
     fn finish_browser_task_verification<I: sovereign_policy::ExecutionIsolationBackend>(
         &mut self,
         runtime: &ExecutionRuntime<'_, I>,
@@ -8754,6 +8782,23 @@ mod browser_download_terminal_tests {
         }
     }
 
+    fn seal_manual_fixture_checkpoint(controller: &mut Controller) {
+        bind_manual_fixture_checkpoint(controller);
+        controller
+            .persist_all_runtime()
+            .unwrap_or_else(|error| panic!("persist browser fixture runtime: {error}"));
+        controller
+            .checkpoint_now()
+            .unwrap_or_else(|error| panic!("checkpoint browser fixture: {error}"));
+        let checkpoint = controller
+            .state
+            .latest_valid_checkpoint_integrity()
+            .unwrap_or_else(|error| panic!("read browser fixture checkpoint: {error}"))
+            .unwrap_or_else(|| panic!("browser fixture checkpoint missing"));
+        load_latest_recoverable_manifest(&controller.state, &checkpoint)
+            .unwrap_or_else(|error| panic!("verify browser fixture manifest CAS: {error}"));
+    }
+
     fn seed_running_attempt(controller: &mut Controller) {
         controller
             .active
@@ -8801,6 +8846,10 @@ mod browser_download_terminal_tests {
             .unwrap_or_else(|| panic!("browser unknown fixture admission omitted lease"))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "browser fixture constructs an exact authorized session"
+    )]
     fn download_session(root: &Path, max_retained_raw_bytes: u64) -> ControllerBrowserSession {
         let root = fs::canonicalize(root)
             .unwrap_or_else(|error| panic!("canonicalize download root: {error}"));
@@ -9197,6 +9246,7 @@ mod browser_download_terminal_tests {
             autonomy_budget(1_000, 0, 1_048_576, 0),
         );
         seed_running_attempt(&mut oversized_fixture.controller);
+        seal_manual_fixture_checkpoint(&mut oversized_fixture.controller);
         let oversized_download_root = oversized_fixture.root.join("downloads");
         fs::create_dir_all(&oversized_download_root)
             .unwrap_or_else(|error| panic!("create oversized receipt download root: {error}"));
@@ -9569,6 +9619,7 @@ mod browser_download_terminal_tests {
             autonomy_budget(1_000, 0, 1_048_576, 0),
         );
         seed_checkpoint_resource_policy(&mut fixture.controller);
+        seal_manual_fixture_checkpoint(&mut fixture.controller);
         let lease = install_resident_model(&mut fixture.controller);
         let backend = HandoffModelBackend::new(true);
 
@@ -9723,6 +9774,10 @@ mod browser_download_terminal_tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "uncertain submit fixture verifies all no-replay recovery bindings"
+    )]
     fn dispatched_submit_form_recovery_after_restart_blocks_replay() {
         let mut fixture = durable_fixture(
             autonomy_budget(1_000, 0, 1_048_576, 0),

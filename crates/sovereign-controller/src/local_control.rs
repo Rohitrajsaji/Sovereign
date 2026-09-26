@@ -226,6 +226,34 @@ impl LocalControl {
         self.controller.resume()
     }
 
+    /// Requests Controller-owned cancellation of one durable goal.
+    ///
+    /// # Errors
+    /// Returns the Controller error when the goal cannot be cancelled safely.
+    pub fn cancel_goal(
+        &mut self,
+        goal_id: &str,
+        principal: &str,
+    ) -> Result<GoalIntentV1, ControllerError> {
+        self.ensure_mutation_authority()?;
+        self.controller.cancel_goal_intent(goal_id, principal)
+    }
+
+    /// Runs one caller-composed Controller mutation while keeping the facade closed.
+    ///
+    /// Used by the local execution service so production advances stay inside
+    /// `LocalControl`. The closure must not persist state except through `Controller`.
+    ///
+    /// # Errors
+    /// Returns the Controller or composition error from the closure.
+    pub fn with_controller_mut<T, F>(&mut self, f: F) -> Result<T, ControllerError>
+    where
+        F: FnOnce(&mut Controller) -> Result<T, ControllerError>,
+    {
+        self.ensure_mutation_authority()?;
+        f(&mut self.controller)
+    }
+
     /// Delegates one exact approval response to the Controller. The caller supplies no action
     /// payload, executable, destination, policy, or dispatch authority.
     ///
@@ -253,6 +281,10 @@ struct DurableActiveRead {
     attempts: BTreeMap<String, super::AttemptRuntime>,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "status projection reads and validates one canonical active revision"
+)]
 fn durable_active_read(
     controller: &Controller,
 ) -> Result<Option<DurableActiveRead>, ControllerError> {

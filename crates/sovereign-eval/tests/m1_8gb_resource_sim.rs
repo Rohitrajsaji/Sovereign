@@ -979,8 +979,22 @@ fn controller_recovery_blocks_ambiguous_reserved_model_before_advancing_epoch() 
         epoch_before,
         "ambiguous pre-crash MODEL must block before execution-epoch advance"
     );
+    let active_raw = recovered_state
+        .get_state("controller.plan", "active")
+        .unwrap_or_else(|error| panic!("read blocked active plan: {error}"))
+        .unwrap_or_else(|| panic!("blocked active plan missing"));
+    let active: Value = serde_json::from_str(&active_raw)
+        .unwrap_or_else(|error| panic!("decode blocked active plan: {error}"));
+    let plan_id = active["plan_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("blocked plan id missing"));
+    let revision = active["revision"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("blocked plan revision missing"));
+    let residency_key = format!("{plan_id}@r{revision}:model");
+    let governor_key = format!("{plan_id}@r{revision}:active");
     let residency_raw = recovered_state
-        .get_state("controller.resource_residency", "model")
+        .get_state("controller.resource_residency", &residency_key)
         .unwrap_or_else(|error| panic!("read blocked MODEL residency: {error}"))
         .unwrap_or_else(|| panic!("blocked MODEL residency must remain durable"));
     let residency: sovereign_controller::ResourceResidencyV1 = serde_json::from_str(&residency_raw)
@@ -988,7 +1002,7 @@ fn controller_recovery_blocks_ambiguous_reserved_model_before_advancing_epoch() 
     assert_eq!(residency.state, ResourceResidencyStateV1::Unknown);
 
     let governor_raw = recovered_state
-        .get_state("controller.resource_governor", "active")
+        .get_state("controller.resource_governor", &governor_key)
         .unwrap_or_else(|error| panic!("read blocked governor snapshot: {error}"))
         .unwrap_or_else(|| panic!("blocked governor snapshot must remain durable"));
     let governor: M6ResourceGovernorSnapshotV1 = serde_json::from_str(&governor_raw)

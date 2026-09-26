@@ -8,10 +8,9 @@ mod catalog;
 
 pub use catalog::{
     CANONICAL_BROWSER_TOOL_ID, CANONICAL_PATCH_TOOL_ID, CANONICAL_PROCESS_TOOL_ID,
-    CANONICAL_READ_TOOL_ID,
-    CANONICAL_TOOL_VERSION, canonical_browser_tool_manifest, canonical_patch_tool_manifest,
-    canonical_patch_tool_schema, canonical_process_tool_manifest, canonical_read_tool_manifest,
-    canonical_read_tool_schema,
+    CANONICAL_READ_TOOL_ID, CANONICAL_TOOL_VERSION, canonical_browser_tool_manifest,
+    canonical_patch_tool_manifest, canonical_patch_tool_schema, canonical_process_tool_manifest,
+    canonical_read_tool_manifest, canonical_read_tool_schema,
 };
 
 use sha2::{Digest, Sha256};
