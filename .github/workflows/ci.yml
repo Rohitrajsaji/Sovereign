@@ -71,6 +71,14 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install 1.89.0 --profile minimal --component clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
+      # web_acquire's Scrapling tests read the vendored parser from research/tools/Scrapling, which
+      # is gitignored, and need its base-parser dependencies. Pin the version the tests assert.
+      - name: Provision vendored Scrapling parser
+        run: |
+          git clone --quiet --depth 1 --branch v0.4.15 https://github.com/D4Vinci/Scrapling research/tools/Scrapling
+          python3 -m venv "$RUNNER_TEMP/scrapling-venv"
+          "$RUNNER_TEMP/scrapling-venv/bin/pip" install --quiet lxml cssselect orjson tld w3lib typing_extensions
+          echo "SOVEREIGN_SCRAPLING_PYTHON=$RUNNER_TEMP/scrapling-venv/bin/python" >> "$GITHUB_ENV"
       - run: ./scripts/verify.sh
 
   e2e-macos:
