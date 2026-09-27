@@ -1055,6 +1055,17 @@ fn compiled_managed_loopback_fixture_with_launch(
     fixture
 }
 
+/// Tests that launch real Chrome sessions and managed app processes run one at a time. Their
+/// Controller grants expire 60s after the session starts, and several of them at once on a small
+/// CI runner stretched a single test past that window.
+static BROWSER_RUNTIME_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialize_browser_runtime_test() -> std::sync::MutexGuard<'static, ()> {
+    BROWSER_RUNTIME_TESTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn managed_loopback_compilation_binds_typed_browser_acceptance_without_symbol_heuristics() {
     let fixture = compiled_managed_loopback_fixture("typed-browser-acceptance", 41_739);
@@ -1898,6 +1909,7 @@ fn production_driver_requests_browser_execution_inputs_instead_of_external_hando
     reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
 )]
 fn production_driver_executes_typed_browser_task_without_external_handoff() {
+    let _serial = serialize_browser_runtime_test();
     let node_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|directory| directory.join("node"))
         .find(|path| path.is_file())
@@ -8695,6 +8707,7 @@ fn committed_v4_repository_update_recovers_through_recovery_manager_to_success()
 #[test]
 #[allow(clippy::too_many_lines)]
 fn managed_loopback_start_rejects_scope_escape_symlink_and_stale_baseline_before_dispatch() {
+    let _serial = serialize_browser_runtime_test();
     let listener = TcpListener::bind("127.0.0.1:0")
         .unwrap_or_else(|error| panic!("reserve managed loopback port: {error}"));
     let port = listener
@@ -8927,6 +8940,7 @@ fn managed_loopback_start_rejects_scope_escape_symlink_and_stale_baseline_before
     reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
 )]
 fn managed_node_launch_uses_controller_pin_dynamic_port_persistence_and_reaps_group() {
+    let _serial = serialize_browser_runtime_test();
     let node_path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
         .map(|directory| directory.join("node"))
         .find(|path| path.is_file())
@@ -9063,6 +9077,7 @@ fn managed_node_launch_uses_controller_pin_dynamic_port_persistence_and_reaps_gr
     reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
 )]
 fn managed_node_postgres_broker_launches_two_generations_and_closes_each_endpoint() {
+    let _serial = serialize_browser_runtime_test();
     let Ok(database_oid) = std::env::var("SOVEREIGN_TEST_LIVE_POSTGRES_OID") else {
         return;
     };
@@ -9266,6 +9281,7 @@ fn managed_node_postgres_broker_launches_two_generations_and_closes_each_endpoin
     reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
 )]
 fn managed_postgres_abrupt_handle_loss_recovery_reaps_generation_without_replay() {
+    let _serial = serialize_browser_runtime_test();
     let Ok(database_oid) = std::env::var("SOVEREIGN_TEST_LIVE_POSTGRES_OID") else {
         return;
     };
