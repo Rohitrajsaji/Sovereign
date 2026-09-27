@@ -51,7 +51,7 @@ Around each step, for a registered project (`actor.rs`, `landing_service.rs`):
   - A file moves into place only after its SHA-256 matches the pin. A marker file stops the 2.5 GB model being re-hashed.
   - Finished paths and the model name are saved in Settings.
 - `POST /v2/setup/model/cancel` pauses the download.
-- The catalog lists every pinned model with `min_memory_mib`, `recommended_memory_mib`, `starting_estimate_mib`, and a `summary`. The default is the largest model whose recommended memory the Mac has, else the smallest that runs.
+- The catalog lists every pinned model with `min_memory_mib`, `recommended_memory_mib`, `starting_estimate_mib`, and a `summary`. The default is the largest model whose recommended memory the Mac has, else the smallest that runs. Pinned today: Qwen3 1.7B Q8_0 (recommended at 8 GB, starting estimate 3072 MiB) and Qwen3 4B Q4_K_M (recommended at 16 GB, 3600 MiB), both at fixed Hugging Face revisions.
 - `GET /v2/setup` includes `models`, one card each: installed, selected, queued, fits, recommended.
   - `POST /v2/setup/model/download {model_id?}` fetches a specific model. Only setup's own download (no `model_id`) also selects it.
   - `POST /v2/models/select {model_id, when}` switches `now` or `after_current`. A queued choice (`queued_model_id` in Settings) is applied by the runner when the next request starts compiling, so a plan never changes models halfway.
