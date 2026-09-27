@@ -32,6 +32,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(400);
 const CURL: &str = "/usr/bin/curl";
 const TAR: &str = "/usr/bin/tar";
 const VERIFIED_SUFFIX: &str = ".verified.json";
+const CODESIGN: &str = "/usr/bin/codesign";
+/// The Apple Team ID a release build is signed with, set by `release.yml`. Unset in
+/// development builds, which accept a bundled runner only by its upstream checksum.
+const RELEASE_TEAM_ID: Option<&str> = option_env!("SOVEREIGN_TEAM_ID");
 
 /// The pinned llama.cpp server build.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -685,7 +689,42 @@ fn bundled_runtime(runtime: &RuntimeEntryV2) -> Option<PathBuf> {
         .join("libexec")
         .join("llama")
         .join(&runtime.executable_name);
-    verify_pinned(&candidate, &runtime.executable_sha256, false).then_some(candidate)
+    let accepted = verify_pinned(&candidate, &runtime.executable_sha256, false)
+        || RELEASE_TEAM_ID.is_some_and(|team| signed_by_team(CODESIGN, &candidate, team));
+    accepted.then_some(candidate)
+}
+
+/// An Apple Team ID: ten uppercase letters or digits.
+fn valid_team_id(team: &str) -> bool {
+    team.len() == 10
+        && team
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+/// Whether `path` carries a valid Developer ID signature from `team`.
+///
+/// Notarizing a release re-signs the bundled runner with Sovereign's own Developer ID, which
+/// changes its checksum, so the release accepts it by signature instead. Downloaded runners are
+/// still checked against the upstream checksum.
+fn signed_by_team(codesign: &str, path: &Path, team: &str) -> bool {
+    if !valid_team_id(team) || !path.is_file() {
+        return false;
+    }
+    let requirement = format!(
+        "=anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists \
+         and certificate leaf[field.1.2.840.113635.100.6.1.13] exists \
+         and certificate leaf[subject.OU] = \"{team}\""
+    );
+    Command::new(codesign)
+        .args(["--verify", "--strict", "-R"])
+        .arg(requirement)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// The runtime to use: the configured one if it matches the pin, else a bundled or earlier
@@ -1146,6 +1185,73 @@ mod tests {
 
     fn file_url(path: &Path) -> String {
         format!("file://{}", path.display())
+    }
+
+    /// A stand-in for `codesign` that records its arguments and exits with `code`.
+    fn fake_codesign(dir: &Path, code: i32) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("codesign");
+        let log = dir.join("codesign.log");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nfor arg in \"$@\"; do printf '%s\\n' \"$arg\"; done >\"{}\"\nexit {code}\n",
+                log.display()
+            ),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|error| panic!("{error}"));
+        (script, log)
+    }
+
+    #[test]
+    fn team_ids_are_ten_uppercase_letters_or_digits() {
+        assert!(valid_team_id("ABCDE12345"));
+        assert!(!valid_team_id(""));
+        assert!(!valid_team_id("abcde12345"));
+        assert!(!valid_team_id("ABCDE1234"));
+        assert!(!valid_team_id("ABCDE\"1234"));
+    }
+
+    #[test]
+    fn bundled_runner_signature_must_name_the_release_team() {
+        let dir = temp_dir("codesign");
+        let runner = dir.join("llama-server");
+        fs::write(&runner, b"re-signed runner").unwrap_or_else(|error| panic!("{error}"));
+
+        let (accepting, log) = fake_codesign(&dir, 0);
+        let codesign = accepting.to_string_lossy().into_owned();
+        assert!(signed_by_team(&codesign, &runner, "ABCDE12345"));
+        let args = fs::read_to_string(&log).unwrap_or_else(|error| panic!("{error}"));
+        let args: Vec<&str> = args.lines().collect();
+        assert_eq!(&args[..3], ["--verify", "--strict", "-R"]);
+        assert!(args[3].starts_with("=anchor apple generic "));
+        assert!(args[3].ends_with("certificate leaf[subject.OU] = \"ABCDE12345\""));
+        assert_eq!(args[4], runner.to_string_lossy());
+
+        // A malformed Team ID or a missing file never reaches codesign.
+        fs::remove_file(&log).unwrap_or_else(|error| panic!("{error}"));
+        assert!(!signed_by_team(&codesign, &runner, "abc"));
+        assert!(!signed_by_team(
+            &codesign,
+            &dir.join("missing"),
+            "ABCDE12345"
+        ));
+        assert!(!log.exists());
+
+        let (rejecting, _) = fake_codesign(&dir, 1);
+        assert!(!signed_by_team(
+            &rejecting.to_string_lossy(),
+            &runner,
+            "ABCDE12345"
+        ));
+        assert!(!signed_by_team(
+            "/nonexistent/codesign",
+            &runner,
+            "ABCDE12345"
+        ));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

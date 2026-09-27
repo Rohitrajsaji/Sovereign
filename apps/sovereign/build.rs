@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=ui-dist");
+    println!("cargo:rerun-if-env-changed=SOVEREIGN_TEAM_ID");
     build_commit();
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap_or_else(|_| "target".to_owned()));

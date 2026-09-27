@@ -1,6 +1,6 @@
 # Code signing, notarization, and the first tagged release
 
-Status: plan, 2026-09-27. Nothing here is implemented yet.
+Status: plan, 2026-09-27. Work items 2 and 4 are implemented: `-rc` tags publish as prereleases, and a release build accepts a bundled runner signed with its Team ID.
 
 ## Where things stand
 
@@ -18,11 +18,11 @@ Status: plan, 2026-09-27. Nothing here is implemented yet.
 
 `apps/sovereign/src/model_setup.rs:680` (`bundled_runtime`) accepts `libexec/llama/llama-server` only if its SHA-256 equals `runtime.executable_sha256` in `apps/sovereign/assets/model-manifest-v2.json` (the upstream `d0878274…`). Notarization requires every Mach-O in the submission to be signed with our Developer ID, the hardened runtime, and a secure timestamp. Re-signing `llama-server` rewrites its signature, so its hash changes and `bundled_runtime` silently rejects the bundled copy. Sovereign then falls back to downloading the unsigned upstream runner.
 
-Recommendation: keep the upstream hash pin for downloaded runners, and accept the bundled runner by code signature instead.
+Implemented: the upstream hash pin stays for downloaded runners, and the bundled runner is also accepted by code signature.
 
-1. Add a `SOVEREIGN_TEAM_ID` compile-time constant (from `option_env!`, set by the release workflow; absent in dev builds).
-2. In `bundled_runtime`, when the constant is set, run `/usr/bin/codesign --verify --strict -R '=anchor apple generic and certificate leaf[subject.OU] = "<TEAM_ID>"'` on the bundled runner and accept it on success. Otherwise fall back to today's hash check, so dev builds and tests behave as now.
-3. Unit-test both branches with a fake `codesign` runner, the same way `launch_agent.rs` fakes `launchctl`.
+1. `RELEASE_TEAM_ID` in `model_setup.rs` comes from `option_env!("SOVEREIGN_TEAM_ID")`. `release.yml` sets it from the `SOVEREIGN_TEAM_ID` repository variable. It is absent in dev builds.
+2. `bundled_runtime` accepts the runner if its hash matches the pin, or if `/usr/bin/codesign --verify --strict` passes a Developer ID requirement naming that Team ID (`signed_by_team`). A malformed Team ID never reaches `codesign`.
+3. Unit tests drive `signed_by_team` with a fake `codesign` script.
 
 The alternative is to sign the runner before `cargo build` and bake the signed hash into the binary through `build.rs`. It keeps a pure hash check but makes the build order fragile, and a timestamped re-sign changes the hash again.
 
@@ -64,25 +64,25 @@ Secrets never enter the repository, logs, or project memory.
 - While below 1.0, a minor bump (`0.2.0`) is any release that changes a persisted format (`StateStore` schema, `settings-v1.json`, `projects-v1.json`) or a public CLI or API contract. Patch releases change neither.
 - Tags are annotated (`git tag -a`) and cut from `main` only, after `./scripts/verify.sh` and `scripts/verify-ui.sh`.
 - Release notes come from `--generate-notes`, plus a hand-written summary that names schema changes.
-- Pre-releases use `vX.Y.Z-rc.N` and are marked prerelease on GitHub. `releases/latest` skips them, so `install.sh` and `sovereign update` never pick them up. Today the workflow's tag check accepts `-rc.1`, but `gh release create` does not pass `--prerelease`, so that flag must be added for tags containing `-`.
-- Add a `release` job gate: the workflow should require CI to be green on the tagged commit before publishing.
+- Pre-releases use `vX.Y.Z-rc.N` and are published as prereleases (`release.yml` passes `--prerelease` for any tag containing `-`). `releases/latest` skips them, so `install.sh` and `sovereign update` never pick them up. The tag must still equal the Cargo version, so an rc tag needs `version = "X.Y.Z-rc.N"` in `Cargo.toml` first.
+- Later, add a gate that requires CI to be green on the tagged commit. It would block every release today, because `verify.sh (macOS arm64)` is red on `main` from the live-Chrome test.
 
 ## The first release: v0.1.0
 
 The first tag should be unsigned, to prove the pipeline end to end. It does not need the Apple credentials.
 
 1. Merge the open readiness work, and check that `main` is green in CI.
-2. On a Mac, run `./scripts/verify.sh` and `scripts/verify-ui.sh`. The live-Chrome case `real_chrome_contains_page_js_writes_and_worker_network_before_execution` is a known failure that also fails on `main` (see `docs/wiki/15-testing-and-evals.md`). Decide whether it blocks a release. I recommend it does not block v0.1.0 but is listed in the notes.
-3. Tag `v0.1.0-rc.1` first (after the `--prerelease` fix above), and run `install.sh` against it with `SOVEREIGN_RELEASE_BASE_URL=https://github.com/Rohitrajsaji/Sovereign/releases/download/v0.1.0-rc.1` on a clean macOS user account. Check onboarding, the model download, one goal, `sovereign update`, and `sovereign uninstall`.
-4. Tag `v0.1.0` from the same commit. `install.sh` from `main` now works for anyone.
+2. On a Mac, run `./scripts/verify.sh` and `scripts/verify-ui.sh`. The live-Chrome case `real_chrome_contains_page_js_writes_and_worker_network_before_execution` is a known failure that also fails on `main` (see `docs/wiki/15-testing-and-evals.md`). Decide whether it blocks a release. Decided 2026-09-27: it does not block v0.1.0, and the release notes must list it.
+3. Set the workspace version to `0.1.0-rc.1`, tag `v0.1.0-rc.1`, and run `install.sh` against it with `SOVEREIGN_RELEASE_BASE_URL=https://github.com/Rohitrajsaji/Sovereign/releases/download/v0.1.0-rc.1` on a clean macOS user account. Check onboarding, the model download, one goal, `sovereign update`, and `sovereign uninstall`.
+4. Set the version back to `0.1.0` and tag `v0.1.0`. `install.sh` from `main` now works for anyone.
 5. Signed builds start at v0.1.1 or v0.2.0, once the credentials exist and the runner check above has landed. Test that release by downloading the tarball in Safari (so it is quarantined), unpacking it, and running `bin/sovereign --version` with no Gatekeeper prompt.
 
 ## Work items, in order
 
 1. Distribution amendment under `output/`, replacing the "out of scope" line (the frozen contract needs it before signing lands).
-2. `--prerelease` for `-` tags and a CI-green gate in `release.yml`. No credentials needed.
+2. Done: `--prerelease` for `-` tags in `release.yml`. The CI-green gate waits until `main` is green.
 3. First unsigned `v0.1.0-rc.1`, then `v0.1.0`. No credentials needed.
-4. Bundled runner accepted by code signature (`model_setup.rs`), with tests. No credentials needed.
+4. Done: bundled runner accepted by code signature (`model_setup.rs`), with tests.
 5. Optional signing and notarization in `package-release.sh` and `release.yml`, skipped when the secrets are absent. No credentials needed to write it; testing it needs item 6.
 6. Rohit: Apple Developer membership, certificate, API key, and the `release` environment secrets.
 7. First signed and notarized release, verified with a browser download on a clean Mac.
