@@ -43,9 +43,9 @@ impl From<io::Error> for RunLockError {
 /// Process-lifetime coordination for one canonical state database.
 ///
 /// The sidecar file deliberately contains no owner/status data and is never durable Controller
-/// truth. Only the kernel file lock held by `_file` has meaning; the sidecar remains after release.
+/// truth. Only the kernel file lock held by `file` has meaning; the sidecar remains after release.
 pub(crate) struct RunLock {
-    _file: File,
+    file: File,
     #[cfg(test)]
     path: PathBuf,
 }
@@ -68,7 +68,7 @@ impl RunLock {
         }
         match file.try_lock() {
             Ok(()) => Ok(Self {
-                _file: file,
+                file,
                 #[cfg(test)]
                 path,
             }),
@@ -80,6 +80,15 @@ impl RunLock {
     #[cfg(test)]
     fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl Drop for RunLock {
+    /// Unlocks explicitly rather than relying on close. The lock belongs to the open file
+    /// description, which a child forked by another thread shares until it execs, so a close alone
+    /// can leave the lock held after release.
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 
@@ -197,21 +206,8 @@ mod tests {
             sidecar.is_file(),
             "run-lock sidecar should remain after release"
         );
-        // Other tests in this binary spawn children with `pre_exec`, which forks. A child forked
-        // while `first` was open shares its lock until the child execs and CLOEXEC closes it, so
-        // a brief contention here is that child, not a lock that survived release.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        let reacquired = loop {
-            match RunLock::acquire(&state_path) {
-                Err(RunLockError::Contended(_)) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                result => {
-                    break result
-                        .unwrap_or_else(|error| panic!("reacquire released run lock: {error}"));
-                }
-            }
-        };
+        let reacquired = RunLock::acquire(&state_path)
+            .unwrap_or_else(|error| panic!("reacquire released run lock: {error}"));
         assert_eq!(reacquired.path(), sidecar);
     }
 
