@@ -3482,7 +3482,16 @@ fn browser_process_spec(
     BrowserProcessSpec {
         executable: PathBuf::from("/bin/sh"),
         args,
-        environment: BTreeMap::from([("TMPDIR".to_owned(), profile_root.display().to_string())]),
+        // Chrome on macOS resolves its default data and Crashpad directories under the
+        // CoreFoundation home even with --user-data-dir, and aborts at startup when it cannot
+        // create them. Pin that home inside the profile root the sandbox lets it write.
+        environment: BTreeMap::from([
+            (
+                "CFFIXED_USER_HOME".to_owned(),
+                profile_root.display().to_string(),
+            ),
+            ("TMPDIR".to_owned(), profile_root.display().to_string()),
+        ]),
         working_directory: private_parent.to_path_buf(),
     }
 }

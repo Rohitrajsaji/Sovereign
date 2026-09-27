@@ -511,6 +511,10 @@ fn prepared_launch_preserves_exact_caller_flags_and_cleans_when_unused() {
     assert_eq!(prepared.process_spec().executable, Path::new("/bin/sh"));
     assert!(!prepared.process_spec().environment.contains_key("HOME"));
     assert_eq!(
+        prepared.process_spec().environment.get("CFFIXED_USER_HOME"),
+        Some(&prepared.profile_root().display().to_string())
+    );
+    assert_eq!(
         prepared.process_spec().environment.get("TMPDIR"),
         Some(&prepared.profile_root().display().to_string())
     );
