@@ -1,0 +1,18 @@
+# TEMPORARY: list every failing workspace test on macOS in one run. Removed before review.
+name: workspace-diag
+on:
+  push:
+    branches: [claude/project-thread-rlije3]
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Workspace tests without fail-fast
+        run: cargo test --workspace --no-fail-fast 2>&1 | grep -E "^test .*FAILED|panicked at|^---- |Running |test result" | grep -v "test result: ok" || true
