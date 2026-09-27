@@ -197,8 +197,21 @@ mod tests {
             sidecar.is_file(),
             "run-lock sidecar should remain after release"
         );
-        let reacquired = RunLock::acquire(&state_path)
-            .unwrap_or_else(|error| panic!("reacquire released run lock: {error}"));
+        // Other tests in this binary spawn children with `pre_exec`, which forks. A child forked
+        // while `first` was open shares its lock until the child execs and CLOEXEC closes it, so
+        // a brief contention here is that child, not a lock that survived release.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reacquired = loop {
+            match RunLock::acquire(&state_path) {
+                Err(RunLockError::Contended(_)) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                result => {
+                    break result
+                        .unwrap_or_else(|error| panic!("reacquire released run lock: {error}"));
+                }
+            }
+        };
         assert_eq!(reacquired.path(), sidecar);
     }
 
