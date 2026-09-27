@@ -1164,15 +1164,18 @@ impl MacBrowserSandboxExecBackend {
         let outside_write = file_write_probe_status(&self.sandbox_exec, &profile, &outside)?;
         drop((allowed_listener, denied_listener));
         let cleanup = fs::remove_dir_all(&root);
-        if !allowed.success()
-            || denied.success()
+        if !allowed.status.success()
+            || denied.status.success()
             || !inside_write.success()
             || outside_write.success()
         {
             return Err(BrowserPolicyError::IsolationUnavailable(format!(
                 "browser Seatbelt self-test did not enforce exact loopback-port/file-write boundary \
-                 (allowed port connect: {allowed}; denied port connect: {denied}; \
-                 profile write: {inside_write}; outside write: {outside_write})"
+                 (allowed port connect: {} {:?}; denied port connect: {}; \
+                 profile write: {inside_write}; outside write: {outside_write})",
+                allowed.status,
+                probe_error_tail(&allowed.stderr),
+                denied.status
             )));
         }
         cleanup?;
@@ -1376,12 +1379,24 @@ fn temporary_self_test_root() -> Result<PathBuf, BrowserPolicyError> {
     Ok(root.canonicalize()?)
 }
 
+/// Last line of a probe's stderr, bounded, so a failed self-test names the probe's own error.
+#[cfg(target_os = "macos")]
+fn probe_error_tail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let last = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    last.chars().take(240).collect()
+}
+
 #[cfg(target_os = "macos")]
 fn network_probe_status(
     sandbox_exec: &Path,
     profile: &str,
     port: u16,
-) -> Result<std::process::ExitStatus, BrowserPolicyError> {
+) -> Result<std::process::Output, BrowserPolicyError> {
     let probe = format!(
         "import socket; s=socket.socket(socket.AF_INET,socket.SOCK_STREAM); s.settimeout(0.5); s.connect(('127.0.0.1',{port}))"
     );
@@ -1389,9 +1404,8 @@ fn network_probe_status(
         .args(["-p", profile, "/usr/bin/python3", "-c", &probe])
         .env_clear()
         .env("PYTHONDONTWRITEBYTECODE", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?)
+        .stdin(Stdio::null())
+        .output()?)
 }
 
 #[cfg(target_os = "macos")]
