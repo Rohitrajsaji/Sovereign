@@ -36,6 +36,9 @@ jobs:
           case "$tag" in *[!A-Za-z0-9._-]*) echo "the tag has characters a version never has" >&2; exit 1 ;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          # v1.2.3-rc.1 and the like are prereleases, which releases/latest (and so install.sh
+          # and `sovereign update`) skips.
+          case "$tag" in *-*) echo "prerelease=true" >> "$GITHUB_OUTPUT" ;; *) echo "prerelease=false" >> "$GITHUB_OUTPUT" ;; esac
       - uses: actions/checkout@v4
         with:
           ref: ${{ steps.tag.outputs.tag }}
@@ -52,6 +55,10 @@ jobs:
           npm --prefix apps/sovereign/ui run build
           git diff --exit-code -- apps/sovereign/ui-dist
       - name: Build sovereign
+        env:
+          # Lets the release accept its re-signed runner by signature (model_setup.rs). Empty
+          # until the Apple Developer account exists, which keeps the checksum-only check.
+          SOVEREIGN_TEAM_ID: ${{ vars.SOVEREIGN_TEAM_ID }}
         run: cargo build --release --locked -p sovereign --bin sovereign
       - name: Check the version matches the tag
         run: |
@@ -76,6 +83,8 @@ jobs:
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/sovereign-macos-arm64.tar.gz dist/SHA256SUMS --clobber
           else
+            prerelease=""
+            if [ "${{ steps.tag.outputs.prerelease }}" = "true" ]; then prerelease="--prerelease"; fi
             gh release create "$tag" dist/sovereign-macos-arm64.tar.gz dist/SHA256SUMS \
-              --title "Sovereign ${{ steps.tag.outputs.version }}" --generate-notes
+              --title "Sovereign ${{ steps.tag.outputs.version }}" --generate-notes $prerelease
           fi
