@@ -51,7 +51,8 @@ const MAX_SOURCE_CANDIDATE_BYTES: usize = 16 * 1024;
 const MAX_SOURCE_CANDIDATE_TOTAL_BYTES: usize = 48 * 1024;
 /// Most bytes of project files shown to the model when a project has no explicit configuration.
 /// Sized so the chosen files fit the compile packet's direct-evidence budget whole.
-const AUTOMATIC_SOURCE_TOTAL_BYTES: u64 = 12 * 1024;
+/// How much of the project the planner reads. A file larger than this is never read whole.
+pub(crate) const AUTOMATIC_SOURCE_TOTAL_BYTES: u64 = 12 * 1024;
 const PROJECT_CONFIGURATION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

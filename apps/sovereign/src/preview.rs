@@ -89,8 +89,15 @@ pub fn resolve_project_path(root: &Path, relative: &str) -> Result<PathBuf, &'st
     }
     let canonical_root = root.canonicalize().map_err(|_| "missing")?;
     let canonical = path.canonicalize().map_err(|_| "missing")?;
-    if !canonical.starts_with(&canonical_root) {
+    let Ok(inside) = canonical.strip_prefix(&canonical_root) else {
         return Err("outside");
+    };
+    // A shortcut inside the project may point at a hidden file, such as `notes -> .git`.
+    if inside
+        .components()
+        .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
+    {
+        return Err("hidden");
     }
     let metadata = fs::metadata(&canonical).map_err(|_| "missing")?;
     if !metadata.is_file() {
@@ -318,6 +325,8 @@ pub struct ProjectFileV1 {
 pub struct ProjectFilesV1 {
     pub files: Vec<ProjectFileV1>,
     pub truncated: bool,
+    /// Files larger than this are too big for the planner to read.
+    pub model_limit_bytes: u64,
 }
 
 /// The project's visible files (tracked, or new and not ignored), without hidden paths.
@@ -344,7 +353,11 @@ pub fn list_project_files(root: &Path) -> Result<ProjectFilesV1, String> {
         .collect::<Vec<_>>();
     let truncated = files.len() > MAX_LISTED_FILES;
     files.truncate(MAX_LISTED_FILES);
-    Ok(ProjectFilesV1 { files, truncated })
+    Ok(ProjectFilesV1 {
+        files,
+        truncated,
+        model_limit_bytes: crate::runner::AUTOMATIC_SOURCE_TOTAL_BYTES,
+    })
 }
 
 /// One file's text, for the viewer. Binary files report no text.
@@ -437,6 +450,17 @@ mod tests {
         std::os::unix::fs::symlink("/etc/hosts", root.join("escape"))
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(resolve_project_path(&root, "escape"), Err("outside"));
+        // Shortcuts to hidden files inside the project are refused too.
+        fs::create_dir_all(root.join(".git")).unwrap_or_else(|error| panic!("{error}"));
+        fs::write(root.join(".git").join("config"), "secret")
+            .unwrap_or_else(|error| panic!("{error}"));
+        fs::write(root.join(".env"), "TOKEN=1").unwrap_or_else(|error| panic!("{error}"));
+        std::os::unix::fs::symlink(".git", root.join("notes"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        std::os::unix::fs::symlink(".env", root.join("env.txt"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(resolve_project_path(&root, "notes/config"), Err("hidden"));
+        assert_eq!(resolve_project_path(&root, "env.txt"), Err("hidden"));
         let _ = fs::remove_dir_all(root);
     }
 

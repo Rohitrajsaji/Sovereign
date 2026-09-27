@@ -62,6 +62,8 @@ pub struct ServiceShared {
     /// The request waiting for memory and by how much, and the memory the person lent it with
     /// "Start anyway". Neither is durable: a restart measures again.
     memory: Mutex<MemoryFacts>,
+    /// Why the last chosen project could not be opened, until one opens.
+    project_problem: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Default)]
@@ -101,7 +103,17 @@ impl ServiceShared {
             project_root: Arc::new(RwLock::new(None)),
             preview: std::sync::OnceLock::new(),
             memory: Mutex::new(MemoryFacts::default()),
+            project_problem: Mutex::new(None),
         })
+    }
+
+    #[must_use]
+    pub fn project_problem(&self) -> Option<String> {
+        lock(&self.project_problem).clone()
+    }
+
+    pub fn set_project_problem(&self, problem: Option<String>) {
+        *lock(&self.project_problem) = problem;
     }
 
     /// The request waiting for memory, and how short it is.
@@ -121,6 +133,12 @@ impl ServiceShared {
         {
             memory.allowance = None;
         }
+    }
+
+    /// Forgets a memory wait once nothing is waiting for memory, so a later request never shows
+    /// an earlier one's figures. Memory already lent to a request is kept.
+    pub fn clear_memory_wait(&self) {
+        lock(&self.memory).wait = None;
     }
 
     /// "Start anyway": lends the waiting request the memory it is short by, when that is at
@@ -389,6 +407,9 @@ mod tests {
         assert_eq!(shared.grant_memory_allowance("goal-1"), Ok(308 + 128));
         assert_eq!(shared.memory_allowance_for("goal-1"), 436);
         assert_eq!(shared.memory_allowance_for("goal-2"), 0);
+        shared.clear_memory_wait();
+        assert_eq!(shared.memory_wait(), None);
+        assert_eq!(shared.memory_allowance_for("goal-1"), 436);
         // Admitted: the wait clears but the allowance stays with its request.
         shared.publish_memory_wait("goal-1", None);
         assert_eq!(shared.memory_allowance_for("goal-1"), 436);

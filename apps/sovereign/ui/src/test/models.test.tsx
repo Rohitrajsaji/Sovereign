@@ -107,6 +107,63 @@ describe("model switcher", () => {
     );
   });
 
+  it("stops the running request before switching, then asks for it again", async () => {
+    const calls = mockApi({
+      "GET /v2/setup": setup([option({}), { ...small, installed: true }]),
+      "GET /v2/goals": [goal({ natural_language_goal: "A budget page" })],
+      "POST /v2/goals/goal-1/cancel": { accepted: true, applied: false, ticket: 4, message: "Stopping." },
+      "POST /v2/models/select": { model_id: "qwen3-1.7b", applies: "now" },
+      "POST /v2/goals": { accepted: true, applied: false, ticket: 5, message: "Got it." },
+    });
+    renderWithProviders(<ModelSwitcher />);
+    await userEvent.click(await screen.findByRole("button", { name: "Use this model" }));
+    await userEvent.click(screen.getByRole("button", { name: "Stop it and start again" }));
+    await waitFor(() => expect(calls.some((call) => call.path === "/v2/goals" && call.method === "POST")).toBe(true));
+    const order = calls
+      .filter((call) => call.method === "POST")
+      .map((call) => call.path);
+    expect(order).toEqual(["/v2/goals/goal-1/cancel", "/v2/models/select", "/v2/goals"]);
+    expect(calls.find((call) => call.path === "/v2/goals" && call.method === "POST")?.body).toEqual({
+      goal: "A budget page",
+    });
+  });
+
+  it("allows one download at a time and explains a failed one", async () => {
+    const downloading = setup([option({}), small, option({ id: "other", display_name: "Other", selected: false, installed: false })]);
+    downloading.download = {
+      phase: "downloading_model",
+      bytes_done: 500_000_000,
+      bytes_total: 1_800_000_000,
+      percent: 28,
+      detail: "",
+      model_id: "qwen3-1.7b",
+    };
+    const routes: Record<string, unknown> = { "GET /v2/setup": downloading, "GET /v2/goals": [] };
+    mockApi(routes);
+    const { unmount } = renderWithProviders(<ModelSwitcher />);
+    expect(await screen.findByRole("progressbar", { name: "Downloading Qwen3 1.7B" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Pause" })).toBeInTheDocument();
+    const other = screen
+      .getAllByRole("button", { name: "Download and use" })
+      .find((button) => button.getAttribute("title") === "Another model is downloading");
+    expect(other).toBeDisabled();
+    unmount();
+
+    const failed = setup([option({}), small]);
+    failed.download = {
+      phase: "failed",
+      bytes_done: 0,
+      bytes_total: 0,
+      percent: 0,
+      detail: "Sovereign couldn't finish the download. Check your internet connection and try again.",
+      model_id: "qwen3-1.7b",
+    };
+    routes["GET /v2/setup"] = failed;
+    renderWithProviders(<ModelSwitcher />);
+    expect(await screen.findByText(/couldn't finish the download/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download and use" })).toBeEnabled();
+  });
+
   it("removes a downloaded model that is not in use", async () => {
     const calls = mockApi({
       "GET /v2/setup": setup([option({}), { ...small, installed: true }]),

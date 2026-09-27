@@ -9,6 +9,7 @@ import type {
   DeveloperToolsInstallResponse,
   DoctorResponse,
   DownloadResponse,
+  FolderSummary,
   GoalActivityResponse,
   GoalIntent,
   GoalView,
@@ -275,6 +276,17 @@ export function useCreateProject() {
     mutationFn: (name: string) =>
       api<ProjectOpenResponse>("/v2/projects/create", { method: "POST", body: JSON.stringify({ name }) }),
     onSuccess: changed,
+  });
+}
+
+/** What adopting a folder would mean, before anything is saved. No root opens the folder picker. */
+export function useInspectFolder() {
+  return useMutation({
+    mutationFn: (root?: string) =>
+      api<FolderSummary>("/v2/projects/inspect", {
+        method: "POST",
+        body: JSON.stringify(root ? { root } : {}),
+      }),
   });
 }
 

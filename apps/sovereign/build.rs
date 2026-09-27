@@ -129,12 +129,16 @@ fn mime_for_path(path: &Path) -> &'static str {
 
 /// Records the commit this binary is built from, so the app can tell builds apart.
 fn build_commit() {
-    for path in [
-        "../../.git/HEAD",
-        "../../.git/refs/heads",
-        "../../.git/packed-refs",
-    ] {
-        println!("cargo:rerun-if-changed={path}");
+    // Only existing files: Cargo reruns the script on every build for a path that is missing.
+    let git = Path::new("../../.git");
+    let mut watched = vec![git.join("HEAD"), git.join("packed-refs")];
+    if let Ok(head) = fs::read_to_string(git.join("HEAD"))
+        && let Some(reference) = head.trim().strip_prefix("ref: ")
+    {
+        watched.push(git.join(reference));
+    }
+    for path in watched.iter().filter(|path| path.is_file()) {
+        println!("cargo:rerun-if-changed={}", path.display());
     }
     let commit = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])

@@ -116,6 +116,12 @@
           "items": {
             "$ref": "#/definitions/PendingCommand"
           }
+        },
+        "project_problem": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -696,7 +702,8 @@
             "blocked_by_local_changes",
             "conflict",
             "undone",
-            "failed"
+            "failed",
+            "undo_queued"
           ]
         },
         "commit": {
@@ -997,6 +1004,12 @@
         },
         "detail": {
           "type": "string"
+        },
+        "model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
@@ -1122,7 +1135,8 @@
       "type": "object",
       "required": [
         "files",
-        "truncated"
+        "truncated",
+        "model_limit_bytes"
       ],
       "properties": {
         "files": {
@@ -1133,6 +1147,9 @@
         },
         "truncated": {
           "type": "boolean"
+        },
+        "model_limit_bytes": {
+          "type": "integer"
         }
       },
       "additionalProperties": false
@@ -1277,6 +1294,66 @@
         },
         "lent_mib": {
           "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FolderSummary": {
+      "type": "object",
+      "required": [
+        "cancelled",
+        "root",
+        "name",
+        "has_history",
+        "parent_project",
+        "file_count",
+        "total_bytes",
+        "more_than",
+        "large",
+        "private_files"
+      ],
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        },
+        "root": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "has_history": {
+          "type": "boolean"
+        },
+        "parent_project": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_count": {
+          "type": "integer"
+        },
+        "total_bytes": {
+          "type": "integer"
+        },
+        "more_than": {
+          "type": "boolean"
+        },
+        "large": {
+          "type": "boolean"
+        },
+        "private_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false

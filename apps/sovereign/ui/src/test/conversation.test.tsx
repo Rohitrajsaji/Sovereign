@@ -112,6 +112,35 @@ describe("reply cards", () => {
     await waitFor(() => expect(calls.map((call) => call.path)).toEqual(["/v2/goals/goal-1/undo"]));
   });
 
+  it("shows an Undo waiting for the current request, without offering Undo again", () => {
+    turn({
+      goal: goal({
+        phase: "done",
+        progress: {
+          phase: "done",
+          headline: "Done",
+          sentence: "Undo will happen as soon as the current request finishes.",
+          steps_done: 0,
+          steps_total: 0,
+          percent: 100,
+          terminal: true,
+        },
+        landing: {
+          goal_id: "goal-1",
+          status: "undo_queued",
+          commit: "abc",
+          undo_commit: null,
+          changed_paths: ["index.html"],
+          detail: "Undo will happen as soon as the current request finishes.",
+          technical_detail: null,
+          updated_at_ms: 2,
+        },
+      }),
+    });
+    expect(screen.getByText("Undo will happen as soon as the current request finishes.")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+
   it("offers Apply when a result could not be applied, with the reason", async () => {
     const calls = mockApi({ "POST /v2/goals/goal-1/apply": { accepted: true, applied: false, ticket: 9, message: "Soon." } });
     turn({

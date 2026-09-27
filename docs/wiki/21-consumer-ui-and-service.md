@@ -26,15 +26,17 @@ Around each step, for a registered project (`actor.rs`, `landing_service.rs`):
 - **Before planning, in a managed project,** the person's own edits are saved as a "Your edits" commit, so the plan builds on them. This only happens while no plan is active, because task worktrees are pinned to HEAD.
 - **After a plan is finalized,** each completed goal without a landing record is landed. `sovereign_repo::land_change_sets` replays its verified change sets in a temporary worktree and fast-forwards the folder. It never overwrites unsaved edits: a blocked or conflicting result is kept under `refs/sovereign/results/<goal>` for Apply.
 - **Records** live in `landings-v1.json` beside the project state. Goals that completed before the file existed are marked `predates_landing` and never applied by surprise.
-- **Compiles** for projects without `SOVEREIGN_PROJECT_CONFIG` see up to 12 KiB of the project's own text files, chosen by `runner::automatic_source_candidates`.
+- **Compiles** for projects without `SOVEREIGN_PROJECT_CONFIG` see up to 12 KiB of the project's own text files, chosen by `runner::automatic_source_candidates`. A single file larger than that is never read. `GET /v2/files` reports `model_limit_bytes`, and the UI flags such files and warns above the composer. The starter's `SOVEREIGN.md` asks the model to keep files under 10 KB and put features in separate files.
 
 ## Projects
 
 `projects.rs` and `scaffold.rs`:
 
 - `POST /v2/projects/create {name}` makes `~/Sovereign Projects/<name>` with a static web app starter: `index.html`, `styles.css`, `app.js`, `tests/test_site.py`, `SOVEREIGN.md`, and `README.md`. It then runs `git init` and makes a "Starting point" commit. The project is `managed`.
+- `POST /v2/projects/inspect {root?}` describes a folder before anything is saved: whether it has history, the bigger repository around it (`parent_project`), the file count (stopping at 20,000), total size, `large`, and up to five private-looking files (`.env`, keys). No root opens the folder picker. The UI shows this and asks before `open`.
 - `POST /v2/projects/open {root?}` adopts a folder, from the path given or the macOS folder picker (`osascript`). A folder without Git gets history and becomes managed. An existing repository is used as it is and never auto-committed.
-- `POST /v2/goals/{id}/undo` reverts a landed result with a new commit. `POST /v2/goals/{id}/apply` retries a kept result.
+- **Switching projects.** The actor opens the new project's state before releasing the current one. If it cannot be opened, the current project keeps running, `projects-v1.json` points back at it, and the overview's `project_problem` says why until a switch succeeds.
+- `POST /v2/goals/{id}/undo` reverts a landed result with a new commit. While a plan is active, it records `undo_queued` instead. The actor's landing pass runs queued Undos once no plan is active, because moving HEAD under a plan's worktrees could break it. `POST /v2/goals/{id}/apply` retries a kept result.
 
 ## Model setup
 
@@ -105,7 +107,11 @@ Every response includes:
 
 The installed app lives in `~/.sovereign/versions/<version>/`, with `current` switched atomically. `~/.local/bin/sovereign` links the current version, and `~/Applications/Sovereign.app` opens it from Spotlight and Launchpad.
 
-`install.sh` and `sovereign update` verify the release tarball against `SHA256SUMS` and hand over to the new binary's `self-install`. `sovereign uninstall` never touches project folders.
+`install.sh` and `sovereign update` verify the release tarball against `SHA256SUMS` and hand over to the new binary's `self-install`.
+- The version in use is never deleted or replaced. A same-version release is reported as already installed.
+- Any other existing copy of that version is moved aside before the new one is moved in, and put back if the move fails.
+- `scripts/install-from-source.sh` stages and swaps the same way.
+- `sovereign uninstall` never touches project folders.
 
 ## LaunchAgent
 

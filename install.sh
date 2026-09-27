@@ -63,8 +63,22 @@ case "$version" in
     "" | .* | *[!A-Za-z0-9._-]*) fail "the release has an invalid version." ;;
 esac
 destination="$INSTALL_ROOT/versions/$version"
-rm -rf "$destination"
-mv "$unpacked" "$destination"
+current_version="$(cat "$INSTALL_ROOT/current/VERSION" 2>/dev/null | tr -d ' \n\r\t' || true)"
+if [ "$version" = "$current_version" ] && [ -x "$destination/bin/sovereign" ]; then
+    # Already installed and in use: keep the running copy and only repair the setup around it.
+    echo "Sovereign $version is already installed."
+else
+    # Move any old copy aside first, so a complete version is always on disk.
+    aside="$INSTALL_ROOT/versions/.replaced-$version-$$"
+    rm -rf "$aside"
+    if [ -e "$destination" ]; then mv "$destination" "$aside"; fi
+    if ! mv "$unpacked" "$destination"; then
+        if [ -e "$aside" ]; then mv "$aside" "$destination"; fi
+        echo "Could not install Sovereign $version." >&2
+        exit 1
+    fi
+    rm -rf "$aside"
+fi
 rm -rf "$staging"
 
 say "Setting up Sovereign $version..."

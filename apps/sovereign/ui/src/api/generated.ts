@@ -30,6 +30,7 @@ export type OverviewResponse = {
   blocked_approvals?: Array<ApprovalRequest>;
   working?: boolean;
   pending_commands?: Array<PendingCommand>;
+  project_problem?: string | null;
 };
 
 export type ApprovalRequest = {
@@ -178,7 +179,7 @@ export type GoalOutcome = {
 
 export type LandingRecord = {
   goal_id: string;
-  status: "predates_landing" | "landed" | "nothing_to_land" | "blocked_by_local_changes" | "conflict" | "undone" | "failed";
+  status: "predates_landing" | "landed" | "nothing_to_land" | "blocked_by_local_changes" | "conflict" | "undone" | "failed" | "undo_queued";
   commit: string | null;
   undo_commit: string | null;
   changed_paths: Array<string>;
@@ -249,6 +250,7 @@ export type DownloadProgress = {
   bytes_total: number;
   percent: number;
   detail: string;
+  model_id?: string | null;
 };
 
 export type SetupStatus = {
@@ -285,6 +287,7 @@ export type ProjectFile = {
 export type ProjectFilesResponse = {
   files: Array<ProjectFile>;
   truncated: boolean;
+  model_limit_bytes: number;
 };
 
 export type ProjectFileContent = {
@@ -326,4 +329,17 @@ export type ModelRemoveResponse = {
 export type StartAnywayResponse = {
   goal_id: string;
   lent_mib: number;
+};
+
+export type FolderSummary = {
+  cancelled: boolean;
+  root: string | null;
+  name: string | null;
+  has_history: boolean;
+  parent_project: string | null;
+  file_count: number;
+  total_bytes: number;
+  more_than: boolean;
+  large: boolean;
+  private_files: Array<string>;
 };

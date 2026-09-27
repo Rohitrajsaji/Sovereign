@@ -315,8 +315,51 @@ fn sha256_file(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Unpacks a verified release tarball into `versions/<version>` and returns that folder.
-fn unpack_release(layout: &InstallLayout, tarball: &Path) -> Result<(String, PathBuf), String> {
+/// What unpacking a release did.
+#[derive(Debug, PartialEq, Eq)]
+enum Unpacked {
+    /// The release is the version already in use; nothing installed was touched.
+    AlreadyCurrent(String),
+    Installed {
+        version: String,
+        destination: PathBuf,
+    },
+}
+
+/// Moves `staged` into `destination`. An existing folder there is moved aside first and put
+/// back if the move fails, so a complete copy is always on disk.
+fn replace_folder(staged: &Path, destination: &Path) -> Result<(), String> {
+    let aside = destination.with_file_name(format!(
+        ".replaced-{}-{}",
+        destination
+            .file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+        std::process::id()
+    ));
+    let had_existing = destination.exists();
+    if had_existing {
+        let _ = fs::remove_dir_all(&aside);
+        fs::rename(destination, &aside).map_err(|error| error.to_string())?;
+    }
+    if let Err(error) = fs::rename(staged, destination) {
+        if had_existing {
+            let _ = fs::rename(&aside, destination);
+        }
+        return Err(error.to_string());
+    }
+    if had_existing {
+        let _ = fs::remove_dir_all(&aside);
+    }
+    Ok(())
+}
+
+/// Unpacks a verified release tarball into `versions/<version>`. The version already in use
+/// (`current_version`) is never replaced or deleted.
+fn unpack_release(
+    layout: &InstallLayout,
+    tarball: &Path,
+    current_version: &str,
+) -> Result<Unpacked, String> {
     let staging = layout
         .versions()
         .join(format!(".staging-{}", std::process::id()));
@@ -341,10 +384,15 @@ fn unpack_release(layout: &InstallLayout, tarball: &Path) -> Result<(String, Pat
         if !valid_version(&version) {
             return Err("the downloaded release has an invalid version".to_owned());
         }
+        if version == current_version {
+            return Ok(Unpacked::AlreadyCurrent(version));
+        }
         let destination = layout.versions().join(&version);
-        let _ = fs::remove_dir_all(&destination);
-        fs::rename(&root, &destination).map_err(|error| error.to_string())?;
-        Ok((version, destination))
+        replace_folder(&root, &destination)?;
+        Ok(Unpacked::Installed {
+            version,
+            destination,
+        })
     })();
     let _ = fs::remove_dir_all(&staging);
     result
@@ -378,13 +426,19 @@ pub fn update(layout: &InstallLayout) -> Result<String, String> {
     let current_version = fs::read_to_string(layout.current().join("VERSION"))
         .map(|text| text.trim().to_owned())
         .unwrap_or_default();
-    let (version, destination) = unpack_release(layout, &tarball)?;
+    let unpacked = unpack_release(layout, &tarball, &current_version)?;
     let _ = fs::remove_file(&tarball);
-    if version == current_version {
-        return Ok(format!(
-            "Sovereign {version} is already the newest version."
-        ));
-    }
+    let (version, destination) = match unpacked {
+        Unpacked::AlreadyCurrent(version) => {
+            return Ok(format!(
+                "Sovereign {version} is already the newest version."
+            ));
+        }
+        Unpacked::Installed {
+            version,
+            destination,
+        } => (version, destination),
+    };
     let handed_over = Command::new(destination.join("bin").join("sovereign"))
         .arg("self-install")
         .stdin(Stdio::null())
@@ -559,13 +613,38 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         assert!(packed.success());
         fs::create_dir_all(layout.versions()).unwrap_or_else(|error| panic!("{error}"));
-        let (version, destination) =
-            unpack_release(&layout, &tarball).unwrap_or_else(|error| panic!("{error}"));
-        assert_eq!(version, "0.3.0");
-        assert_eq!(destination, layout.versions().join("0.3.0"));
+        let unpacked =
+            unpack_release(&layout, &tarball, "0.2.0").unwrap_or_else(|error| panic!("{error}"));
+        let destination = layout.versions().join("0.3.0");
+        assert_eq!(
+            unpacked,
+            Unpacked::Installed {
+                version: "0.3.0".to_owned(),
+                destination: destination.clone()
+            }
+        );
         assert!(destination.join("bin").join("sovereign").is_file());
         let leftovers = fs::read_dir(layout.versions()).map_or(0, Iterator::count);
         assert_eq!(leftovers, 1, "no staging folder is left behind");
+
+        // The same release again, while it is the version in use: nothing installed changes.
+        fs::write(destination.join("in-use"), b"running").unwrap_or_else(|error| panic!("{error}"));
+        let again =
+            unpack_release(&layout, &tarball, "0.3.0").unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(again, Unpacked::AlreadyCurrent("0.3.0".to_owned()));
+        assert!(
+            destination.join("in-use").is_file(),
+            "the running version was not replaced"
+        );
+        let leftovers = fs::read_dir(layout.versions()).map_or(0, Iterator::count);
+        assert_eq!(leftovers, 1, "no staging folder is left behind");
+
+        // Reinstalling a version that is not in use replaces it completely.
+        let replaced =
+            unpack_release(&layout, &tarball, "0.2.0").unwrap_or_else(|error| panic!("{error}"));
+        assert!(matches!(replaced, Unpacked::Installed { .. }));
+        assert!(!destination.join("in-use").exists());
+        assert!(destination.join("bin").join("sovereign").is_file());
         let _ = fs::remove_dir_all(home);
     }
 

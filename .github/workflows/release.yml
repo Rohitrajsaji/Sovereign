@@ -27,9 +27,13 @@ jobs:
     steps:
       - name: Resolve the tag
         id: tag
+        # The tag comes in through the environment, never pasted into the script.
+        env:
+          REQUESTED_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          case "$tag" in v*) ;; *) echo "tags start with v" >&2; exit 1 ;; esac
+          tag="$REQUESTED_TAG"
+          case "$tag" in v[0-9]*) ;; *) echo "tags look like v1.2.3" >&2; exit 1 ;; esac
+          case "$tag" in *[!A-Za-z0-9._-]*) echo "the tag has characters a version never has" >&2; exit 1 ;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4

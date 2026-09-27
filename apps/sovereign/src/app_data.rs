@@ -24,7 +24,9 @@ pub struct SettingsV1 {
     pub approval_principal: String,
     /// A catalog model chosen while a request was running. It replaces the model in use when
     /// the next request starts.
-    #[serde(default)]
+    /// Written only when set, so a settings file saved without a queued model still loads in
+    /// versions from before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queued_model_id: Option<String>,
 }
 

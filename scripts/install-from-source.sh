@@ -22,10 +22,20 @@ echo "Building Sovereign ($version). The first build takes a few minutes."
 cargo build --release --locked -p sovereign --bin sovereign
 
 destination="$HOME/.sovereign/versions/$version"
-rm -rf "$destination"
-mkdir -p "$destination/bin"
-cp target/release/sovereign "$destination/bin/sovereign"
-printf '%s\n' "$version" >"$destination/VERSION"
+staging="$HOME/.sovereign/versions/.staging-$version-$$"
+aside="$HOME/.sovereign/versions/.replaced-$version-$$"
+rm -rf "$staging" "$aside"
+mkdir -p "$staging/bin"
+cp target/release/sovereign "$staging/bin/sovereign"
+printf '%s\n' "$version" >"$staging/VERSION"
+# Swap the new build in; the old copy is moved aside first, so a complete version is always on disk.
+if [ -e "$destination" ]; then mv "$destination" "$aside"; fi
+if ! mv "$staging" "$destination"; then
+    if [ -e "$aside" ]; then mv "$aside" "$destination"; fi
+    echo "Could not install the new build." >&2
+    exit 1
+fi
+rm -rf "$aside"
 
 # `sovereign app` compares this checkout with the running version and says when to reinstall.
 printf '%s\n' "$repo" >"$HOME/.sovereign/source-checkout"

@@ -2,7 +2,7 @@
 // API: plain-language formatting for sizes, times, approval permissions, and progress stages.
 // Schema: GoalProgress.phase, ApprovalRequest.permission_class, DownloadProgress.
 
-import type { DownloadProgress, GoalProgress } from "../api/generated";
+import type { DownloadProgress, FolderSummary, GoalProgress, ProjectFile } from "../api/generated";
 
 export const GOAL_LIMIT = 4000;
 
@@ -83,6 +83,51 @@ export function stageIndex(phase: GoalProgress["phase"]): number {
     default:
       return 4;
   }
+}
+
+/**
+ * A notice when project files are too big for the planner to read whole, or null. Names at most
+ * two files.
+ */
+export function bigFilesNotice(files: ProjectFile[], limitBytes: number): string | null {
+  const big = files.filter((file) => file.size_bytes > limitBytes);
+  if (big.length === 0) {
+    return null;
+  }
+  const names = big.slice(0, 2).map((file) => file.path);
+  const more = big.length > 2 ? ` and ${big.length - 2} more` : "";
+  const subject = `${names.join(" and ")}${more}`;
+  return `${subject} ${big.length === 1 ? "is" : "are"} too big for Sovereign to read (it reads files up to ${formatBytes(limitBytes)}). Changes to ${big.length === 1 ? "it" : "them"} may not work well; ask for new features in separate files.`;
+}
+
+/** `/Users/ana/Documents` reads as `~/Documents`. */
+export function homeRelative(path: string): string {
+  return path.replace(/^\/(Users|home)\/[^/]+(?=\/|$)/, "~");
+}
+
+/** What adopting a folder means, in sentences, shown before anything is saved. */
+export function folderSentences(summary: FolderSummary): string[] {
+  if (summary.parent_project) {
+    return [
+      `This folder is part of a bigger project at ${homeRelative(summary.parent_project)}. Sovereign would work on that whole project.`,
+    ];
+  }
+  if (summary.has_history) {
+    return ["This folder already keeps a history. Sovereign works in it and never saves your own changes for you."];
+  }
+  const count = summary.more_than ? `more than ${summary.file_count.toLocaleString()}` : summary.file_count.toLocaleString();
+  const sentences = [
+    `Sovereign will start keeping a history of this folder. Everything in it (${count} ${summary.file_count === 1 ? "file" : "files"}, ${formatBytes(summary.total_bytes)}) is saved in that history.`,
+  ];
+  if (summary.private_files.length > 0) {
+    sentences.push(
+      `It includes files that may be private, like ${summary.private_files.join(", ")}. They would be saved too.`,
+    );
+  }
+  if (summary.large) {
+    sentences.push("That's a lot, so Sovereign may be slow in this folder. A folder with just your app works best.");
+  }
+  return sentences;
 }
 
 export function downloadRunning(download: DownloadProgress | undefined): boolean {

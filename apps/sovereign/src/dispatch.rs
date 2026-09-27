@@ -179,8 +179,12 @@ fn select_model(model_id: &str, after_current: bool) -> Result<Value, String> {
     )
 }
 
-/// Deletes a downloaded model that is neither in use nor waiting to be used.
-fn remove_model(model_id: &str) -> Result<Value, String> {
+/// Deletes a downloaded model that is neither in use, waiting to be used, nor downloading.
+fn remove_model(actor: &ControllerActorHandle, model_id: &str) -> Result<Value, String> {
+    let download = actor.model_setup().progress();
+    if download.running() && download.model_id.as_deref() == Some(model_id) {
+        return Err("This model is downloading. Pause the download first.".to_owned());
+    }
     let data = app_data::AppData::open_default().map_err(|e| e.to_string())?;
     let paths = model_setup::SetupPaths {
         app_data: data.root().to_path_buf(),
@@ -295,6 +299,7 @@ pub(crate) fn handle_actor_request(
                 "blocked_approvals": model.blocked_approvals,
                 "working": actor.working(),
                 "pending_commands": actor.pending_commands(),
+                "project_problem": actor.project_problem(),
             }))
         }
         ControlApiRequest::ListProjects => {
@@ -320,6 +325,20 @@ pub(crate) fn handle_actor_request(
             let parent = projects::projects_home()?;
             let (projects, record) = projects::create_project(&data, &name, &parent)?;
             switch_to_project(actor, &projects, &record)
+        }
+        ControlApiRequest::InspectFolder { root } => {
+            // Nothing is saved here: the person sees what adopting the folder means first.
+            let root = match root {
+                Some(root) => PathBuf::from(root),
+                None => match projects::choose_folder_dialog()? {
+                    Some(root) => root,
+                    None => {
+                        return serde_json::to_value(projects::FolderSummaryV1::cancelled())
+                            .map_err(|e| e.to_string());
+                    }
+                },
+            };
+            serde_json::to_value(projects::inspect_folder(&root)?).map_err(|e| e.to_string())
         }
         ControlApiRequest::OpenFolder { root } => {
             let root = match root {
@@ -463,7 +482,7 @@ pub(crate) fn handle_actor_request(
             model_id,
             after_current,
         } => select_model(&model_id, after_current),
-        ControlApiRequest::RemoveModel { model_id } => remove_model(&model_id),
+        ControlApiRequest::RemoveModel { model_id } => remove_model(actor, &model_id),
         ControlApiRequest::StartAnyway { goal_id } => {
             let lent = actor.grant_memory_allowance(&goal_id)?;
             Ok(json!({"goal_id": goal_id, "lent_mib": lent}))

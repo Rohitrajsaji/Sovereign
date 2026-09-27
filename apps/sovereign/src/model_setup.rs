@@ -349,6 +349,8 @@ pub struct DownloadProgressV1 {
     pub bytes_total: u64,
     pub percent: u8,
     pub detail: String,
+    /// The catalog model this download is for.
+    pub model_id: Option<String>,
 }
 
 impl Default for DownloadProgressV1 {
@@ -359,7 +361,19 @@ impl Default for DownloadProgressV1 {
             bytes_total: 0,
             percent: 0,
             detail: String::new(),
+            model_id: None,
         }
+    }
+}
+
+impl DownloadProgressV1 {
+    /// True while a download or its check is under way.
+    #[must_use]
+    pub fn running(&self) -> bool {
+        matches!(
+            self.phase.as_str(),
+            "checking" | "downloading_runtime" | "downloading_model" | "verifying"
+        )
     }
 }
 
@@ -875,9 +889,6 @@ impl ModelSetup {
         model_id: Option<&str>,
         on_installed: impl FnOnce(&InstalledModel) + Send + 'static,
     ) -> Result<DownloadProgressV1, String> {
-        if self.busy.load(Ordering::Acquire) {
-            return Ok(self.progress());
-        }
         let catalog = load_catalog()?;
         let memory_mib = probe_memory_mib();
         let model = match model_id {
@@ -891,6 +902,17 @@ impl ModelSetup {
                 .cloned()
                 .ok_or_else(|| "Sovereign needs at least 8 GB of memory.".to_owned())?,
         };
+        if self.busy.load(Ordering::Acquire) {
+            let current = self.progress();
+            return if current.model_id.as_deref() == Some(model.id.as_str()) {
+                Ok(current)
+            } else {
+                Err(
+                    "Another download is running. Wait for it to finish, then try again."
+                        .to_owned(),
+                )
+            };
+        }
         let partial = fs::metadata(partial_path(&paths.model_path(&model)))
             .map_or(0, |metadata| metadata.len());
         let machine = evaluate_machine(
@@ -914,6 +936,7 @@ impl ModelSetup {
             *progress = DownloadProgressV1 {
                 phase: "checking".to_owned(),
                 detail: "Checking what is already downloaded.".to_owned(),
+                model_id: Some(model.id.clone()),
                 ..DownloadProgressV1::default()
             };
         });
@@ -1169,6 +1192,33 @@ mod tests {
             Some("small")
         );
         assert!(entry_for_path(&catalog, Path::new("/x/models/own.gguf")).is_none());
+    }
+
+    #[test]
+    fn one_download_at_a_time_and_asking_again_reports_it() {
+        let setup = Arc::new(ModelSetup::default());
+        setup.busy.store(true, Ordering::Release);
+        setup.set(|progress| {
+            "downloading_model".clone_into(&mut progress.phase);
+            progress.model_id = Some("qwen3-4b-q4_k_m".to_owned());
+        });
+        let paths = SetupPaths {
+            app_data: temp_dir("one-download"),
+        };
+        let same = setup.start(paths.clone(), None, Some("qwen3-4b-q4_k_m"), |_| {});
+        assert_eq!(
+            same.map(|progress| progress.phase),
+            Ok("downloading_model".to_owned())
+        );
+        setup.set(|progress| progress.model_id = Some("another-model".to_owned()));
+        let other = setup.start(paths.clone(), None, Some("qwen3-4b-q4_k_m"), |_| {});
+        assert!(other.is_err_and(|reason| reason.starts_with("Another download is running")));
+        assert!(
+            setup
+                .start(paths.clone(), None, Some("no-such-model"), |_| {})
+                .is_err()
+        );
+        let _ = fs::remove_dir_all(paths.app_data);
     }
 
     #[test]

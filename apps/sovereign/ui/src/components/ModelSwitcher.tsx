@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { GoalView, ModelOption } from "../api/generated";
 import {
+  useCancelDownload,
   useCancelGoal,
   useGoals,
   useRemoveModel,
@@ -36,34 +37,45 @@ export function ModelSwitcher() {
   const remove = useRemoveModel();
   const cancel = useCancelGoal();
   const submit = useSubmitGoal();
+  const pause = useCancelDownload();
   const [asking, setAsking] = useState<string | null>(null);
   const [plan, setPlan] = useState<Plan | null>(null);
   const running = (goals.data ?? []).find((goal) => !goal.progress.terminal && !goal.goal_id.startsWith("pending-"));
   const models = useMemo(() => setup.data?.models ?? [], [setup.data?.models]);
   const progress = setup.data?.download;
 
-  // Finish a switch once its download is in place.
+  // Finish a switch once its download is in place; forget it if the download stopped.
   useEffect(() => {
     if (!plan) {
       return;
     }
+    if (progress?.model_id === plan.modelId && (progress.phase === "failed" || progress.phase === "cancelled")) {
+      setPlan(null);
+      return;
+    }
     const target = models.find((model) => model.id === plan.modelId);
-    if (!target?.installed || select.isPending) {
+    if (!target?.installed || select.isPending || cancel.isPending) {
       return;
     }
     setPlan(null);
-    select.mutate(
-      { modelId: plan.modelId, when: plan.when },
-      {
-        onSuccess: () => {
-          if (plan.restart) {
-            const text = plan.restart.natural_language_goal;
-            cancel.mutate(plan.restart.goal_id, { onSuccess: () => submit.mutate(text) });
-          }
+    const switchNow = () =>
+      select.mutate(
+        { modelId: plan.modelId, when: plan.when },
+        {
+          onSuccess: () => {
+            if (plan.restart) {
+              submit.mutate(plan.restart.natural_language_goal);
+            }
+          },
         },
-      },
-    );
-  }, [plan, models, select, cancel, submit]);
+      );
+    // Stop the running request before switching, so no step of it runs on the new model.
+    if (plan.restart) {
+      cancel.mutate(plan.restart.goal_id, { onSuccess: switchNow });
+    } else {
+      switchNow();
+    }
+  }, [plan, models, progress, select, cancel, submit]);
 
   const begin = (model: ModelOption, restart: GoalView | null, when: "now" | "after_current") => {
     setAsking(null);
@@ -84,11 +96,14 @@ export function ModelSwitcher() {
   if (setup.isPending) {
     return <p className="inline-note">Checking…</p>;
   }
-  const downloading = plan !== null && downloadRunning(progress);
+  const downloadingId = downloadRunning(progress) ? progress?.model_id : undefined;
   return (
     <div className="model-list">
       {models.map((model) => {
         const busyHere = plan?.modelId === model.id;
+        const downloadingHere = downloadingId === model.id;
+        // One download at a time.
+        const blocked = !model.installed && downloadingId !== undefined && !downloadingHere;
         return (
           <div className={`model-card${model.selected ? " model-card-current" : ""}`} key={model.id}>
             <div className="model-card-head">
@@ -102,11 +117,19 @@ export function ModelSwitcher() {
             {model.fits ? null : (
               <p className="subtle">This Mac has less memory than this model is best with, so requests may wait for memory.</p>
             )}
-            {busyHere && downloading && progress ? (
+            {downloadingHere && progress ? (
               <>
                 <ProgressBar value={progress.percent} label={`Downloading ${model.display_name}`} />
-                <p className="subtle">{downloadLine(progress)}</p>
+                <div className="settings-row">
+                  <p className="subtle">{downloadLine(progress)}</p>
+                  <Button variant="ghost" busy={pause.isPending} onClick={() => pause.mutate()}>
+                    Pause
+                  </Button>
+                </div>
               </>
+            ) : null}
+            {progress?.model_id === model.id && (progress.phase === "failed" || progress.phase === "cancelled") ? (
+              <p className={progress.phase === "failed" ? "inline-error" : "inline-note"}>{progress.detail}</p>
             ) : null}
             {asking === model.id && running ? (
               <div className="model-ask" role="group" aria-label="A request is running">
@@ -127,11 +150,16 @@ export function ModelSwitcher() {
             {model.selected || asking === model.id ? null : (
               <div className="choice-row">
                 {model.queued ? null : (
-                  <Button busy={busyHere && (downloading || select.isPending)} disabled={plan !== null && !busyHere} onClick={() => choose(model)}>
-                    {model.installed ? "Use this model" : "Download and use"}
+                  <Button
+                    busy={downloadingHere || (busyHere && (select.isPending || cancel.isPending))}
+                    disabled={blocked || (plan !== null && !busyHere)}
+                    title={blocked ? "Another model is downloading" : undefined}
+                    onClick={() => choose(model)}
+                  >
+                    {model.installed ? "Use this model" : progress?.model_id === model.id && progress.phase === "cancelled" ? "Resume download" : "Download and use"}
                   </Button>
                 )}
-                {model.installed && !model.queued ? (
+                {model.installed && !model.queued && !downloadingHere ? (
                   <Button variant="ghost" busy={remove.isPending && remove.variables === model.id} onClick={() => remove.mutate(model.id)}>
                     Remove
                   </Button>
@@ -141,7 +169,6 @@ export function ModelSwitcher() {
           </div>
         );
       })}
-      {progress?.phase === "failed" && plan ? <p className="inline-error">{progress.detail}</p> : null}
       <InlineError error={download.error ?? select.error ?? remove.error ?? cancel.error ?? submit.error} />
     </div>
   );

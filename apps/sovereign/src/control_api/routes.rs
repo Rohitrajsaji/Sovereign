@@ -102,6 +102,13 @@ pub(crate) fn parse_control_request(
                 name: required_string(&value, "name")?,
             })
         }
+        ("POST", "/v2/projects/inspect") => {
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &["root"])?;
+            Ok(ControlApiRequest::InspectFolder {
+                root: optional_string(&value, "root")?,
+            })
+        }
         ("POST", "/v2/projects/open") => {
             let value = parse_optional_json_object(body)?;
             require_only_fields(&value, &["root"])?;

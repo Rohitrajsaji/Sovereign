@@ -271,6 +271,18 @@ fn control_api_v2_live_serve_matches_frozen_schema() {
         );
     }
 
+    // Inspecting a folder describes it and saves nothing.
+    let (status, summary) = post(
+        "/v2/projects/inspect",
+        &json!({"root": home.display().to_string()}),
+    );
+    assert_eq!(status, 200, "{summary}");
+    assert!(
+        load_validator("FolderSummary").is_valid(&summary),
+        "{summary}"
+    );
+    assert_eq!(summary["cancelled"], json!(false));
+
     // Model switching and Start anyway refuse, in words, what they cannot do.
     for (path, body) in [
         (

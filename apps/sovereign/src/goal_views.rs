@@ -378,7 +378,20 @@ fn completed_progress(
         LandingStatusV1::Landed => progress(
             "done",
             "Done",
-            "Finished, checked, and saved in your project.",
+            // An Undo that could not finish says why.
+            record
+                .detail
+                .clone()
+                .unwrap_or_else(|| "Finished, checked, and saved in your project.".to_owned()),
+            (0, 0),
+            100,
+        ),
+        LandingStatusV1::UndoQueued => progress(
+            "done",
+            "Done",
+            record.detail.clone().unwrap_or_else(|| {
+                "Undo will happen as soon as the current request finishes.".to_owned()
+            }),
             (0, 0),
             100,
         ),
@@ -631,7 +644,7 @@ pub fn goal_activity(
 ) -> Vec<GoalActivityV1> {
     let mut needles = vec![goal_id];
     needles.extend(plan_ids.iter().map(String::as_str));
-    events
+    let mut lines = events
         .iter()
         .filter(|event| event_mentions(event, &needles))
         .filter_map(|event| {
@@ -642,8 +655,11 @@ pub fn goal_activity(
                 tone: tone.to_owned(),
             })
         })
-        .take(MAX_ACTIVITY)
-        .collect()
+        .collect::<Vec<_>>();
+    // A long request keeps its latest lines: those say where it stands now.
+    let overflow = lines.len().saturating_sub(MAX_ACTIVITY);
+    lines.drain(..overflow);
+    lines
 }
 
 #[cfg(test)]
@@ -846,5 +862,14 @@ mod tests {
             .map(|line| line.text.as_str())
             .collect::<Vec<_>>();
         assert_eq!(texts, vec!["Planning started.", "Cancelled."]);
+
+        // More lines than fit: the newest are kept, in order.
+        let many = (1..=250)
+            .map(|sequence| event(sequence, "goal-a", "goal_intent_claimed", "{}"))
+            .collect::<Vec<_>>();
+        let kept = goal_activity(&many, "goal-a", &[]);
+        assert_eq!(kept.len(), MAX_ACTIVITY);
+        assert_eq!(kept.first().map(|line| line.sequence), Some(51));
+        assert_eq!(kept.last().map(|line| line.sequence), Some(250));
     }
 }

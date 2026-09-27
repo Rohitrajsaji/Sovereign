@@ -1129,6 +1129,19 @@ p {
   font-weight: 600;
 }
 
+.folder-confirm {
+  display: grid;
+  gap: var(--s-2);
+  padding: var(--s-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.folder-confirm-warn {
+  border-color: var(--warning);
+  background: var(--warning-soft);
+}
+
 .model-list {
   display: grid;
   gap: var(--s-2);

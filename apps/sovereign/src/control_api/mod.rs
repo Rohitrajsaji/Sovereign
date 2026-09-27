@@ -80,6 +80,9 @@ pub(crate) enum ControlApiRequest {
     OpenFolder {
         root: Option<String>,
     },
+    InspectFolder {
+        root: Option<String>,
+    },
     ListGoals,
     GetGoal {
         goal_id: String,

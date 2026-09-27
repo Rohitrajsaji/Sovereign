@@ -276,12 +276,16 @@ fn run_serve(args: &[String], state_path: &Path) -> Result<String, String> {
         .map(|data| data.root().to_path_buf());
     let token = if let Ok(data) = app_data::AppData::open_default() {
         service_logs::spawn_rotation(data.root().join("logs"));
-        let _ = build_info::write_service_version(data.root());
         doctor::write_session_token(&data.token_path()).ok()
     } else {
         None
     };
     let listener = bind_loopback(address)?;
+    // Only a service that is listening records its version, so `sovereign app` never mistakes
+    // a restart that failed to bind for one that is up.
+    if let Some(root) = app_data_root.as_deref() {
+        let _ = build_info::write_service_version(root);
+    }
     let local_address = listener.local_addr().map_err(|error| error.to_string())?;
     eprintln!("sovereign local dashboard listening on http://{local_address}/");
     let projects_index = app_data::AppData::open_default()
@@ -531,6 +535,7 @@ fn handle_control_request(
         }
         ControlApiRequest::CreateProject { .. }
         | ControlApiRequest::OpenFolder { .. }
+        | ControlApiRequest::InspectFolder { .. }
         | ControlApiRequest::UndoGoal { .. }
         | ControlApiRequest::ApplyGoal { .. } => {
             Err("projects and results are served by the local service".to_owned())
