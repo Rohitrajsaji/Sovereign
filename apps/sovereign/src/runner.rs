@@ -1691,6 +1691,76 @@ http.createServer((request, response) => {
         clippy::expect_used,
         reason = "deterministic runner fixture requires exact setup and evidence assertions"
     )]
+    fn starter_project_goal_that_changes_several_files_compiles_to_single_file_tasks() {
+        let _guard = RUNNER_LOCK_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = fixture();
+        crate::scaffold::write_starter_project(&root, "Budget").expect("starter project");
+        for relative in ["index.html", "styles.css", "app.js"] {
+            let content = fs::read_to_string(root.join(relative)).expect("starter file");
+            commit_fixture_file(&root, relative, &content);
+        }
+        let state = external_fixture_state(&root);
+        drop(queued_compilation(
+            &state,
+            "A page that tracks my monthly budget with a simple chart",
+        ));
+        let backend = fixture_backend(vec![fixture_model_response(
+            json!({
+                "tasks": [{
+                    "title": "Build the budget page",
+                    "objective": "Track monthly spending and draw a simple chart.",
+                    "rationale": "The starter page, script and styles all change.",
+                    "files": ["index.html", "app.js", "styles.css"],
+                    "symbols": [],
+                    "evidence_queries": [],
+                    "expected_change": "The page records monthly amounts and charts them."
+                }]
+            })
+            .to_string(),
+        )]);
+        let compiled = run_at_with_overrides(
+            &root,
+            &state,
+            RunOptions { once: true },
+            Some(&backend),
+            None,
+            None,
+            Some(green_fixture_pressure()),
+        )
+        .expect("compile the multi-file goal");
+        assert!(compiled.contains("PlanActivated"), "{compiled}");
+        let plan_json = StateStore::open(&state)
+            .expect("state after compile")
+            .get_state("controller.plan_document", "active")
+            .expect("read active plan")
+            .expect("compiled plan");
+        let plan: Value = serde_json::from_str(&plan_json).expect("parse compiled plan");
+        let scoped = plan["tasks"]
+            .as_array()
+            .expect("compiled tasks")
+            .iter()
+            .map(|task| task["scope"]["files"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scoped,
+            vec![
+                json!(["index.html"]),
+                json!(["app.js"]),
+                json!(["styles.css"])
+            ]
+        );
+        fs::remove_dir_all(root).expect("cleanup starter fixture");
+        fs::remove_dir_all(state.parent().expect("state directory"))
+            .expect("cleanup state fixture");
+    }
+
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        reason = "deterministic runner fixture requires exact setup and evidence assertions"
+    )]
     fn unconfigured_project_shows_the_model_its_useful_files_within_the_bound() {
         let root = fixture();
         commit_fixture_file(&root, "SOVEREIGN.md", "# Conventions\n");
