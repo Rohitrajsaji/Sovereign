@@ -1705,7 +1705,6 @@ fn production_driver_compiles_executes_verifies_and_finalizes_queued_goal() {
 #[test]
 #[expect(
     clippy::expect_used,
-    clippy::unwrap_used,
     reason = "deterministic test fixture fails explicitly when required setup or evidence is missing"
 )]
 fn production_compilation_failure_does_not_refill_model_calls_after_restart() {
@@ -1738,27 +1737,28 @@ fn production_compilation_failure_does_not_refill_model_calls_after_restart() {
             },
         )
         .expect("bounded compile rejection");
-    assert!(matches!(
-        failed,
-        ProductionAdvanceOutcome::Blocked {
-            reason: ProductionBlockReason::CompilationFailed(_),
-            ..
-        }
-    ));
-    assert_eq!(
+    // The fixture allows one model call, so the failed call exhausts the budget and the goal
+    // ends as failed instead of holding the head of the queue.
+    assert!(
+        matches!(
+            &failed,
+            ProductionAdvanceOutcome::GoalFailed { goal_id, reason_code }
+                if goal_id == &intent.goal_id && reason_code == "compilation_budget_exhausted"
+        ),
+        "{failed:?}"
+    );
+    assert!(
         controller
             .next_queued_goal_intent()
             .expect("queue")
-            .unwrap()
-            .goal_id,
-        intent.goal_id
+            .is_none()
     );
     drop(controller);
     let state = StateStore::open(&fixture.repo.state_path).expect("reopen state");
-    let mut controller = Controller::reopen_local(state).expect("recover queued state");
+    let mut controller = Controller::reopen_local(state).expect("recover ended goal");
     let valid_backend = backend(vec![fixture.planning_response.clone()]);
     let mut fresh_budget = ModelCallBudget::new(1, 30_000);
-    let exhausted = controller
+    let after_restart = controller
         .advance_production_goal(
             &fixture.registry,
             ProductionAdvanceResources::<MacSandboxExecBackend> {
@@ -1772,21 +1772,23 @@ fn production_compilation_failure_does_not_refill_model_calls_after_restart() {
                 execution: None,
             },
         )
-        .expect("durable compile budget denial");
-    assert!(matches!(
-        exhausted,
-        ProductionAdvanceOutcome::Blocked {
-            reason: ProductionBlockReason::CompilationBudgetExhausted,
-            ..
-        }
-    ));
-    assert_eq!(
+        .expect("restart does not revive the failed goal");
+    assert!(
+        matches!(after_restart, ProductionAdvanceOutcome::Idle),
+        "{after_restart:?}"
+    );
+    assert!(
         controller
             .next_queued_goal_intent()
             .expect("queue")
-            .unwrap()
-            .goal_id,
-        intent.goal_id
+            .is_none()
+    );
+    assert!(
+        controller
+            .durable_status()
+            .expect("status")
+            .active_plan
+            .is_none()
     );
 }
 
@@ -1804,6 +1806,9 @@ fn production_compilation_budget_rejects_tampered_reservation_history() {
         .expect("submit goal");
     let mut input = fixture.compilation_input.clone();
     input.goal_id = intent.goal_id.clone();
+    // Two allowed calls keep the goal queued after one failed call, so the forged row is the
+    // only thing that could refill the budget.
+    input.max_model_calls = 2;
     let bad_backend = backend(vec![model_response(
         "invalid planning proposal".to_owned(),
         fixture.packet.metrics.final_serialized_input_tokens,
