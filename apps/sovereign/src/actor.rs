@@ -895,6 +895,10 @@ fn run_actor_loop(
                     },
                 };
                 if let Err(error) = &res {
+                    eprintln!(
+                        "sovereign: could not open the project at {}: {error}",
+                        state_path.display()
+                    );
                     // The current project keeps running; the chosen one is not made active.
                     let message = crate::projects::restore_active_project(
                         &shared.state_path(),
