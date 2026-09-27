@@ -3482,7 +3482,16 @@ fn browser_process_spec(
     BrowserProcessSpec {
         executable: PathBuf::from("/bin/sh"),
         args,
-        environment: BTreeMap::from([("TMPDIR".to_owned(), profile_root.display().to_string())]),
+        // Crashpad resolves its database from Chrome's default user-data directory, not from
+        // --user-data-dir. When that directory does not exist yet the Seatbelt profile denies
+        // creating it and Chrome aborts at startup, so crash dumps stay inside the profile root.
+        environment: BTreeMap::from([
+            ("TMPDIR".to_owned(), profile_root.display().to_string()),
+            (
+                "BREAKPAD_DUMP_LOCATION".to_owned(),
+                profile_root.join("Crashpad").display().to_string(),
+            ),
+        ]),
         working_directory: private_parent.to_path_buf(),
     }
 }
