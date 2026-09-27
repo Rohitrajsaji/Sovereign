@@ -849,7 +849,25 @@ impl MacLoopbackServerSandboxExecBackend {
         })
     }
 
+    /// A refused bind on the allowed port is fail-closed (a busy CI host can refuse it, or another
+    /// process can take the freed port), so only that outcome is retried, on fresh ports. Any probe
+    /// showing the profile granted more than it should fails at once.
     fn self_test(&self) -> Result<(), BrowserPolicyError> {
+        let mut attempt = 1;
+        loop {
+            match self.self_test_attempt()? {
+                None => return Ok(()),
+                Some((_, true)) if attempt < LOOPBACK_SELF_TEST_ATTEMPTS => attempt += 1,
+                Some((message, _)) => {
+                    return Err(BrowserPolicyError::IsolationUnavailable(message));
+                }
+            }
+        }
+    }
+
+    /// Returns `None` when every probe matched, else the failure and whether only the allowed
+    /// bind was refused.
+    fn self_test_attempt(&self) -> Result<Option<(String, bool)>, BrowserPolicyError> {
         let nonce = format!(
             "{}-{}",
             std::process::id(),
@@ -927,21 +945,22 @@ impl MacLoopbackServerSandboxExecBackend {
         )?;
         drop(outbound_listener);
         let _ = fs::remove_dir_all(&root);
-        if !allowed_bind.success()
-            || denied_bind.success()
-            || !repository_read.success()
-            || !data_read.success()
-            || protected_read.success()
-            || !write_inside.success()
-            || write_outside.success()
-            || outbound.success()
-        {
-            return Err(BrowserPolicyError::IsolationUnavailable(
-                "loopback server Seatbelt self-test did not enforce exact bind/read/write/outbound authority"
-                    .to_owned(),
-            ));
+        let denials_held = !denied_bind.success()
+            && !protected_read.success()
+            && !write_outside.success()
+            && !outbound.success();
+        let grants_held =
+            repository_read.success() && data_read.success() && write_inside.success();
+        if allowed_bind.success() && denials_held && grants_held {
+            return Ok(None);
         }
-        Ok(())
+        let message = format!(
+            "loopback server Seatbelt self-test did not enforce exact bind/read/write/outbound authority \
+             (allowed port {allowed_port} bind: {allowed_bind}; denied port {denied_port} bind: {denied_bind}; \
+             repository read: {repository_read}; data read: {data_read}; protected read: {protected_read}; \
+             data write: {write_inside}; repository write: {write_outside}; outbound connect: {outbound})"
+        );
+        Ok(Some((message, denials_held && grants_held)))
     }
 
     fn file_read_probe(
@@ -1386,6 +1405,9 @@ fn chrome_process_singleton_prefix(profile_root: &Path) -> Result<PathBuf, Brows
     }
     Ok(temp_root.join("com.google.Chrome."))
 }
+
+/// Attempts the loopback server self-test makes before a refused allowed-port bind is final.
+const LOOPBACK_SELF_TEST_ATTEMPTS: u32 = 3;
 
 /// Attempts the browser self-test makes before a fail-closed allowed-port refusal is final.
 #[cfg(target_os = "macos")]
