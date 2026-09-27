@@ -3678,15 +3678,35 @@ fn terminate_exact_process_group(
         return wait_for_group_absence(pgid, PROCESS_KILL_GRACE);
     }
     verify_current_group_identity(pgid, expected_identity)?;
-    signal_process_group(pgid, "-TERM")?;
+    signal_exiting_process_group(child, pgid, "-TERM")?;
     if wait_child_until(child, PROCESS_TERM_GRACE)? {
         child.wait()?;
         return wait_for_group_absence(pgid, PROCESS_KILL_GRACE);
     }
     verify_current_group_identity(pgid, expected_identity)?;
-    signal_process_group(pgid, "-KILL")?;
+    signal_exiting_process_group(child, pgid, "-KILL")?;
     let _ = child.wait()?;
     wait_for_group_absence(pgid, PROCESS_KILL_GRACE)
+}
+
+/// macOS refuses to signal a group whose only members are already exiting, so a Chrome that
+/// finishes closing between the identity check and the signal fails with EPERM. That is only
+/// success when the leader then exits; absence of the group is still proven by the caller.
+fn signal_exiting_process_group(
+    child: &mut Child,
+    pgid: u32,
+    signal: &str,
+) -> Result<(), BrowserError> {
+    match signal_process_group(pgid, signal) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if wait_child_until(child, PROCESS_TERM_GRACE)? {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 fn prove_absence_without_identity(child: &mut Child, pgid: u32) -> Result<(), BrowserError> {
