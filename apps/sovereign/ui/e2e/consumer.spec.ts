@@ -115,7 +115,10 @@ test.describe("consumer journey", () => {
     await page.getByRole("button", { name: "New project" }).click();
     const name = page.getByLabel("Project name");
     await name.fill("Second app");
-    await page.getByRole("button", { name: "Create" }).click();
+    await expect(page.getByRole("button", { name: "Create" })).toBeEnabled();
+    // Enter, not a click: the dialog opens over the preview, a cross-origin frame. For a moment
+    // after it opens, Chrome can still route a click at those coordinates into that frame.
+    await name.press("Enter");
     await expect(page.getByRole("heading", { level: 1, name: "Second app" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Second app" })).toHaveAttribute("aria-current", "true");
   });
