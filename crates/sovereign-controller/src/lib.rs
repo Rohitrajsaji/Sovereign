@@ -96,7 +96,7 @@ pub use local_control::{
     LOCAL_CONTROL_READ_MODEL_SCHEMA_VERSION, LocalControl, LocalControlCheckpointV1,
     LocalControlReadModelV1, LocalControlRecoveryProjectionV1,
 };
-pub use model_calibration::PeakRssRecorder;
+pub use model_calibration::{MemoryWaitV1, PeakRssRecorder};
 pub use production_driver::{
     ProductionAdvanceOutcome, ProductionAdvanceResources, ProductionBlockReason,
     ProductionBrowserResources, ProductionCompilationResources, ProductionExecutionCatalog,
@@ -2819,6 +2819,7 @@ pub struct Controller {
     managed_postgres_backend: Option<postgres_broker::PostgresBrokerConfig>,
     trusted_recovery_intent_digests: BTreeMap<String, String>,
     model_calibration_identity: Option<String>,
+    model_memory: model_calibration::ModelMemory,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2847,6 +2848,7 @@ impl Controller {
             managed_postgres_backend: None,
             trusted_recovery_intent_digests: BTreeMap::new(),
             model_calibration_identity: None,
+            model_memory: model_calibration::ModelMemory::default(),
         }
     }
 
@@ -2867,6 +2869,7 @@ impl Controller {
             managed_postgres_backend: None,
             trusted_recovery_intent_digests: BTreeMap::new(),
             model_calibration_identity: None,
+            model_memory: model_calibration::ModelMemory::default(),
         }
     }
 
@@ -9206,11 +9209,12 @@ impl Controller {
                 ),
             )));
         }
-        let snapshot = self.resource_probe.sample().map_err(|error| {
+        let snapshot = self.model_pressure_snapshot().map_err(|error| {
             ControllerError::Policy(PolicyError::ResourceDenied(format!(
                 "live resource pressure probe failed: {error}"
             )))
         })?;
+        let free_mib = snapshot.host_headroom_mib;
         let pressure = self.resources.observe_pressure(snapshot);
         let request = ResourceLeaseRequestV1 {
             lease_id: format!("ready:{plan_id}:r{revision}:{task_id}:{epoch}"),
@@ -9229,6 +9233,7 @@ impl Controller {
             disk_expanding: false,
         };
         let admission = self.resources.admit(&request, &pressure);
+        self.note_model_admission(admission.lease.is_some(), model_admission_mib, free_mib);
         let Some(resource_lease) = admission.lease.clone() else {
             self.persist_resource_policy_decision(&pressure, &admission.event, None, None)?;
             if matches!(
@@ -21102,6 +21107,7 @@ fn bootstrap_uncheckpointed_initial_activation(
         managed_postgres_backend: None,
         trusted_recovery_intent_digests: BTreeMap::new(),
         model_calibration_identity: None,
+        model_memory: model_calibration::ModelMemory::default(),
     };
     controller.checkpoint_now()?;
     Ok(controller.state)
@@ -21288,6 +21294,7 @@ impl RecoveryManager {
             managed_postgres_backend: None,
             trusted_recovery_intent_digests,
             model_calibration_identity: None,
+            model_memory: model_calibration::ModelMemory::default(),
         };
 
         reconcile_recovered_resources_before_epoch(&mut controller, execution_epoch_before)?;
