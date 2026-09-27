@@ -16,7 +16,7 @@ fi
 
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo test --workspace --no-fail-fast
 
 if command -v node >/dev/null 2>&1; then
     "$(dirname "$0")/verify-ui.sh"
