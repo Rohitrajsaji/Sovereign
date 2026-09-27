@@ -7616,11 +7616,11 @@ fn handle_proxy_client(
     client.set_nonblocking(false)?;
     client.set_read_timeout(Some(GATEWAY_IO_TIMEOUT))?;
     client.set_write_timeout(Some(GATEWAY_IO_TIMEOUT))?;
-    let Some(request) = read_proxy_request(&mut client)? else {
+    let Some(request) = read_proxy_request(&mut client).inspect_err(|e| eprintln!("TEMP-DIAG site=read_proxy_request {e}"))? else {
         return Ok(());
     };
     if !proxy_request_authenticated(&request, loopback_capability)? {
-        write_proxy_auth_challenge(&mut client)?;
+        write_proxy_auth_challenge(&mut client).inspect_err(|e| eprintln!("TEMP-DIAG site=auth_challenge {e}"))?;
         return Ok(());
     }
     if request.method.eq_ignore_ascii_case("CONNECT") {
@@ -7656,21 +7656,21 @@ fn handle_connect_proxy_request(
     let mut upstream = match authority.connect_authorized(&destination) {
         Ok(upstream) => upstream,
         Err(BrowserGatewayConnectError::Denied) => {
-            write_proxy_policy_denial(client)?;
+            write_proxy_policy_denial(client).inspect_err(|e| eprintln!("TEMP-DIAG site=denial_connect {e}"))?;
             return Ok(());
         }
         Err(BrowserGatewayConnectError::Failure(error)) => return Err(error),
     };
     upstream.set_read_timeout(Some(GATEWAY_IO_TIMEOUT))?;
     upstream.set_write_timeout(Some(GATEWAY_IO_TIMEOUT))?;
-    client.write_all(b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n")?;
+    client.write_all(b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n").inspect_err(|e| eprintln!("TEMP-DIAG site=connect_established {e}"))?;
     tunnel_bidirectional(
         client,
         &mut upstream,
         stop,
         transferred_bytes,
         authority.max_network_bytes,
-    )?;
+    ).inspect_err(|e| eprintln!("TEMP-DIAG site=tunnel {e}"))?;
     Ok(())
 }
 
@@ -7695,7 +7695,7 @@ fn handle_http_proxy_request(
     let mut upstream = match authority.connect_authorized(&parsed.destination) {
         Ok(upstream) => upstream,
         Err(BrowserGatewayConnectError::Denied) => {
-            write_proxy_policy_denial(&mut client)?;
+            write_proxy_policy_denial(&mut client).inspect_err(|e| eprintln!("TEMP-DIAG site=denial_http {e}"))?;
             return Ok(());
         }
         Err(BrowserGatewayConnectError::Failure(error)) => return Err(error),
@@ -7725,7 +7725,7 @@ fn handle_http_proxy_request(
         authority.max_network_bytes,
         outbound.len(),
     )?;
-    upstream.write_all(&outbound)?;
+    upstream.write_all(&outbound).inspect_err(|e| eprintln!("TEMP-DIAG site=upstream_request {e} target={}", request.target))?;
     if request.remaining_body_bytes > 0 {
         relay_exact(
             &mut client,
@@ -7740,7 +7740,7 @@ fn handle_http_proxy_request(
         &mut client,
         transferred_bytes,
         authority.max_network_bytes,
-    )?;
+    ).inspect_err(|e| eprintln!("TEMP-DIAG site=relay_to_eof {e} method={method} target={}", request.target))?;
     Ok(())
 }
 
