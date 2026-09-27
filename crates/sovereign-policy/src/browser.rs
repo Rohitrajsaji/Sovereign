@@ -1169,10 +1169,11 @@ impl MacBrowserSandboxExecBackend {
             || !inside_write.success()
             || outside_write.success()
         {
-            return Err(BrowserPolicyError::IsolationUnavailable(
-                "browser Seatbelt self-test did not enforce exact loopback-port/file-write boundary"
-                    .to_owned(),
-            ));
+            return Err(BrowserPolicyError::IsolationUnavailable(format!(
+                "browser Seatbelt self-test did not enforce exact loopback-port/file-write boundary \
+                 (allowed port connect: {allowed}; denied port connect: {denied}; \
+                 profile write: {inside_write}; outside write: {outside_write})"
+            )));
         }
         cleanup?;
         Ok(())
