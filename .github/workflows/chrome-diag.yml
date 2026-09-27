@@ -14,15 +14,13 @@ jobs:
       - name: Install pinned toolchain
         run: rustup toolchain install 1.89.0 --profile minimal
       - uses: Swatinem/rust-cache@v2
-      - name: Seatbelt loopback probe (x300)
-        run: python3 .github/workflows/seatbelt-probe.py 300
       - name: Build tests
         run: cargo test -p sovereign --no-run
-      - name: Runner browser test on a fresh runner (x16)
+      - name: Runner browser test on a fresh runner (x24)
         run: |
           pass=0
-          for i in $(seq 1 16); do
+          for i in $(seq 1 24); do
             echo "=== runner browser run $i"
-            if cargo test -p sovereign --bin sovereign browser_goal_run_once -- --nocapture 2>&1 | grep -v -e cv_display_link -e backupd.sandbox | tee run.log | grep -q "test result: ok"; then pass=$((pass+1)); else grep -E "panicked|outcome|error" run.log | head -20; grep -E "Seatbelt|FATAL|ERROR" run.log | head -10; fi
+            if cargo test -p sovereign --bin sovereign browser_goal_run_once -- --nocapture 2>&1 | grep -v -e cv_display_link -e backupd.sandbox | tee run.log | grep -q "test result: ok"; then pass=$((pass+1)); else grep -E "panicked|outcome|error" run.log | head -20; grep -E "Seatbelt|FATAL|ERROR" run.log | head -10; echo "--- sandbox log"; log show --last 2m --style compact --predicate 'sender == "Sandbox" OR eventMessage CONTAINS "deny("' 2>/dev/null | grep -i -E "python|network" | tail -20; fi
           done
-          echo "PASSED $pass of 16"
+          echo "PASSED $pass of 24"
