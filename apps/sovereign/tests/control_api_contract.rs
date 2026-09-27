@@ -195,7 +195,12 @@ fn control_api_v2_live_serve_matches_frozen_schema() {
     );
     assert_eq!(created["project"]["managed"], json!(true), "{created}");
     let created_root = PathBuf::from(created["project"]["root"].as_str().unwrap());
-    assert!(created_root.starts_with(home.join("Sovereign Projects")));
+    // The service reports canonical roots; on macOS the temp dir is under a /var -> /private/var link.
+    let canonical_home = home.canonicalize().unwrap();
+    assert!(
+        created_root.starts_with(canonical_home.join("Sovereign Projects")),
+        "{created}"
+    );
     assert!(created_root.join("index.html").is_file());
 
     let plain = home.join("plain-folder");
