@@ -2771,6 +2771,7 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
                 cancellation: Some(cancellation),
             },
         )?;
+        let monitored = start.elapsed();
 
         let reaped = wait_group_absent(pgid, Duration::from_millis(500))?;
         if !reaped {
@@ -2807,6 +2808,15 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             receive_reader(stderr_handle, Duration::from_millis(500)).inspect_err(|_| {
                 let _ = journal.transition(action, ActionState::Dispatched, ActionState::Unknown);
             })?;
+        let limited = match limited {
+            Some(limit) => Some(limit),
+            None => limit_exceeded_after_exit(
+                &action.command,
+                output_count.load(Ordering::Relaxed),
+                monitored,
+                prepared.baseline_disk,
+            )?,
+        };
 
         let result = RawToolResult {
             exit_code: status.code(),
@@ -2869,6 +2879,7 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
                 cancellation: Some(cancellation),
             },
         )?;
+        let monitored = start.elapsed();
         let reaped = wait_group_absent(pgid, Duration::from_millis(500))?;
         if !reaped {
             journal.transition(action, ActionState::Dispatched, ActionState::Unknown)?;
@@ -2904,6 +2915,15 @@ impl<'a, I: ExecutionIsolationBackend> ProcessRunner<'a, I> {
             .inspect_err(|_| {
                 let _ = journal.transition(action, ActionState::Dispatched, ActionState::Unknown);
             })?;
+        let limited = match limited {
+            Some(limit) => Some(limit),
+            None => limit_exceeded_after_exit(
+                &action.command,
+                output_count.load(Ordering::Relaxed),
+                monitored,
+                prepared.baseline_disk,
+            )?,
+        };
         let redactor = Redactor::v1();
         let stdout = redactor.redact_bytes(&raw_stdout, &[secret_bytes])?.bytes;
         let stderr = redactor.redact_bytes(&raw_stderr, &[secret_bytes])?.bytes;
@@ -3398,6 +3418,32 @@ fn parse_resource_limit_name(value: &str) -> Result<ResourceLimitKind, ToolError
         "subprocesses" => Ok(ResourceLimitKind::Subprocesses),
         _ => Err(malformed_action_receipt()),
     }
+}
+
+/// A limit the process crossed but exited before a monitor poll saw it.
+///
+/// The monitor polls, so a fast command can exceed a ceiling and exit between two polls. Its
+/// output is fully drained by now, so the byte count is final; a crossed ceiling is still reported
+/// rather than recorded as a clean run.
+fn limit_exceeded_after_exit(
+    command: &CommandSpec,
+    output_bytes: u64,
+    elapsed: Duration,
+    baseline_disk: u64,
+) -> Result<Option<ResourceLimitKind>, ToolError> {
+    let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    if elapsed_ms > command.timeout_ms {
+        return Ok(Some(ResourceLimitKind::Timeout));
+    }
+    if output_bytes > command.output_limit_bytes {
+        return Ok(Some(ResourceLimitKind::OutputBytes));
+    }
+    if directory_size(&command.working_directory)?.saturating_sub(baseline_disk)
+        > command.disk_write_limit_bytes
+    {
+        return Ok(Some(ResourceLimitKind::DiskBytes));
+    }
+    Ok(None)
 }
 
 /// Bytes in regular files under `root`, not following symlinks.
@@ -4961,6 +5007,37 @@ mod directory_size_tests {
         assert_eq!(directory_size(&root).ok(), Some(5));
         let _ = fs::remove_dir_all(&root);
         assert!(matches!(directory_size(&root), Err(ToolError::Io(_))));
+    }
+
+    #[test]
+    fn a_limit_crossed_before_exit_is_still_reported() {
+        let root = test_root("after-exit");
+        let command = CommandSpec {
+            executable: PathBuf::from("/bin/sh"),
+            args: Vec::new(),
+            working_directory: root.clone(),
+            environment: BTreeMap::new(),
+            mode: sovereign_policy::CommandMode::Direct,
+            declared_risk: CommandRisk::Shell,
+            timeout_ms: 1_000,
+            output_limit_bytes: 128,
+            disk_write_limit_bytes: 4,
+            subprocess_limit: 0,
+        };
+        let quick = Duration::from_millis(10);
+        let observe = |output, elapsed| {
+            limit_exceeded_after_exit(&command, output, elapsed, 0)
+                .unwrap_or_else(|error| panic!("observe limits: {error}"))
+        };
+        assert_eq!(observe(128, quick), None);
+        assert_eq!(observe(129, quick), Some(ResourceLimitKind::OutputBytes));
+        assert_eq!(
+            observe(0, Duration::from_millis(1_001)),
+            Some(ResourceLimitKind::Timeout)
+        );
+        fs::write(root.join("grown"), b"12345").unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(observe(0, quick), Some(ResourceLimitKind::DiskBytes));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

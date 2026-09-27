@@ -4577,7 +4577,14 @@ def delayed_download_terminal():
             'suggestedFilename': 'ignored.bin'
         }
     })
-    time.sleep(0.20)
+    # Non-terminal frames keep arriving well past the caller's deadline, and the terminal frame
+    # comes last. Only a wait that refreshes its timeout on every frame could reach it.
+    for _ in range(35):
+        time.sleep(0.04)
+        emit({
+            'method': 'Browser.downloadProgress',
+            'params': {'guid': 'guid-deadline-download', 'state': 'inProgress'}
+        })
     emit({
         'method': 'Browser.downloadProgress',
         'params': {'guid': 'guid-deadline-download', 'state': 'completed'}
@@ -5071,8 +5078,10 @@ while True:
             panic!("download terminal wait must not receive a refreshed inner timeout");
         };
         assert!(error.is_transport_uncertain());
+        // The terminal frame arrives after about 1.5s, so a refreshed wait would have returned it.
+        // This bound only has to sit below that, which leaves room for a loaded machine.
         assert!(
-            started.elapsed() < Duration::from_millis(260),
+            started.elapsed() < Duration::from_millis(1_000),
             "download terminal wait extended the caller-owned deadline: {:?}",
             started.elapsed()
         );
