@@ -3482,15 +3482,15 @@ fn browser_process_spec(
     BrowserProcessSpec {
         executable: PathBuf::from("/bin/sh"),
         args,
-        // Crashpad resolves its database from Chrome's default user-data directory, not from
-        // --user-data-dir. When that directory does not exist yet the Seatbelt profile denies
-        // creating it and Chrome aborts at startup, so crash dumps stay inside the profile root.
+        // Chrome on macOS resolves its default data and Crashpad directories under the
+        // CoreFoundation home even with --user-data-dir, and aborts at startup when it cannot
+        // create them. Pin that home inside the profile root the sandbox lets it write.
         environment: BTreeMap::from([
-            ("TMPDIR".to_owned(), profile_root.display().to_string()),
             (
-                "BREAKPAD_DUMP_LOCATION".to_owned(),
-                profile_root.join("Crashpad").display().to_string(),
+                "CFFIXED_USER_HOME".to_owned(),
+                profile_root.display().to_string(),
             ),
+            ("TMPDIR".to_owned(), profile_root.display().to_string()),
         ]),
         working_directory: private_parent.to_path_buf(),
     }

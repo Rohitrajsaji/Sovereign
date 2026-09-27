@@ -515,17 +515,8 @@ fn prepared_launch_preserves_exact_caller_flags_and_cleans_when_unused() {
         Some(&prepared.profile_root().display().to_string())
     );
     assert_eq!(
-        prepared
-            .process_spec()
-            .environment
-            .get("BREAKPAD_DUMP_LOCATION"),
-        Some(
-            &prepared
-                .profile_root()
-                .join("Crashpad")
-                .display()
-                .to_string()
-        )
+        prepared.process_spec().environment.get("CFFIXED_USER_HOME"),
+        Some(&prepared.profile_root().display().to_string())
     );
     let profile = prepared.profile_root().to_path_buf();
     assert!(profile.is_dir());
