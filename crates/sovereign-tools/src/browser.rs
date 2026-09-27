@@ -3654,7 +3654,7 @@ fn prepared_browser_command(
         .envs(&prepared.process_spec.environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .process_group(0);
     command
 }

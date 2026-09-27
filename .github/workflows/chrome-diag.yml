@@ -1,0 +1,53 @@
+# TEMPORARY diagnostic for the live-Chrome "CDP response pipe closed" failure. Removed before review.
+name: chrome-diag
+on:
+  push:
+    branches: [claude/project-thread-07tqdk]
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Chrome version
+        run: '"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --version; echo "TMPDIR=$TMPDIR"'
+      - name: Manual pipe launch, short vs long TMPDIR
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, tempfile, json, select, time
+          chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+          def trial(label, depth):
+              base = os.path.realpath(tempfile.mkdtemp())
+              prof = os.path.join(base, "x" * depth)
+              os.makedirs(prof, mode=0o700)
+              r_cmd, w_cmd = os.pipe(); r_out, w_out = os.pipe()
+              def pre():
+                  os.dup2(r_cmd, 3); os.dup2(w_out, 4)
+              args = [chrome, "--headless=new", "--remote-debugging-pipe", "--no-first-run",
+                      "--no-default-browser-check", "--disable-breakpad", "--no-proxy-server",
+                      "--use-mock-keychain", "--password-store=basic",
+                      f"--user-data-dir={prof}", "about:blank"]
+              p = subprocess.Popen(args, env={"TMPDIR": prof}, cwd=base, preexec_fn=pre,
+                                   pass_fds=(3, 4), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE)
+              os.close(r_cmd); os.close(w_out)
+              os.write(w_cmd, json.dumps({"id": 1, "method": "Browser.getVersion"}).encode() + b"\0")
+              ready, _, _ = select.select([r_out], [], [], 20)
+              data = os.read(r_out, 65536) if ready else b"<timeout>"
+              p.kill(); _, err = p.communicate(timeout=10)
+              print(f"=== {label}: profile path len {len(prof)} -> {data[:120]!r}")
+              print(err.decode(errors="replace")[-3000:])
+          for depth in (10, 40, 80, 120):
+              trial(f"depth{depth}", depth)
+          PY
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Live-Chrome browser tests
+        run: cargo test -p sovereign-tools --test browser -- --nocapture --test-threads=1
+        continue-on-error: true
+      - name: Runner browser test
+        run: cargo test -p sovereign --bin sovereign browser_goal_run_once -- --nocapture
+        continue-on-error: true
