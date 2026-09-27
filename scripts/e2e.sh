@@ -39,4 +39,16 @@ cd "$root/apps/sovereign/ui"
 if [ ! -d node_modules ]; then
     npm ci
 fi
-npx playwright test
+status=0
+npx playwright test || status=$?
+if [ "$status" -ne 0 ]; then
+    # CI keeps these as an artifact too; printing them makes a failure readable from the log.
+    echo "--- e2e server log (last 80 lines)" >&2
+    tail -n 80 "$target_dir/e2e-server.err" >&2 || true
+    for context in test-results/*/error-context.md; do
+        [ -f "$context" ] || continue
+        echo "--- $context" >&2
+        head -n 120 "$context" >&2
+    done
+fi
+exit "$status"

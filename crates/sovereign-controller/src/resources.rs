@@ -528,6 +528,13 @@ struct CounterSample {
     compressor_pages: u64,
 }
 
+/// `sysctl -n hw.memsize` output (bytes) in MiB.
+#[cfg(target_os = "macos")]
+fn parse_physical_memory_mib(text: &str) -> Option<u64> {
+    let bytes = text.trim().parse::<u64>().ok()?;
+    (bytes > 0).then_some(bytes / (1_024 * 1_024))
+}
+
 /// Read-only macOS pressure probe for the selected M1/8GB local profile.
 #[derive(Debug, Default)]
 pub struct MacOsResourceProbe {
@@ -555,9 +562,12 @@ impl ResourcePressureProbe for MacOsResourceProbe {
             let swap_used_mib = parse_swap_used_mib(&swap);
             let thermal = command_stdout("/usr/bin/pmset", &["-g", "therm"])?;
             let controlled_working_set_mib = controlled_process_tree_rss_mib()?;
-            let host_headroom_mib = u64::from(free_percent)
-                .saturating_mul(HardwareProfileV1::m1_8gb().physical_memory_mib)
-                / 100;
+            // The Mac's real memory, not the profile's 8 GB, so larger Macs are not undercounted.
+            let physical_mib = command_stdout("/usr/sbin/sysctl", &["-n", "hw.memsize"])
+                .ok()
+                .and_then(|text| parse_physical_memory_mib(&text))
+                .unwrap_or(HardwareProfileV1::m1_8gb().physical_memory_mib);
+            let host_headroom_mib = u64::from(free_percent).saturating_mul(physical_mib) / 100;
             let current = CounterSample {
                 observed_at_ms,
                 swapouts: counters.swapouts,
@@ -816,11 +826,19 @@ fn unix_time_ms() -> io::Result<i64> {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{CounterSample, pressure_growth_signals};
+    use super::{CounterSample, parse_physical_memory_mib, pressure_growth_signals};
     use sovereign_policy::{
         M6ResourceGovernor, OsMemoryPressure, PressureBand, RESOURCE_PRESSURE_EVENT_SCHEMA_VERSION,
         ResourcePressureSnapshotV1, ThermalPressure,
     };
+
+    #[test]
+    fn physical_memory_is_read_from_hw_memsize() {
+        assert_eq!(parse_physical_memory_mib("8589934592\n"), Some(8_192));
+        assert_eq!(parse_physical_memory_mib("17179869184"), Some(16_384));
+        assert_eq!(parse_physical_memory_mib("0"), None);
+        assert_eq!(parse_physical_memory_mib("unknown"), None);
+    }
 
     #[test]
     fn fresh_pressure_probe_counter_state_cannot_synthesize_green() {

@@ -3,6 +3,7 @@
 export type SessionResponse = {
   authenticated: boolean;
   csrf_token: string;
+  version?: string;
 };
 
 export type DoctorCheck = {
@@ -29,6 +30,7 @@ export type OverviewResponse = {
   blocked_approvals?: Array<ApprovalRequest>;
   working?: boolean;
   pending_commands?: Array<PendingCommand>;
+  project_problem?: string | null;
 };
 
 export type ApprovalRequest = {
@@ -122,6 +124,7 @@ export type SettingsV1 = {
   node_path?: string | null;
   execute_on_start: boolean;
   approval_principal: string;
+  queued_model_id?: string | null;
 };
 
 export type GoalDetail = {
@@ -160,6 +163,7 @@ export type GoalProgress = {
   steps_total: number;
   percent: number;
   terminal: boolean;
+  memory?: MemoryNeed | null;
 };
 
 export type GoalOutcome = {
@@ -175,7 +179,7 @@ export type GoalOutcome = {
 
 export type LandingRecord = {
   goal_id: string;
-  status: "predates_landing" | "landed" | "nothing_to_land" | "blocked_by_local_changes" | "conflict" | "undone" | "failed";
+  status: "predates_landing" | "landed" | "nothing_to_land" | "blocked_by_local_changes" | "conflict" | "undone" | "failed" | "undo_queued";
   commit: string | null;
   undo_commit: string | null;
   changed_paths: Array<string>;
@@ -246,6 +250,7 @@ export type DownloadProgress = {
   bytes_total: number;
   percent: number;
   detail: string;
+  model_id?: string | null;
 };
 
 export type SetupStatus = {
@@ -253,6 +258,7 @@ export type SetupStatus = {
   machine: MachineInfo;
   developer_tools: DeveloperTools;
   model: ModelChoice | null;
+  models: Array<ModelOption>;
   runtime_ready: boolean;
   model_ready: boolean;
   download: DownloadProgress;
@@ -281,6 +287,7 @@ export type ProjectFile = {
 export type ProjectFilesResponse = {
   files: Array<ProjectFile>;
   truncated: boolean;
+  model_limit_bytes: number;
 };
 
 export type ProjectFileContent = {
@@ -289,4 +296,50 @@ export type ProjectFileContent = {
   binary: boolean;
   truncated: boolean;
   text: string;
+};
+
+export type MemoryNeed = {
+  short_mib: number;
+  can_start_anyway: boolean;
+};
+
+export type ModelOption = {
+  id: string;
+  display_name: string;
+  summary: string;
+  size_bytes: number;
+  recommended_memory_mib: number;
+  installed: boolean;
+  selected: boolean;
+  queued: boolean;
+  fits: boolean;
+  recommended: boolean;
+};
+
+export type ModelSelectResponse = {
+  model_id: string;
+  applies: "now" | "after_current";
+};
+
+export type ModelRemoveResponse = {
+  model_id: string;
+  removed: boolean;
+};
+
+export type StartAnywayResponse = {
+  goal_id: string;
+  lent_mib: number;
+};
+
+export type FolderSummary = {
+  cancelled: boolean;
+  root: string | null;
+  name: string | null;
+  has_history: boolean;
+  parent_project: string | null;
+  file_count: number;
+  total_bytes: number;
+  more_than: boolean;
+  large: boolean;
+  private_files: Array<string>;
 };

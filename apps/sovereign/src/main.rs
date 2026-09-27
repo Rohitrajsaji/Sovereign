@@ -1,5 +1,6 @@
 mod actor;
 mod app_data;
+mod build_info;
 mod consumer_status;
 mod control_api;
 mod dispatch;
@@ -280,6 +281,11 @@ fn run_serve(args: &[String], state_path: &Path) -> Result<String, String> {
         None
     };
     let listener = bind_loopback(address)?;
+    // Only a service that is listening records its version, so `sovereign app` never mistakes
+    // a restart that failed to bind for one that is up.
+    if let Some(root) = app_data_root.as_deref() {
+        let _ = build_info::write_service_version(root);
+    }
     let local_address = listener.local_addr().map_err(|error| error.to_string())?;
     eprintln!("sovereign local dashboard listening on http://{local_address}/");
     let projects_index = app_data::AppData::open_default()
@@ -378,7 +384,13 @@ fn app_command() -> Result<String, String> {
     let data = app_data::AppData::open_default().map_err(|error| error.to_string())?;
     let launchctl = launch_agent::SystemLaunchctl;
     let bin = std::env::current_exe().map_err(|error| error.to_string())?;
-    launch_agent::open_ui(&data, &launchctl, &bin, launch_agent::system_open)
+    let opened = launch_agent::open_ui(&data, &launchctl, &bin, launch_agent::system_open)?;
+    let notice = std::env::var_os("HOME")
+        .and_then(|home| build_info::source_checkout_notice(Path::new(&home)));
+    Ok(match notice {
+        Some(notice) => format!("{opened}\n\n{notice}"),
+        None => opened,
+    })
 }
 
 fn open_local_control(state_path: &Path) -> Result<LocalControl, String> {
@@ -509,6 +521,7 @@ fn handle_control_request(
                     working: false,
                     paused: model.status.execution_control.paused,
                     pending: &[],
+                    memory: None,
                 },
             );
             let view = views
@@ -522,6 +535,7 @@ fn handle_control_request(
         }
         ControlApiRequest::CreateProject { .. }
         | ControlApiRequest::OpenFolder { .. }
+        | ControlApiRequest::InspectFolder { .. }
         | ControlApiRequest::UndoGoal { .. }
         | ControlApiRequest::ApplyGoal { .. } => {
             Err("projects and results are served by the local service".to_owned())
@@ -610,6 +624,9 @@ fn handle_control_request(
                 .and_then(|item| serde_json::to_value(item).map_err(|e| e.to_string()))
         }
         ControlApiRequest::DownloadModel { .. }
+        | ControlApiRequest::SelectModel { .. }
+        | ControlApiRequest::RemoveModel { .. }
+        | ControlApiRequest::StartAnyway { .. }
         | ControlApiRequest::SetupStatus
         | ControlApiRequest::CancelModelDownload
         | ControlApiRequest::InstallDeveloperTools

@@ -15,6 +15,9 @@
         },
         "csrf_token": {
           "type": "string"
+        },
+        "version": {
+          "type": "string"
         }
       },
       "additionalProperties": false
@@ -113,6 +116,12 @@
           "items": {
             "$ref": "#/definitions/PendingCommand"
           }
+        },
+        "project_problem": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -450,6 +459,12 @@
         },
         "approval_principal": {
           "type": "string"
+        },
+        "queued_model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -602,6 +617,16 @@
         },
         "terminal": {
           "type": "boolean"
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MemoryNeed"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -677,7 +702,8 @@
             "blocked_by_local_changes",
             "conflict",
             "undone",
-            "failed"
+            "failed",
+            "undo_queued"
           ]
         },
         "commit": {
@@ -978,6 +1004,12 @@
         },
         "detail": {
           "type": "string"
+        },
+        "model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
@@ -989,6 +1021,7 @@
         "machine",
         "developer_tools",
         "model",
+        "models",
         "runtime_ready",
         "model_ready",
         "download",
@@ -1013,6 +1046,12 @@
               "type": "null"
             }
           ]
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ModelOption"
+          }
         },
         "runtime_ready": {
           "type": "boolean"
@@ -1096,7 +1135,8 @@
       "type": "object",
       "required": [
         "files",
-        "truncated"
+        "truncated",
+        "model_limit_bytes"
       ],
       "properties": {
         "files": {
@@ -1107,6 +1147,9 @@
         },
         "truncated": {
           "type": "boolean"
+        },
+        "model_limit_bytes": {
+          "type": "integer"
         }
       },
       "additionalProperties": false
@@ -1135,6 +1178,182 @@
         },
         "text": {
           "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MemoryNeed": {
+      "type": "object",
+      "required": [
+        "short_mib",
+        "can_start_anyway"
+      ],
+      "properties": {
+        "short_mib": {
+          "type": "integer"
+        },
+        "can_start_anyway": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelOption": {
+      "type": "object",
+      "required": [
+        "id",
+        "display_name",
+        "summary",
+        "size_bytes",
+        "recommended_memory_mib",
+        "installed",
+        "selected",
+        "queued",
+        "fits",
+        "recommended"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer"
+        },
+        "recommended_memory_mib": {
+          "type": "integer"
+        },
+        "installed": {
+          "type": "boolean"
+        },
+        "selected": {
+          "type": "boolean"
+        },
+        "queued": {
+          "type": "boolean"
+        },
+        "fits": {
+          "type": "boolean"
+        },
+        "recommended": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelSelectResponse": {
+      "type": "object",
+      "required": [
+        "model_id",
+        "applies"
+      ],
+      "properties": {
+        "model_id": {
+          "type": "string"
+        },
+        "applies": {
+          "type": "string",
+          "enum": [
+            "now",
+            "after_current"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelRemoveResponse": {
+      "type": "object",
+      "required": [
+        "model_id",
+        "removed"
+      ],
+      "properties": {
+        "model_id": {
+          "type": "string"
+        },
+        "removed": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "StartAnywayResponse": {
+      "type": "object",
+      "required": [
+        "goal_id",
+        "lent_mib"
+      ],
+      "properties": {
+        "goal_id": {
+          "type": "string"
+        },
+        "lent_mib": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FolderSummary": {
+      "type": "object",
+      "required": [
+        "cancelled",
+        "root",
+        "name",
+        "has_history",
+        "parent_project",
+        "file_count",
+        "total_bytes",
+        "more_than",
+        "large",
+        "private_files"
+      ],
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        },
+        "root": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "has_history": {
+          "type": "boolean"
+        },
+        "parent_project": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_count": {
+          "type": "integer"
+        },
+        "total_bytes": {
+          "type": "integer"
+        },
+        "more_than": {
+          "type": "boolean"
+        },
+        "large": {
+          "type": "boolean"
+        },
+        "private_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false

@@ -13,7 +13,7 @@ use crate::execution::ServiceStatusV1;
 use crate::model_setup::ModelSetup;
 use crate::preview::{PreviewAddressV1, PreviewRoot};
 use serde::Serialize;
-use sovereign_controller::CancellationHandle;
+use sovereign_controller::{CancellationHandle, MAX_MEMORY_ALLOWANCE_MIB, MemoryWaitV1};
 use sovereign_model::ModelBackend;
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -59,7 +59,22 @@ pub struct ServiceShared {
     /// The bound project's folder, which the preview and the Files tab show read-only.
     project_root: PreviewRoot,
     preview: std::sync::OnceLock<PreviewAddressV1>,
+    /// The request waiting for memory and by how much, and the memory the person lent it with
+    /// "Start anyway". Neither is durable: a restart measures again.
+    memory: Mutex<MemoryFacts>,
+    /// Why the last chosen project could not be opened, until one opens.
+    project_problem: Mutex<Option<String>>,
 }
+
+#[derive(Debug, Default)]
+struct MemoryFacts {
+    wait: Option<(String, MemoryWaitV1)>,
+    allowance: Option<(String, u64)>,
+}
+
+/// Extra memory lent on top of the shortfall, so a small change in free memory between the
+/// wait and the next try does not stop it again.
+const ALLOWANCE_MARGIN_MIB: u64 = 128;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -87,7 +102,78 @@ impl ServiceShared {
             model_setup: Arc::new(ModelSetup::default()),
             project_root: Arc::new(RwLock::new(None)),
             preview: std::sync::OnceLock::new(),
+            memory: Mutex::new(MemoryFacts::default()),
+            project_problem: Mutex::new(None),
         })
+    }
+
+    #[must_use]
+    pub fn project_problem(&self) -> Option<String> {
+        lock(&self.project_problem).clone()
+    }
+
+    pub fn set_project_problem(&self, problem: Option<String>) {
+        *lock(&self.project_problem) = problem;
+    }
+
+    /// The request waiting for memory, and how short it is.
+    #[must_use]
+    pub fn memory_wait(&self) -> Option<(String, MemoryWaitV1)> {
+        lock(&self.memory).wait.clone()
+    }
+
+    fn publish_memory_wait(&self, goal_id: &str, wait: Option<MemoryWaitV1>) {
+        let mut memory = lock(&self.memory);
+        memory.wait = wait.map(|wait| (goal_id.to_owned(), wait));
+        if memory.wait.is_none()
+            && memory
+                .allowance
+                .as_ref()
+                .is_some_and(|(allowed, _)| allowed != goal_id)
+        {
+            memory.allowance = None;
+        }
+    }
+
+    /// Forgets a memory wait once nothing is waiting for memory, so a later request never shows
+    /// an earlier one's figures. Memory already lent to a request is kept.
+    pub fn clear_memory_wait(&self) {
+        lock(&self.memory).wait = None;
+    }
+
+    /// "Start anyway": lends the waiting request the memory it is short by, when that is at
+    /// most [`MAX_MEMORY_ALLOWANCE_MIB`]. Returns the amount lent.
+    ///
+    /// # Errors
+    /// Returns a plain reason when the request is not waiting for memory or is too far short.
+    pub fn grant_memory_allowance(&self, goal_id: &str) -> Result<u64, String> {
+        let mut memory = lock(&self.memory);
+        let Some((waiting, wait)) = memory.wait.as_ref() else {
+            return Err("This request isn't waiting for memory.".to_owned());
+        };
+        if waiting != goal_id {
+            return Err("This request isn't the one waiting for memory.".to_owned());
+        }
+        let short = wait.short_mib();
+        if short > MAX_MEMORY_ALLOWANCE_MIB {
+            return Err(format!(
+                "This request needs about {:.1} GB more free memory, too much to start anyway. Close other apps or choose a smaller model in Settings.",
+                gib(short)
+            ));
+        }
+        let lent = short
+            .saturating_add(ALLOWANCE_MARGIN_MIB)
+            .min(MAX_MEMORY_ALLOWANCE_MIB);
+        memory.allowance = Some((goal_id.to_owned(), lent));
+        Ok(lent)
+    }
+
+    fn memory_allowance_for(&self, goal_id: &str) -> u64 {
+        lock(&self.memory)
+            .allowance
+            .as_ref()
+            .filter(|(allowed, _)| allowed == goal_id)
+            .map_or(0, |(_, mib)| *mib)
     }
 
     /// The folder shared with the preview server.
@@ -268,6 +354,32 @@ pub fn register_compile_interrupt(
     CompileInterruptGuard(())
 }
 
+/// Memory lent to `goal_id` with "Start anyway". Zero outside a service step.
+#[must_use]
+pub fn memory_allowance_for(goal_id: &str) -> u64 {
+    STEP_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map_or(0, |shared| shared.memory_allowance_for(goal_id))
+    })
+}
+
+/// Reports whether `goal_id`'s model is waiting for memory. No-op outside a service step.
+pub fn publish_memory_wait(goal_id: &str, wait: Option<MemoryWaitV1>) {
+    STEP_CONTEXT.with(|slot| {
+        if let Some(shared) = slot.borrow().as_ref() {
+            shared.publish_memory_wait(goal_id, wait);
+        }
+    });
+}
+
+/// Mebibytes as gigabytes for plain sentences.
+#[must_use]
+#[expect(clippy::cast_precision_loss, reason = "a rounded figure for people")]
+pub fn gib(mib: u64) -> f64 {
+    mib as f64 / 1_024.0
+}
+
 fn clear_compile_interrupt() {
     STEP_CONTEXT.with(|slot| {
         if let Some(shared) = slot.borrow().as_ref() {
@@ -279,6 +391,47 @@ fn clear_compile_interrupt() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_anyway_lends_only_a_small_shortfall_to_the_waiting_request() {
+        let shared = ServiceShared::new(PathBuf::from("/tmp/state.sqlite3"));
+        assert!(shared.grant_memory_allowance("goal-1").is_err());
+        shared.publish_memory_wait(
+            "goal-1",
+            Some(MemoryWaitV1 {
+                needed_mib: 5_632,
+                free_mib: 5_324,
+            }),
+        );
+        assert!(shared.grant_memory_allowance("goal-2").is_err());
+        assert_eq!(shared.grant_memory_allowance("goal-1"), Ok(308 + 128));
+        assert_eq!(shared.memory_allowance_for("goal-1"), 436);
+        assert_eq!(shared.memory_allowance_for("goal-2"), 0);
+        shared.clear_memory_wait();
+        assert_eq!(shared.memory_wait(), None);
+        assert_eq!(shared.memory_allowance_for("goal-1"), 436);
+        // Admitted: the wait clears but the allowance stays with its request.
+        shared.publish_memory_wait("goal-1", None);
+        assert_eq!(shared.memory_allowance_for("goal-1"), 436);
+        // Another request runs: the old allowance is dropped.
+        shared.publish_memory_wait("goal-2", None);
+        assert_eq!(shared.memory_allowance_for("goal-1"), 0);
+
+        shared.publish_memory_wait(
+            "goal-3",
+            Some(MemoryWaitV1 {
+                needed_mib: 5_632,
+                free_mib: 2_000,
+            }),
+        );
+        let refused = shared.grant_memory_allowance("goal-3");
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|reason| reason.contains("smaller model")),
+            "{refused:?}"
+        );
+    }
 
     #[test]
     fn pending_commands_are_tracked_by_ticket() {

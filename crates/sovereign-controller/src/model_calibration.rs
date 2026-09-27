@@ -10,11 +10,13 @@
 //! a failed sample write never fails the task, and the post-load RSS budget check still applies.
 
 use crate::{Controller, ControllerError, M1_MODEL_OUTPUT_TOKENS, sha256_prefixed};
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sovereign_model::{
     BackendHealth, ModelBackend, ModelCapabilities, ModelError, ModelLease, ModelLoadProfile,
     ModelRequest, ModelResidencyProof, ModelResponse,
 };
+use sovereign_policy::ResourcePressureSnapshotV1;
 use sovereign_policy::{
     AdmissionStatus, ConditionalLeaseContextV1, HardwareProfileV1, HeavyLeaseClass,
     ModelCalibrationKeyV1, ModelCalibrationV1, PlanHeavyLeaseClass, ResourceLeaseOwnerV1,
@@ -22,6 +24,35 @@ use sovereign_policy::{
 };
 use sovereign_state::{NewJournalEvent, StateRecordCasMutation, StateStore};
 use std::sync::Mutex;
+
+/// The most a person can lend the model with "Start anyway": the launch reserve shrinks by at
+/// most this much, and only for the request they chose it for.
+pub const MAX_MEMORY_ALLOWANCE_MIB: u64 = 1_024;
+
+/// Why the model is waiting for memory, in numbers the service can explain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryWaitV1 {
+    /// Free memory the model needs before it starts, including the launch reserve.
+    pub needed_mib: u64,
+    /// Free memory measured when admission was refused.
+    pub free_mib: u64,
+}
+
+impl MemoryWaitV1 {
+    #[must_use]
+    pub const fn short_mib(&self) -> u64 {
+        self.needed_mib.saturating_sub(self.free_mib)
+    }
+}
+
+/// Per-process MODEL memory settings. None of this is durable: the composer sets it before each
+/// step, and the last wait is only reported, never used as authority.
+#[derive(Debug, Default)]
+pub(crate) struct ModelMemory {
+    starting_estimate_mib: Option<u64>,
+    allowance_mib: u64,
+    last_wait: Option<MemoryWaitV1>,
+}
 
 pub(crate) const MODEL_CALIBRATION_NAMESPACE: &str = "controller.model_calibration";
 const CALIBRATION_EVENT_KIND: &str = "model_calibration_sample_recorded";
@@ -202,7 +233,7 @@ impl Controller {
     /// deferral, not an error, so compilation fails closed.
     pub fn compilation_model_admission(&mut self) -> Result<Option<String>, ControllerError> {
         let (calibrated, admission_mib) = self.model_admission_estimate()?;
-        let snapshot = match self.resource_probe.sample() {
+        let snapshot = match self.model_pressure_snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 return Ok(Some(format!(
@@ -232,13 +263,19 @@ impl Controller {
         if let Some(lease) = decision.lease.as_ref() {
             let _ = self.resources.release(&lease.lease_id);
         }
-        if decision.status == AdmissionStatus::Admitted {
+        let admitted = decision.status == AdmissionStatus::Admitted;
+        self.note_model_admission(admitted, admission_mib, headroom_mib);
+        if admitted {
             return Ok(None);
         }
-        let required_mib =
-            admission_mib.saturating_add(self.resources.profile().minimum_launch_headroom_soft_mib);
+        let wait = self.model_memory.last_wait.unwrap_or(MemoryWaitV1 {
+            needed_mib: admission_mib,
+            free_mib: headroom_mib,
+        });
         Ok(Some(format!(
-            "waiting for memory: the model needs about {required_mib} MiB free and {headroom_mib} MiB is free ({} estimate, {:?})",
+            "waiting for memory: the model needs about {} MiB free and {} MiB is free ({} estimate, {:?})",
+            wait.needed_mib,
+            wait.free_mib,
             if calibrated {
                 "measured"
             } else {
@@ -270,11 +307,57 @@ impl Controller {
                 .and_then(|(calibration, _)| calibration.admission_estimate_mib()),
             None => None,
         };
-        Ok(
-            calibrated.map_or((false, crate::M1_MODEL_UNCALIBRATED_ADMISSION_MIB), |mib| {
-                (true, mib)
-            }),
-        )
+        let uncalibrated = self
+            .model_memory
+            .starting_estimate_mib
+            .unwrap_or(crate::M1_MODEL_UNCALIBRATED_ADMISSION_MIB);
+        Ok(calibrated.map_or((false, uncalibrated), |mib| (true, mib)))
+    }
+
+    /// Sets the starting MODEL estimate for a known model file, used until this Mac has measured
+    /// its own. `None` keeps the conservative generic estimate. It never exceeds the generic
+    /// estimate, so a catalog entry can only make admission more precise, not looser than that.
+    pub fn set_model_starting_estimate(&mut self, mib: Option<u64>) {
+        self.model_memory.starting_estimate_mib =
+            mib.map(|mib| mib.min(crate::M1_MODEL_UNCALIBRATED_ADMISSION_MIB));
+    }
+
+    /// Lends the model up to [`MAX_MEMORY_ALLOWANCE_MIB`] of the launch reserve, because the
+    /// person chose "Start anyway" for the current request. Zero removes it.
+    pub fn set_memory_allowance_mib(&mut self, mib: u64) {
+        self.model_memory.allowance_mib = mib.min(MAX_MEMORY_ALLOWANCE_MIB);
+    }
+
+    /// The last MODEL admission that waited for memory, or `None` once one was admitted.
+    #[must_use]
+    pub const fn memory_wait(&self) -> Option<MemoryWaitV1> {
+        self.model_memory.last_wait
+    }
+
+    /// Samples pressure for a MODEL admission, counting any memory the person lent the model.
+    pub(crate) fn model_pressure_snapshot(
+        &mut self,
+    ) -> std::io::Result<ResourcePressureSnapshotV1> {
+        let mut snapshot = self.resource_probe.sample()?;
+        snapshot.host_headroom_mib = snapshot
+            .host_headroom_mib
+            .saturating_add(self.model_memory.allowance_mib);
+        Ok(snapshot)
+    }
+
+    /// Remembers whether a MODEL admission waited, with the free memory it saw before any
+    /// allowance.
+    pub(crate) fn note_model_admission(
+        &mut self,
+        admitted: bool,
+        admission_mib: u64,
+        free_mib: u64,
+    ) {
+        self.model_memory.last_wait = (!admitted).then(|| MemoryWaitV1 {
+            needed_mib: admission_mib
+                .saturating_add(self.resources.profile().minimum_launch_headroom_soft_mib),
+            free_mib: free_mib.saturating_sub(self.model_memory.allowance_mib),
+        });
     }
 
     /// Records the RSS of a load whose context matches the profile.
@@ -468,6 +551,71 @@ mod tests {
                 host_free_disk_mib: Some(100 * 1_024),
             })
         }
+    }
+
+    #[test]
+    fn starting_estimate_and_start_anyway_decide_admission_on_an_8_gb_mac() {
+        let (dir, state) = temp_state("starting-estimate");
+        let mut controller = Controller::new(state);
+        // The reported case: 5324 MiB free, 4096 + 1536 = 5632 MiB needed.
+        controller.set_resource_pressure_probe(Box::new(FixedProbe(5_324)));
+        assert!(
+            controller
+                .compilation_model_admission()
+                .ok()
+                .flatten()
+                .is_some()
+        );
+        assert_eq!(
+            controller.memory_wait(),
+            Some(MemoryWaitV1 {
+                needed_mib: 5_632,
+                free_mib: 5_324
+            })
+        );
+        assert_eq!(
+            controller.memory_wait().map(|wait| wait.short_mib()),
+            Some(308)
+        );
+
+        // "Start anyway" lends the shortfall, and the wait clears once admitted.
+        controller.set_memory_allowance_mib(400);
+        assert_eq!(controller.compilation_model_admission().ok(), Some(None));
+        assert_eq!(controller.memory_wait(), None);
+        controller.set_memory_allowance_mib(0);
+
+        // The catalog's measured estimate for the model fits without help.
+        controller.set_model_starting_estimate(Some(3_600));
+        assert_eq!(
+            controller.model_admission_estimate().ok(),
+            Some((false, 3_600))
+        );
+        assert_eq!(controller.compilation_model_admission().ok(), Some(None));
+
+        // A starting estimate never loosens admission past the generic estimate, and the
+        // allowance is capped.
+        controller.set_model_starting_estimate(Some(9_000));
+        assert_eq!(
+            controller.model_admission_estimate().ok(),
+            Some((false, crate::M1_MODEL_UNCALIBRATED_ADMISSION_MIB))
+        );
+        controller.set_resource_pressure_probe(Box::new(FixedProbe(3_000)));
+        controller.set_memory_allowance_mib(u64::MAX);
+        assert!(
+            controller
+                .compilation_model_admission()
+                .ok()
+                .flatten()
+                .is_some()
+        );
+        assert_eq!(
+            controller.memory_wait(),
+            Some(MemoryWaitV1 {
+                needed_mib: 5_632,
+                free_mib: 3_000
+            })
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

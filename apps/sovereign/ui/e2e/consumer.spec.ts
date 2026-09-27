@@ -96,6 +96,9 @@ test.describe("consumer journey", () => {
     await open(page, { onboarded: true });
     await page.getByRole("button", { name: "Settings" }).click();
     await expect(page.getByRole("dialog", { name: "Settings" })).toBeVisible();
+    // Every pinned model has a card with its size and what it needs.
+    await expect(page.getByRole("heading", { name: "Qwen3 4B", level: 4 })).toBeVisible();
+    await expect(page.getByText(/GB download · best with \d+ GB of memory/).first()).toBeVisible();
     await page.getByText("Advanced").click();
     await expect(page.getByRole("list", { name: "Diagnostics" })).toBeVisible();
     await assertAxe(page);

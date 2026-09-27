@@ -24,7 +24,7 @@ Setup has three steps:
    - Choose **Download** for the AI model (about 2.5 GB, once). You can pause and resume. If the connection drops, it continues where it stopped.
 3. **Your first project.** Either:
    - start a new one: Sovereign makes a folder under **Sovereign Projects** in your home folder; or
-   - choose a folder you already have.
+   - choose a folder you already have. Before using it, Sovereign shows how many files it would save in the folder's history and points out files that may be private, like `.env`, and you decide. A folder with just your app works best.
 
 You can choose **Set up later** and look around first. Requests wait until setup is finished.
 
@@ -41,7 +41,7 @@ Each request gets a card that shows where it is: **Planning → Building → Che
 When a request is done, its card lists the files that changed.
 
 - **Open preview** shows your app on the right.
-- **Undo** takes the change back.
+- **Undo** takes the change back. If another request is running, the Undo waits and happens as soon as that request finishes.
 
 Every change, including your own edits between requests, is saved in the project's history. Undo never loses anything else.
 
@@ -62,7 +62,10 @@ Every change, including your own edits between requests, is saved in the project
 
 **"Sovereign isn't running" or "This page needs a fresh link."** Open Sovereign from Spotlight or Launchpad, or type `sovereign` in Terminal. That restarts it if needed and opens a fresh page.
 
-**"Waiting for memory."** The AI model needs several gigabytes of free memory. Close apps you aren't using; Sovereign tries again on its own. After a few runs it measures its real memory use, and the requirement often drops.
+**"Waiting for memory."** The AI model needs several gigabytes of free memory, and the card says roughly how much more it needs. Close apps and browser tabs you aren't using; Sovereign tries again on its own.
+- When it is less than 1 GB short, **Start anyway** starts it now for that request. Your Mac may slow down while it works.
+- When it is further short, choose a smaller model in **Settings → AI model**.
+- After a few runs Sovereign measures the model's real memory use, and the requirement often drops.
 
 **"Having trouble."** Sovereign hit a problem and keeps retrying. The card says why in plain words, and Details shows the exact message.
 - "The AI model isn't set up yet": open **Settings → Set up** and finish the download.
@@ -72,14 +75,22 @@ Every change, including your own edits between requests, is saved in the project
 
 **The model download keeps failing.** Check your internet connection and choose **Try again**. It continues where it stopped. Sovereign only accepts the file if it matches its published checksum, so a damaged download is thrown away rather than used.
 
-**A request keeps failing.** A 4-billion-parameter model on a laptop is good at small, clear requests. Split a big idea into several smaller ones, or describe the result you want to see.
+**A request keeps failing.** A model small enough to run on a laptop is good at small, clear requests. Split a big idea into several smaller ones, or describe the result you want to see. If you use a smaller model, a larger one in **Settings → AI model** may do better.
+
+**A file is "too big for Sovereign to read."** Sovereign reads files up to 12 KB when it plans a change. Larger files still work in your app, but changes to them may not work well. Ask for new features in separate files, for example "put the chart in its own file".
+
+**The same problem is still there after pulling new code.** `git pull` changes the source folder only. Run `./scripts/install-from-source.sh` to build, install, and restart Sovereign. `sovereign` also tells you when your source folder has code that isn't installed yet.
 
 ## Settings
 
-- **Local AI model:** whether the model is ready, and **Set up** to finish or check it.
+- **AI model:** a card for each model Sovereign offers, with its download size and the memory it works best with.
+  - **Download and use** fetches a model and switches to it. **Use this model** switches to one already downloaded. **Remove** frees its disk space.
+  - When a request is running, Sovereign asks whether to switch **After it finishes** or to **Stop it and start again** on the new model.
+  - Macs with 8 GB of memory start with the smaller model; larger Macs start with the larger one.
 - **Work:** **Pause work** stops Sovereign from starting anything new; **Resume work** continues.
 - **Notifications:** hear when a request finishes or needs you while the tab is in the background.
 - **Advanced:**
+  - the version that is running;
   - diagnostics for every check;
   - your own model files (a `llama-server` program and a `.gguf` model);
   - the name recorded with your approvals.

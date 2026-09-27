@@ -20,6 +20,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryS
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::consumer_status::ServicePhase;
 use crate::execution::{ExecutionService, ServiceStatusV1};
 use crate::landing_service::{self, LandingRecordV1, ProjectWorkspace};
 use crate::run_lock::RunLock;
@@ -180,6 +181,26 @@ impl ControllerActorHandle {
     #[must_use]
     pub fn pending_commands(&self) -> Vec<PendingCommandV1> {
         self.shared.pending()
+    }
+
+    /// Why the last chosen project could not be opened, if it could not.
+    #[must_use]
+    pub fn project_problem(&self) -> Option<String> {
+        self.shared.project_problem()
+    }
+
+    /// The request waiting for memory, and by how much.
+    #[must_use]
+    pub fn memory_wait(&self) -> Option<(String, sovereign_controller::MemoryWaitV1)> {
+        self.shared.memory_wait()
+    }
+
+    /// "Start anyway" for the request waiting for memory.
+    ///
+    /// # Errors
+    /// Returns a plain reason when it is not waiting or is too far short.
+    pub fn grant_memory_allowance(&self, goal_id: &str) -> Result<u64, String> {
+        self.shared.grant_memory_allowance(goal_id)
     }
 
     /// Onboarding's model download, which runs beside the actor.
@@ -497,8 +518,8 @@ impl ActorState {
         if self.current_state_path == new_path && self.control.is_some() {
             return Ok(());
         }
-        self.control = None;
-        self.lock = None;
+        // Open the new project before letting go of this one, so a project that cannot be opened
+        // leaves the current one working instead of none.
         let new_lock =
             RunLock::acquire(&new_path).map_err(|err| format!("run lock error: {err}"))?;
         let new_store =
@@ -622,15 +643,20 @@ fn land_finished_goals(control: &LocalControl, workspace: &ProjectWorkspace) {
         return;
     }
     let completed = completed_goals(&model);
-    if completed.is_empty() {
-        return;
-    }
-    if let Err(error) = landing_service::land_completed_goals(workspace, &completed, |goal_id| {
-        control
-            .completed_goal_work(goal_id)
-            .map_err(|error| error.to_string())
-    }) {
+    if !completed.is_empty()
+        && let Err(error) =
+            landing_service::land_completed_goals(workspace, &completed, |goal_id| {
+                control
+                    .completed_goal_work(goal_id)
+                    .map_err(|error| error.to_string())
+            })
+    {
         eprintln!("sovereign: could not record a landed result: {error}");
+    }
+    if let Err(error) =
+        landing_service::run_queued_undos(workspace, |goal_id| goal_words(control, goal_id))
+    {
+        eprintln!("sovereign: could not run a waiting Undo: {error}");
     }
 }
 
@@ -758,6 +784,9 @@ fn run_step(
         land_finished_goals(control, workspace);
     }
     shared.end_step();
+    if service.status().phase != ServicePhase::DeferredResource.as_str() {
+        shared.clear_memory_wait();
+    }
     shared.publish_status(service.status().clone());
 }
 
@@ -865,7 +894,22 @@ fn run_actor_loop(
                         Err(e) => Err(e),
                     },
                 };
+                if let Err(error) = &res {
+                    eprintln!(
+                        "sovereign: could not open the project at {}: {error}",
+                        state_path.display()
+                    );
+                    // The current project keeps running; the chosen one is not made active.
+                    let message = crate::projects::restore_active_project(
+                        &shared.state_path(),
+                        &state_path,
+                        error,
+                    );
+                    shared.set_project_problem(Some(message));
+                }
                 if res.is_ok() {
+                    shared.set_project_problem(None);
+                    shared.clear_memory_wait();
                     shared.set_state_path(state_path.clone());
                     bind_workspace(
                         options.execute,
@@ -952,11 +996,22 @@ fn run_actor_loop(
                             control: Some(control),
                             ..
                         }),
-                    ) => landing_service::undo_goal(
-                        workspace,
-                        &goal_id,
-                        &goal_words(control, &goal_id),
-                    ),
+                    ) => {
+                        // Undo moves the project's history, so while a request runs it waits
+                        // and runs as soon as that request finishes.
+                        if control
+                            .read_model()
+                            .is_ok_and(|model| model.status.active_plan.is_some())
+                        {
+                            landing_service::queue_undo(workspace, &goal_id)
+                        } else {
+                            landing_service::undo_goal(
+                                workspace,
+                                &goal_id,
+                                &goal_words(control, &goal_id),
+                            )
+                        }
+                    }
                     _ => Err(NO_LANDING_WORKSPACE.to_owned()),
                 };
                 shared.complete(ticket);
@@ -1144,6 +1199,29 @@ mod tests {
         );
         assert!(matches!(reply, Reply::Queued { .. }));
         shared.end_step();
+    }
+
+    #[test]
+    fn a_project_that_cannot_be_opened_leaves_the_current_one_working() {
+        let state_path = temp_state("switch-keeps");
+        let (actor, handle) = ControllerActorHandle::spawn(state_path.clone())
+            .unwrap_or_else(|error| panic!("spawn: {error}"));
+        // Another process holds the chosen project, so it cannot be opened.
+        let blocked = temp_state("switch-blocked");
+        let _held = RunLock::acquire(&blocked).unwrap_or_else(|error| panic!("hold lock: {error}"));
+        let refused = actor.switch_project(blocked.clone(), None, false);
+        assert!(refused.is_err(), "{refused:?}");
+        assert_eq!(actor.state_path(), state_path);
+        assert!(actor.project_problem().is_some());
+        // The current project still takes commands.
+        let paused = actor
+            .pause(Some("still here".to_owned()))
+            .unwrap_or_else(|error| panic!("pause after a failed switch: {error}"));
+        assert!(matches!(paused, Reply::Applied(_)));
+        actor
+            .shutdown()
+            .unwrap_or_else(|error| panic!("shutdown: {error}"));
+        handle.join().unwrap_or_else(|_| panic!("join actor"));
     }
 
     #[test]

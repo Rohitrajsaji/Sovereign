@@ -48,6 +48,20 @@ macOS folder picker.
 
 ## Also check
 
+- Models, on an 8 GB Mac:
+  - Setup downloads the smaller model.
+  - **Settings → AI model** lists every model with its size and memory.
+  - **Download and use** the larger model while a request runs: Sovereign asks. **After it finishes** keeps the running request on the old model; the next request uses the new one.
+  - **Stop it and start again** restarts the request on the new model.
+  - **Remove** a model that is not in use: its file leaves `~/Library/Application Support/Sovereign/models/`.
+- Memory: with the larger model on 8 GB, open apps until requests wait for memory.
+  - The card says about how much more memory is needed, in GB.
+  - When it is less than 1 GB short, **Start anyway** asks, then starts the request.
+- Folders: choose your Documents folder. Sovereign shows the file count, size, and any private-looking files, and saves nothing until you choose **Use this folder**. **Choose another** leaves the folder untouched.
+- Undo while another request runs: the card says Undo will happen when that request finishes. Once it does, the change is undone.
+- Big files: grow `index.html` past 12 KB. The Files tab marks it, and a notice above the message box explains.
+- Versions: after `git pull` without reinstalling, `sovereign` says the source folder has code that isn't installed. After `./scripts/install-from-source.sh`, **Settings → Advanced** shows the new version.
+
 - Edit a file in the project folder by hand, then ask for a change to the same file. The result
   lands on top of your edit, and your edit is kept.
 - Open a folder that is already a Git repository with uncommitted changes. Ask for a change to a

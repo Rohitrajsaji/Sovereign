@@ -51,6 +51,76 @@ pub enum LandingStatusV1 {
     Undone,
     /// Applying hit an unexpected error; `technical_detail` has it.
     Failed,
+    /// Undo was asked for while another request was running. It runs as soon as no request is,
+    /// because moving the project's history under a running request could break it.
+    UndoQueued,
+}
+
+const UNDO_QUEUED_DETAIL: &str = "Undo will happen as soon as the current request finishes.";
+
+/// Records an Undo to run once no request is running.
+///
+/// # Errors
+/// Returns a plain-language error when the request's result is not in the project.
+pub fn queue_undo(workspace: &ProjectWorkspace, goal_id: &str) -> Result<LandingRecordV1, String> {
+    let mut landings = load_landings(&workspace.state_dir)?
+        .ok_or_else(|| "This project has no results to undo.".to_owned())?;
+    let mut record = landings
+        .record(goal_id)
+        .cloned()
+        .ok_or_else(|| "This request has no result to undo.".to_owned())?;
+    match record.status {
+        LandingStatusV1::UndoQueued | LandingStatusV1::Undone => return Ok(record),
+        LandingStatusV1::Landed => {}
+        _ => {
+            return Err(
+                "This request's result is not in your project, so there is nothing to undo."
+                    .to_owned(),
+            );
+        }
+    }
+    record.status = LandingStatusV1::UndoQueued;
+    record.detail = Some(UNDO_QUEUED_DETAIL.to_owned());
+    record.technical_detail = None;
+    record.updated_at_ms = now_ms();
+    landings.upsert(record.clone());
+    save_landings(&workspace.state_dir, &landings)?;
+    Ok(record)
+}
+
+/// Runs every Undo that waited for a request to finish. Call only while no plan is active.
+///
+/// # Errors
+/// Returns when the landing records cannot be read or written.
+pub fn run_queued_undos(
+    workspace: &ProjectWorkspace,
+    title_for: impl Fn(&str) -> String,
+) -> Result<(), String> {
+    let Some(landings) = load_landings(&workspace.state_dir)? else {
+        return Ok(());
+    };
+    let queued = landings
+        .records
+        .iter()
+        .filter(|record| record.status == LandingStatusV1::UndoQueued)
+        .map(|record| record.goal_id.clone())
+        .collect::<Vec<_>>();
+    for goal_id in queued {
+        if let Err(error) = undo_goal(workspace, &goal_id, &title_for(&goal_id)) {
+            // Never retried in a loop: the result stays in place and says why.
+            let Some(mut landings) = load_landings(&workspace.state_dir)? else {
+                continue;
+            };
+            if let Some(mut record) = landings.record(&goal_id).cloned() {
+                record.status = LandingStatusV1::Landed;
+                record.detail = Some(format!("Undo couldn't finish: {error}"));
+                record.updated_at_ms = now_ms();
+                landings.upsert(record);
+                save_landings(&workspace.state_dir, &landings)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One request's result in the project folder.
@@ -338,6 +408,9 @@ pub fn apply_goal(
         Some(LandingStatusV1::Landed) => {
             return Err("This result is already in your project.".to_owned());
         }
+        Some(LandingStatusV1::UndoQueued) => {
+            return Err("This result is waiting to be undone.".to_owned());
+        }
         Some(LandingStatusV1::Undone) => {
             return Err("This result was undone. Ask again to redo it.".to_owned());
         }
@@ -369,6 +442,11 @@ pub fn undo_goal(
         .ok_or_else(|| "This request has no result to undo.".to_owned())?;
     if record.status == LandingStatusV1::Undone {
         return Ok(record);
+    }
+    if record.status == LandingStatusV1::UndoQueued {
+        // A queued Undo that cannot finish leaves the result in place, with the reason.
+        record.status = LandingStatusV1::Landed;
+        record.detail = None;
     }
     let Some(commit) = record
         .commit
@@ -572,6 +650,75 @@ mod tests {
         assert_eq!(
             reloaded.record("goal-hi").map(|record| record.status),
             Some(LandingStatusV1::Undone)
+        );
+    }
+
+    #[test]
+    fn an_undo_asked_for_during_a_request_waits_and_then_runs() {
+        let fixture = Fixture::new("queued-undo", true);
+        ensure_landings(&fixture.workspace, &[]).unwrap_or_else(|error| panic!("{error}"));
+        let change_set = fixture.change_set("<h1>Hi</h1>\n");
+        land_completed_goals(
+            &fixture.workspace,
+            &completed("goal-hi"),
+            work_for(change_set),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        // While another request runs, Undo is recorded but the folder does not change.
+        let queued =
+            queue_undo(&fixture.workspace, "goal-hi").unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(queued.status, LandingStatusV1::UndoQueued);
+        assert_eq!(fixture.read("index.html").as_deref(), Some("<h1>Hi</h1>\n"));
+        // Asking twice is fine.
+        assert_eq!(
+            queue_undo(&fixture.workspace, "goal-hi").map(|record| record.status),
+            Ok(LandingStatusV1::UndoQueued)
+        );
+
+        // Once nothing is running, the waiting Undo runs.
+        run_queued_undos(&fixture.workspace, |_| "Make the page say hi".to_owned())
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            fixture.read("index.html").as_deref(),
+            Some("<h1>Hello</h1>\n")
+        );
+        let reloaded = load_landings(&fixture.workspace.state_dir)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("records exist"));
+        assert_eq!(
+            reloaded.record("goal-hi").map(|record| record.status),
+            Some(LandingStatusV1::Undone)
+        );
+        // Nothing left to run, and an unknown request cannot be queued.
+        assert!(run_queued_undos(&fixture.workspace, |_| String::new()).is_ok());
+        assert!(queue_undo(&fixture.workspace, "goal-unknown").is_err());
+
+        // A queued Undo that cannot finish is not retried forever: the result stays, with why.
+        let mut landings = load_landings(&fixture.workspace.state_dir)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("records exist"));
+        let mut broken = landings
+            .record("goal-hi")
+            .cloned()
+            .unwrap_or_else(|| panic!("record"));
+        broken.status = LandingStatusV1::UndoQueued;
+        broken.commit = None;
+        landings.upsert(broken);
+        save_landings(&fixture.workspace.state_dir, &landings)
+            .unwrap_or_else(|error| panic!("{error}"));
+        run_queued_undos(&fixture.workspace, |_| String::new())
+            .unwrap_or_else(|error| panic!("{error}"));
+        let after = load_landings(&fixture.workspace.state_dir)
+            .unwrap_or_else(|error| panic!("{error}"))
+            .unwrap_or_else(|| panic!("records exist"));
+        let record = after.record("goal-hi").unwrap_or_else(|| panic!("record"));
+        assert_eq!(record.status, LandingStatusV1::Landed);
+        assert!(
+            record
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.starts_with("Undo couldn't finish"))
         );
     }
 

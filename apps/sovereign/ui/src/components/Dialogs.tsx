@@ -5,7 +5,16 @@
 
 import { useState } from "react";
 import type { OverviewResponse, SetupStatus } from "../api/generated";
-import { useDoctor, usePause, useResume, useSaveSettings, useSettings, useVerifyModel } from "../api/query";
+import {
+  useDoctor,
+  usePause,
+  useResume,
+  useSaveSettings,
+  useSession,
+  useSettings,
+  useVerifyModel,
+} from "../api/query";
+import { ModelSwitcher } from "./ModelSwitcher";
 import { ProjectChooser } from "./ProjectChooser";
 import { Button, Dialog, InlineError } from "./ui";
 
@@ -34,6 +43,15 @@ function Diagnostics({ enabled }: { enabled: boolean }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+function Version() {
+  const session = useSession();
+  return (
+    <p className="subtle">
+      Version <span className="mono">{session.data?.version ?? "unknown"}</span>
+    </p>
   );
 }
 
@@ -140,14 +158,16 @@ export function SettingsDialog({
   return (
     <Dialog open={open} onOpenChange={onOpenChange} title="Settings">
       <section className="settings-section">
-        <h3>Local AI model</h3>
-        <div className="settings-row">
-          <span className="muted">
-            {setup?.model?.display_name ?? "Model"} ·{" "}
-            {ready ? "Ready on this Mac" : "Not set up yet"}
-          </span>
-          <Button onClick={onOpenSetup}>{ready ? "Check setup" : "Set up"}</Button>
-        </div>
+        <h3>AI model</h3>
+        {ready ? (
+          <p className="muted">Smaller models fit in less memory but build simpler apps. Switch any time.</p>
+        ) : (
+          <div className="settings-row">
+            <span className="muted">Sovereign's AI isn't set up yet.</span>
+            <Button onClick={onOpenSetup}>Set up</Button>
+          </div>
+        )}
+        <ModelSwitcher />
       </section>
       <section className="settings-section">
         <h3>Work</h3>
@@ -194,6 +214,7 @@ export function SettingsDialog({
         <details className="advanced">
           <summary>Advanced</summary>
           <div className="faq">
+            <Version />
             <Diagnostics enabled={open} />
             <OwnModelFiles />
             <ApprovalName />

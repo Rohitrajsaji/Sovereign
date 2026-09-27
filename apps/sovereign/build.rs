@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-changed=ui-dist");
+    build_commit();
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap_or_else(|_| "target".to_owned()));
     let manifest_dir =
@@ -124,4 +125,28 @@ fn mime_for_path(path: &Path) -> &'static str {
         "wasm" => "application/wasm",
         _ => "application/octet-stream",
     }
+}
+
+/// Records the commit this binary is built from, so the app can tell builds apart.
+fn build_commit() {
+    // Only existing files: Cargo reruns the script on every build for a path that is missing.
+    let git = Path::new("../../.git");
+    let mut watched = vec![git.join("HEAD"), git.join("packed-refs")];
+    if let Ok(head) = fs::read_to_string(git.join("HEAD"))
+        && let Some(reference) = head.trim().strip_prefix("ref: ")
+    {
+        watched.push(git.join(reference));
+    }
+    for path in watched.iter().filter(|path| path.is_file()) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .filter(|commit| !commit.is_empty() && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .unwrap_or_else(|| "unknown".to_owned());
+    println!("cargo:rustc-env=SOVEREIGN_BUILD_COMMIT={commit}");
 }

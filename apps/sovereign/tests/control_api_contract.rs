@@ -271,6 +271,54 @@ fn control_api_v2_live_serve_matches_frozen_schema() {
         );
     }
 
+    // Inspecting a folder describes it and saves nothing.
+    let (status, summary) = post(
+        "/v2/projects/inspect",
+        &json!({"root": home.display().to_string()}),
+    );
+    assert_eq!(status, 200, "{summary}");
+    assert!(
+        load_validator("FolderSummary").is_valid(&summary),
+        "{summary}"
+    );
+    assert_eq!(summary["cancelled"], json!(false));
+
+    // Model switching and Start anyway refuse, in words, what they cannot do.
+    for (path, body) in [
+        (
+            "/v2/models/select",
+            json!({"model_id": "no-such-model", "when": "now"}),
+        ),
+        ("/v2/models/remove", json!({"model_id": "no-such-model"})),
+        (&*format!("/v2/goals/{goal_id}/start-anyway"), json!({})),
+    ] {
+        let (status, refused) = post(path, &body);
+        assert!(status != 200 && status != 404, "{path}: {status} {refused}");
+        assert!(
+            load_validator("ErrorResponse").is_valid(&refused),
+            "{path}: {refused}"
+        );
+    }
+    let (status, bad) = post(
+        "/v2/models/select",
+        &json!({"model_id": "qwen3-4b-q4_k_m", "when": "later"}),
+    );
+    assert_eq!(status, 400, "{bad}");
+    let (status, session) = http(
+        &addr,
+        &format!("GET /v2/session HTTP/1.1\r\nHost: 127.0.0.1\r\n{cookie}\r\n"),
+    );
+    assert_eq!(status, 200, "{session}");
+    assert!(
+        load_validator("SessionResponse").is_valid(&session),
+        "{session}"
+    );
+    assert!(
+        session["version"]
+            .as_str()
+            .is_some_and(|version| !version.is_empty())
+    );
+
     let _ = child.kill();
     let _ = child.wait();
     let _ = fs::remove_dir_all(&home);

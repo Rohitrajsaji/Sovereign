@@ -53,6 +53,7 @@ fn current_goal_views(
             working: actor.working(),
             paused: model.status.execution_control.paused,
             pending: &pending,
+            memory: actor.memory_wait().map(|(_, wait)| wait),
         },
     ))
 }
@@ -123,27 +124,80 @@ fn setup_status(actor: &ControllerActorHandle) -> Result<Value, String> {
         &paths,
         settings.model_runtime.as_deref().map(Path::new),
         settings.model_path.as_deref().map(Path::new),
+        settings.queued_model_id.as_deref(),
     );
     serde_json::to_value(status).map_err(|e| e.to_string())
 }
 
-/// Starts the pinned download and saves the installed paths in Settings when it finishes.
-fn start_model_download(actor: &ControllerActorHandle) -> Result<Value, String> {
+/// Starts a pinned download and saves the runtime in Settings when it finishes. Setup's own
+/// download (no `model_id`) also makes the model the one in use; a download from the model
+/// switcher leaves the choice to `/v2/models/select`.
+fn start_model_download(
+    actor: &ControllerActorHandle,
+    model_id: Option<&str>,
+) -> Result<Value, String> {
     let (paths, settings) = setup_context()?;
+    let select = model_id.is_none() || settings.model_path.is_none();
     let progress = actor.model_setup().start(
         paths,
         settings.model_runtime.as_deref().map(PathBuf::from),
-        |installed| {
+        model_id,
+        move |installed: &model_setup::InstalledModel| {
             if let Ok(data) = app_data::AppData::open_default() {
                 let mut settings = data.load_settings().unwrap_or_default();
                 settings.model_runtime = Some(installed.runtime.display().to_string());
-                settings.model_path = Some(installed.model.display().to_string());
-                settings.model_name = Some(installed.model_name.clone());
+                if select {
+                    settings.model_path = Some(installed.model.display().to_string());
+                    settings.model_name = Some(installed.model_name.clone());
+                }
                 let _ = data.save_settings(&settings);
             }
         },
     )?;
     Ok(json!({ "download": progress }))
+}
+
+/// Makes a downloaded catalog model the one in use, now or when the next request starts.
+fn select_model(model_id: &str, after_current: bool) -> Result<Value, String> {
+    let data = app_data::AppData::open_default().map_err(|e| e.to_string())?;
+    let paths = model_setup::SetupPaths {
+        app_data: data.root().to_path_buf(),
+    };
+    let (path, name) = model_setup::installed_model_path(&paths, model_id)
+        .ok_or_else(|| "Download this model before switching to it.".to_owned())?;
+    let mut settings = data.load_settings().unwrap_or_default();
+    if after_current {
+        settings.queued_model_id = Some(model_id.to_owned());
+    } else {
+        settings.model_path = Some(path.display().to_string());
+        settings.model_name = Some(name);
+        settings.queued_model_id = None;
+    }
+    data.save_settings(&settings).map_err(|e| e.to_string())?;
+    Ok(
+        json!({"model_id": model_id, "applies": if after_current { "after_current" } else { "now" }}),
+    )
+}
+
+/// Deletes a downloaded model that is neither in use, waiting to be used, nor downloading.
+fn remove_model(actor: &ControllerActorHandle, model_id: &str) -> Result<Value, String> {
+    let download = actor.model_setup().progress();
+    if download.running() && download.model_id.as_deref() == Some(model_id) {
+        return Err("This model is downloading. Pause the download first.".to_owned());
+    }
+    let data = app_data::AppData::open_default().map_err(|e| e.to_string())?;
+    let paths = model_setup::SetupPaths {
+        app_data: data.root().to_path_buf(),
+    };
+    let settings = data.load_settings().unwrap_or_default();
+    let in_use = model_setup::installed_model_path(&paths, model_id).is_some_and(|(path, _)| {
+        settings.model_path.as_deref() == Some(path.display().to_string().as_str())
+    });
+    if in_use || settings.queued_model_id.as_deref() == Some(model_id) {
+        return Err("Switch to another model before removing this one.".to_owned());
+    }
+    model_setup::remove_model(&paths, model_id)?;
+    Ok(json!({"model_id": model_id, "removed": true}))
 }
 
 #[expect(clippy::too_many_lines, reason = "v2 dispatch is an explicit match")]
@@ -245,6 +299,7 @@ pub(crate) fn handle_actor_request(
                 "blocked_approvals": model.blocked_approvals,
                 "working": actor.working(),
                 "pending_commands": actor.pending_commands(),
+                "project_problem": actor.project_problem(),
             }))
         }
         ControlApiRequest::ListProjects => {
@@ -270,6 +325,20 @@ pub(crate) fn handle_actor_request(
             let parent = projects::projects_home()?;
             let (projects, record) = projects::create_project(&data, &name, &parent)?;
             switch_to_project(actor, &projects, &record)
+        }
+        ControlApiRequest::InspectFolder { root } => {
+            // Nothing is saved here: the person sees what adopting the folder means first.
+            let root = match root {
+                Some(root) => PathBuf::from(root),
+                None => match projects::choose_folder_dialog()? {
+                    Some(root) => root,
+                    None => {
+                        return serde_json::to_value(projects::FolderSummaryV1::cancelled())
+                            .map_err(|e| e.to_string());
+                    }
+                },
+            };
+            serde_json::to_value(projects::inspect_folder(&root)?).map_err(|e| e.to_string())
         }
         ControlApiRequest::OpenFolder { root } => {
             let root = match root {
@@ -406,7 +475,18 @@ pub(crate) fn handle_actor_request(
                 .ok_or_else(|| format!("not found: approval {request_id}"))
                 .and_then(|item| serde_json::to_value(item).map_err(|e| e.to_string()))
         }
-        ControlApiRequest::DownloadModel { .. } => start_model_download(actor),
+        ControlApiRequest::DownloadModel { model_id, .. } => {
+            start_model_download(actor, model_id.as_deref())
+        }
+        ControlApiRequest::SelectModel {
+            model_id,
+            after_current,
+        } => select_model(&model_id, after_current),
+        ControlApiRequest::RemoveModel { model_id } => remove_model(actor, &model_id),
+        ControlApiRequest::StartAnyway { goal_id } => {
+            let lent = actor.grant_memory_allowance(&goal_id)?;
+            Ok(json!({"goal_id": goal_id, "lent_mib": lent}))
+        }
         ControlApiRequest::SetupStatus => setup_status(actor),
         ControlApiRequest::Preview => {
             let root = actor.project_root();

@@ -9,6 +9,7 @@ import type {
   DeveloperToolsInstallResponse,
   DoctorResponse,
   DownloadResponse,
+  FolderSummary,
   GoalActivityResponse,
   GoalIntent,
   GoalView,
@@ -20,7 +21,10 @@ import type {
   ProjectsResponse,
   QueuedCommandResponse,
   LandingRecord,
+  ModelRemoveResponse,
+  ModelSelectResponse,
   SessionResponse,
+  StartAnywayResponse,
   SettingsV1,
   SetupStatus,
 } from "./generated";
@@ -275,6 +279,17 @@ export function useCreateProject() {
   });
 }
 
+/** What adopting a folder would mean, before anything is saved. No root opens the folder picker. */
+export function useInspectFolder() {
+  return useMutation({
+    mutationFn: (root?: string) =>
+      api<FolderSummary>("/v2/projects/inspect", {
+        method: "POST",
+        body: JSON.stringify(root ? { root } : {}),
+      }),
+  });
+}
+
 export function useOpenFolder() {
   const changed = useProjectChange();
   return useMutation({
@@ -299,11 +314,57 @@ export function useActivateProject() {
   });
 }
 
+/** Downloads the model setup picked for this Mac, or one chosen in the model switcher. */
 export function useStartDownload() {
   const client = useQueryClient();
   return useMutation({
-    mutationFn: () => api<DownloadResponse>("/v2/setup/model/download", { method: "POST", body: "{}" }),
+    mutationFn: (modelId?: string) =>
+      api<DownloadResponse>("/v2/setup/model/download", {
+        method: "POST",
+        body: JSON.stringify(modelId ? { model_id: modelId } : {}),
+      }),
     onSuccess: () => void client.invalidateQueries({ queryKey: keys.setup }),
+  });
+}
+
+/** Makes a downloaded model the one in use, now or when the next request starts. */
+export function useSelectModel() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: ({ modelId, when }: { modelId: string; when: "now" | "after_current" }) =>
+      api<ModelSelectResponse>("/v2/models/select", {
+        method: "POST",
+        body: JSON.stringify({ model_id: modelId, when }),
+      }),
+    onSuccess: () => {
+      void client.invalidateQueries({ queryKey: keys.setup });
+      void client.invalidateQueries({ queryKey: keys.settings });
+    },
+  });
+}
+
+export function useRemoveModel() {
+  const client = useQueryClient();
+  return useMutation({
+    mutationFn: (modelId: string) =>
+      api<ModelRemoveResponse>("/v2/models/remove", {
+        method: "POST",
+        body: JSON.stringify({ model_id: modelId }),
+      }),
+    onSuccess: () => void client.invalidateQueries({ queryKey: keys.setup }),
+  });
+}
+
+/** Lends a request waiting for a little memory what it is short by. */
+export function useStartAnyway() {
+  const refresh = useRefreshWork();
+  return useMutation({
+    mutationFn: (goalId: string) =>
+      api<StartAnywayResponse>(`/v2/goals/${encodeURIComponent(goalId)}/start-anyway`, {
+        method: "POST",
+        body: "{}",
+      }),
+    onSuccess: refresh,
   });
 }
 

@@ -16,6 +16,7 @@ function setup(overrides: Partial<SetupStatus> = {}): SetupStatus {
     machine: { supported: true, apple_silicon: true, memory_mib: 16384, free_disk_mib: 204800, problems: [] },
     developer_tools: { installed: true, detail: "Apple's Command Line Tools are installed." },
     model: { id: "qwen3-4b-q4_k_m", display_name: "Qwen3 4B", size_bytes: 2_497_280_256 },
+    models: [],
     runtime_ready: false,
     model_ready: false,
     download: { phase: "idle", bytes_done: 0, bytes_total: 0, percent: 0, detail: "" },

@@ -8,6 +8,8 @@
 mod actor;
 #[path = "app_data.rs"]
 mod app_data;
+#[path = "build_info.rs"]
+mod build_info;
 #[path = "consumer_status.rs"]
 mod consumer_status;
 #[path = "control_api/mod.rs"]

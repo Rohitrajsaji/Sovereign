@@ -51,7 +51,8 @@ const MAX_SOURCE_CANDIDATE_BYTES: usize = 16 * 1024;
 const MAX_SOURCE_CANDIDATE_TOTAL_BYTES: usize = 48 * 1024;
 /// Most bytes of project files shown to the model when a project has no explicit configuration.
 /// Sized so the chosen files fit the compile packet's direct-evidence budget whole.
-const AUTOMATIC_SOURCE_TOTAL_BYTES: u64 = 12 * 1024;
+/// How much of the project the planner reads. A file larger than this is never read whole.
+pub(crate) const AUTOMATIC_SOURCE_TOTAL_BYTES: u64 = 12 * 1024;
 const PROJECT_CONFIGURATION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,6 +283,41 @@ fn configured_model_paths() -> (Option<PathBuf>, Option<PathBuf>) {
         .map(PathBuf::from)
         .or_else(|| settings.model_path.as_ref().map(PathBuf::from));
     (runtime, model)
+}
+
+/// Switches to the model chosen while the last request ran, now that a new one starts. Runs
+/// only between requests, so a plan never changes models halfway through.
+fn apply_queued_model() {
+    let Ok(data) = crate::app_data::AppData::open_default() else {
+        return;
+    };
+    let Ok(mut settings) = data.load_settings() else {
+        return;
+    };
+    let Some(model_id) = settings.queued_model_id.take() else {
+        return;
+    };
+    let paths = crate::model_setup::SetupPaths {
+        app_data: data.root().to_path_buf(),
+    };
+    if let Some((path, name)) = crate::model_setup::installed_model_path(&paths, &model_id) {
+        settings.model_path = Some(path.display().to_string());
+        settings.model_name = Some(name);
+    }
+    let _ = data.save_settings(&settings);
+}
+
+/// Sets the per-model memory facts for this step: the catalog's starting estimate for the model
+/// in use, and any memory the person lent `goal_id` with "Start anyway".
+fn prepare_model_memory(controller: &mut Controller, goal_id: Option<&str>) {
+    controller.set_model_starting_estimate(
+        configured_model_paths()
+            .1
+            .as_deref()
+            .and_then(crate::model_setup::starting_estimate_for),
+    );
+    controller
+        .set_memory_allowance_mib(goal_id.map_or(0, crate::service_state::memory_allowance_for));
 }
 
 /// The model's name: the environment, then Settings (written by onboarding's download), then
@@ -675,6 +711,10 @@ fn advance_with_overrides(
             .then(model_calibration_identity)
             .flatten(),
     );
+    let active_goal = controller
+        .active_goal_interrupt()
+        .map(|(goal_id, _)| goal_id);
+    prepare_model_memory(controller, active_goal.as_deref());
     let probe = controller
         .advance_production_goal(
             registry,
@@ -688,17 +728,22 @@ fn advance_with_overrides(
         } => {
             let input = compilation_input(controller, registry, project_config)?
                 .ok_or("queued compilation lost its goal intent")?;
-            // The configured model is never started without resource-governor admission.
-            // Fixture backends start no process, so they skip this gate.
-            if backend_override.is_none()
-                && let Some(reason) = controller
+            if backend_override.is_none() {
+                apply_queued_model();
+                controller.set_model_calibration_identity(model_calibration_identity());
+                prepare_model_memory(controller, Some(&input.goal_id));
+                // The configured model is never started without resource-governor admission.
+                // Fixture backends start no process, so they skip this gate.
+                let deferral = controller
                     .compilation_model_admission()
-                    .map_err(|error| error.to_string())?
-            {
-                return Ok(ProductionAdvanceOutcome::Blocked {
-                    task_id: None,
-                    reason: ProductionBlockReason::Readiness(reason),
-                });
+                    .map_err(|error| error.to_string())?;
+                crate::service_state::publish_memory_wait(&input.goal_id, controller.memory_wait());
+                if let Some(reason) = deferral {
+                    return Ok(ProductionAdvanceOutcome::Blocked {
+                        task_id: None,
+                        reason: ProductionBlockReason::Readiness(reason),
+                    });
+                }
             }
             let owned_backend = backend_override
                 .is_none()
@@ -876,7 +921,7 @@ fn advance_with_overrides(
                 tool_manifest: &manifest,
                 python_executable: &python,
             };
-            controller
+            let result = controller
                 .advance_production_goal_with_catalog(
                     registry,
                     ProductionAdvanceResources {
@@ -891,7 +936,11 @@ fn advance_with_overrides(
                     },
                     Some(&catalog),
                 )
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string());
+            if let Some(goal_id) = active_goal.as_deref() {
+                crate::service_state::publish_memory_wait(goal_id, controller.memory_wait());
+            }
+            result
         }
         outcome => Ok(outcome),
     }

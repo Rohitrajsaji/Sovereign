@@ -152,8 +152,9 @@ server, and no packages to install.\n\n\
 - `app.js`: how it behaves. Store data in `localStorage` if it must survive a reload.\n\
 - `tests/`: checks that must keep passing.\n\n\
 ## Conventions\n\n\
-- Keep the app in these files unless a new file is clearly needed. Reference any new file from \
-`index.html` with a relative path.\n\
+- Keep every file under 10 KB, so all of it fits in what Sovereign reads while planning. Put a \
+new feature in its own file (for example `chart.js`) and reference it from `index.html` with a \
+relative path, instead of growing one file.\n\
 - Plain HTML, CSS, and JavaScript only. No frameworks, CDNs, or network requests.\n\
 - Checks: `python3 -m unittest discover -s tests` must pass. Add a small test in `tests/` for new \
 behavior when practical.\n"

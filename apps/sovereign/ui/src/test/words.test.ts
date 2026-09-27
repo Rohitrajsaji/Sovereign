@@ -4,10 +4,45 @@
 
 import { describe, expect, it } from "vitest";
 import { goalNotice } from "../lib/notify";
-import { formatBytes, permissionPhrase, stageIndex } from "../lib/words";
+import { bigFilesNotice, folderSentences, formatBytes, permissionPhrase, stageIndex } from "../lib/words";
 import { goal } from "./render";
 
 describe("words", () => {
+  it("names files too big for the planner, and stays quiet otherwise", () => {
+    const limit = 12 * 1024;
+    expect(bigFilesNotice([{ path: "index.html", size_bytes: 4_000 }], limit)).toBeNull();
+    const one = bigFilesNotice([{ path: "index.html", size_bytes: 18_000 }], limit) ?? "";
+    expect(one).toMatch(/^index\.html is too big for Sovereign to read/);
+    expect(one).toContain("separate files");
+    const many = bigFilesNotice(
+      [
+        { path: "a.js", size_bytes: 20_000 },
+        { path: "b.js", size_bytes: 20_000 },
+        { path: "c.js", size_bytes: 20_000 },
+      ],
+      limit,
+    );
+    expect(many).toMatch(/^a\.js and b\.js and 1 more are too big/);
+  });
+
+  it("describes a folder that already keeps a history without warnings", () => {
+    const sentences = folderSentences({
+      cancelled: false,
+      root: "/Users/ana/site",
+      name: "site",
+      has_history: true,
+      parent_project: null,
+      file_count: 10,
+      total_bytes: 1_000,
+      more_than: false,
+      large: false,
+      private_files: [],
+    });
+    expect(sentences).toEqual([
+      "This folder already keeps a history. Sovereign works in it and never saves your own changes for you.",
+    ]);
+  });
+
   it("formats sizes the way people read them", () => {
     expect(formatBytes(2_497_280_256)).toBe("2.5 GB");
     expect(formatBytes(11_089_823)).toBe("11 MB");

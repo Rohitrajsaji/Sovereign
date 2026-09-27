@@ -91,7 +91,10 @@ function FilesTab() {
               onClick={() => setSelected(file.path)}
             >
               <span>{file.path}</span>
-              <span className="subtle">{formatBytes(file.size_bytes)}</span>
+              <span className="subtle">
+                {file.size_bytes > (files.data?.model_limit_bytes ?? Infinity) ? "Too big for Sovereign to read · " : ""}
+                {formatBytes(file.size_bytes)}
+              </span>
             </button>
           </li>
         ))}

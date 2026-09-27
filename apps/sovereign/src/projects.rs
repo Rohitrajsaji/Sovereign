@@ -246,6 +246,182 @@ pub fn open_folder(data: &AppData, root: &Path) -> Result<(ProjectsV1, ProjectRe
     register_folder(data, root, &display_name, managed)
 }
 
+/// Entries counted before a folder is reported as "more than" that many files.
+const INSPECT_MAX_ENTRIES: u64 = 20_000;
+/// A folder at least this big gets a "may be slow" warning.
+const LARGE_FOLDER_FILES: u64 = 2_000;
+const LARGE_FOLDER_BYTES: u64 = 200 * 1024 * 1024;
+/// Folders skipped when counting, as the default ignore list skips them in history.
+const INSPECT_SKIPPED: &[&str] = &[".git", "node_modules", "__pycache__", ".venv"];
+const PRIVATE_SHOWN: usize = 5;
+
+/// What adopting a folder would mean, shown before anything is saved.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts about one folder, shown together"
+)]
+pub struct FolderSummaryV1 {
+    pub cancelled: bool,
+    pub root: Option<String>,
+    pub name: Option<String>,
+    /// The folder is in a Git repository already, so nothing is saved for the person.
+    pub has_history: bool,
+    /// The repository's top folder when it is a bigger project than the folder chosen.
+    pub parent_project: Option<String>,
+    pub file_count: u64,
+    pub total_bytes: u64,
+    /// Counting stopped at the limit: there are more files than `file_count`.
+    pub more_than: bool,
+    /// Big enough that Sovereign may be slow in it.
+    pub large: bool,
+    /// Up to five files whose names suggest passwords or keys.
+    pub private_files: Vec<String>,
+}
+
+impl FolderSummaryV1 {
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self {
+            cancelled: true,
+            root: None,
+            name: None,
+            has_history: false,
+            parent_project: None,
+            file_count: 0,
+            total_bytes: 0,
+            more_than: false,
+            large: false,
+            private_files: Vec::new(),
+        }
+    }
+}
+
+fn looks_private(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower == ".env"
+        || lower.starts_with(".env.")
+        || lower.starts_with("id_rsa")
+        || lower.starts_with("id_ed25519")
+        || lower.starts_with("id_ecdsa")
+        || lower == ".netrc"
+        || lower == ".npmrc"
+        || lower == ".pgpass"
+        || lower.starts_with("credentials")
+        || lower.starts_with("secrets")
+        || [".pem", ".key", ".p12", ".pfx", ".keychain", ".kdbx"]
+            .iter()
+            .any(|suffix| lower.ends_with(suffix))
+}
+
+/// Counts what adopting `root` would put in its history, without changing anything.
+///
+/// # Errors
+/// Returns a plain reason for a missing or relative folder.
+pub fn inspect_folder(root: &Path) -> Result<FolderSummaryV1, String> {
+    if !root.is_absolute() {
+        return Err("Choose a folder with a full path.".to_owned());
+    }
+    if !root.is_dir() {
+        return Err(format!("{} is not a folder.", root.display()));
+    }
+    let root = root.canonicalize().map_err(|error| error.to_string())?;
+    let top = Command::new(PINNED_GIT)
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|text| PathBuf::from(text.trim()))
+        .and_then(|top| top.canonicalize().ok());
+    let mut summary = FolderSummaryV1 {
+        cancelled: false,
+        root: Some(root.display().to_string()),
+        name: root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+        has_history: top.is_some(),
+        parent_project: top
+            .as_ref()
+            .filter(|top| **top != root)
+            .map(|top| top.display().to_string()),
+        ..FolderSummaryV1::cancelled()
+    };
+    summary.cancelled = false;
+    let mut pending = vec![root.clone()];
+    'walk: while let Some(folder) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if !INSPECT_SKIPPED.contains(&name.as_str()) {
+                    pending.push(entry.path());
+                }
+                continue;
+            }
+            if summary.file_count >= INSPECT_MAX_ENTRIES {
+                summary.more_than = true;
+                break 'walk;
+            }
+            summary.file_count += 1;
+            if kind.is_file() {
+                summary.total_bytes = summary
+                    .total_bytes
+                    .saturating_add(entry.metadata().map_or(0, |metadata| metadata.len()));
+            }
+            if summary.private_files.len() < PRIVATE_SHOWN && looks_private(&name) {
+                let relative = entry
+                    .path()
+                    .strip_prefix(&root)
+                    .map_or_else(|_| name.clone(), |path| path.display().to_string());
+                summary.private_files.push(relative);
+            }
+        }
+    }
+    summary.large = summary.more_than
+        || summary.file_count >= LARGE_FOLDER_FILES
+        || summary.total_bytes >= LARGE_FOLDER_BYTES;
+    Ok(summary)
+}
+
+/// Makes the project that uses `current_state` active again after `failed_state` could not be
+/// opened, and returns a plain sentence saying so.
+#[must_use]
+pub fn restore_active_project(current_state: &Path, failed_state: &Path, error: &str) -> String {
+    let Ok(data) = AppData::open_default() else {
+        return format!("Sovereign couldn't open that project: {error}");
+    };
+    let mut projects = data.load_projects().unwrap_or_default();
+    let name_of = |state: &Path| {
+        projects
+            .projects
+            .iter()
+            .find(|project| Path::new(&project.state_path) == state)
+            .map(|project| (project.project_id.clone(), project.display_name.clone()))
+    };
+    let failed = name_of(failed_state).map_or_else(
+        || "that project".to_owned(),
+        |(_, name)| format!("“{name}”"),
+    );
+    let current = name_of(current_state);
+    if let Some((project_id, _)) = &current {
+        projects.active_project_id = Some(project_id.clone());
+        let _ = data.save_projects(&projects);
+    }
+    match current {
+        Some((_, name)) => {
+            format!("Sovereign couldn't open {failed}, so you're still in “{name}”. ({error})")
+        }
+        None => format!("Sovereign couldn't open {failed}. ({error})"),
+    }
+}
+
 /// Shows the native macOS "Choose a folder" dialog. Returns `None` when the person cancels.
 ///
 /// # Errors
@@ -327,6 +503,52 @@ mod tests {
             .unwrap_or_default()
             .as_nanos();
         std::env::temp_dir().join(format!("sovereign-projects-{label}-{nonce}"))
+    }
+
+    #[test]
+    fn inspecting_a_folder_counts_it_and_names_private_files_without_changing_it() {
+        let root = temp_root("inspect");
+        fs::create_dir_all(root.join("src")).unwrap_or_else(|error| panic!("{error}"));
+        fs::create_dir_all(root.join("node_modules").join("big"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        fs::write(root.join("index.html"), "<h1>Hi</h1>").unwrap_or_else(|error| panic!("{error}"));
+        fs::write(root.join("src").join("app.js"), "1").unwrap_or_else(|error| panic!("{error}"));
+        fs::write(root.join(".env"), "TOKEN=1").unwrap_or_else(|error| panic!("{error}"));
+        fs::write(root.join("src").join("server.key"), "k")
+            .unwrap_or_else(|error| panic!("{error}"));
+        fs::write(
+            root.join("node_modules").join("big").join("x.js"),
+            "skipped",
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+
+        let summary = inspect_folder(&root).unwrap_or_else(|error| panic!("{error}"));
+        assert!(!summary.cancelled && !summary.has_history && !summary.large);
+        assert_eq!(summary.file_count, 4, "node_modules is not counted");
+        assert_eq!(summary.parent_project, None);
+        let mut private = summary.private_files.clone();
+        private.sort();
+        assert_eq!(
+            private,
+            vec![".env".to_owned(), "src/server.key".to_owned()]
+        );
+        assert!(!root.join(".git").exists(), "inspecting never adds history");
+
+        // A folder inside another project names that project.
+        let git = Command::new("/usr/bin/git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(git.success());
+        let inner = inspect_folder(&root.join("src")).unwrap_or_else(|error| panic!("{error}"));
+        assert!(inner.has_history);
+        let parent = root
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(inner.parent_project, Some(parent.display().to_string()));
+        assert!(inspect_folder(Path::new("relative")).is_err());
+        let _ = fs::remove_dir_all(root);
     }
 
     fn init_git(dir: &Path) {

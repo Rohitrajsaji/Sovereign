@@ -6,9 +6,12 @@
 import { CircleHelp, PanelRightOpen, Plus, Settings } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { GoalView, SetupStatus } from "../api/generated";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   isSwitchingProject,
+  keys,
   useActivateProject,
+  useFiles,
   useGoals,
   useOverview,
   useProjects,
@@ -23,6 +26,7 @@ import { ProjectChooser } from "../components/ProjectChooser";
 import { SidePanel, type PanelTab } from "../components/SidePanel";
 import { BrandMark, Button, IconButton, InlineError, Notice, Spinner, useToast } from "../components/ui";
 import { desktopNotify, goalNotice } from "../lib/notify";
+import { bigFilesNotice, homeRelative } from "../lib/words";
 
 type DialogName = "settings" | "help" | "new" | null;
 
@@ -39,10 +43,6 @@ function serviceLine(working: boolean, paused: boolean, running: boolean, ready:
   return { dot: "dot-success", text: "Ready" };
 }
 
-/** `/Users/ana/Sovereign Projects/Budget` reads as `~/Sovereign Projects/Budget`. */
-function homeRelative(path: string): string {
-  return path.replace(/^\/(Users|home)\/[^/]+(?=\/|$)/, "~");
-}
 
 /** Changes whenever a result lands or is undone, so the preview and files reload. */
 function resultKey(projectId: string | null | undefined, goals: GoalView[]): string {
@@ -55,6 +55,7 @@ export function Workspace({ setup, onOpenSetup }: { setup: SetupStatus | undefin
   const goals = useGoals(true);
   const overview = useOverview(true);
   const settings = useSettings(true);
+  const files = useFiles(true);
   const activate = useActivateProject();
   const resume = useResume();
   const toast = useToast();
@@ -91,6 +92,13 @@ export function Workspace({ setup, onOpenSetup }: { setup: SetupStatus | undefin
     previousGoals.current = undefined;
     setSelectedGoal(undefined);
   }, [activeId, switching]);
+
+  // A result landing or being undone changes the files, so the big-file notice looks again.
+  const landedKey = resultKey(activeId, list);
+  const client = useQueryClient();
+  useEffect(() => {
+    void client.invalidateQueries({ queryKey: keys.files });
+  }, [client, landedKey]);
 
   const detailsGoal = list.find((goal) => goal.goal_id === selectedGoal) ?? list.at(-1);
 
@@ -160,6 +168,11 @@ export function Workspace({ setup, onOpenSetup }: { setup: SetupStatus | undefin
                 </IconButton>
               )}
             </header>
+            {overview.data?.project_problem ? (
+              <div className="banner-row">
+                <Notice tone="danger">{overview.data.project_problem}</Notice>
+              </div>
+            ) : null}
             {!ready ? (
               <div className="banner-row">
                 <Notice tone="warning">
@@ -213,6 +226,16 @@ export function Workspace({ setup, onOpenSetup }: { setup: SetupStatus | undefin
                 onRetry={retry}
               />
             )}
+            {!switching && files.data ? (
+              (() => {
+                const notice = bigFilesNotice(files.data.files, files.data.model_limit_bytes);
+                return notice ? (
+                  <div className="banner-row">
+                    <Notice tone="warning">{notice}</Notice>
+                  </div>
+                ) : null;
+              })()
+            ) : null}
             <Composer
               value={draft}
               onChange={setDraft}

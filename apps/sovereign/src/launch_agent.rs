@@ -144,11 +144,43 @@ pub fn open_ui<L: Launchctl>(
             ));
         }
     }
+    // A service left on another version (for example after installing from source) is pointed
+    // at this binary, so the app and the service always run the same code.
+    let is_current = std::env::var_os("HOME").is_some_and(|home| {
+        crate::build_info::is_current_install(Path::new(&home), sovereign_path)
+    });
+    let running = crate::build_info::running_service_version(data.root());
+    if crate::build_info::service_needs_restart(
+        running.as_deref(),
+        crate::build_info::BUILD_VERSION,
+        is_current,
+    ) {
+        install(data, launchctl, sovereign_path, DEFAULT_BIND)?;
+        if !restarted_service_answers(data) {
+            return Ok(missing_service_guidance(
+                "it did not come back after switching to the new version",
+            ));
+        }
+    }
     // A single-use, short-lived code keeps the long-lived session token out of browser history.
     let code = crate::launch_code::issue(data.root()).map_err(|error| error.to_string())?;
     let url = format!("http://{DEFAULT_BIND}/?c={code}");
     opener(&url)?;
     Ok(format!("opened {DEFAULT_BIND}"))
+}
+
+/// Waits for the restarted service to record this version and answer.
+fn restarted_service_answers(data: &AppData) -> bool {
+    let deadline = std::time::Instant::now() + SERVICE_START_WAIT;
+    while std::time::Instant::now() < deadline {
+        if crate::build_info::running_service_version(data.root()).as_deref()
+            == Some(crate::build_info::BUILD_VERSION)
+        {
+            return service_answers(SERVICE_START_WAIT);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    false
 }
 
 #[must_use]
