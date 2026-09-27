@@ -1734,8 +1734,14 @@ impl Display for PlanCompilationError {
             ),
             Self::ValidationRejected(diagnostics) => write!(
                 f,
-                "compiled Plan IR candidate failed PlanValidator with {} diagnostic(s)",
-                diagnostics.len()
+                "compiled Plan IR candidate failed PlanValidator with {} diagnostic(s): {}",
+                diagnostics.len(),
+                bounded_rejection_summary(
+                    &diagnostics
+                        .iter()
+                        .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+                        .collect::<Vec<_>>()
+                )
             ),
             Self::Serialization(error) => write!(f, "PlanCompiler serialization failed: {error}"),
         }
@@ -2028,11 +2034,15 @@ impl<'a> PlanCompiler<'a> {
         let requirement_id = format!("REQ.{stem}");
         let known_paths =
             known_repository_paths(&input.context_packet, &input.repository.repository_id);
+        let write_allowed =
+            string_set(input.policy.pointer("/capability_ceiling")).contains("repo_write");
+        let proposed_tasks = split_multi_file_writes(&proposal.tasks, &known_paths, write_allowed);
+        let split = proposed_tasks.len() != proposal.tasks.len();
         let mut tasks = Vec::new();
         let mut prior_binding: Option<(String, String, String)> = None;
         let mut evidence_types = BTreeSet::new();
 
-        for (index, proposed) in proposal.tasks.iter().enumerate() {
+        for (index, proposed) in proposed_tasks.iter().enumerate() {
             let ordinal = index + 1;
             let task_id = format!("task.{stem}.{ordinal:02}");
             let task = build_task(
@@ -2086,17 +2096,26 @@ impl<'a> PlanCompiler<'a> {
             &input.repository.repository_id,
             &input.compiled_at,
         );
-        let edges = if tasks.len() == 2 {
-            json!([{
-                "edge_id": format!("edge.{stem}.01"),
-                "from": tasks[0]["task_id"],
-                "to": tasks[1]["task_id"],
-                "kind": "produces_for",
-                "contract": "Linear M1 split justified by explicit evidence acquisition."
-            }])
+        let edge_contract = if split {
+            "Linear M1 split: each repository mutation is its own single-file Controller task."
         } else {
-            json!([])
+            "Linear M1 split justified by explicit evidence acquisition."
         };
+        let edges = Value::Array(
+            tasks
+                .windows(2)
+                .enumerate()
+                .map(|(index, pair)| {
+                    json!({
+                        "edge_id": format!("edge.{stem}.{:02}", index + 1),
+                        "from": pair[0]["task_id"],
+                        "to": pair[1]["task_id"],
+                        "kind": "produces_for",
+                        "contract": edge_contract
+                    })
+                })
+                .collect(),
+        );
         let required_evidence_types = evidence_types.into_iter().collect::<Vec<_>>();
         let mut plan = json!({
             "ir_version": "1.2",
@@ -2143,6 +2162,8 @@ impl<'a> PlanCompiler<'a> {
                 "mode": if tasks.len() == 1 { "D1" } else { "D2" },
                 "reason": if tasks.len() == 1 {
                     "Bounded M1 compiler resolved a single task from exact C0/C1 evidence."
+                } else if split {
+                    "A multi-file change is split into one linear single-file task per existing file."
                 } else {
                     "Explicit evidence acquisition requires one short linear split before implementation."
                 },
@@ -2525,7 +2546,7 @@ struct MinimalPlanProposal {
     tasks: Vec<MinimalTaskProposal>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MinimalTaskProposal {
     title: String,
@@ -4448,6 +4469,22 @@ fn parse_and_bound_proposal(
             return Err("planning proposal exceeds deterministic M1 bounds".to_owned());
         }
     }
+    let split_task_count = proposal
+        .tasks
+        .iter()
+        .map(|task| {
+            task.files
+                .iter()
+                .filter(|path| known_paths.contains(path.as_str()))
+                .count()
+                .max(1)
+        })
+        .sum::<usize>();
+    if split_task_count > MAX_PROPOSAL_FILES {
+        return Err(format!(
+            "planning proposal changes more than {MAX_PROPOSAL_FILES} existing files; narrow the change"
+        ));
+    }
     if proposal.tasks.len() == 2 {
         let explicit_evidence = proposal
             .tasks
@@ -4465,6 +4502,47 @@ fn parse_and_bound_proposal(
         }
     }
     Ok(proposal)
+}
+
+/// Splits every proposed task that would mutate more than one existing file into
+/// a linear run of single-file tasks, because `PlanValidator` authorizes exactly
+/// one mutable path per `repo_write` task. The first piece keeps the task's
+/// unresolved paths and evidence queries so evidence is still acquired first.
+fn split_multi_file_writes(
+    tasks: &[MinimalTaskProposal],
+    known_paths: &BTreeSet<String>,
+    write_allowed: bool,
+) -> Vec<MinimalTaskProposal> {
+    let mut result = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let known = task
+            .files
+            .iter()
+            .filter(|path| known_paths.contains(path.as_str()))
+            .collect::<Vec<_>>();
+        if !write_allowed || known.len() < 2 {
+            result.push(task.clone());
+            continue;
+        }
+        let unknown = task
+            .files
+            .iter()
+            .filter(|path| !known_paths.contains(path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for (index, path) in known.into_iter().enumerate() {
+            let mut piece = task.clone();
+            piece.title = truncate_text(&format!("{} ({path})", task.title), 200);
+            piece.files = vec![path.clone()];
+            if index == 0 {
+                piece.files.extend(unknown.iter().cloned());
+            } else {
+                piece.evidence_queries = Vec::new();
+            }
+            result.push(piece);
+        }
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

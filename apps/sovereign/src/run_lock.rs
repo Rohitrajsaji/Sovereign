@@ -43,9 +43,9 @@ impl From<io::Error> for RunLockError {
 /// Process-lifetime coordination for one canonical state database.
 ///
 /// The sidecar file deliberately contains no owner/status data and is never durable Controller
-/// truth. Only the kernel file lock held by `_file` has meaning; the sidecar remains after release.
+/// truth. Only the kernel file lock held by `file` has meaning; the sidecar remains after release.
 pub(crate) struct RunLock {
-    _file: File,
+    file: File,
     #[cfg(test)]
     path: PathBuf,
 }
@@ -68,7 +68,7 @@ impl RunLock {
         }
         match file.try_lock() {
             Ok(()) => Ok(Self {
-                _file: file,
+                file,
                 #[cfg(test)]
                 path,
             }),
@@ -80,6 +80,15 @@ impl RunLock {
     #[cfg(test)]
     fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl Drop for RunLock {
+    /// Unlocks explicitly rather than relying on close. The lock belongs to the open file
+    /// description, which a child forked by another thread shares until it execs, so a close alone
+    /// can leave the lock held after release.
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
     }
 }
 

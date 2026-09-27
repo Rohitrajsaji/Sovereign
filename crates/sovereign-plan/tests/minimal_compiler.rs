@@ -1431,6 +1431,57 @@ fn minimal_compiler_two_task_split_requires_evidence_and_is_linear() {
 }
 
 #[test]
+fn minimal_compiler_splits_a_multi_file_change_into_single_file_write_tasks() {
+    let proposal = json!({
+        "tasks": [{
+            "title": "Rename the Save button",
+            "objective": "Rename Save to Apply and keep its test in step.",
+            "rationale": "The form and its focused test both name the button.",
+            "files": [
+                "src/settings/SettingsForm.tsx",
+                "src/settings/SettingsForm.test.tsx"
+            ],
+            "symbols": ["SettingsForm"],
+            "evidence_queries": [],
+            "expected_change": "The button and its test say Apply."
+        }]
+    })
+    .to_string();
+    let backend = RecordingBackend::new(vec![response(proposal)]);
+    let validator = validator();
+    let compiler = compiler(&backend, &validator);
+    let input = compilation_input();
+    let mut budget = ModelCallBudget::new(1, 1_000);
+    let result = compiler
+        .compile(&input, &mut budget)
+        .unwrap_or_else(|error| panic!("multi-file change must compile: {error}"));
+    let plan = result.plan().as_value();
+    let tasks = plan["tasks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("tasks must be array"));
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(
+        tasks[0]["scope"]["files"],
+        json!(["src/settings/SettingsForm.tsx"])
+    );
+    assert_eq!(
+        tasks[1]["scope"]["files"],
+        json!(["src/settings/SettingsForm.test.tsx"])
+    );
+    for task in tasks {
+        assert!(
+            task["permissions"]
+                .as_array()
+                .is_some_and(|permissions| permissions.contains(&json!("repo_write")))
+        );
+    }
+    assert_eq!(tasks[1]["dependencies"], json!([tasks[0]["task_id"]]));
+    assert_eq!(plan["edges"].as_array().map(Vec::len), Some(1));
+    assert_eq!(plan["depth"]["mode"], json!("D2"));
+    assert!(validator.is_valid(result.plan()));
+}
+
+#[test]
 fn minimal_compiler_uses_bounded_exact_handles_not_repository_dump() {
     let backend = RecordingBackend::new(vec![response(one_task_proposal())]);
     let validator = validator();
