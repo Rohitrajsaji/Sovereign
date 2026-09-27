@@ -7592,6 +7592,10 @@ impl Drop for BrowserGateway {
 }
 
 fn record_gateway_failure(failure: &Mutex<Option<String>>, message: String) {
+    eprintln!(
+        "TEMP-DIAG gateway failure: {message}\n{}",
+        std::backtrace::Backtrace::force_capture()
+    );
     if let Ok(mut failure) = failure.lock()
         && failure.is_none()
     {

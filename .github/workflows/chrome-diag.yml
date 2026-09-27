@@ -19,9 +19,6 @@ jobs:
       - name: Runner browser test first on a fresh runner (x3)
         run: |
           echo "X dir before: $(getconf DARWIN_USER_TEMP_DIR)/../X"; ls -la "$(getconf DARWIN_USER_TEMP_DIR)/../X" || true
-          for i in 1 2 3 4 5 6; do echo "=== runner browser run $i"; cargo test -p sovereign --bin sovereign browser_goal_run_once -- --nocapture 2>&1 | grep -v -e cv_display_link -e backupd.sandbox; done
+          for i in 1 2 3 4 5 6; do echo "=== runner browser run $i"; cargo test -p sovereign --bin sovereign browser_goal_run_once -- --nocapture 2>&1 | grep -v -e cv_display_link -e backupd.sandbox -e "^  *[0-9]*: std::" -e "at /rustc/"; done
           echo "X dir after:"; ls -la "$(getconf DARWIN_USER_TEMP_DIR)/../X" || true
-        continue-on-error: true
-      - name: Browser tests in parallel x5
-        run: for i in 1 2 3 4 5; do echo "=== browser parallel run $i"; cargo test -p sovereign-tools --test browser 2>&1 | grep -E "test result|FAILED|panicked|kill:|failed:"; done
         continue-on-error: true
