@@ -22,6 +22,10 @@ pub struct SettingsV1 {
     pub node_path: Option<String>,
     pub execute_on_start: bool,
     pub approval_principal: String,
+    /// A catalog model chosen while a request was running. It replaces the model in use when
+    /// the next request starts.
+    #[serde(default)]
+    pub queued_model_id: Option<String>,
 }
 
 impl Default for SettingsV1 {
@@ -35,6 +39,7 @@ impl Default for SettingsV1 {
             node_path: None,
             execute_on_start: false,
             approval_principal: "operator@ui".to_owned(),
+            queued_model_id: None,
         }
     }
 }

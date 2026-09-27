@@ -27,6 +27,8 @@ mkdir -p "$destination/bin"
 cp target/release/sovereign "$destination/bin/sovereign"
 printf '%s\n' "$version" >"$destination/VERSION"
 
+# `sovereign app` compares this checkout with the running version and says when to reinstall.
+printf '%s\n' "$repo" >"$HOME/.sovereign/source-checkout"
 "$destination/bin/sovereign" self-install
 "$destination/bin/sovereign" app >/dev/null 2>&1 || true
 echo "Sovereign is open in your browser. Next time, type: sovereign"

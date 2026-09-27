@@ -182,6 +182,20 @@ impl ControllerActorHandle {
         self.shared.pending()
     }
 
+    /// The request waiting for memory, and by how much.
+    #[must_use]
+    pub fn memory_wait(&self) -> Option<(String, sovereign_controller::MemoryWaitV1)> {
+        self.shared.memory_wait()
+    }
+
+    /// "Start anyway" for the request waiting for memory.
+    ///
+    /// # Errors
+    /// Returns a plain reason when it is not waiting or is too far short.
+    pub fn grant_memory_allowance(&self, goal_id: &str) -> Result<u64, String> {
+        self.shared.grant_memory_allowance(goal_id)
+    }
+
     /// Onboarding's model download, which runs beside the actor.
     #[must_use]
     pub fn model_setup(&self) -> Arc<crate::model_setup::ModelSetup> {

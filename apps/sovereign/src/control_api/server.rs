@@ -248,6 +248,7 @@ where
                 &json!({
                     "authenticated": true,
                     "csrf_token": csrf_token,
+                    "version": crate::build_info::BUILD_VERSION,
                 }),
             )
         }

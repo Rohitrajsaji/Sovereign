@@ -1129,6 +1129,63 @@ p {
   font-weight: 600;
 }
 
+.model-list {
+  display: grid;
+  gap: var(--s-2);
+}
+
+.model-card {
+  display: grid;
+  gap: var(--s-1);
+  padding: var(--s-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.model-card-current {
+  border-color: var(--accent);
+  background: var(--bg-accent-soft);
+}
+
+.model-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  align-items: center;
+}
+
+.model-card-head h4 {
+  font-size: var(--fs-14);
+  font-weight: 600;
+}
+
+.model-card .choice-row {
+  margin-top: var(--s-1);
+}
+
+.model-ask {
+  display: grid;
+  gap: var(--s-2);
+  margin-top: var(--s-1);
+  padding: var(--s-2) var(--s-3);
+  border-radius: var(--radius);
+  background: var(--warning-soft);
+}
+
+.badge {
+  padding: 1px var(--s-2);
+  border-radius: 999px;
+  background: var(--accent-fill);
+  color: var(--on-accent);
+  font-size: var(--fs-12);
+  font-weight: 500;
+}
+
+.badge-quiet {
+  background: var(--bg-active);
+  color: var(--text);
+}
+
 .settings-row {
   display: flex;
   gap: var(--s-3);

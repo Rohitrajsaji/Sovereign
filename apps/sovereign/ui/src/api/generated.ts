@@ -3,6 +3,7 @@
 export type SessionResponse = {
   authenticated: boolean;
   csrf_token: string;
+  version?: string;
 };
 
 export type DoctorCheck = {
@@ -122,6 +123,7 @@ export type SettingsV1 = {
   node_path?: string | null;
   execute_on_start: boolean;
   approval_principal: string;
+  queued_model_id?: string | null;
 };
 
 export type GoalDetail = {
@@ -160,6 +162,7 @@ export type GoalProgress = {
   steps_total: number;
   percent: number;
   terminal: boolean;
+  memory?: MemoryNeed | null;
 };
 
 export type GoalOutcome = {
@@ -253,6 +256,7 @@ export type SetupStatus = {
   machine: MachineInfo;
   developer_tools: DeveloperTools;
   model: ModelChoice | null;
+  models: Array<ModelOption>;
   runtime_ready: boolean;
   model_ready: boolean;
   download: DownloadProgress;
@@ -289,4 +293,37 @@ export type ProjectFileContent = {
   binary: boolean;
   truncated: boolean;
   text: string;
+};
+
+export type MemoryNeed = {
+  short_mib: number;
+  can_start_anyway: boolean;
+};
+
+export type ModelOption = {
+  id: string;
+  display_name: string;
+  summary: string;
+  size_bytes: number;
+  recommended_memory_mib: number;
+  installed: boolean;
+  selected: boolean;
+  queued: boolean;
+  fits: boolean;
+  recommended: boolean;
+};
+
+export type ModelSelectResponse = {
+  model_id: string;
+  applies: "now" | "after_current";
+};
+
+export type ModelRemoveResponse = {
+  model_id: string;
+  removed: boolean;
+};
+
+export type StartAnywayResponse = {
+  goal_id: string;
+  lent_mib: number;
 };

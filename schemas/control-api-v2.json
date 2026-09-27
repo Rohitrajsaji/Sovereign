@@ -15,6 +15,9 @@
         },
         "csrf_token": {
           "type": "string"
+        },
+        "version": {
+          "type": "string"
         }
       },
       "additionalProperties": false
@@ -450,6 +453,12 @@
         },
         "approval_principal": {
           "type": "string"
+        },
+        "queued_model_id": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       }
     },
@@ -602,6 +611,16 @@
         },
         "terminal": {
           "type": "boolean"
+        },
+        "memory": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/MemoryNeed"
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -989,6 +1008,7 @@
         "machine",
         "developer_tools",
         "model",
+        "models",
         "runtime_ready",
         "model_ready",
         "download",
@@ -1013,6 +1033,12 @@
               "type": "null"
             }
           ]
+        },
+        "models": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/ModelOption"
+          }
         },
         "runtime_ready": {
           "type": "boolean"
@@ -1135,6 +1161,122 @@
         },
         "text": {
           "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MemoryNeed": {
+      "type": "object",
+      "required": [
+        "short_mib",
+        "can_start_anyway"
+      ],
+      "properties": {
+        "short_mib": {
+          "type": "integer"
+        },
+        "can_start_anyway": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelOption": {
+      "type": "object",
+      "required": [
+        "id",
+        "display_name",
+        "summary",
+        "size_bytes",
+        "recommended_memory_mib",
+        "installed",
+        "selected",
+        "queued",
+        "fits",
+        "recommended"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "size_bytes": {
+          "type": "integer"
+        },
+        "recommended_memory_mib": {
+          "type": "integer"
+        },
+        "installed": {
+          "type": "boolean"
+        },
+        "selected": {
+          "type": "boolean"
+        },
+        "queued": {
+          "type": "boolean"
+        },
+        "fits": {
+          "type": "boolean"
+        },
+        "recommended": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelSelectResponse": {
+      "type": "object",
+      "required": [
+        "model_id",
+        "applies"
+      ],
+      "properties": {
+        "model_id": {
+          "type": "string"
+        },
+        "applies": {
+          "type": "string",
+          "enum": [
+            "now",
+            "after_current"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelRemoveResponse": {
+      "type": "object",
+      "required": [
+        "model_id",
+        "removed"
+      ],
+      "properties": {
+        "model_id": {
+          "type": "string"
+        },
+        "removed": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "StartAnywayResponse": {
+      "type": "object",
+      "required": [
+        "goal_id",
+        "lent_mib"
+      ],
+      "properties": {
+        "goal_id": {
+          "type": "string"
+        },
+        "lent_mib": {
+          "type": "integer"
         }
       },
       "additionalProperties": false

@@ -117,6 +117,17 @@ pub(crate) enum ControlApiRequest {
     },
     DownloadModel {
         confirmation: Option<String>,
+        model_id: Option<String>,
+    },
+    SelectModel {
+        model_id: String,
+        after_current: bool,
+    },
+    RemoveModel {
+        model_id: String,
+    },
+    StartAnyway {
+        goal_id: String,
     },
     SetupStatus,
     CancelModelDownload,

@@ -258,6 +258,17 @@ pub(crate) fn parse_control_request(
                 principal,
             })
         }
+        ("POST", path) if path.starts_with("/v2/goals/") && path.ends_with("/start-anyway") => {
+            let goal_id = path
+                .strip_prefix("/v2/goals/")
+                .and_then(|rest| rest.strip_suffix("/start-anyway"))
+                .filter(|goal_id| !goal_id.is_empty() && !goal_id.contains('/'))
+                .ok_or_else(|| ApiError::new(ApiStatus::BadRequest, "invalid goal path"))?
+                .to_owned();
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &[])?;
+            Ok(ControlApiRequest::StartAnyway { goal_id })
+        }
         ("POST", path)
             if path.starts_with("/v2/goals/")
                 && (path.ends_with("/undo") || path.ends_with("/apply")) =>
@@ -310,9 +321,35 @@ pub(crate) fn parse_control_request(
         }
         ("POST", "/v2/setup/model/download") => {
             let value = parse_optional_json_object(body)?;
-            require_only_fields(&value, &["confirmation"])?;
+            require_only_fields(&value, &["confirmation", "model_id"])?;
             Ok(ControlApiRequest::DownloadModel {
                 confirmation: optional_string(&value, "confirmation")?,
+                model_id: optional_string(&value, "model_id")?,
+            })
+        }
+        ("POST", "/v2/models/select") => {
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &["model_id", "when"])?;
+            let after_current = match optional_string(&value, "when")?.as_deref() {
+                None | Some("now") => false,
+                Some("after_current") => true,
+                Some(_) => {
+                    return Err(ApiError::new(
+                        ApiStatus::BadRequest,
+                        "when must be now or after_current",
+                    ));
+                }
+            };
+            Ok(ControlApiRequest::SelectModel {
+                model_id: required_string(&value, "model_id")?,
+                after_current,
+            })
+        }
+        ("POST", "/v2/models/remove") => {
+            let value = parse_optional_json_object(body)?;
+            require_only_fields(&value, &["model_id"])?;
+            Ok(ControlApiRequest::RemoveModel {
+                model_id: required_string(&value, "model_id")?,
             })
         }
         ("GET", path) if path.starts_with("/v2/artifacts/") => {

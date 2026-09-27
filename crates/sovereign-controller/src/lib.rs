@@ -96,7 +96,7 @@ pub use local_control::{
     LOCAL_CONTROL_READ_MODEL_SCHEMA_VERSION, LocalControl, LocalControlCheckpointV1,
     LocalControlReadModelV1, LocalControlRecoveryProjectionV1,
 };
-pub use model_calibration::{MemoryWaitV1, PeakRssRecorder};
+pub use model_calibration::{MAX_MEMORY_ALLOWANCE_MIB, MemoryWaitV1, PeakRssRecorder};
 pub use production_driver::{
     ProductionAdvanceOutcome, ProductionAdvanceResources, ProductionBlockReason,
     ProductionBrowserResources, ProductionCompilationResources, ProductionExecutionCatalog,

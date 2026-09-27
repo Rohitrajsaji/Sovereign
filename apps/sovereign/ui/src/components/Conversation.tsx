@@ -11,6 +11,7 @@ import {
   isQueued,
   useApplyGoal,
   useCancelGoal,
+  useStartAnyway,
   useRespondApproval,
   useSubmitGoal,
   useUndoGoal,
@@ -130,7 +131,9 @@ function LiveReply({
   onDetails: () => void;
 }) {
   const cancel = useCancelGoal();
+  const startAnyway = useStartAnyway();
   const [confirming, setConfirming] = useState(false);
+  const [confirmingStart, setConfirmingStart] = useState(false);
   const [feedback, setFeedback] = useState<Feedback>(null);
   const { progress } = goal;
   const pending = goal.goal_id.startsWith("pending-");
@@ -159,6 +162,11 @@ function LiveReply({
       ))}
       {pending ? null : (
         <div className="reply-actions">
+          {progress.memory?.can_start_anyway ? (
+            <Button variant="primary" busy={startAnyway.isPending} onClick={() => setConfirmingStart(true)}>
+              Start anyway
+            </Button>
+          ) : null}
           {progress.phase === "stopping" ? null : (
             <Button variant="danger" busy={cancel.isPending} onClick={() => setConfirming(true)}>
               {started ? "Stop" : "Cancel"}
@@ -170,7 +178,28 @@ function LiveReply({
         </div>
       )}
       {feedback ? <p className="inline-note">{feedback.message}</p> : null}
-      <InlineError error={cancel.error} />
+      <InlineError error={cancel.error ?? startAnyway.error} />
+      <Dialog
+        open={confirmingStart}
+        onOpenChange={setConfirmingStart}
+        title="Start anyway?"
+        description="Your Mac is a little short of free memory. Sovereign can start now, but your Mac may slow down while it works. This applies to this request only."
+      >
+        <div className="dialog-actions">
+          <Button onClick={() => setConfirmingStart(false)}>Keep waiting</Button>
+          <Button
+            variant="primary"
+            onClick={() => {
+              setConfirmingStart(false);
+              startAnyway.mutate(goal.goal_id, {
+                onSuccess: () => setFeedback({ message: "Starting. It may take a moment." }),
+              });
+            }}
+          >
+            Start anyway
+          </Button>
+        </div>
+      </Dialog>
       <Dialog
         open={confirming}
         onOpenChange={setConfirming}

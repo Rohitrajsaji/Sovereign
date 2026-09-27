@@ -554,6 +554,71 @@ mod tests {
     }
 
     #[test]
+    fn starting_estimate_and_start_anyway_decide_admission_on_an_8_gb_mac() {
+        let (dir, state) = temp_state("starting-estimate");
+        let mut controller = Controller::new(state);
+        // The reported case: 5324 MiB free, 4096 + 1536 = 5632 MiB needed.
+        controller.set_resource_pressure_probe(Box::new(FixedProbe(5_324)));
+        assert!(
+            controller
+                .compilation_model_admission()
+                .ok()
+                .flatten()
+                .is_some()
+        );
+        assert_eq!(
+            controller.memory_wait(),
+            Some(MemoryWaitV1 {
+                needed_mib: 5_632,
+                free_mib: 5_324
+            })
+        );
+        assert_eq!(
+            controller.memory_wait().map(|wait| wait.short_mib()),
+            Some(308)
+        );
+
+        // "Start anyway" lends the shortfall, and the wait clears once admitted.
+        controller.set_memory_allowance_mib(400);
+        assert_eq!(controller.compilation_model_admission().ok(), Some(None));
+        assert_eq!(controller.memory_wait(), None);
+        controller.set_memory_allowance_mib(0);
+
+        // The catalog's measured estimate for the model fits without help.
+        controller.set_model_starting_estimate(Some(3_600));
+        assert_eq!(
+            controller.model_admission_estimate().ok(),
+            Some((false, 3_600))
+        );
+        assert_eq!(controller.compilation_model_admission().ok(), Some(None));
+
+        // A starting estimate never loosens admission past the generic estimate, and the
+        // allowance is capped.
+        controller.set_model_starting_estimate(Some(9_000));
+        assert_eq!(
+            controller.model_admission_estimate().ok(),
+            Some((false, crate::M1_MODEL_UNCALIBRATED_ADMISSION_MIB))
+        );
+        controller.set_resource_pressure_probe(Box::new(FixedProbe(3_000)));
+        controller.set_memory_allowance_mib(u64::MAX);
+        assert!(
+            controller
+                .compilation_model_admission()
+                .ok()
+                .flatten()
+                .is_some()
+        );
+        assert_eq!(
+            controller.memory_wait(),
+            Some(MemoryWaitV1 {
+                needed_mib: 5_632,
+                free_mib: 3_000
+            })
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn compilation_admission_uses_calibration_and_never_holds_a_lease() {
         let (dir, state) = temp_state("compile-admission");
         let mut controller = Controller::new(state);

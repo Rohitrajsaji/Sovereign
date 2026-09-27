@@ -56,7 +56,14 @@ pub struct ModelEntryV2 {
     pub url: String,
     pub sha256: String,
     pub size_bytes: u64,
+    /// Below this the model cannot run at all.
     pub min_memory_mib: u64,
+    /// The largest model whose recommendation fits is picked by default.
+    pub recommended_memory_mib: u64,
+    /// MODEL admission estimate until this Mac has measured the model itself.
+    pub starting_estimate_mib: u64,
+    /// One plain sentence for the model switcher.
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,23 +122,59 @@ fn parse_catalog(json: &str) -> Result<ModelCatalogV2, String> {
             || !is_sha256_hex(&model.sha256)
             || model.size_bytes == 0
             || model.min_memory_mib == 0
+            || model.recommended_memory_mib < model.min_memory_mib
+            || model.starting_estimate_mib == 0
+            || model.summary.trim().is_empty()
             || !is_plain_file_name(&model.file_name)
+            || !is_plain_file_name(&model.id)
             || model.model_name.trim().is_empty()
         {
             return Err(format!("model {} is not fully pinned", model.id));
         }
     }
+    let mut ids = catalog
+        .models
+        .iter()
+        .map(|model| &model.id)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    if ids.len() != catalog.models.len() {
+        return Err("the model catalog repeats a model id".to_owned());
+    }
     Ok(catalog)
 }
 
-/// The largest pinned model this much memory runs.
+/// The model picked by default: the largest whose recommended memory this Mac has, or else the
+/// smallest that runs at all.
 #[must_use]
 pub fn pick_model(catalog: &ModelCatalogV2, memory_mib: u64) -> Option<&ModelEntryV2> {
     catalog
         .models
         .iter()
-        .filter(|model| model.min_memory_mib <= memory_mib)
-        .max_by_key(|model| (model.min_memory_mib, model.size_bytes))
+        .filter(|model| model.recommended_memory_mib <= memory_mib)
+        .max_by_key(|model| (model.recommended_memory_mib, model.size_bytes))
+        .or_else(|| {
+            catalog
+                .models
+                .iter()
+                .filter(|model| model.min_memory_mib <= memory_mib)
+                .min_by_key(|model| (model.recommended_memory_mib, model.size_bytes))
+        })
+}
+
+/// The catalog entry whose downloaded file is `path`, matched by file name.
+#[must_use]
+pub fn entry_for_path<'a>(catalog: &'a ModelCatalogV2, path: &Path) -> Option<&'a ModelEntryV2> {
+    let name = path.file_name()?.to_str()?;
+    catalog.models.iter().find(|model| model.file_name == name)
+}
+
+/// The starting MODEL estimate for the model file in use, when it is a catalog model.
+#[must_use]
+pub fn starting_estimate_for(path: &Path) -> Option<u64> {
+    let catalog = load_catalog().ok()?;
+    entry_for_path(&catalog, path).map(|model| model.starting_estimate_mib)
 }
 
 /// What Sovereign found about this Mac.
@@ -320,13 +363,40 @@ impl Default for DownloadProgressV1 {
     }
 }
 
+/// One card in the model switcher.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent facts shown together on one card"
+)]
+pub struct ModelOptionV1 {
+    pub id: String,
+    pub display_name: String,
+    pub summary: String,
+    pub size_bytes: u64,
+    pub recommended_memory_mib: u64,
+    /// Downloaded and verified.
+    pub installed: bool,
+    /// Used for new work now.
+    pub selected: bool,
+    /// Used once the current request finishes.
+    pub queued: bool,
+    /// This Mac has the memory the model is recommended for.
+    pub fits: bool,
+    /// Picked by default for this Mac.
+    pub recommended: bool,
+}
+
 /// Everything onboarding needs to know.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SetupStatusV1 {
     pub schema_version: u32,
     pub machine: MachineV1,
     pub developer_tools: DeveloperToolsV1,
+    /// The model in use, or the one setup will download.
     pub model: Option<ModelChoiceV1>,
+    /// Every catalog model, for the switcher in Settings.
+    pub models: Vec<ModelOptionV1>,
     pub runtime_ready: bool,
     pub model_ready: bool,
     pub download: DownloadProgressV1,
@@ -641,6 +711,37 @@ fn ready_model(
     verify_pinned(&path, &model.sha256, true).then_some(path)
 }
 
+/// A catalog model's downloaded file, when it is in place and verified.
+#[must_use]
+pub fn installed_model_path(paths: &SetupPaths, model_id: &str) -> Option<(PathBuf, String)> {
+    let catalog = load_catalog().ok()?;
+    let model = catalog.models.iter().find(|model| model.id == model_id)?;
+    let path = paths.model_path(model);
+    verify_pinned(&path, &model.sha256, true).then(|| (path, model.model_name.clone()))
+}
+
+/// Deletes a downloaded catalog model, its verification marker, and any partial download.
+///
+/// # Errors
+/// Returns a plain reason for an unknown model or a file that cannot be removed.
+pub fn remove_model(paths: &SetupPaths, model_id: &str) -> Result<(), String> {
+    let catalog = load_catalog()?;
+    let model = catalog
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| format!("Sovereign doesn't know a model called {model_id}."))?;
+    let path = paths.model_path(model);
+    for file in [marker_path(&path), partial_path(&path), path] {
+        match fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Could not remove {}: {error}", file.display())),
+        }
+    }
+    Ok(())
+}
+
 /// What a finished setup run configures.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledModel {
@@ -692,12 +793,37 @@ impl ModelSetup {
         paths: &SetupPaths,
         configured_runtime: Option<&Path>,
         configured_model: Option<&Path>,
+        queued_model_id: Option<&str>,
     ) -> SetupStatusV1 {
         let catalog = load_catalog().ok();
         let memory_mib = probe_memory_mib();
-        let chosen = catalog
+        let memory = memory_mib.unwrap_or(MIN_MEMORY_MIB);
+        let recommended = catalog
             .as_ref()
-            .and_then(|catalog| pick_model(catalog, memory_mib.unwrap_or(MIN_MEMORY_MIB)));
+            .and_then(|catalog| pick_model(catalog, memory));
+        let selected = catalog
+            .as_ref()
+            .zip(configured_model)
+            .and_then(|(catalog, path)| entry_for_path(catalog, path));
+        let chosen = selected.or(recommended);
+        let models = catalog.as_ref().map_or_else(Vec::new, |catalog| {
+            catalog
+                .models
+                .iter()
+                .map(|model| ModelOptionV1 {
+                    id: model.id.clone(),
+                    display_name: model.display_name.clone(),
+                    summary: model.summary.clone(),
+                    size_bytes: model.size_bytes,
+                    recommended_memory_mib: model.recommended_memory_mib,
+                    installed: verify_pinned(&paths.model_path(model), &model.sha256, true),
+                    selected: selected.is_some_and(|entry| entry.id == model.id),
+                    queued: queued_model_id == Some(model.id.as_str()),
+                    fits: model.recommended_memory_mib <= memory,
+                    recommended: recommended.is_some_and(|entry| entry.id == model.id),
+                })
+                .collect()
+        });
         let runtime_ready = catalog.as_ref().is_some_and(|catalog| {
             ready_runtime(paths, &catalog.runtime, configured_runtime).is_some()
         });
@@ -727,6 +853,7 @@ impl ModelSetup {
                 display_name: model.display_name.clone(),
                 size_bytes: model.size_bytes,
             }),
+            models,
             machine,
             developer_tools,
             runtime_ready,
@@ -745,6 +872,7 @@ impl ModelSetup {
         self: &Arc<Self>,
         paths: SetupPaths,
         configured_runtime: Option<PathBuf>,
+        model_id: Option<&str>,
         on_installed: impl FnOnce(&InstalledModel) + Send + 'static,
     ) -> Result<DownloadProgressV1, String> {
         if self.busy.load(Ordering::Acquire) {
@@ -752,9 +880,17 @@ impl ModelSetup {
         }
         let catalog = load_catalog()?;
         let memory_mib = probe_memory_mib();
-        let model = pick_model(&catalog, memory_mib.unwrap_or(MIN_MEMORY_MIB))
-            .cloned()
-            .ok_or_else(|| "Sovereign needs at least 8 GB of memory.".to_owned())?;
+        let model = match model_id {
+            Some(id) => catalog
+                .models
+                .iter()
+                .find(|model| model.id == id)
+                .cloned()
+                .ok_or_else(|| format!("Sovereign doesn't know a model called {id}."))?,
+            None => pick_model(&catalog, memory_mib.unwrap_or(MIN_MEMORY_MIB))
+                .cloned()
+                .ok_or_else(|| "Sovereign needs at least 8 GB of memory.".to_owned())?,
+        };
         let partial = fs::metadata(partial_path(&paths.model_path(&model)))
             .map_or(0, |metadata| metadata.len());
         let machine = evaluate_machine(
@@ -1003,6 +1139,71 @@ mod tests {
         assert!(pick_model(&catalog, 4 * 1_024).is_none());
     }
 
+    fn two_model_catalog() -> ModelCatalogV2 {
+        let mut catalog: serde_json::Value =
+            serde_json::from_str(CATALOG_JSON).unwrap_or_else(|error| panic!("{error}"));
+        let mut small = catalog["models"][0].clone();
+        small["id"] = serde_json::json!("small");
+        small["file_name"] = serde_json::json!("small.gguf");
+        small["size_bytes"] = serde_json::json!(1_000_000_000_u64);
+        small["recommended_memory_mib"] = serde_json::json!(8_192);
+        small["starting_estimate_mib"] = serde_json::json!(3_072);
+        catalog["models"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("models"))
+            .push(small);
+        parse_catalog(&catalog.to_string()).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[test]
+    fn eight_gb_macs_get_the_smaller_model_and_larger_macs_the_best_fit() {
+        let catalog = two_model_catalog();
+        let pick = |memory| pick_model(&catalog, memory).map(|model| model.id.as_str());
+        assert_eq!(pick(8 * 1_024), Some("small"));
+        assert_eq!(pick(16 * 1_024), Some("qwen3-4b-q4_k_m"));
+        assert_eq!(pick(24 * 1_024), Some("qwen3-4b-q4_k_m"));
+        assert_eq!(pick(4 * 1_024), None);
+        assert_eq!(
+            entry_for_path(&catalog, Path::new("/x/models/small.gguf"))
+                .map(|model| model.id.as_str()),
+            Some("small")
+        );
+        assert!(entry_for_path(&catalog, Path::new("/x/models/own.gguf")).is_none());
+    }
+
+    #[test]
+    fn a_repeated_model_id_fails_closed() {
+        let mut catalog: serde_json::Value =
+            serde_json::from_str(CATALOG_JSON).unwrap_or_else(|error| panic!("{error}"));
+        let copy = catalog["models"][0].clone();
+        catalog["models"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("models"))
+            .push(copy);
+        assert!(parse_catalog(&catalog.to_string()).is_err());
+    }
+
+    #[test]
+    fn removing_a_model_deletes_it_and_its_leftovers() {
+        let dir = temp_dir("remove");
+        let paths = SetupPaths {
+            app_data: dir.clone(),
+        };
+        let catalog = load_catalog().unwrap_or_else(|error| panic!("{error}"));
+        let model = &catalog.models[0];
+        let path = paths.model_path(model);
+        fs::create_dir_all(path.parent().unwrap_or(&dir)).unwrap_or_else(|error| panic!("{error}"));
+        for file in [path.clone(), partial_path(&path), marker_path(&path)] {
+            fs::write(&file, b"x").unwrap_or_else(|error| panic!("{error}"));
+        }
+        remove_model(&paths, &model.id).unwrap_or_else(|error| panic!("{error}"));
+        assert!(!path.exists() && !partial_path(&path).exists() && !marker_path(&path).exists());
+        // Removing again is fine; an unknown model is not.
+        assert!(remove_model(&paths, &model.id).is_ok());
+        assert!(remove_model(&paths, "no-such-model").is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn unpinned_entries_fail_closed() {
         let mut catalog: serde_json::Value =
@@ -1012,6 +1213,10 @@ mod tests {
         let mut catalog: serde_json::Value =
             serde_json::from_str(CATALOG_JSON).unwrap_or_else(|error| panic!("{error}"));
         catalog["models"][0]["url"] = serde_json::json!("http://example.invalid/model.gguf");
+        assert!(parse_catalog(&catalog.to_string()).is_err());
+        let mut catalog: serde_json::Value =
+            serde_json::from_str(CATALOG_JSON).unwrap_or_else(|error| panic!("{error}"));
+        catalog["models"][0]["recommended_memory_mib"] = serde_json::json!(1_024);
         assert!(parse_catalog(&catalog.to_string()).is_err());
     }
 

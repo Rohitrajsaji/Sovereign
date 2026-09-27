@@ -12,7 +12,10 @@ use crate::landing_service::{LandingRecordV1, LandingStatusV1, LandingsV1};
 use crate::service_state::PendingCommandV1;
 use serde::Serialize;
 use serde_json::Value;
-use sovereign_controller::{GoalOutcomeKindV1, GoalOutcomeV1, LocalControlReadModelV1};
+use sovereign_controller::{
+    GoalOutcomeKindV1, GoalOutcomeV1, LocalControlReadModelV1, MAX_MEMORY_ALLOWANCE_MIB,
+    MemoryWaitV1,
+};
 use sovereign_state::JournalEvent;
 
 pub const GOAL_VIEW_SCHEMA_VERSION: u32 = 1;
@@ -40,6 +43,16 @@ pub struct GoalProgressV1 {
     pub steps_total: u32,
     pub percent: u8,
     pub terminal: bool,
+    /// Set while the model waits for memory.
+    pub memory: Option<MemoryNeedV1>,
+}
+
+/// How far short of memory the model is, for the waiting card.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct MemoryNeedV1 {
+    pub short_mib: u64,
+    /// Close enough that the person may start the model anyway.
+    pub can_start_anyway: bool,
 }
 
 /// A request as the UI shows it. Field names up to `submitted_at_ms` match `GoalIntentV1`.
@@ -74,6 +87,40 @@ pub struct ServiceFacts<'a> {
     pub working: bool,
     pub paused: bool,
     pub pending: &'a [PendingCommandV1],
+    /// The measured memory shortfall of the request that is waiting, when there is one.
+    pub memory: Option<MemoryWaitV1>,
+}
+
+/// The waiting card for a model that has no room yet, in plain words.
+fn memory_progress(facts: &ServiceFacts<'_>, steps: (u32, u32), percent: u8) -> GoalProgressV1 {
+    let Some(wait) = facts.memory else {
+        let plain = if facts.status.detail.starts_with("waiting for memory")
+            || facts.status.detail.starts_with("MODEL resource admission")
+        {
+            "Waiting for memory to free up. Closing browser tabs or other apps usually helps."
+                .to_owned()
+        } else {
+            facts.status.detail.clone()
+        };
+        return progress("waiting", "Waiting for memory", plain, steps, percent);
+    };
+    let short = wait.short_mib();
+    let can_start_anyway = short <= MAX_MEMORY_ALLOWANCE_MIB;
+    let mut sentence = format!(
+        "Waiting for about {:.1} GB more free memory. Closing browser tabs or other apps usually helps.",
+        crate::service_state::gib(short.max(100))
+    );
+    if can_start_anyway {
+        sentence.push_str(" You can also start anyway; your Mac may slow down while it works.");
+    } else {
+        sentence.push_str(" A smaller model in Settings needs less.");
+    }
+    let mut view = progress("waiting", "Waiting for memory", sentence, steps, percent);
+    view.memory = Some(MemoryNeedV1 {
+        short_mib: short,
+        can_start_anyway,
+    });
+    view
 }
 
 fn progress(
@@ -94,6 +141,7 @@ fn progress(
             phase,
             "done" | "not_applied" | "undone" | "failed" | "cancelled"
         ),
+        memory: None,
     }
 }
 
@@ -208,13 +256,7 @@ fn active_progress(
         );
     }
     if facts.status.phase == "deferred_resource" && !facts.status.detail.is_empty() {
-        return progress(
-            "waiting",
-            "Waiting for memory",
-            facts.status.detail.clone(),
-            (done, total),
-            percent,
-        );
+        return memory_progress(facts, (done, total), percent);
     }
     if let Some(problem) = service_problem(facts, (done, total), percent) {
         return problem;
@@ -296,13 +338,7 @@ fn queued_progress(position: u32, head_is_next: bool, facts: &ServiceFacts<'_>) 
         );
     }
     if facts.status.phase == "deferred_resource" && !facts.status.detail.is_empty() {
-        return progress(
-            "waiting",
-            "Waiting for memory",
-            facts.status.detail.clone(),
-            (0, 0),
-            2,
-        );
+        return memory_progress(facts, (0, 0), 2);
     }
     if let Some(problem) = service_problem(facts, (0, 0), 2) {
         return problem;
@@ -625,6 +661,7 @@ mod tests {
             working: false,
             paused: false,
             pending: &[],
+            memory: None,
         }
     }
 
@@ -729,7 +766,38 @@ mod tests {
         status.detail = "waiting for memory: needs 5000 MiB".to_owned();
         let view = queued_progress(1, true, &facts(&status));
         assert_eq!(view.headline, "Waiting for memory");
-        assert!(view.sentence.contains("5000 MiB"));
+        assert!(view.sentence.starts_with("Waiting for memory to free up"));
+        assert!(!view.sentence.contains("MiB"));
+        assert_eq!(view.memory, None);
+
+        // 5632 needed and 5324 free: about 0.3 GB short, close enough to start anyway.
+        let mut close = facts(&status);
+        close.memory = Some(MemoryWaitV1 {
+            needed_mib: 5_632,
+            free_mib: 5_324,
+        });
+        let view = queued_progress(1, true, &close);
+        assert!(
+            view.sentence.contains("about 0.3 GB more"),
+            "{}",
+            view.sentence
+        );
+        assert!(view.sentence.contains("start anyway"));
+        assert_eq!(
+            view.memory,
+            Some(MemoryNeedV1 {
+                short_mib: 308,
+                can_start_anyway: true
+            })
+        );
+        let mut far = facts(&status);
+        far.memory = Some(MemoryWaitV1 {
+            needed_mib: 5_632,
+            free_mib: 2_000,
+        });
+        let view = queued_progress(1, true, &far);
+        assert!(view.sentence.contains("smaller model"));
+        assert_eq!(view.memory.map(|need| need.can_start_anyway), Some(false));
     }
 
     #[test]
@@ -744,6 +812,7 @@ mod tests {
             working: true,
             paused: false,
             pending: &[],
+            memory: None,
         };
         assert_eq!(queued_progress(1, true, &working).phase, "planning");
     }

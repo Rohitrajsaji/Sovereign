@@ -49,8 +49,29 @@ Around each step, for a registered project (`actor.rs`, `landing_service.rs`):
   - A file moves into place only after its SHA-256 matches the pin. A marker file stops the 2.5 GB model being re-hashed.
   - Finished paths and the model name are saved in Settings.
 - `POST /v2/setup/model/cancel` pauses the download.
+- The catalog lists every pinned model with `min_memory_mib`, `recommended_memory_mib`, `starting_estimate_mib`, and a `summary`. The default is the largest model whose recommended memory the Mac has, else the smallest that runs.
+- `GET /v2/setup` includes `models`, one card each: installed, selected, queued, fits, recommended.
+  - `POST /v2/setup/model/download {model_id?}` fetches a specific model. Only setup's own download (no `model_id`) also selects it.
+  - `POST /v2/models/select {model_id, when}` switches `now` or `after_current`. A queued choice (`queued_model_id` in Settings) is applied by the runner when the next request starts compiling, so a plan never changes models halfway.
+  - `POST /v2/models/remove {model_id}` deletes a model that is neither in use nor queued.
 - `POST /v2/setup/developer-tools/install` opens Apple's installer.
 - A runner shipped at `../libexec/llama/llama-server` beside the installed binary is used when it matches the pin.
+
+## Memory admission
+
+MODEL admission needs `estimate + 1536 MiB` of launch reserve free (`compilation_model_admission` and ready-task admission in `sovereign-controller`).
+
+- **Free memory** is `memory_pressure`'s free percentage of the Mac's real memory (`sysctl hw.memsize`). It used to assume 8 GB on every Mac.
+- **Estimate.** A measured calibration for this model, runtime, and profile wins. Until three samples exist, the catalog's `starting_estimate_mib` for the model in use applies, capped at the generic 4096 MiB.
+- **Waiting.** A deferral keeps `needed_mib` and `free_mib`. The runner publishes them to `ServiceShared`, and goal views turn them into a plain sentence and `progress.memory {short_mib, can_start_anyway}`.
+- **Start anyway.** `POST /v2/goals/{id}/start-anyway` lends the waiting request its shortfall plus 128 MiB. It is refused beyond `MAX_MEMORY_ALLOWANCE_MIB` (1024). The allowance is added to measured headroom for MODEL admission only, for that request only, and never persists.
+
+## Versions
+
+- `build.rs` embeds the Git commit. `/v2/session` reports `version`, and Settings → Advanced shows it.
+- `serve` writes `service-version` beside the session token.
+- `sovereign app`, run from the installed current version, re-points the LaunchAgent at itself when the service reports another version or none. An older copy run by hand never downgrades it.
+- `scripts/install-from-source.sh` records its checkout in `~/.sovereign/source-checkout`. `sovereign app` then says when that checkout's `HEAD` differs from the running build.
 
 ## Preview and files
 
