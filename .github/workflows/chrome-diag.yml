@@ -16,9 +16,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build tests
         run: cargo test -p sovereign-tools -p sovereign --no-run
-      - name: Browser tests in parallel x3
-        run: for i in 1 2 3; do echo "=== browser parallel run $i"; cargo test -p sovereign-tools --test browser 2>&1 | grep -v -e cv_display_link -e backupd.sandbox; done
-        continue-on-error: true
-      - name: Full sovereign bin tests x2
-        run: for i in 1 2; do echo "=== sovereign bin run $i"; cargo test -p sovereign --bin sovereign 2>&1 | grep -v -e cv_display_link -e backupd.sandbox -e ' ... ok$'; done
+      - name: Runner browser test first on a fresh runner (x3)
+        run: |
+          echo "X dir before: $(getconf DARWIN_USER_TEMP_DIR)/../X"; ls -la "$(getconf DARWIN_USER_TEMP_DIR)/../X" || true
+          for i in 1 2 3; do echo "=== runner browser run $i"; cargo test -p sovereign --bin sovereign browser_goal_run_once -- --nocapture 2>&1 | grep -v -e cv_display_link -e backupd.sandbox; done
+          echo "X dir after:"; ls -la "$(getconf DARWIN_USER_TEMP_DIR)/../X" || true
         continue-on-error: true
