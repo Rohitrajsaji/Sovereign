@@ -1126,8 +1126,25 @@ impl MacBrowserSandboxExecBackend {
         })
     }
 
+    /// Some macOS hosts intermittently refuse the explicitly allowed loopback connect with
+    /// EPERM. That refusal is fail-closed, so only it is retried, on fresh ports; any probe
+    /// that shows the boundary was not enforced fails the self-test at once.
     #[cfg(target_os = "macos")]
     fn self_test(&self) -> Result<(), BrowserPolicyError> {
+        let mut attempt = 1;
+        loop {
+            match self.self_test_attempt()? {
+                SelfTestAttempt::Enforced => return Ok(()),
+                SelfTestAttempt::AllowedRefused(_) if attempt < SELF_TEST_ATTEMPTS => attempt += 1,
+                SelfTestAttempt::AllowedRefused(message) | SelfTestAttempt::Violated(message) => {
+                    return Err(BrowserPolicyError::IsolationUnavailable(message));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn self_test_attempt(&self) -> Result<SelfTestAttempt, BrowserPolicyError> {
         let allowed_listener = TcpListener::bind("127.0.0.1:0")?;
         let denied_listener = TcpListener::bind("127.0.0.1:0")?;
         let allowed_port = allowed_listener.local_addr()?.port();
@@ -1164,22 +1181,27 @@ impl MacBrowserSandboxExecBackend {
         let outside_write = file_write_probe_status(&self.sandbox_exec, &profile, &outside)?;
         drop((allowed_listener, denied_listener));
         let cleanup = fs::remove_dir_all(&root);
-        if !allowed.status.success()
-            || denied.status.success()
-            || !inside_write.success()
-            || outside_write.success()
-        {
-            return Err(BrowserPolicyError::IsolationUnavailable(format!(
+        let enforced = !denied.status.success() && !outside_write.success();
+        if !allowed.status.success() || !enforced || !inside_write.success() {
+            let message = format!(
                 "browser Seatbelt self-test did not enforce exact loopback-port/file-write boundary \
                  (allowed port {allowed_port} connect: {} {:?}; denied port {denied_port} connect: {}; \
                  profile write: {inside_write}; outside write: {outside_write})",
                 allowed.status,
                 probe_error_tail(&allowed.stderr),
                 denied.status
-            )));
+            );
+            let refused_only = enforced
+                && inside_write.success()
+                && probe_error_tail(&allowed.stderr).contains("Operation not permitted");
+            return Ok(if refused_only {
+                SelfTestAttempt::AllowedRefused(message)
+            } else {
+                SelfTestAttempt::Violated(message)
+            });
         }
         cleanup?;
-        Ok(())
+        Ok(SelfTestAttempt::Enforced)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -1363,6 +1385,21 @@ fn chrome_process_singleton_prefix(profile_root: &Path) -> Result<PathBuf, Brows
         ));
     }
     Ok(temp_root.join("com.google.Chrome."))
+}
+
+/// Attempts the browser self-test makes before a fail-closed allowed-port refusal is final.
+#[cfg(target_os = "macos")]
+const SELF_TEST_ATTEMPTS: u32 = 3;
+
+/// One browser Seatbelt self-test attempt.
+#[cfg(target_os = "macos")]
+enum SelfTestAttempt {
+    /// Every probe matched the profile.
+    Enforced,
+    /// Only the allowed-port connect was refused with EPERM; every denial held.
+    AllowedRefused(String),
+    /// A probe showed the boundary was not enforced as built.
+    Violated(String),
 }
 
 #[cfg(target_os = "macos")]
