@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{IpAddr, ToSocketAddrs};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -3400,24 +3400,48 @@ fn parse_resource_limit_name(value: &str) -> Result<ResourceLimitKind, ToolError
     }
 }
 
+/// Bytes in regular files under `root`, not following symlinks.
+///
+/// The running command may create and delete files while this walks (Cargo and rustc temporary
+/// files, for example). A path that disappears between listing and inspection holds no disk, so it
+/// counts as zero; any other error, and a missing `root`, still fail.
 fn directory_size(root: &Path) -> Result<u64, ToolError> {
     let mut total = 0_u64;
     let mut stack = vec![root.to_path_buf()];
     while let Some(path) = stack.pop() {
-        for entry in fs::read_dir(path)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
+        let entries = match fs::read_dir(&path) {
+            Ok(entries) => entries,
+            Err(error) if path != root && error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let Some(entry) = vanished_is_none(entry)? else {
+                continue;
+            };
+            let Some(file_type) = vanished_is_none(entry.file_type())? else {
+                continue;
+            };
             if file_type.is_symlink() {
                 continue;
             }
             if file_type.is_dir() {
                 stack.push(entry.path());
-            } else if file_type.is_file() {
-                total = total.saturating_add(entry.metadata()?.len());
+            } else if file_type.is_file()
+                && let Some(metadata) = vanished_is_none(entry.metadata())?
+            {
+                total = total.saturating_add(metadata.len());
             }
         }
     }
     Ok(total)
+}
+
+fn vanished_is_none<T>(result: io::Result<T>) -> Result<Option<T>, ToolError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn descendant_count(pgid: u32) -> Result<u32, ToolError> {
@@ -4907,5 +4931,68 @@ mod managed_process_tests {
             &mut process,
             ResourceLimitKind::Subprocesses,
         );
+    }
+}
+
+#[cfg(test)]
+mod directory_size_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn test_root(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let path = std::env::temp_dir().join(format!(
+            "sovereign-tools-size-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).unwrap_or_else(|error| panic!("create size test dir: {error}"));
+        path
+    }
+
+    #[test]
+    fn counts_regular_files_and_fails_for_a_missing_root() {
+        let root = test_root("count");
+        fs::create_dir_all(root.join("nested")).unwrap_or_else(|error| panic!("{error}"));
+        fs::write(root.join("a"), b"abc").unwrap_or_else(|error| panic!("{error}"));
+        fs::write(root.join("nested/b"), b"de").unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(directory_size(&root).ok(), Some(5));
+        let _ = fs::remove_dir_all(&root);
+        assert!(matches!(directory_size(&root), Err(ToolError::Io(_))));
+    }
+
+    #[test]
+    fn files_deleted_during_the_walk_count_as_zero() {
+        let root = test_root("churn");
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let root = root.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut round = 0_u64;
+                while !stop.load(Ordering::Acquire) {
+                    let dir = root.join(format!("tmp-{}", round % 4));
+                    let _ = fs::create_dir_all(dir.join("inner"));
+                    for index in 0..8 {
+                        let _ = fs::write(dir.join(format!("f{index}")), b"x");
+                        let _ = fs::write(dir.join("inner").join(format!("g{index}")), b"y");
+                    }
+                    let _ = fs::remove_dir_all(&dir);
+                    round += 1;
+                }
+            })
+        };
+        for _ in 0..2_000 {
+            if let Err(error) = directory_size(&root) {
+                stop.store(true, Ordering::Release);
+                let _ = churn.join();
+                panic!("walk failed while files churned: {error}");
+            }
+        }
+        stop.store(true, Ordering::Release);
+        let _ = churn.join();
+        let _ = fs::remove_dir_all(&root);
     }
 }
