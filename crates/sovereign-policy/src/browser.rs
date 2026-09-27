@@ -1171,7 +1171,7 @@ impl MacBrowserSandboxExecBackend {
         {
             return Err(BrowserPolicyError::IsolationUnavailable(format!(
                 "browser Seatbelt self-test did not enforce exact loopback-port/file-write boundary \
-                 (allowed port connect: {} {:?}; denied port connect: {}; \
+                 (allowed port {allowed_port} connect: {} {:?}; denied port {denied_port} connect: {}; \
                  profile write: {inside_write}; outside write: {outside_write})",
                 allowed.status,
                 probe_error_tail(&allowed.stderr),
