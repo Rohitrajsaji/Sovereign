@@ -7616,8 +7616,7 @@ fn handle_proxy_client(
         return Ok(());
     };
     if !proxy_request_authenticated(&request, loopback_capability)? {
-        write_proxy_auth_challenge(&mut client)?;
-        return Ok(());
+        return client_write_result(write_proxy_auth_challenge(&mut client));
     }
     if request.method.eq_ignore_ascii_case("CONNECT") {
         return handle_connect_proxy_request(
@@ -7652,14 +7651,17 @@ fn handle_connect_proxy_request(
     let mut upstream = match authority.connect_authorized(&destination) {
         Ok(upstream) => upstream,
         Err(BrowserGatewayConnectError::Denied) => {
-            write_proxy_policy_denial(client)?;
-            return Ok(());
+            return client_write_result(write_proxy_policy_denial(client));
         }
         Err(BrowserGatewayConnectError::Failure(error)) => return Err(error),
     };
     upstream.set_read_timeout(Some(GATEWAY_IO_TIMEOUT))?;
     upstream.set_write_timeout(Some(GATEWAY_IO_TIMEOUT))?;
-    client.write_all(b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n")?;
+    if let Err(error) =
+        client.write_all(b"HTTP/1.1 200 Connection Established\r\nConnection: close\r\n\r\n")
+    {
+        return client_write_result(Err(ToolError::Io(error)));
+    }
     tunnel_bidirectional(
         client,
         &mut upstream,
@@ -7691,8 +7693,7 @@ fn handle_http_proxy_request(
     let mut upstream = match authority.connect_authorized(&parsed.destination) {
         Ok(upstream) => upstream,
         Err(BrowserGatewayConnectError::Denied) => {
-            write_proxy_policy_denial(&mut client)?;
-            return Ok(());
+            return client_write_result(write_proxy_policy_denial(&mut client));
         }
         Err(BrowserGatewayConnectError::Failure(error)) => return Err(error),
     };
@@ -7776,6 +7777,27 @@ fn proxy_request_authenticated(
     Ok(loopback_capability
         .verify_token(token.as_bytes(), current_unix_millis()?)
         .is_ok())
+}
+
+/// Chrome closes proxy connections it no longer needs, such as a cancelled subresource or a
+/// connection it abandons after a 407. That is the browser giving up on one request, not a
+/// gateway policy or I/O failure, so it must not fail the whole browser action.
+fn browser_client_disconnected(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
+/// Maps a failed write to the browser client: a disconnected client ends the request cleanly,
+/// any other error stays a gateway failure.
+fn client_write_result(result: Result<(), ToolError>) -> Result<(), ToolError> {
+    match result {
+        Err(ToolError::Io(error)) if browser_client_disconnected(&error) => Ok(()),
+        other => other,
+    }
 }
 
 fn write_proxy_auth_challenge(client: &mut TcpStream) -> Result<(), ToolError> {
@@ -7976,7 +7998,9 @@ fn relay_to_eof(
             Ok(0) => return Ok(()),
             Ok(read) => {
                 charge_gateway_bytes(transferred_bytes, max_network_bytes, read)?;
-                destination.write_all(&buffer[..read])?;
+                if let Err(error) = destination.write_all(&buffer[..read]) {
+                    return client_write_result(Err(ToolError::Io(error)));
+                }
             }
             Err(error)
                 if matches!(
@@ -8014,6 +8038,7 @@ fn tunnel_bidirectional(
                     progressed = true;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if browser_client_disconnected(&error) => client_open = false,
                 Err(error) => return Err(ToolError::Io(error)),
             }
         }
@@ -8022,7 +8047,11 @@ fn tunnel_bidirectional(
                 Ok(0) => upstream_open = false,
                 Ok(read) => {
                     charge_gateway_bytes(transferred_bytes, max_network_bytes, read)?;
-                    client.write_all(&buffer[..read])?;
+                    match client.write_all(&buffer[..read]) {
+                        Ok(()) => {}
+                        Err(error) if browser_client_disconnected(&error) => break,
+                        Err(error) => return Err(ToolError::Io(error)),
+                    }
                     progressed = true;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -10218,5 +10247,25 @@ mod browser_download_terminal_tests {
                 .is_err(),
             "Controller must independently require one normal GUID path component"
         );
+    }
+}
+
+#[cfg(test)]
+mod browser_gateway_client_disconnect_tests {
+    use super::{ToolError, client_write_result};
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn a_browser_that_hangs_up_ends_its_request_but_other_failures_still_fail() {
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+        ] {
+            assert!(client_write_result(Err(ToolError::Io(Error::from(kind)))).is_ok());
+        }
+        assert!(client_write_result(Err(ToolError::Io(Error::from(ErrorKind::TimedOut)))).is_err());
+        assert!(client_write_result(Err(ToolError::Authority("denied".to_owned()))).is_err());
+        assert!(client_write_result(Ok(())).is_ok());
     }
 }
