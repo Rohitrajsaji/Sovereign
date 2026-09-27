@@ -1151,13 +1151,32 @@ mod tests {
     #[test]
     fn committed_catalog_is_fully_pinned() {
         let catalog = load_catalog().unwrap_or_else(|error| panic!("{error}"));
-        let model = pick_model(&catalog, 8 * 1_024).unwrap_or_else(|| panic!("an 8 GB pick"));
-        assert_eq!(model.model_name, "Qwen3-4B-Q4_K_M");
-        assert_eq!(model.size_bytes, 2_497_280_256);
+        // 8 GB Macs start with the smaller model; the stronger one stays available.
+        let small = pick_model(&catalog, 8 * 1_024).unwrap_or_else(|| panic!("an 8 GB pick"));
+        assert_eq!(small.model_name, "Qwen3-1.7B-Q8_0");
+        assert_eq!(small.size_bytes, 1_834_426_016);
+        assert_eq!(
+            small.sha256,
+            "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a"
+        );
         assert!(
-            model
+            small
+                .url
+                .contains("90862c4b9d2787eaed51d12237eafdfe7c5f6077")
+        );
+        let large = pick_model(&catalog, 16 * 1_024).unwrap_or_else(|| panic!("a 16 GB pick"));
+        assert_eq!(large.model_name, "Qwen3-4B-Q4_K_M");
+        assert_eq!(large.size_bytes, 2_497_280_256);
+        assert!(
+            large
                 .url
                 .contains("bc640142c66e1fdd12af0bd68f40445458f3869b")
+        );
+        assert!(
+            catalog
+                .models
+                .iter()
+                .all(|model| model.min_memory_mib <= 8 * 1_024)
         );
         assert!(pick_model(&catalog, 4 * 1_024).is_none());
     }
@@ -1165,7 +1184,14 @@ mod tests {
     fn two_model_catalog() -> ModelCatalogV2 {
         let mut catalog: serde_json::Value =
             serde_json::from_str(CATALOG_JSON).unwrap_or_else(|error| panic!("{error}"));
-        let mut small = catalog["models"][0].clone();
+        // The committed 4B model plus a made-up smaller one.
+        let large = catalog["models"]
+            .as_array()
+            .and_then(|models| models.iter().find(|model| model["id"] == "qwen3-4b-q4_k_m"))
+            .cloned()
+            .unwrap_or_else(|| panic!("the 4B entry"));
+        catalog["models"] = serde_json::json!([large.clone()]);
+        let mut small = large;
         small["id"] = serde_json::json!("small");
         small["file_name"] = serde_json::json!("small.gguf");
         small["size_bytes"] = serde_json::json!(1_000_000_000_u64);
