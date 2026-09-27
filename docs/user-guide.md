@@ -86,7 +86,7 @@ Every change, including your own edits between requests, is saved in the project
 - **AI model:** a card for each model Sovereign offers, with its download size and the memory it works best with.
   - **Download and use** fetches a model and switches to it. **Use this model** switches to one already downloaded. **Remove** frees its disk space.
   - When a request is running, Sovereign asks whether to switch **After it finishes** or to **Stop it and start again** on the new model.
-  - Macs with 8 GB of memory start with the smaller model; larger Macs start with the larger one.
+  - Macs with 8 GB of memory start with **Qwen3 1.7B** (a 1.8 GB download). Macs with 16 GB or more start with **Qwen3 4B**, which builds better apps. Either Mac can switch to the other.
 - **Work:** **Pause work** stops Sovereign from starting anything new; **Resume work** continues.
 - **Notifications:** hear when a request finishes or needs you while the tab is in the background.
 - **Advanced:**

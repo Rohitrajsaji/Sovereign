@@ -10,6 +10,19 @@
   },
   "models": [
     {
+      "id": "qwen3-1.7b-q8_0",
+      "display_name": "Qwen3 1.7B",
+      "model_name": "Qwen3-1.7B-Q8_0",
+      "file_name": "Qwen3-1.7B-Q8_0.gguf",
+      "url": "https://huggingface.co/Qwen/Qwen3-1.7B-GGUF/resolve/90862c4b9d2787eaed51d12237eafdfe7c5f6077/Qwen3-1.7B-Q8_0.gguf",
+      "sha256": "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+      "size_bytes": 1834426016,
+      "min_memory_mib": 8192,
+      "recommended_memory_mib": 8192,
+      "starting_estimate_mib": 3072,
+      "summary": "Fits 8 GB Macs comfortably. Builds simpler apps than Qwen3 4B."
+    },
+    {
       "id": "qwen3-4b-q4_k_m",
       "display_name": "Qwen3 4B",
       "model_name": "Qwen3-4B-Q4_K_M",
